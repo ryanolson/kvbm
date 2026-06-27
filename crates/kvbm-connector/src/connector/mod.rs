@@ -1,0 +1,26 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Connector module shared across framework integrations.
+//!
+//! The shared slot state machine and transfer planning logic live in `slot`.
+//! Framework-specific leaders (vLLM, etc.) can build on top of these pieces
+//! while supplying their own scheduling semantics.
+
+pub mod disk_cleanup;
+
+pub mod leader;
+pub mod worker;
+
+pub(crate) mod engine;
+pub(crate) mod metadata;
+pub(crate) mod shim;
+
+#[cfg(test)]
+mod surface;
+
+pub use leader::{Error, Leader, RequestSlot};
+pub use metadata::ConnectorMetadata;
+pub use worker::{ConnectorWorkerInterface, FinishedRequests, Worker, WorkerLeaderActions};
+
+pub use kvbm_engine::{G1, G2, G3};

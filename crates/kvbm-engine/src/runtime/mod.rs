@@ -1,0 +1,132 @@
+// SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! KVBM Runtime - composed infrastructure for kvbm operations.
+//!
+//! The runtime contains the minimal shared components needed to construct
+//! all downstream managers and services:
+//! - Tokio runtime (for async execution)
+//! - NixlAgent (for RDMA/UCX transfers)
+//! - Velo (for distributed RPC)
+//!
+//! # Usage
+//!
+//! ```rust,ignore
+//! // Build from environment (leader role)
+//! let runtime = KvbmRuntime::from_env_leader().await?;
+//!
+//! // Build with custom config and injected components
+//! let config = KvbmConfig::extract_from(
+//!     KvbmConfig::figment()
+//!         .merge(("velo.backend.tcp_port", 8080u16))
+//! )?;
+//! let runtime = KvbmRuntime::builder(config)
+//!     .with_runtime_handle(Handle::current())
+//!     .build_leader()
+//!     .await?;
+//!
+//! // Use runtime components
+//! let transfer_mgr = TransferManager::builder()
+//!     .nixl_agent(runtime.nixl_agent().clone())
+//!     .event_system(runtime.event_system().clone())
+//!     .build()?;
+//! ```
+
+mod builder;
+
+pub use builder::{KvbmRuntimeBuilder, RuntimeHandle};
+
+use std::sync::Arc;
+
+use dynamo_memory::nixl::NixlAgent;
+use kvbm_config::KvbmConfig;
+use kvbm_observability::SharedKvbmObservability;
+use tokio::runtime::Handle;
+use velo::{Messenger, Velo};
+
+/// KVBM Runtime - composed infrastructure for kvbm operations.
+///
+/// Contains the minimal shared components needed to construct
+/// all downstream managers and services:
+/// - Tokio runtime (for async execution)
+/// - NixlAgent (for RDMA/UCX transfers)
+/// - Velo (for distributed RPC)
+///
+/// The `LocalEventSystem` is available via `event_system()` which
+/// returns the system from Velo.
+pub struct KvbmRuntime {
+    pub(crate) config: KvbmConfig,
+    pub(crate) runtime: RuntimeHandle,
+    pub(crate) messenger: Arc<Messenger>,
+    /// Full Velo instance, present when the runtime built (or was given)
+    /// one. Required by the disagg session machinery (anchor
+    /// and rendezvous management). Test paths that inject only a bare
+    /// `Messenger` leave this `None` — CD wiring will fail loudly if
+    /// invoked against a runtime without a Velo.
+    pub(crate) velo: Option<Arc<Velo>>,
+    pub(crate) nixl_agent: Option<NixlAgent>,
+    pub(crate) observability: SharedKvbmObservability,
+}
+
+impl KvbmRuntime {
+    /// Create a builder for customized construction.
+    pub fn builder(config: KvbmConfig) -> KvbmRuntimeBuilder {
+        KvbmRuntimeBuilder::new(config)
+    }
+
+    /// Quick construction from environment (for leader role).
+    pub async fn from_env_leader() -> anyhow::Result<Self> {
+        KvbmRuntimeBuilder::from_env()?.build_leader().await
+    }
+
+    /// Quick construction from environment (for worker role).
+    pub async fn from_env_worker() -> anyhow::Result<Self> {
+        KvbmRuntimeBuilder::from_env()?.build_worker().await
+    }
+
+    /// Get the configuration.
+    pub fn config(&self) -> &KvbmConfig {
+        &self.config
+    }
+
+    /// Get the tokio runtime handle.
+    pub fn handle(&self) -> Handle {
+        self.runtime.handle()
+    }
+
+    /// Get the tokio runtime handle (convenience alias for handle()).
+    pub fn tokio(&self) -> Handle {
+        self.handle()
+    }
+
+    /// Get Messenger.
+    pub fn messenger(&self) -> &Arc<Messenger> {
+        &self.messenger
+    }
+
+    /// Get the full Velo instance, if one is associated with this runtime.
+    ///
+    /// Production paths build a Velo (which carries the messenger plus
+    /// streaming/anchor/rendezvous managers needed by the
+    /// disagg session machinery). Test paths that inject only
+    /// a bare Messenger return `None` here — those tests don't use CD.
+    pub fn velo(&self) -> Option<&Arc<Velo>> {
+        self.velo.as_ref()
+    }
+
+    /// Get shared KVBM observability handles and registry.
+    pub fn observability(&self) -> &SharedKvbmObservability {
+        &self.observability
+    }
+
+    /// Get NixlAgent for RDMA/UCX transfers.
+    /// Returns None if NixL is disabled in config.
+    pub fn nixl_agent(&self) -> Option<&NixlAgent> {
+        self.nixl_agent.as_ref()
+    }
+
+    /// Get the event manager for worker coordination and transfer notifications.
+    pub fn event_system(&self) -> Arc<velo::EventManager> {
+        Arc::new(self.messenger.event_manager())
+    }
+}

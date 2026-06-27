@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[build]
+# tokio-console needs this
+rustflags = ["--cfg", "tokio_unstable"]
+
+# NIXL link-time fix: libnixl.so has a transitive NEEDED on libstream.so (and
+# libserdes.so), but nixl-sys's build.rs links only nixl/nixl_build/nixl_common
+# and emits no -rpath-link, so `ld` cannot resolve libnixl's indirect deps when
+# producing an executable (e.g. a `cargo test` binary) and fails with
+# "undefined reference to nixlMDStreamListener". -rpath-link is a link-time-only
+# search path (embeds nothing in the artifact) pointed at the default
+# NIXL_PREFIX install, so libstream's ABI matches the linked libnixl. The
+# NIXL-less stub build (CI) ignores the absent directory. Override if you build
+# against a NIXL_PREFIX other than /opt/nvidia/nvda_nixl.
+
+# Target Haswell (2013) era+ machines. That gets us AVX-2
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "force-frame-pointers=yes", "--cfg", "tokio_unstable", "-C", "link-arg=-Wl,-rpath-link,/opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu"]
+
+# Target Graviton 2 / Ampere Altra + machines. NEON vector, and LSE atomics.
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=neoverse-n1", "-C", "force-frame-pointers=yes", "--cfg", "tokio_unstable", "-C", "link-arg=-Wl,-rpath-link,/opt/nvidia/nvda_nixl/lib/aarch64-linux-gnu"]
+
+# Static-link pcre2 C library (used by the fastokens tokenizer crate).
+# Without this, pcre2-sys tries to find a system libpcre2 via pkg-config,
+# which breaks Docker builds and bundles a .so into the Python wheel.
+[env]
+PCRE2_SYS_STATIC = "1"
+
+
+[net]
+git-fetch-with-cli = true

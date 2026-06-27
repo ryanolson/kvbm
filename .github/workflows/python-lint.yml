@@ -1,0 +1,63 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Optional / low-priority Python gate for the python/ tree.
+#
+# Scope is deliberately light. The real coverage (test_legacy_imports.py) is
+# guarded by `requires_kvbm_runtime` (needs nixl) and `requires_vllm` markers,
+# so on a no-GPU / no-nixl runner the suite collects and SKIPS — that still
+# catches collection/syntax breakage. Full execution needs the .sandbox-style
+# venv (built wheel + nixl + LD_LIBRARY_PATH) and belongs on a GPU runner.
+#
+# ruff/mypy are best-effort: the repo currently ships NO ruff/mypy config, so
+# they run with defaults under continue-on-error. TODO(human): add a [tool.ruff]
+# / mypy config to pyproject.toml and then make these blocking.
+
+name: Python Lint
+
+on:
+  pull_request:
+    paths:
+      - 'python/**'
+      - 'pyproject.toml'
+      - '.github/workflows/python-lint.yml'
+  push:
+    branches:
+      - main
+      - release/*.*.*
+    paths:
+      - 'python/**'
+      - 'pyproject.toml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('{0}-{1}', github.workflow, github.event.pull_request.number) || format('{0}-{1}', github.workflow, github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  python-lint:
+    name: ruff / pytest (collect+skip)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install lint/test tooling
+        run: |
+          python -m pip install -U pip
+          pip install ruff pytest
+
+      - name: ruff (best-effort, no config yet)
+        continue-on-error: true
+        run: ruff check python
+
+      - name: pytest collect + skip (no nixl/vllm -> all skip)
+        # Without nixl installed, requires_kvbm_runtime skips the import tests;
+        # this still exercises collection + module import of the test file.
+        run: pytest python/tests -q -rs

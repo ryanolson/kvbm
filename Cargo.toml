@@ -1,0 +1,125 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Standalone wheel root. The kvbm Rust crates live in the separate `crates/`
+# workspace; this package consumes them as path deps. Marked as its own
+# (single-package) workspace so it is NOT a member of `crates/`.
+[workspace]
+exclude = ["crates"]
+
+[package]
+name = "kvbm-py3"
+version = "1.2.0"
+edition = "2024"
+authors = ["NVIDIA"]
+license = "Apache-2.0"
+homepage = "https://github.com/ai-dynamo/dynamo"
+repository = "https://github.com/ai-dynamo/dynamo.git"
+
+[lib]
+path = "src/lib.rs"
+name = "_core"
+# "cdylib" is necessary to produce a shared library for Python to import from.
+# "rlib" is necessary to support doctests.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["hub"]
+kernels = ["dep:kvbm-kernels", "dep:cudarc", "dep:once_cell"]
+# Hub-facing pyclasses: `PrefillRouterHandler` + `CompletionEvent`. Pulls
+# kvbm-hub + velo.
+hub = [
+    "dep:kvbm-hub",
+    "dep:kvbm-protocols",
+    "dep:velo",
+    "dep:velo-ext",
+    "dep:tokio",
+    "dep:parking_lot",
+    "dep:pythonize",
+]
+
+[dependencies]
+# Connector deps — path deps into the crates/ workspace
+kvbm-common = { path = "crates/kvbm-common" }
+kvbm-connector = { path = "crates/kvbm-connector", features = ["static-kernels"] }
+
+# kernels deps (optional)
+kvbm-kernels = { path = "crates/kvbm-kernels", optional = true }
+
+# hub deps (optional)
+kvbm-hub = { path = "crates/kvbm-hub", optional = true }
+kvbm-protocols = { path = "crates/kvbm-protocols", optional = true }
+velo = { version = "0.4.1", optional = true }
+velo-ext = { version = "0.2.0", optional = true }
+tokio = { version = "1.46", features = ["rt-multi-thread", "sync", "macros", "time"], optional = true }
+parking_lot = { version = "0.12.4", optional = true }
+pythonize = { version = "0.28", optional = true }
+
+anyhow = { version = "1" }
+serde = { version = "1" }
+serde_json = { version = "1.0.138" }
+tracing = { version = "0" }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.17", features = ["v4", "serde"] }
+
+# "extension-module" tells pyo3 we want to build an extension module (skips linking against libpython.so)
+# "abi3-py310" tells pyo3 (and maturin) to build using the stable ABI with minimum Python version 3.10
+pyo3 = { version = "0.28.3", default-features = false, features = [
+  "macros",
+  "experimental-async",
+  "experimental-inspect",
+  "extension-module",
+  "py-clone",
+  "abi3-py310",
+] }
+
+once_cell = { version = "1", optional = true }
+cudarc = { version = "=0.19.3", features = ["cuda-version-from-build-system", "fallback-latest"], optional = true }
+
+[dev-dependencies]
+rstest = "0.26"
+
+# ---------------------------------------------------------------------------
+# Build profiles for the `kvbm-py3` wheel (lib `_core`, cdylib + rlib).
+# This package is its OWN workspace (see [workspace] exclude = ["crates"]), so
+# the [profile.*] in crates/Cargo.toml do NOT apply to the wheel build — these
+# do. Profiles apply graph-wide: this crate plus every dependency.
+#
+# The 747MB default-profile cdylib was ~81% DWARF debuginfo emitted across the
+# whole closure (pyo3/tokio/velo/dynamo + the kvbm-* crates). The static CUDA
+# kernels are a fixed ~1.9MB fatbin (nvcc -O3, no -g) and are NOT the lever —
+# the `debug` setting is.
+# ---------------------------------------------------------------------------
+
+# DEFAULT dev/test build — what `maturin develop` and `cargo test` produce.
+# `line-tables-only` is the leanest debug level that still yields file:line in
+# RUST_BACKTRACE panic traces; it sheds the bulk of DWARF (types/variables).
+# Do NOT strip here: cargo has no "keep .debug_line, drop .symtab" mode — any
+# strip would delete the line tables we just emitted. debug-assertions /
+# overflow-checks stay on (dev default).
+[profile.dev]
+opt-level = 0
+debug = "line-tables-only"
+strip = "none"
+
+# Shippable wheel — `maturin build --release`.
+# debug=false ⇒ no .debug_* sections are emitted; strip=true also drops .symtab
+# for the smallest .so. Trade-off: production crash backtraces lose file:line
+# and function names (panic messages still print). opt-level=3 + thin LTO +
+# 1 codegen-unit mirror the sibling crates/ workspace. panic stays the default
+# "unwind" — never set panic="abort" for a pyo3 cdylib (it converts catchable
+# Python exceptions into interpreter aborts).
+[profile.release]
+opt-level = 3
+debug = false
+strip = true
+lto = "thin"
+codegen-units = 1
+
+# Opt-in fully-debuggable build — `maturin develop --profile debuginfo`.
+# Inherits dev (opt-level 0 + assertions kept) and turns on full DWARF for
+# gdb/lldb on the .so. Largest + slowest to link; normal dev/test uses dev.
+[profile.debuginfo]
+inherits = "dev"
+debug = 2
+strip = "none"

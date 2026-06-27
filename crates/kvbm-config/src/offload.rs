@@ -1,0 +1,263 @@
+// SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Offload policy configuration for KVBM.
+//!
+//! Defines configuration for offload policies that control which blocks
+//! are transferred between storage tiers (G1→G2, G2→G3).
+//!
+//! # Policy Types
+//!
+//! - `pass_all`: No filtering, all blocks pass
+//! - `presence`: Skip blocks already present in destination tier
+//! - `presence_lfu`: Presence check + LFU count threshold
+//!
+//! # Configuration
+//!
+//! Policies are configured per tier transition. Multiple policies in the
+//! `policies` list are applied in order with implicit AND logic (all must pass).
+//!
+//! ## JSON Example
+//!
+//! ```json
+//! {
+//!   "offload": {
+//!     "g1_to_g2": {
+//!       "policies": ["presence"],
+//!       "presence": {}
+//!     },
+//!     "g2_to_g3": {
+//!       "policies": ["presence_lfu"],
+//!       "presence_lfu": { "min_lfu_count": 1 }
+//!     }
+//!   }
+//! }
+//! ```
+
+use serde::{Deserialize, Serialize};
+use validator::Validate;
+
+/// Policy type enum for serialization.
+///
+/// Each variant corresponds to a policy implementation in the kvbm crate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyType {
+    /// PassAllPolicy - no filtering, all blocks pass
+    PassAll,
+    /// PresenceFilter - skip blocks already in destination tier
+    Presence,
+    /// PresenceAndLFUFilter - presence check + LFU threshold
+    PresenceLfu,
+}
+
+/// Configuration for presence filter.
+///
+/// Currently has no parameters, but the struct exists for future extensibility
+/// and to maintain consistent configuration patterns.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Validate)]
+pub struct PresenceFilterConfig {}
+
+/// Default LFU count threshold.
+///
+/// The filter passes when `count > min_lfu_count`. The TinyLFU sketch counts
+/// every register and prefix re-match, so:
+/// - `0` → first registration triggers offload (effectively no LFU gating)
+/// - `1` → second hit triggers offload (matches KVBM v1's `FrequencyFilter`
+///   default of `min_offload_frequency = 2`)
+/// - higher values → require more re-matches before promoting
+///
+/// Default `1` matches v1 UX: a block crosses to the next tier the moment a
+/// second request prefix-matches it.
+fn default_min_lfu_count() -> u32 {
+    1
+}
+
+/// Configuration for presence + LFU filter.
+///
+/// Combines presence checking with LFU (Least Frequently Used) count threshold.
+/// Only blocks with access count above the threshold are offloaded.
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+pub struct PresenceLfuFilterConfig {
+    /// Minimum LFU count threshold for offload.
+    ///
+    /// A block is offloaded when its access count is **strictly greater** than
+    /// this value. The TinyLFU sketch counts each register and prefix re-match.
+    ///
+    /// Default: 1 (block crosses on the second hit, matching KVBM v1).
+    #[serde(default = "default_min_lfu_count")]
+    #[validate(range(min = 0))]
+    pub min_lfu_count: u32,
+}
+
+impl Default for PresenceLfuFilterConfig {
+    fn default() -> Self {
+        Self {
+            min_lfu_count: default_min_lfu_count(),
+        }
+    }
+}
+
+/// Configuration for a tier transition (e.g., G1→G2, G2→G3).
+///
+/// Defines which policies to apply when offloading blocks between tiers.
+/// Policies are evaluated in order with implicit AND logic - a block must
+/// pass ALL policies to be transferred.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Validate)]
+pub struct TierOffloadConfig {
+    /// Ordered list of policies to apply (implicit AND).
+    ///
+    /// If empty, tier-specific defaults are applied by the engine.
+    /// Policies are evaluated in order; a block must pass all to be transferred.
+    #[serde(default)]
+    pub policies: Vec<PolicyType>,
+
+    /// Presence filter configuration.
+    ///
+    /// Used when "presence" is in the policies list.
+    #[serde(default)]
+    #[validate(nested)]
+    pub presence: PresenceFilterConfig,
+
+    /// Presence + LFU filter configuration.
+    ///
+    /// Used when "presence_lfu" is in the policies list.
+    #[serde(default)]
+    #[validate(nested)]
+    pub presence_lfu: PresenceLfuFilterConfig,
+
+    /// Minimum priority threshold for prefix-contiguous offload filtering.
+    ///
+    /// Offloading stops at the first block below this threshold.
+    /// 0 means no priority filtering (default).
+    ///
+    /// V1 compat: `DYN_KVBM_HOST_OFFLOAD_PREFIX_MIN_PRIORITY`
+    #[serde(default)]
+    pub min_priority: i32,
+
+    /// Maximum number of concurrent transfers for this tier transition.
+    ///
+    /// If None, the engine uses its own default (typically 4).
+    ///
+    /// V1 compat: `DYN_KVBM_MAX_CONCURRENT_TRANSFERS`
+    #[serde(default)]
+    pub max_concurrent_transfers: Option<usize>,
+
+    /// Maximum batch size for transfers.
+    ///
+    /// If None, the engine uses its own default (typically 16).
+    ///
+    /// V1 compat: `DYN_KVBM_MAX_TRANSFER_BATCH_SIZE` or `DYN_KVBM_TRANSFER_BATCH_SIZE`
+    #[serde(default)]
+    pub max_batch_size: Option<usize>,
+}
+
+/// Top-level offload configuration.
+///
+/// Groups policy configurations for each tier transition.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Validate)]
+pub struct OffloadConfig {
+    /// G1 (GPU) → G2 (Host) offload policies.
+    #[serde(default)]
+    #[validate(nested)]
+    pub g1_to_g2: TierOffloadConfig,
+
+    /// G2 (Host) → G3 (Disk) offload policies.
+    #[serde(default)]
+    #[validate(nested)]
+    pub g2_to_g3: TierOffloadConfig,
+
+    /// G1 (GPU) → G3 (Disk) direct offload policies (host-bypass mode).
+    ///
+    /// Only consulted when the cache config has `bypass_host_cache() == true`
+    /// (disk configured, host not). In that mode the G1→G2 + G2→G3 chain is
+    /// replaced by a single G1→G3 pipeline that uses GDS for direct GPU→disk
+    /// transfers.
+    #[serde(default)]
+    #[validate(nested)]
+    pub g1_to_g3: TierOffloadConfig,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config() {
+        let config = OffloadConfig::default();
+        // Empty policies - engine applies tier-specific defaults
+        assert!(config.g1_to_g2.policies.is_empty());
+        assert!(config.g2_to_g3.policies.is_empty());
+        assert_eq!(config.g2_to_g3.presence_lfu.min_lfu_count, 1);
+    }
+
+    #[test]
+    fn test_policy_type_serde() {
+        let json = r#"["pass_all", "presence", "presence_lfu"]"#;
+        let policies: Vec<PolicyType> = serde_json::from_str(json).unwrap();
+        assert_eq!(policies.len(), 3);
+        assert_eq!(policies[0], PolicyType::PassAll);
+        assert_eq!(policies[1], PolicyType::Presence);
+        assert_eq!(policies[2], PolicyType::PresenceLfu);
+
+        // Roundtrip (serde_json doesn't add spaces after commas)
+        let serialized = serde_json::to_string(&policies).unwrap();
+        let roundtrip: Vec<PolicyType> = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(policies, roundtrip);
+    }
+
+    #[test]
+    fn test_tier_config_serde() {
+        let json = r#"{
+            "policies": ["presence_lfu"],
+            "presence_lfu": { "min_lfu_count": 16 }
+        }"#;
+
+        let config: TierOffloadConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.policies.len(), 1);
+        assert_eq!(config.policies[0], PolicyType::PresenceLfu);
+        assert_eq!(config.presence_lfu.min_lfu_count, 16);
+    }
+
+    #[test]
+    fn test_offload_config_serde() {
+        let json = r#"{
+            "g1_to_g2": {
+                "policies": ["presence"]
+            },
+            "g2_to_g3": {
+                "policies": ["presence_lfu"],
+                "presence_lfu": { "min_lfu_count": 4 }
+            }
+        }"#;
+
+        let config: OffloadConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.g1_to_g2.policies, vec![PolicyType::Presence]);
+        assert_eq!(config.g2_to_g3.policies, vec![PolicyType::PresenceLfu]);
+        assert_eq!(config.g2_to_g3.presence_lfu.min_lfu_count, 4);
+    }
+
+    #[test]
+    fn test_default_lfu_threshold() {
+        let json = r#"{"policies": ["presence_lfu"]}"#;
+        let config: TierOffloadConfig = serde_json::from_str(json).unwrap();
+        // Should use default of 1 (offload on second hit, matching KVBM v1)
+        assert_eq!(config.presence_lfu.min_lfu_count, 1);
+    }
+
+    #[test]
+    fn test_validation() {
+        let config = OffloadConfig::default();
+        assert!(config.validate().is_ok());
+
+        let config_with_lfu = OffloadConfig {
+            g2_to_g3: TierOffloadConfig {
+                policies: vec![PolicyType::PresenceLfu],
+                presence_lfu: PresenceLfuFilterConfig { min_lfu_count: 1 },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(config_with_lfu.validate().is_ok());
+    }
+}

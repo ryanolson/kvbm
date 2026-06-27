@@ -1,0 +1,38 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# --- Rust build artifacts ---
+/target/
+/crates/target/
+**/*.rs.bk
+
+# --- Python ---
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Local dev venvs (provision via the kvbm-sandbox-venv skill) ---
+/.sandbox/
+/.sandbox-repro/
+**/venv/
+**/.venv/
+
+# --- Vendored wheels are a LOCAL cache only ---
+# The durable vllm pin is the per-commit URL / release asset recorded in
+# .sandbox/requirements.release-pinned.txt; the 200MB+ wheel must never hit git.
+/wheels/
+
+# --- Test outputs / logs ---
+test_determinism_*/
+*.log
+*pytest_report.*
+
+# --- Editor / OS ---
+.idea/
+.vscode/
+.helix/
+.*.swp
+.DS_Store

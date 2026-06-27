@@ -1,0 +1,164 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Standalone replacement for the wheel that dynamo's release.yml used to harvest
+# out of the dynamo container image
+# (opt/dynamo/wheelhouse/kvbm-*{x86_64,aarch64}*.whl).
+#
+# Builds the `kvbm` wheel (module kvbm._core, abi3-py310) from the REPO ROOT via
+# `maturin build --release`. The wheel root's default feature is `hub`; the
+# KVBM connector is mandatory and enables kvbm-connector/static-kernels so the
+# CUDA tensor kernels are nvcc-compiled and statically embedded in `_core`. That requires a CUDA
+# toolkit (KVBM_REQUIRE_CUDA=1, set in pyproject [tool.maturin.environment] and
+# re-exported here) but NOT a GPU to compile — so this job runs in a CUDA devel
+# container with no --gpus.
+#
+# The optional import-smoke (a GPU + nixl job) is split into a separate,
+# disabled-by-default job below.
+
+name: Wheel Build
+
+on:
+  push:
+    branches:
+      - main
+      - release/*.*.*
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'pyproject.toml'
+      - 'python/**'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+      - '.github/workflows/wheel-build.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('{0}-{1}', github.workflow, github.event.pull_request.number) || format('{0}-{1}', github.workflow, github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # See rust-checks.yml — only needed if the dynamo git-deps are private.
+  DYNAMO_GIT_TOKEN: ${{ secrets.DYNAMO_GIT_TOKEN }}
+
+jobs:
+  build-wheel:
+    name: wheel (${{ matrix.arch }})
+    # TODO(human): provision native runners for each arch with Docker available
+    # (the CUDA toolkit comes from the container, so the host only needs Docker;
+    # a GPU is NOT required to compile). aarch64 MUST be a native arm64 runner —
+    # do NOT rely on qemu emulation for an nvcc build. Replace these labels.
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest            # TODO(human): x86_64 runner w/ Docker
+            cuda_image: nvidia/cuda:12.8.1-devel-ubuntu24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm          # TODO(human): native arm64 runner w/ Docker
+            cuda_image: nvidia/cuda:12.8.1-devel-ubuntu24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Build wheel in CUDA devel container
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/wheelhouse"
+          docker run --rm \
+            -e DYNAMO_GIT_TOKEN \
+            -v "${GITHUB_WORKSPACE}:/workspace:ro" \
+            -v "${GITHUB_WORKSPACE}/wheelhouse:/out" \
+            ${{ matrix.cuda_image }} \
+            bash -c '
+              set -euo pipefail
+              export DEBIAN_FRONTEND=noninteractive
+
+              # Build + python tooling. protobuf-compiler for tonic-build in the
+              # kvbm-client/kvbm-service closure; python3-venv for maturin.
+              apt-get update -qq
+              apt-get install -y -qq \
+                curl git build-essential pkg-config protobuf-compiler \
+                python3 python3-pip python3-venv > /dev/null
+
+              # Optional private dynamo git-dep auth.
+              if [ -n "${DYNAMO_GIT_TOKEN:-}" ]; then
+                git config --global \
+                  url."https://x-access-token:${DYNAMO_GIT_TOKEN}@github.com/".insteadOf \
+                  "https://github.com/"
+              fi
+
+              # Rust (pinned toolchain auto-installs from rust-toolchain.toml).
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --default-toolchain none
+              source "$HOME/.cargo/env"
+
+              # maturin in a clean venv (avoids PEP-668 system-pip friction).
+              python3 -m venv /tmp/venv
+              . /tmp/venv/bin/activate
+              pip install -q -U pip
+              pip install -q "maturin>=1,<2" patchelf
+
+              # Source is ro-mounted; copy to a writable location to build.
+              cp -a /workspace /tmp/build
+              cd /tmp/build
+              rustup show   # installs 1.93.1 per rust-toolchain.toml
+
+              # CUDA build env (mirrors the repo build instructions).
+              export CUDA_PATH=/usr/local/cuda
+              export CUDA_HOME=/usr/local/cuda
+              export PATH=/usr/local/cuda/bin:$PATH
+              export KVBM_REQUIRE_CUDA=1
+              nvcc --version
+
+              # Build the release wheel straight into the mounted output dir.
+              maturin build --release --manifest-path Cargo.toml -o /out
+              chmod -R a+rwX /out
+              ls -l /out
+            '
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kvbm-wheel-${{ matrix.arch }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Optional import-smoke: install the built wheel and run
+  # `python -c "import kvbm"`. Use the cu13 extra when the runner should also
+  # validate NIXL package availability. Disabled by default — enable once a
+  # GPU+nixl runner is provisioned.
+  # ---------------------------------------------------------------------------
+  import-smoke:
+    name: import smoke (GPU + nixl)
+    if: false   # TODO(human): set to a real condition once a GPU+nixl runner exists
+    needs: build-wheel
+    # TODO(human): GPU runner with nixl libs at /opt/nvidia/nvda_nixl/lib/<arch>.
+    runs-on: gpu-nixl-runner-PLACEHOLDER
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Download wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: kvbm-wheel-x86_64
+          path: wheelhouse
+      - name: Install + import
+        env:
+          # arch dir is x86_64-linux-gnu / aarch64-linux-gnu — adjust per runner.
+          LD_LIBRARY_PATH: /opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu:/usr/local/cuda/lib64
+        run: |
+          python3 -m venv /tmp/smoke
+          . /tmp/smoke/bin/activate
+          pip install -q -U pip
+          pip install -q "$(ls wheelhouse/*.whl)[cu13]"
+          python -c "import kvbm; print(kvbm.__version__); print('core:', kvbm.is_available())"

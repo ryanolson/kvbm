@@ -1,0 +1,211 @@
+// SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Builder for KvbmRuntime with optional pre-built components.
+
+use std::sync::Arc;
+
+use anyhow::Result;
+use dynamo_memory::nixl::NixlAgent;
+use kvbm_config::KvbmConfig;
+use kvbm_observability::{KvbmObservability, SharedKvbmObservability};
+use tokio::runtime::{Handle, Runtime};
+use velo::{Messenger, Velo};
+
+/// Runtime handle - either owned or borrowed.
+pub enum RuntimeHandle {
+    /// Owned runtime (created by builder).
+    Owned(Arc<Runtime>),
+    /// Borrowed handle (external runtime).
+    Handle(Handle),
+}
+
+impl RuntimeHandle {
+    /// Get a handle to the runtime.
+    pub fn handle(&self) -> Handle {
+        match self {
+            RuntimeHandle::Owned(rt) => rt.handle().clone(),
+            RuntimeHandle::Handle(h) => h.clone(),
+        }
+    }
+}
+
+/// Builder for KvbmRuntime with optional pre-built components.
+///
+/// The builder allows injecting pre-built components or building them from config:
+/// - If a component is provided, it's used directly
+/// - If not provided, the component is built from the config
+pub struct KvbmRuntimeBuilder {
+    config: KvbmConfig,
+    runtime: Option<RuntimeHandle>,
+    velo: Option<Arc<Velo>>,
+    messenger: Option<Arc<Messenger>>,
+    nixl_agent: Option<NixlAgent>,
+    observability: Option<SharedKvbmObservability>,
+    discovery_override: Option<Arc<dyn velo::discovery::PeerDiscovery>>,
+}
+
+impl KvbmRuntimeBuilder {
+    /// Create builder from config.
+    pub fn new(config: KvbmConfig) -> Self {
+        Self {
+            config,
+            runtime: None,
+            velo: None,
+            messenger: None,
+            nixl_agent: None,
+            observability: None,
+            discovery_override: None,
+        }
+    }
+
+    /// Create builder from environment.
+    pub fn from_env() -> Result<Self, kvbm_config::ConfigError> {
+        Ok(Self::new(KvbmConfig::from_env()?))
+    }
+
+    /// Create builder from JSON config string (merged with env/files).
+    ///
+    /// JSON has highest priority - overrides env vars, TOML files, and defaults.
+    /// This is the primary entrypoint for vLLM's `kv_connector_extra_config` dict.
+    pub fn from_json(json: &str) -> Result<Self, kvbm_config::ConfigError> {
+        Ok(Self::new(KvbmConfig::from_figment_with_json(json)?))
+    }
+
+    /// Use an existing tokio Runtime (takes ownership via Arc).
+    pub fn with_runtime(mut self, runtime: Arc<Runtime>) -> Self {
+        self.runtime = Some(RuntimeHandle::Owned(runtime));
+        self
+    }
+
+    /// Use an existing tokio Handle (borrowed).
+    pub fn with_runtime_handle(mut self, handle: Handle) -> Self {
+        self.runtime = Some(RuntimeHandle::Handle(handle));
+        self
+    }
+
+    /// Use an existing Messenger instance. Resulting `KvbmRuntime` has no
+    /// Velo — disagg wiring will fail at init time. For CD,
+    /// inject a full Velo via [`with_velo`](Self::with_velo) instead.
+    pub fn with_messenger(mut self, messenger: Arc<Messenger>) -> Self {
+        self.messenger = Some(messenger);
+        self
+    }
+
+    /// Use an existing Velo instance. The runtime extracts the messenger
+    /// from it; later accessors (`messenger()`, `velo()`) both return the
+    /// derived components.
+    pub fn with_velo(mut self, velo: Arc<Velo>) -> Self {
+        self.velo = Some(velo);
+        self
+    }
+
+    /// Use an existing NixlAgent instance.
+    pub fn with_nixl_agent(mut self, agent: NixlAgent) -> Self {
+        self.nixl_agent = Some(agent);
+        self
+    }
+
+    /// Use an existing observability registry and metric handles.
+    pub fn with_observability(mut self, observability: SharedKvbmObservability) -> Self {
+        self.observability = Some(observability);
+        self
+    }
+
+    /// Inject a peer-discovery backend that velo will use to resolve
+    /// remote instance ids → `PeerInfo`. Overrides the
+    /// [`kvbm_config::messenger::DiscoveryConfig`] field. Ignored when
+    /// a pre-built `Velo` is provided via [`with_velo`](Self::with_velo)
+    /// — that velo already has its own discovery, set at its own build
+    /// time.
+    ///
+    /// Intended for the kvbm-connector path: when `disagg.hub_url` is
+    /// configured, the connector builds an `Arc<HubClient>` (which
+    /// implements `PeerDiscovery`) and passes it here so velo's standard
+    /// `messenger.discover_and_register_peer` lookup goes through the
+    /// hub instead of a static filesystem dir.
+    pub fn with_discovery(mut self, discovery: Arc<dyn velo::discovery::PeerDiscovery>) -> Self {
+        self.discovery_override = Some(discovery);
+        self
+    }
+
+    /// Build runtime for leader role.
+    pub async fn build_leader(self) -> Result<super::KvbmRuntime> {
+        self.build_internal("leader").await
+    }
+
+    /// Build runtime for worker role.
+    pub async fn build_worker(self) -> Result<super::KvbmRuntime> {
+        self.build_internal("worker").await
+    }
+
+    async fn build_internal(self, role: &'static str) -> Result<super::KvbmRuntime> {
+        // 1. Tokio runtime - use provided or build from config
+        let runtime = match self.runtime {
+            Some(rt) => rt,
+            None => RuntimeHandle::Owned(Arc::new(self.config.tokio.build_runtime()?)),
+        };
+
+        // 2. Messenger / Velo - resolve to (messenger, velo: Option) per
+        //    injection precedence: explicit velo wins; then explicit
+        //    messenger (no velo); else build a fresh Velo from config and
+        //    derive the messenger from it.
+        let (messenger, velo) = match (self.velo, self.messenger) {
+            (Some(velo), _) => {
+                let messenger = velo.messenger().clone();
+                (messenger, Some(velo))
+            }
+            (None, Some(m)) => (m, None),
+            (None, None) => {
+                let velo = kvbm_runtime::build_velo_with_discovery(
+                    &self.config.messenger,
+                    self.discovery_override,
+                )
+                .await?;
+                let messenger = velo.messenger().clone();
+                (messenger, Some(velo))
+            }
+        };
+
+        // 3. NixL - use provided or build from config (AFTER Messenger).
+        //    Backend selection (UCX for host, POSIX/GDS_MT for disk) is handled
+        //    by `KvbmConfig::auto_enable_nixl_backends_for_tiers` at extract time.
+        let nixl_agent = match self.nixl_agent {
+            Some(agent) => Some(agent),
+            None => match &self.config.nixl {
+                Some(nixl_config) => {
+                    let agent_name = format!("nixl-{}", messenger.instance_id());
+                    let backend_config = kvbm_runtime::nixl_backend_config(nixl_config);
+                    Some(NixlAgent::from_nixl_backend_config(
+                        &agent_name,
+                        backend_config,
+                    )?)
+                }
+                None => None, // NixL disabled
+            },
+        };
+
+        // 4. Observability - shared registry and metric handles
+        let observability = match self.observability {
+            Some(observability) => observability,
+            None => Arc::new(KvbmObservability::new()?),
+        };
+        observability.set_external_labels(vec![
+            (
+                "instance_id".to_string(),
+                messenger.instance_id().to_string(),
+            ),
+            ("role".to_string(), role.to_string()),
+        ]);
+        observability.start_server(self.config.metrics.enabled, self.config.metrics.port);
+
+        Ok(super::KvbmRuntime {
+            config: self.config,
+            runtime,
+            messenger,
+            velo,
+            nixl_agent,
+            observability,
+        })
+    }
+}

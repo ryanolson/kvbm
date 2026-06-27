@@ -1,0 +1,164 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# CPU pre-merge / PR gate for the standalone kvbm repo.
+#
+# Two Cargo workspaces exist and BOTH are checked here:
+#   * repo root  -> package `kvbm-py3` (the `_core` wheel cdylib),
+#                   [workspace] excludes crates/, default feature `hub`;
+#                   connector/runtime bindings are mandatory
+#   * crates/    -> the 14-member kvbm-* workspace
+#
+# This job is CPU-only: nixl-sys stub-falls-back (no NIXL needed to build) and
+# KVBM_REQUIRE_CUDA is intentionally NOT set, so kvbm-kernels build.rs compiles
+# C stubs (dynamic) instead of requiring nvcc. GPU/NIXL crate tests live in
+# gpu-tests.yml; the CUDA kernel matrix lives in kvbm-kernels-cuda.yml.
+
+name: Rust Checks (CPU)
+
+on:
+  push:
+    branches:
+      - main
+      - release/*.*.*
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'deny.toml'
+      - '.cargo/**'
+      - '.github/workflows/rust-checks.yml'
+
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('{0}-{1}', github.workflow, github.event.pull_request.number) || format('{0}-{1}', github.workflow, github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Optional: a PAT/token with read access to github.com/ai-dynamo/dynamo.
+  # ONLY required if that repo (and the `ryan/kvbm-engine-service` branch the
+  # 4 dynamo git-deps point at) is private. If it is public, leave this secret
+  # unset and anonymous HTTPS fetch (git-fetch-with-cli is on in .cargo/config)
+  # works. TODO(human): create the `DYNAMO_GIT_TOKEN` secret if the dep is private.
+  DYNAMO_GIT_TOKEN: ${{ secrets.DYNAMO_GIT_TOKEN }}
+
+jobs:
+  rust-checks:
+    name: ${{ matrix.name }}
+    # TODO(human): a hosted ubuntu-latest (2 vCPU / 7 GB) compiles the full
+    # closure (tokio-full + velo + 4 dynamo git-deps + pyo3) but slowly. Swap
+    # to a larger self-hosted CPU runner if pre-merge latency matters.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # crates/ workspace (the 14 kvbm-* crates)
+          - name: crates workspace
+            workdir: crates
+            run_deny: true
+          # repo-root wheel package (kvbm-py3 / `_core`). Its own workspace
+          # (excludes crates/), so lockfile + clippy must run here too.
+          - name: wheel root (kvbm-py3)
+            workdir: .
+            run_deny: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Configure git auth for private dynamo git-deps (optional)
+        if: ${{ env.DYNAMO_GIT_TOKEN != '' }}
+        run: |
+          git config --global \
+            url."https://x-access-token:${DYNAMO_GIT_TOKEN}@github.com/".insteadOf \
+            "https://github.com/"
+
+      - name: Install protoc
+        # kvbm-client + kvbm-service build.rs run tonic-build; the root wheel's
+        # dep closure pulls them transitively. apt's protobuf-compiler is
+        # arch-agnostic and recent enough for prost/tonic 0.13.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq protobuf-compiler
+          protoc --version
+
+      - name: Install Rust toolchain (pinned via rust-toolchain.toml)
+        run: |
+          # `rustup show` installs the channel pinned in rust-toolchain.toml
+          # (1.93.1). rust-toolchain.toml is at the repo root and applies to the
+          # crates/ subdir too (rustup searches upward).
+          rustup show
+          rustup component add rustfmt clippy
+
+      - name: Cache cargo artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+            crates/target/
+          key: ${{ runner.os }}-cargo-${{ matrix.workdir }}-${{ hashFiles('Cargo.lock', 'crates/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.workdir }}-
+            ${{ runner.os }}-cargo-
+
+      - name: Verify code formatting
+        working-directory: ${{ matrix.workdir }}
+        run: cargo fmt --all -- --check
+
+      - name: Verify Cargo.lock is in sync
+        working-directory: ${{ matrix.workdir }}
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
+      - name: Clippy (all targets, deny warnings)
+        working-directory: ${{ matrix.workdir }}
+        # Default features only. NOT --all-features: on crates/ that would turn
+        # on testing-nixl/testing-kvbm/nccl/s3 (GPU/NIXL/NCCL backends) and on
+        # the root it would add the `kernels`+cudarc real-CUDA path. --no-deps
+        # lints only the local kvbm crates (mirrors dynamo pre-merge).
+        run: cargo clippy --no-deps --all-targets -- -D warnings
+
+      - name: Install and run cargo-deny
+        if: ${{ matrix.run_deny }}
+        working-directory: ${{ matrix.workdir }}
+        run: |
+          cargo-deny --version || cargo install cargo-deny@0.19.0 --locked
+          cargo-deny -L error --all-features check licenses bans \
+            --config ${{ github.workspace }}/deny.toml
+
+      - name: Install and run cargo-machete
+        working-directory: ${{ matrix.workdir }}
+        # Soft gate for now: the extracted crates currently trip machete on
+        # several deps that are real false positives (used via generated/macro/
+        # cfg code, e.g. prost, cudarc, tracing) plus some genuinely-unused ones.
+        # TODO(human): triage the findings (add [package.metadata.cargo-machete]
+        # ignored=[...] for false positives, drop the truly-unused deps), then
+        # set continue-on-error to false to make this blocking.
+        continue-on-error: true
+        run: |
+          cargo-machete --version || cargo install cargo-machete@0.9.1 --locked
+          cargo machete
+
+      - name: Compile tests (no run)
+        working-directory: ${{ matrix.workdir }}
+        run: timeout 2400 cargo test --locked --all-targets --no-run
+
+      - name: Run unit tests
+        working-directory: ${{ matrix.workdir }}
+        # GPU/NIXL tests are gated behind the non-default `testing-kvbm` /
+        # `testing-nixl` features and are compiled out here, so this is a CPU
+        # run. timeout-wrapped per repo convention (deadlocking async tests).
+        run: timeout 2400 cargo test --locked --all-targets
+
+      - name: Run doc tests
+        working-directory: ${{ matrix.workdir }}
+        run: timeout 1200 cargo test --locked --doc

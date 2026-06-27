@@ -1,0 +1,97 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# GPU + NIXL-gated crate tests, lifted from the dynamo-pipeline.yml "Rust Checks"
+# steps that ran inside the prebuilt dynamo image:
+#
+#   cargo clippy -p kvbm-physical  --no-deps --all-targets -- -D warnings
+#   cargo test  -p kvbm-physical  --features testing-kvbm -- --test-threads=4
+#   cargo clippy -p kvbm-connector --features testing-nixl --no-deps --all-targets -- -D warnings
+#   cargo test  -p kvbm-connector --features testing-nixl --all-targets -- --test-threads=1
+#
+# These need a real GPU + a working NIXL/UCX runtime + the CUDA toolkit. The
+# standalone repo has no prebuilt image carrying NIXL/UCX, so this job targets a
+# self-hosted GPU runner that already has CUDA + NIXL/UCX installed (libs under
+# /opt/nvidia/nvda_nixl/lib/<arch>, matching the -rpath-link in .cargo/config).
+#
+# NOTE: kvbm-connector testing-nixl test binaries link against real NIXL; a
+# nixl-sys / NIXL-lib ABI mismatch causes a `-lstream` link failure (a known
+# trap on some boxes). Keep nixl-sys aligned with the installed NIXL on the
+# runner.
+
+name: GPU Tests (CUDA + NIXL)
+
+on:
+  # Default to manual + main pushes; PR fan-out to a scarce GPU runner is opt-in.
+  push:
+    branches:
+      - main
+      - release/*.*.*
+    paths:
+      - 'crates/**'
+      - '.github/workflows/gpu-tests.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('{0}-{1}', github.workflow, github.event.pull_request.number) || format('{0}-{1}', github.workflow, github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  DYNAMO_GIT_TOKEN: ${{ secrets.DYNAMO_GIT_TOKEN }}
+
+jobs:
+  gpu-crate-tests:
+    name: kvbm-physical + kvbm-connector (GPU/NIXL)
+    # TODO(human): self-hosted GPU runner with CUDA toolkit + NIXL/UCX installed
+    # and a rust toolchain reachable (or rustup, which will honor
+    # rust-toolchain.toml = 1.93.1). Replace this placeholder label.
+    runs-on: gpu-nixl-runner-PLACEHOLDER
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      KVBM_REQUIRE_CUDA: "1"
+      # nixl + CUDA shared libs for test-binary runtime. aarch64-linux-gnu
+      # matches the GB10 smoke hardware; switch to x86_64-linux-gnu on x86 runners.
+      LD_LIBRARY_PATH: /opt/nvidia/nvda_nixl/lib/aarch64-linux-gnu:/usr/local/cuda/lib64
+    defaults:
+      run:
+        working-directory: crates
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Configure git auth for private dynamo git-deps (optional)
+        if: ${{ env.DYNAMO_GIT_TOKEN != '' }}
+        working-directory: .
+        run: |
+          git config --global \
+            url."https://x-access-token:${DYNAMO_GIT_TOKEN}@github.com/".insteadOf \
+            "https://github.com/"
+
+      - name: Tool versions
+        run: |
+          nvcc --version || echo "WARNING: nvcc not found on runner"
+          nvidia-smi || echo "WARNING: nvidia-smi not found / no GPU"
+          rustup show
+          rustup component add clippy
+
+      - name: kvbm-physical clippy
+        run: cargo clippy -p kvbm-physical --no-deps --all-targets -- -D warnings
+
+      - name: kvbm-physical tests (testing-kvbm)
+        run: |
+          timeout 1800 cargo test --locked -p kvbm-physical \
+            --features testing-kvbm -- --nocapture --test-threads=4
+
+      - name: kvbm-connector clippy (testing-nixl)
+        run: |
+          cargo clippy -p kvbm-connector --features testing-nixl \
+            --no-deps --all-targets -- -D warnings
+
+      - name: kvbm-connector tests (testing-nixl, serial)
+        # Serial: each test stands up TCP messengers + NIXL agents.
+        run: |
+          timeout 1800 cargo test --locked -p kvbm-connector \
+            --features testing-nixl --all-targets -- --nocapture --test-threads=1

@@ -1,0 +1,553 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Layer B: vLLM server bring-up.
+
+Decomposed out of `test_determinism_agg.py`'s previous inline `LLMServerManager`.
+
+External-attach mode: when `KVBM_EXTERNAL_BASE_URL` is set, the `kvbm_server`
+fixture skips spawning vllm and binds to the running server. Used by
+`scripts/run_eval.sh` for layered local iteration.
+"""
+
+import json
+import logging
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, TextIO
+
+import pytest
+import requests
+
+from tests.utils.port_utils import allocate_port, deallocate_port
+from tests.utils.test_output import resolve_test_output_path
+
+from ..common import ServerType
+
+
+# ---------------------------------------------------------------------------
+# Model config (moved from test_determinism_agg.py so other tests can reuse it)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class KvbmModelConfig:
+    """Describes a model and the vLLM serving flags needed for KVBM testing."""
+
+    model_id: str
+    block_size: Optional[int] = None  # None = let vllm decide
+    attention_backend: Optional[str] = None  # None = let vllm decide
+    max_model_len: int = 8000
+    # Set False for MLA models: VLLM_BATCH_INVARIANT=1 disables prefix caching
+    # for TRITON_MLA in vLLM 0.17.1, defeating KV offload testing.
+    batch_invariant: bool = True
+
+    @property
+    def short_name(self) -> str:
+        return self.model_id.split("/")[-1]
+
+    @property
+    def use_mla(self) -> bool:
+        """True when the model uses Multi-head Latent Attention (e.g. TRITON_MLA)."""
+        return self.attention_backend is not None and "MLA" in self.attention_backend
+
+
+# ---------------------------------------------------------------------------
+# kv-transfer-config builder
+# ---------------------------------------------------------------------------
+
+
+_VALID_ONBOARD_MODES = ("intra", "inter")
+
+
+_VALID_BLOCK_LAYOUTS = ("operational", "universal")
+
+
+def build_kv_transfer_config(
+    model_config: KvbmModelConfig,
+    onboard_mode: str = "intra",
+    cpu_blocks: Optional[int] = None,
+    block_layout: Optional[str] = None,
+    prefer_fc: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Build the vLLM ``--kv-transfer-config`` payload for KVBM.
+
+    `onboard_mode` controls `leader.onboard.mode` — `"intra"` matches the
+    sandbox script default; `"inter"` is the alternative.
+
+    `cpu_blocks` sets ``cache.host.num_blocks`` on the leader config. When
+    ``None``, the ``cache.host`` block is omitted; the leader will then fail to
+    start unless a disk tier is configured through some other channel. Callers
+    are expected to pass ``spec.cpu_blocks`` from ``KvbmServerSpec``.
+
+    `block_layout` (optional) pins the G2 block layout — ``"operational"``
+    keeps G2 inheriting G1's NHD/HND; ``"universal"`` pins G2 to
+    ``KvBlockLayout::Universal`` regardless of G1 (G1↔G2 transfers dispatch
+    the fused permute kernel). Injected under
+    ``kv_connector_extra_config.default.block_layout``. ``None`` leaves
+    KVBM's default (``Operational``).
+
+    `prefer_fc` (optional) pins the G1 registration path — ``True`` forces
+    FullyContiguous cross-layer registration, ``False`` forces per-layer
+    LayerSeparate registration, ``None`` lets
+    ``connector.prefer_cross_layer_blocks`` auto-detect from the backend.
+    Injected under ``kv_connector_extra_config.default.prefer_fully_contiguous_blocks``.
+    This is the only override channel that survives vLLM's EngineCore
+    subprocess spawn (env vars are stripped).
+    """
+    if onboard_mode not in _VALID_ONBOARD_MODES:
+        raise ValueError(
+            f"unknown onboard_mode: {onboard_mode!r} "
+            f"(expected one of {_VALID_ONBOARD_MODES})"
+        )
+    if block_layout is not None and block_layout not in _VALID_BLOCK_LAYOUTS:
+        raise ValueError(
+            f"unknown block_layout: {block_layout!r} "
+            f"(expected one of {_VALID_BLOCK_LAYOUTS})"
+        )
+    leader: Dict[str, Any] = {
+        "tokio": {"worker_threads": 2},
+        "onboard": {"mode": onboard_mode},
+    }
+    if cpu_blocks is not None:
+        leader["cache"] = {"host": {"num_blocks": int(cpu_blocks)}}
+    default: Dict[str, Any] = {}
+    if block_layout is not None:
+        default["block_layout"] = block_layout
+    if prefer_fc is not None:
+        default["prefer_fully_contiguous_blocks"] = bool(prefer_fc)
+    extra: Dict[str, Any] = {
+        "leader": leader,
+        "worker": {
+            "nixl": {"backends": {"UCX": {}, "POSIX": {}}},
+            "tokio": {"worker_threads": 2},
+        },
+    }
+    if default:
+        extra["default"] = default
+    return {
+        "kv_connector": "KvbmConnector",
+        "kv_role": "kv_both",
+        "kv_connector_module_path": "kvbm.vllm.connector",
+        "kv_connector_extra_config": extra,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Server spec (single parametrize point for the kvbm_server fixture)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class KvbmServerSpec:
+    """All parameters needed to launch (or attach to) a vLLM+KVBM server."""
+
+    model_config: KvbmModelConfig
+    cpu_blocks: Optional[int] = None
+    gpu_blocks: Optional[int] = None
+    port: Optional[int] = None
+    server_type: str = ServerType.vllm
+    onboard_mode: str = "intra"
+    # G2 block layout — "operational" inherits G1's NHD/HND, "universal"
+    # pins G2 to KvBlockLayout::Universal. None = leave KVBM's default.
+    block_layout: Optional[str] = None
+    # Force the G1 registration path. True = FullyContiguous (single
+    # cross-layer allocation), False = LayerSeparate (one tensor per layer),
+    # None = let connector.prefer_cross_layer_blocks auto-detect from the
+    # backend. Required for tests that pin the FC vs LW dimension explicitly.
+    prefer_fc: Optional[bool] = None
+
+    @property
+    def id(self) -> str:
+        """Pytest parametrize id.
+
+        Encodes only the dimensions that vary across the parametrize axis,
+        in a stable order so test ids are diff-friendly.
+        """
+        base = self.model_config.short_name
+        parts = [self.onboard_mode]
+        if self.block_layout is not None:
+            parts.append(f"g2{self.block_layout[:3]}")  # g2op | g2uni
+        if self.prefer_fc is not None:
+            parts.append("g1fc" if self.prefer_fc else "g1lw")
+        return "-".join([base, *parts]) if parts else base
+
+
+# ---------------------------------------------------------------------------
+# KvbmServerManager — extracted from LLMServerManager
+# ---------------------------------------------------------------------------
+
+
+class KvbmServerManager:
+    """Manages a vllm/trtllm server lifecycle for KVBM determinism testing.
+
+    Identical to the previous `LLMServerManager` in `test_determinism_agg.py`,
+    with two changes:
+      1. The kv-transfer-config is built by `build_kv_transfer_config(...)`
+         instead of being hardcoded.
+      2. The constructor accepts a `KvbmServerSpec` to make parametrization clean.
+    """
+
+    def __init__(
+        self,
+        spec: KvbmServerSpec,
+        log_dir: Optional[Path] = None,
+    ):
+        self.spec = spec
+        self.server_type = spec.server_type
+        self.model_config = spec.model_config
+        self.cpu_cache_blocks = spec.cpu_blocks
+        self.gpu_cache_blocks = spec.gpu_blocks
+
+        # Use provided port, env var, or allocate a dynamic port to avoid conflicts
+        if spec.port is not None:
+            self.port = spec.port
+            self.port_allocated = False
+        elif os.environ.get("KVBM_SERVER_PORT"):
+            self.port = int(os.environ["KVBM_SERVER_PORT"])
+            self.port_allocated = False
+        else:
+            self.port = allocate_port(start_port=8000)
+            self.port_allocated = True
+        self.base_url = f"http://localhost:{self.port}"
+        self.metrics_port = allocate_port(start_port=6880)
+        self.metrics_port_allocated = True
+        self.process: Optional[subprocess.Popen] = None
+
+        # Prepare logging
+        self.log_dir = log_dir or Path(".")
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        config_str = (
+            f"cpu{self.cpu_cache_blocks or 'default'}"
+            f"_gpu{self.gpu_cache_blocks or 'default'}"
+        )
+        self.server_log_file = (
+            self.log_dir / f"{self.server_type}_server_{config_str}_{timestamp}.log"
+        )
+        self.server_stdout_file: Optional[TextIO] = None
+        self._tee_threads: List[threading.Thread] = []
+
+        # Environment for the process
+        self.env = os.environ.copy()
+        self.env.update(
+            {
+                "RUST_BACKTRACE": "1",
+                "DYN_KVBM_METRICS": "true",
+                "DYN_KVBM_METRICS_PORT": str(self.metrics_port),
+            }
+        )
+
+        # CPU cache blocks override via env
+        if self.cpu_cache_blocks is not None:
+            self.env["DYN_KVBM_CPU_CACHE_OVERRIDE_NUM_BLOCKS"] = str(
+                self.cpu_cache_blocks
+            )
+
+        if self.server_type == ServerType.vllm:
+            self._set_up_vllm_config()
+        elif self.server_type == ServerType.trtllm:
+            self._set_up_trtllm_config()
+        else:
+            raise ValueError(
+                f"{self.server_type} is not supported yet in the KVBM test suite"
+            )
+
+    def _set_up_vllm_config(self) -> None:
+        self.env["VLLM_SERVER_DEV_MODE"] = "1"
+        if self.model_config.batch_invariant:
+            self.env["VLLM_BATCH_INVARIANT"] = "1"
+        else:
+            self.env.pop("VLLM_BATCH_INVARIANT", None)
+
+        kv_transfer_config = build_kv_transfer_config(
+            self.model_config,
+            onboard_mode=self.spec.onboard_mode,
+            cpu_blocks=self.spec.cpu_blocks,
+            block_layout=self.spec.block_layout,
+            prefer_fc=self.spec.prefer_fc,
+        )
+
+        self.server_cmd = [
+            "vllm",
+            "serve",
+            "--port",
+            str(self.port),
+            "--kv-transfer-config",
+            json.dumps(kv_transfer_config),
+            self.model_config.model_id,
+            "--max-model-len",
+            str(self.model_config.max_model_len),
+        ]
+
+        gpu_mem_util = os.environ.get("KVBM_GPU_MEMORY_UTILIZATION", "0.9")
+        self.server_cmd.extend(["--gpu-memory-utilization", gpu_mem_util])
+
+        if self.model_config.block_size is not None:
+            self.server_cmd.extend(["--block-size", str(self.model_config.block_size)])
+
+        if self.model_config.attention_backend is not None:
+            self.server_cmd.extend(
+                ["--attention-config.backend", self.model_config.attention_backend]
+            )
+
+        if self.gpu_cache_blocks is not None:
+            self.server_cmd.extend(
+                ["--num-gpu-blocks-override", str(self.gpu_cache_blocks)]
+            )
+
+    def _set_up_trtllm_config(self) -> None:
+        raise RuntimeError(
+            "KVBM TensorRT-LLM integration has been removed (kvbm.trtllm_integration was deleted). "
+            "Use server_type=ServerType.vllm."
+        )
+
+    def _tee_output(self, pipe: Any, log_file: TextIO, prefix: str) -> None:
+        """Read from pipe and write to both log file and stdout (tee)."""
+        try:
+            for line in iter(pipe.readline, ""):
+                if not line:
+                    break
+                log_file.write(line)
+                log_file.flush()
+                sys.stdout.write(f"[{prefix}] {line}")
+                sys.stdout.flush()
+        except (ValueError, OSError):
+            pass
+        finally:
+            pipe.close()
+
+    def start_server(self, timeout: int = 300) -> bool:
+        """Start LLM server and wait for readiness."""
+        if self.is_server_running():
+            self.stop_server()
+            time.sleep(2)
+
+        self.server_stdout_file = open(self.server_log_file.with_suffix(".log"), "w")
+
+        header = (
+            f"=== {self.server_type} Server Started at {datetime.now()} ===\n"
+            f"Command: {' '.join(self.server_cmd)}\n"
+        )
+        self.server_stdout_file.write(header)
+        self.server_stdout_file.flush()
+        print(f"[{self.server_type}] {header}", end="")
+
+        self.process = subprocess.Popen(
+            self.server_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=self.env,
+            preexec_fn=os.setsid,
+            text=True,
+            bufsize=1,
+        )
+
+        self._tee_threads = [
+            threading.Thread(
+                target=self._tee_output,
+                args=(self.process.stdout, self.server_stdout_file, self.server_type),
+                daemon=True,
+            ),
+        ]
+        for t in self._tee_threads:
+            t.start()
+
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            if self.is_server_running():
+                try:
+                    requests.get(
+                        f"http://localhost:{self.metrics_port}/metrics", timeout=5
+                    )
+                    return True
+                except requests.exceptions.RequestException:
+                    print(
+                        f"Warning: server healthy but metrics port {self.metrics_port} not reachable yet"
+                    )
+            if self.process.poll() is not None:
+                for t in self._tee_threads:
+                    t.join(timeout=2)
+                self._close_log_files()
+                return False
+            time.sleep(5)
+
+        self.stop_server()
+        return False
+
+    def stop_server(self) -> None:
+        """Stop LLM server and close logs."""
+        if self.process:
+            try:
+                os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
+                try:
+                    self.process.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
+                    self.process.wait()
+            except (ProcessLookupError, OSError):
+                pass
+            finally:
+                self.process = None
+        for t in self._tee_threads:
+            t.join(timeout=2)
+        self._tee_threads = []
+        self._close_log_files()
+
+        if self.port_allocated:
+            deallocate_port(self.port)
+            self.port_allocated = False
+        if self.metrics_port_allocated:
+            deallocate_port(self.metrics_port)
+            self.metrics_port_allocated = False
+
+    def _close_log_files(self) -> None:
+        if self.server_stdout_file:
+            self.server_stdout_file.write(
+                f"\n=== Server Stopped at {datetime.now()} ===\n"
+            )
+            self.server_stdout_file.close()
+            self.server_stdout_file = None
+
+    def is_server_running(self) -> bool:
+        try:
+            response = requests.get(f"{self.base_url}/health", timeout=5)
+            if response.status_code != 200:
+                return False
+
+            test_payload = {
+                "model": self.model_config.model_id,
+                "messages": [{"role": "user", "content": "test"}],
+                "max_completion_tokens": 1,
+                "temperature": 0,
+            }
+
+            response = requests.post(
+                f"{self.base_url}/v1/chat/completions",
+                headers={"Content-Type": "application/json"},
+                json=test_payload,
+                timeout=10,
+            )
+            return response.status_code == 200
+
+        except requests.exceptions.RequestException:
+            return False
+
+
+# ---------------------------------------------------------------------------
+# ServerHandle: the duck-typed object yielded by `kvbm_server`
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _ExternalServer:
+    """Drop-in stand-in for `KvbmServerManager` when KVBM_EXTERNAL_BASE_URL is set.
+
+    Exposes the same attributes the test bodies and `common.py` reach for
+    (`base_url`, `metrics_port`, `model_config`, `server_type`). `stop_server()`
+    is a no-op — the external process owns its own lifecycle.
+    """
+
+    base_url: str
+    metrics_port: int
+    model_config: KvbmModelConfig
+    server_type: str = ServerType.vllm
+    cpu_cache_blocks: Optional[int] = None
+    gpu_cache_blocks: Optional[int] = None
+
+    def stop_server(self) -> None:
+        return None
+
+    def is_server_running(self) -> bool:
+        try:
+            return requests.get(f"{self.base_url}/health", timeout=5).status_code == 200
+        except requests.exceptions.RequestException:
+            return False
+
+
+# ServerHandle = either KvbmServerManager (spawn mode) or _ExternalServer (attach mode).
+# Both expose: base_url, metrics_port, model_config, server_type, stop_server(), is_server_running().
+ServerHandle = Any
+
+
+# ---------------------------------------------------------------------------
+# Pytest fixtures
+# ---------------------------------------------------------------------------
+
+_SERVER_START_TIMEOUT = int(os.environ.get("KVBM_SERVER_START_TIMEOUT", "600"))
+
+
+@pytest.fixture(scope="function")
+def kvbm_server_spec(request) -> KvbmServerSpec:
+    """Indirect-parametrize entry point: provides the KvbmServerSpec for one test case."""
+    spec = getattr(request, "param", None)
+    if spec is None:
+        raise RuntimeError(
+            "kvbm_server_spec must be parametrized indirectly with a KvbmServerSpec instance"
+        )
+    if not isinstance(spec, KvbmServerSpec):
+        raise TypeError(
+            f"kvbm_server_spec param must be a KvbmServerSpec, got {type(spec).__name__}"
+        )
+    return spec
+
+
+@pytest.fixture(scope="function")
+def kvbm_server(request, kvbm_server_spec, kvbm_deps):
+    """Spawn vllm+KVBM (or attach to a running one) and yield a server handle.
+
+    External-attach mode: when ``KVBM_EXTERNAL_BASE_URL`` is set the fixture
+    skips spawning and returns an `_ExternalServer` bound to the env-var
+    base URL + metrics port. Used by `scripts/run_eval.sh`.
+    """
+    external_url = os.environ.get("KVBM_EXTERNAL_BASE_URL")
+    if external_url:
+        external_metrics = int(os.environ.get("KVBM_EXTERNAL_METRICS_PORT", "0"))
+        if external_metrics == 0:
+            raise RuntimeError(
+                "KVBM_EXTERNAL_BASE_URL is set but KVBM_EXTERNAL_METRICS_PORT is not — "
+                "both are required for external-attach mode"
+            )
+        handle = _ExternalServer(
+            base_url=external_url,
+            metrics_port=external_metrics,
+            model_config=kvbm_server_spec.model_config,
+            server_type=kvbm_server_spec.server_type,
+            cpu_cache_blocks=kvbm_server_spec.cpu_blocks,
+            gpu_cache_blocks=kvbm_server_spec.gpu_blocks,
+        )
+        if not handle.is_server_running():
+            pytest.fail(
+                f"KVBM_EXTERNAL_BASE_URL={external_url} is not reachable; "
+                "is the server running?"
+            )
+        yield handle
+        return
+
+    # Spawn mode — kvbm_deps enforces dependency ordering.
+    del kvbm_deps  # only used to enforce ordering; runtime_services env vars are set
+    logger = logging.getLogger("pytest")
+    logger.setLevel(logging.INFO)
+
+    log_dir = Path(resolve_test_output_path(request.node.name))
+    server_manager = KvbmServerManager(spec=kvbm_server_spec, log_dir=log_dir)
+
+    if not server_manager.start_server(timeout=_SERVER_START_TIMEOUT):
+        pytest.fail(
+            f"Failed to start {kvbm_server_spec.server_type} server "
+            f"(model={kvbm_server_spec.model_config.short_name}, "
+            f"cpu_blocks={kvbm_server_spec.cpu_blocks}, "
+            f"gpu_blocks={kvbm_server_spec.gpu_blocks}, "
+            f"port={server_manager.port})"
+        )
+
+    yield server_manager
+
+    server_manager.stop_server()
