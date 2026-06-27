@@ -101,10 +101,10 @@
 //! | `is_complete()`           | `generated_tokens >= max_output_tokens`         |
 //! | `new_tokens_for_prefill()`| Tokens not covered by cache hits               |
 
-use crate::KvbmSequenceHashProvider;
 use crate::blocks::{BlockMetadata, ImmutableBlock};
 use crate::manager::BlockManager;
 use crate::sequence::{BlockSequence, LogicalBlockAssignmentError, LogicalBlockAssignments};
+use crate::{BlockId, KvbmSequenceHashProvider, SequenceHash};
 
 use dynamo_tokens::Token;
 
@@ -130,6 +130,10 @@ use dynamo_tokens::Token;
 pub struct RequestSequence<T: BlockMetadata> {
     sequence: BlockSequence,
     assignments: LogicalBlockAssignments<T>,
+    /// Registered identities whose strong guards were transferred to an
+    /// external policy owner. They retain sequence position and page mapping
+    /// without preventing that owner from demoting or releasing the blocks.
+    detached_assigned: Vec<(BlockId, SequenceHash)>,
     generated_tokens: usize,
     max_output_tokens: usize,
     num_input_tokens: usize,
@@ -159,6 +163,7 @@ impl<T: BlockMetadata> RequestSequence<T> {
         Self {
             sequence,
             assignments,
+            detached_assigned: Vec::new(),
             generated_tokens: 0,
             max_output_tokens,
             num_input_tokens,
@@ -185,7 +190,7 @@ impl<T: BlockMetadata> RequestSequence<T> {
         manager: &BlockManager<T>,
     ) -> Result<usize, LogicalBlockAssignmentError<T>> {
         assert!(
-            self.assignments.is_empty(),
+            self.assignments.is_empty() && self.detached_assigned.is_empty(),
             "match_and_add_prefix called on sequence with existing assignments"
         );
         let matched = self.match_prefix(manager);
@@ -216,7 +221,7 @@ impl<T: BlockMetadata> RequestSequence<T> {
         blocks: Vec<ImmutableBlock<T>>,
     ) -> Result<usize, LogicalBlockAssignmentError<T>> {
         let count = blocks.len();
-        let start = self.assignments.assigned_count();
+        let start = self.detached_assigned.len() + self.assignments.assigned_count();
         let end = start + count;
         let sequence_blocks = self.sequence.blocks();
 
@@ -264,7 +269,9 @@ impl<T: BlockMetadata> RequestSequence<T> {
     /// [`register_staged`](Self::register_staged) after the GPU has computed
     /// their KV data.
     pub fn stage_pending(&mut self) {
-        let start = self.assignments.assigned_count() + self.assignments.staged_count();
+        let start = self.detached_assigned.len()
+            + self.assignments.assigned_count()
+            + self.assignments.staged_count();
         let completed = self.sequence.blocks().len();
         if start < completed {
             let blocks_slice = &self.sequence.blocks()[start..completed];
@@ -297,6 +304,23 @@ impl<T: BlockMetadata> RequestSequence<T> {
     pub fn complete_and_register_pending(&mut self, manager: &BlockManager<T>) {
         self.stage_pending();
         self.register_staged(manager);
+    }
+
+    /// Transfer every newly registered strong block to a policy owner while
+    /// retaining its physical identity and logical sequence position.
+    ///
+    /// Detached identities continue to participate in staging offsets and
+    /// [`page_indices`](Self::page_indices), but this sequence no longer keeps
+    /// their `ImmutableBlock` guards alive. The caller becomes responsible for
+    /// the returned guards' strong/weak/null lifecycle.
+    pub fn detach_registered_blocks(&mut self) -> Vec<ImmutableBlock<T>> {
+        let assigned = self.assignments.take_assigned();
+        self.detached_assigned.extend(
+            assigned
+                .iter()
+                .map(|(block_id, block)| (*block_id, block.sequence_hash())),
+        );
+        assigned.into_iter().map(|(_, block)| block).collect()
     }
 
     // =====================================================================
@@ -344,6 +368,7 @@ impl<T: BlockMetadata> RequestSequence<T> {
     /// Releases all block assignments (RAII returns them to pools).
     pub fn release(&mut self) {
         self.assignments.clear();
+        self.detached_assigned.clear();
     }
 
     /// Re-acquires blocks from the manager after a release/preemption.
@@ -354,7 +379,7 @@ impl<T: BlockMetadata> RequestSequence<T> {
     /// Returns `true` if all blocks were successfully acquired.
     pub fn reacquire(&mut self, manager: &BlockManager<T>) -> bool {
         assert!(
-            self.assignments.is_empty(),
+            self.assignments.is_empty() && self.detached_assigned.is_empty(),
             "reacquire called with existing assignments"
         );
 
@@ -441,7 +466,7 @@ impl<T: BlockMetadata> RequestSequence<T> {
 
     /// Number of blocks currently assigned (registered or cache-matched).
     pub fn assigned_blocks(&self) -> usize {
-        self.assignments.assigned_count()
+        self.detached_assigned.len() + self.assignments.assigned_count()
     }
 
     /// Number of blocks currently staged (completed but not registered).
@@ -470,7 +495,9 @@ impl<T: BlockMetadata> RequestSequence<T> {
         &self.sequence
     }
 
-    /// Reference to the underlying `LogicalBlockAssignments`.
+    /// Reference to the still-owned `LogicalBlockAssignments`. Blocks returned
+    /// by [`detach_registered_blocks`](Self::detach_registered_blocks) are
+    /// intentionally absent from this guard collection.
     pub fn assignments(&self) -> &LogicalBlockAssignments<T> {
         &self.assignments
     }
@@ -484,8 +511,10 @@ impl<T: BlockMetadata> RequestSequence<T> {
     ///
     /// Block IDs identity-map to page indices in the GPU page pool.
     pub fn page_indices(&self) -> Vec<u32> {
-        self.assignments
-            .all_block_ids()
+        self.detached_assigned
+            .iter()
+            .map(|(block_id, _)| block_id)
+            .chain(self.assignments.all_block_ids())
             .map(|&id| id as u32)
             .collect()
     }
@@ -535,7 +564,8 @@ impl<T: BlockMetadata> std::fmt::Debug for RequestSequence<T> {
             .field("max_output_tokens", &self.max_output_tokens)
             .field("num_input_tokens", &self.num_input_tokens)
             .field("prefix_matched_blocks", &self.prefix_matched_blocks)
-            .field("assigned", &self.assignments.assigned_count())
+            .field("assigned", &self.assigned_blocks())
+            .field("detached_assigned", &self.detached_assigned.len())
             .field("staged", &self.assignments.staged_count())
             .field("unassigned", &self.assignments.unassigned_count())
             .finish()
@@ -902,6 +932,32 @@ mod tests {
     // =========================================================================
     // Release / reacquire
     // =========================================================================
+
+    #[test]
+    fn test_detach_registered_blocks_preserves_identity_and_decode_offsets() {
+        let manager = create_test_manager::<TestMeta>(8);
+        let mut seq = RequestSequence::<TestMeta>::new(make_tokens(4), 4, BLOCK_SIZE);
+        assert!(seq.allocate_blocks(2, &manager));
+        seq.complete_and_register_pending(&manager);
+        let allocated_ids = seq.page_indices();
+
+        let first = seq.detach_registered_blocks();
+        assert_eq!(first.len(), 1);
+        assert_eq!(seq.assigned_blocks(), 1);
+        assert_eq!(seq.assignments().assigned_count(), 0);
+        assert_eq!(seq.page_indices(), allocated_ids);
+
+        for token in 100..104 {
+            seq.append_token(token);
+        }
+        seq.complete_and_register_pending(&manager);
+        let second = seq.detach_registered_blocks();
+
+        assert_eq!(second.len(), 1);
+        assert_eq!(seq.assigned_blocks(), 2);
+        assert_eq!(seq.assignments().assigned_count(), 0);
+        assert_eq!(seq.page_indices(), allocated_ids);
+    }
 
     #[test]
     fn test_release() {
