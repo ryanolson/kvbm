@@ -16,7 +16,7 @@ use crate::layout::physical::PhysicalLayout;
 
 use super::{
     BlockDimension, FullyContiguousLayout, KvBlockLayout, LayerSeparateLayout, Layout,
-    LayoutConfig, MemoryDescriptor, physical::NixlMetadata,
+    LayoutConfig, MemoryDescriptor, RaggedLayerSeparateLayout, physical::NixlMetadata,
 };
 use crate::layout::serialize::BlockFormat;
 
@@ -40,6 +40,7 @@ const REGION_ALIGNMENT: usize = 512;
 pub enum LayoutKind {
     FullyContiguous,
     LayerSeparate { block_dim: BlockDimension },
+    RaggedLayerSeparate { bytes_per_layer_block: Vec<usize> },
 }
 
 /// Allocation strategies for builder-managed memory.
@@ -236,6 +237,23 @@ impl<M> PhysicalLayoutBuilder<HasConfig, NoLayout, M> {
             block_layout,
         )
     }
+
+    /// Select independently sized contiguous segments for each logical block.
+    pub fn ragged_layer_separate(
+        self,
+        bytes_per_layer_block: Vec<usize>,
+    ) -> PhysicalLayoutBuilder<HasConfig, HasLayout, M> {
+        let (agent, config, _layout, memory_plan, block_layout) = self.into_parts();
+        PhysicalLayoutBuilder::<HasConfig, HasLayout, M>::from_parts(
+            agent,
+            config,
+            Some(LayoutKind::RaggedLayerSeparate {
+                bytes_per_layer_block,
+            }),
+            memory_plan,
+            block_layout,
+        )
+    }
 }
 
 impl PhysicalLayoutBuilder<HasConfig, HasLayout, NoMemory> {
@@ -349,7 +367,9 @@ impl PhysicalLayoutBuilder<HasConfig, HasLayout, NoMemory> {
     /// * `tensors` - KV cache tensors from vLLM (one per layer). All tensors must:
     ///   - Be on the same CUDA device
     ///   - Be contiguous in memory
-    ///   - Have the same shape
+    ///   - Match the selected layout's required region count and sizes. Standard
+    ///     layer-separated layouts use one same-shaped tensor per layer;
+    ///     ragged layouts intentionally accept different shapes.
     ///
     /// # Requirements
     /// - The NIXL agent must be registered with an RDMA-capable backend
@@ -453,6 +473,17 @@ impl PhysicalLayoutBuilder<HasConfig, HasLayout, HasMemory> {
                     kv_block_layout,
                 )?;
                 Arc::new(layout)
+            }
+            LayoutKind::RaggedLayerSeparate {
+                bytes_per_layer_block,
+            } => {
+                let regions = entries.iter().map(|entry| entry.region.clone()).collect();
+                Arc::new(RaggedLayerSeparateLayout::new(
+                    config.clone(),
+                    regions,
+                    bytes_per_layer_block,
+                    kv_block_layout,
+                )?)
             }
         };
 
@@ -708,6 +739,16 @@ fn compute_allocation_sizes(config: &LayoutConfig, kind: &LayoutKind) -> Result<
             let per_layer = mul_chain(&factors)?;
             Ok(vec![per_layer; config.num_layers])
         }
+        LayoutKind::RaggedLayerSeparate {
+            bytes_per_layer_block,
+        } => bytes_per_layer_block
+            .iter()
+            .map(|bytes| {
+                config.num_blocks.checked_mul(*bytes).ok_or_else(|| {
+                    anyhow!("allocation size overflow during ragged layout computation")
+                })
+            })
+            .collect(),
     }
 }
 

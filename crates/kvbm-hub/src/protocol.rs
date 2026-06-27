@@ -710,6 +710,7 @@ mod tests {
                 dtype_width_bytes: 2,
                 num_heads: Some(8),
             },
+            block_region_sizes: None,
             tp_size: 1,
             pp_size: 1,
         };

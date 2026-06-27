@@ -151,6 +151,14 @@ pub(crate) fn validate_layout_compatibility(
     let src_layout = src.layout();
     let dst_layout = dst.layout();
 
+    let src_region_sizes = src_layout.block_region_sizes();
+    let dst_region_sizes = dst_layout.block_region_sizes();
+    if src_region_sizes != dst_region_sizes {
+        return Err(anyhow!(
+            "Layout block-region sizes differ: src={src_region_sizes:?}, dst={dst_region_sizes:?}"
+        ));
+    }
+
     if src_layout
         .block_layout()
         .requires_transform(&dst_layout.block_layout())

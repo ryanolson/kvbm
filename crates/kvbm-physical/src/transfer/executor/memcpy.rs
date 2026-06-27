@@ -72,7 +72,7 @@ pub fn execute_memcpy_transfer(
     if can_use_whole_block_transfer(src, dst, layer_range.as_ref()) {
         tracing::debug!(
             num_blocks = src_block_ids.len(),
-            bytes_per_block = src_layout.config().bytes_per_block(),
+            bytes_per_block = src_layout.bytes_per_block(),
             "Using whole-block memcpy path"
         );
         execute_whole_block_memcpy(src, dst, src_block_ids, dst_block_ids)?;
@@ -101,7 +101,7 @@ fn execute_whole_block_memcpy(
     src_block_ids: &[BlockId],
     dst_block_ids: &[BlockId],
 ) -> Result<()> {
-    let bytes_per_block = src.layout().config().bytes_per_block();
+    let bytes_per_block = src.layout().bytes_per_block();
 
     for (&src_block_id, &dst_block_id) in src_block_ids.iter().zip(dst_block_ids.iter()) {
         // Get block base address (layer=0, outer=0 for FC layout gives base)

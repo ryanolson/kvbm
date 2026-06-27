@@ -58,6 +58,10 @@ pub struct LayoutCompatPayload {
     /// leaders carry identical config across workers (verified by
     /// `validate_remote_metadata`), so a rank-0 sample is sufficient.
     pub per_worker_config: LayoutConfigDescription,
+    /// Variable-width block-region sizes for opaque ragged layouts.
+    /// Standard tensor layouts leave this unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_region_sizes: Option<Vec<usize>>,
     /// Tensor-parallel size. Operational equality requires identical
     /// `tp_size` because per-worker shape varies with TP fan-out.
     pub tp_size: usize,
@@ -172,6 +176,13 @@ pub fn check_layout_compat(
                 candidate.pp_size,
             );
         }
+        if baseline.block_region_sizes != candidate.block_region_sizes {
+            bail!(
+                "operational block region sizes differ (baseline={:?}, candidate={:?})",
+                baseline.block_region_sizes,
+                candidate.block_region_sizes,
+            );
+        }
         require_layout_config_eq(&baseline.per_worker_config, &candidate.per_worker_config)?;
     }
     Ok(())
@@ -244,6 +255,7 @@ mod tests {
                 BlockLayoutMode::Universal => KvBlockLayout::Universal,
             },
             per_worker_config: cfg(),
+            block_region_sizes: None,
             tp_size: 2,
             pp_size: 1,
         }
@@ -304,6 +316,17 @@ mod tests {
         b.per_worker_layout = KvBlockLayout::OperationalHND;
         let err = check_layout_compat(&a, &b).unwrap_err();
         assert!(format!("{err}").contains("KvBlockLayout"));
+    }
+
+    #[test]
+    fn operational_rejects_different_ragged_region_sizes() {
+        let mut baseline = payload(BlockLayoutMode::Operational);
+        baseline.block_region_sizes = Some(vec![16, 24, 40]);
+        let mut candidate = baseline.clone();
+        candidate.block_region_sizes = Some(vec![16, 32, 40]);
+
+        let error = check_layout_compat(&baseline, &candidate).unwrap_err();
+        assert!(error.to_string().contains("block region sizes differ"));
     }
 
     /// Regression for the second Codex finding: the manager's

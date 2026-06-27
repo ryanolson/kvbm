@@ -122,6 +122,24 @@ fn build_layout_on_agent(
     typed.allocate_device(0).build()
 }
 
+fn build_ragged_layout_on_agent(agent: NixlAgent, num_blocks: usize) -> Result<PhysicalLayout> {
+    let bytes_per_layer_block = vec![16, 24, 40];
+    let config = LayoutConfig::builder()
+        .num_blocks(num_blocks)
+        .num_layers(bytes_per_layer_block.len())
+        .outer_dim(1)
+        .page_size(128)
+        .inner_dim(1)
+        .dtype_width_bytes(1)
+        .num_heads(Some(1))
+        .build()?;
+    PhysicalLayout::builder(agent)
+        .with_config(config)
+        .ragged_layer_separate(bytes_per_layer_block)
+        .allocate_device(0)
+        .build()
+}
+
 /// Run one cross-agent NIXL transfer and verify the destination
 /// matches the source by position.
 ///
@@ -255,6 +273,49 @@ async fn assert_planner_matches_legacy(
 }
 
 // ──────────── pull (NixlReadFlipped) ────────────
+
+#[tokio::test]
+async fn ragged_nixl_pull_copies_serialized_segments() -> Result<()> {
+    skip_if_stubs_and_device!(StorageKind::Device(0));
+    if !is_nixl_backend_available("UCX") {
+        eprintln!("Skipping ragged NIXL test — UCX backend unavailable");
+        return Ok(());
+    }
+    nixl_serial!();
+
+    let (owner_name, remote_name) = agent_pair_names("ragged-pull");
+    let owner = build_ucx_agent(&owner_name)?.expect("UCX was probed above");
+    let remote = build_ucx_agent(&remote_name)?.expect("UCX was probed above");
+    let src_local = build_ragged_layout_on_agent(owner.clone(), 4)?;
+    let src_remote = PhysicalLayout::from_descriptor(src_local.to_descriptor()?)?;
+    let dst = build_ragged_layout_on_agent(remote.clone(), 4)?;
+
+    let owner_md = owner
+        .get_local_md()
+        .map_err(|error| anyhow::anyhow!("owner.get_local_md: {error:?}"))?;
+    remote
+        .load_remote_md(&owner_md)
+        .map_err(|error| anyhow::anyhow!("remote.load_remote_md: {error:?}"))?;
+
+    let src_blocks = vec![0, 1];
+    let dst_blocks = vec![2, 3];
+    let checksums = fill_and_checksum(&src_local, &src_blocks, FillPattern::Sequential)?;
+    let capabilities = crate::transfer::TransferCapabilities::default().with_gpu_rdma(true);
+    let ctx = create_transfer_context(remote, Some(capabilities))?;
+
+    execute_transfer(
+        &src_remote,
+        &dst,
+        &src_blocks,
+        &dst_blocks,
+        TransferOptionsInternal::default(),
+        ctx.context(),
+    )?
+    .await?;
+
+    verify_checksums_by_position(&checksums, &src_blocks, &dst, &dst_blocks)?;
+    Ok(())
+}
 
 #[tokio::test]
 async fn use_planner_nixl_pull_matches_legacy_fc_fc() -> Result<()> {

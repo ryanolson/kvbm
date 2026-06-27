@@ -213,11 +213,11 @@ pub(crate) fn execute_planner_cuda_transfer(
 
     // PR-7.6: capture telemetry fields from the outcome before dispatch
     // so we can compute bytes/descriptors once without a second projection.
-    // `src.layout().config().bytes_per_block()` is a pure integer multiply
+    // `src.layout().bytes_per_block()` is a pure integer sum/multiply
     // (no allocation), so it's cheap even when no subscriber is active.
     let tel_class = outcome.candidate_class();
     let tel_descriptors = outcome.descriptor_count();
-    let tel_bytes = outcome.coalesced_bytes(src.layout().config().bytes_per_block());
+    let tel_bytes = outcome.coalesced_bytes(src.layout().bytes_per_block());
     // `submit_latency_us` brackets from here to after the synchronous
     // dispatch returns. It does NOT include stream-record or event-register
     // time — just the planner-dispatch submit path itself.
@@ -1802,7 +1802,7 @@ fn dispatch_staged_nixl_transform(
     // Does NOT include the async stage-2 chain.
     let tel_t0 = std::time::Instant::now();
     // Byte volume = n block-pairs × bytes_per_block on the src side.
-    let tel_bytes = n * src.layout().config().bytes_per_block();
+    let tel_bytes = n * src.layout().bytes_per_block();
 
     // ──────── Build owned context. ────────
     let staged = OwnedStagedContext::from_ctx(ctx);

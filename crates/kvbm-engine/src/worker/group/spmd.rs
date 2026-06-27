@@ -761,6 +761,7 @@ fn require_universal_remote_labels(metadata: &[SerializedLayout]) -> Result<()> 
             let kv = match &layout.layout.layout_type_details {
                 LayoutTypeDetails::FullyContiguous(d) => d.kv_block_layout,
                 LayoutTypeDetails::LayerSeparate(d) => d.kv_block_layout,
+                LayoutTypeDetails::RaggedLayerSeparate(d) => d.kv_block_layout,
             };
             if matches!(kv, KvBlockLayout::Unknown) {
                 anyhow::bail!(

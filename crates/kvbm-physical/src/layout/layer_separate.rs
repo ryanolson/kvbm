@@ -421,6 +421,14 @@ impl Layout for LayerSeparateLayout {
         &self.config
     }
 
+    fn bytes_per_block(&self) -> usize {
+        self.config.bytes_per_block()
+    }
+
+    fn block_region_sizes(&self) -> Vec<usize> {
+        vec![self.region_size; self.config.num_layers * self.config.outer_dim]
+    }
+
     fn memory_regions(&self) -> &[Buffer] {
         &self.memory_regions
     }

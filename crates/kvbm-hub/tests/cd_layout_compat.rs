@@ -130,6 +130,7 @@ fn payload_with_topology(
             dtype_width_bytes: canonical.dtype_width_bytes,
             num_heads: Some(num_heads),
         },
+        block_region_sizes: None,
         tp_size,
         pp_size,
     }
