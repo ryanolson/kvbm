@@ -203,6 +203,11 @@ pub struct EvictionOutcome {
 /// Synchronous error from the leader seam.
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum LeaderEngineError {
+    /// An explicit model resource has no G1-to-G2 execution route.
+    #[error("G1-to-G2 offload is not configured for logical resource {resource:?}")]
+    ResourceOffloadNotConfigured {
+        resource: kvbm_common::LogicalResourceId,
+    },
     /// `onboard_blocks` routed to a local search whose pin is no longer live.
     #[error("search not matched (pin lost or still pending)")]
     SearchNotMatched,

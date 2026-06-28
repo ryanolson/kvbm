@@ -78,6 +78,13 @@ Implemented and tested:
   such as Rhino can install the same owner routing directly in
   `InstanceLeader`. KVBM can initialize an ordered in-process worker group
   concurrently because `ncclCommInitRank` is collective.
+- Logical managers, physical layouts, placement metadata, transfer sessions,
+  and proactive G1-to-G2 pipelines are keyed by logical resource. One worker
+  group can therefore combine tensor-sharded attention with replicated MLA.
+- Narwhal preserves model resource and group identity, submits proactive
+  mirrors to the matching KVBM pipeline, and acquires resource-specific G2
+  RAII pins for `Mirror` and `Move` blocks while allowing `Drop` blocks to be
+  released without a lower-tier copy.
 
 Not yet production-wired:
 
@@ -86,11 +93,14 @@ Not yet production-wired:
 - Replicated remote search has owner-routed G2→G2 planning and dispatch, but
   still needs a real two-instance, two-GPU NIXL validation.
 - Replicated G2↔G3 placement.
+- Multi-resource same-request G2-to-G1 restoration. Proactive offload and the
+  eviction-safety gate are resource-complete, while external-prefix onboard is
+  still the selected primary resource compatibility path.
 - Pipelined per-layer replicated onboard; the first implementation completes
   replicated onboard before model execution for correctness.
 
-Until those items are complete, `ReplicatedData` must not be described as a
-working TP>1 connector mode.
+Until the two-GPU tests run, `ReplicatedData` should be described as wired and
+unit/integration tested, but not hardware-validated for TP>1 production use.
 
 ## Progression to hybrid MLA
 
@@ -101,13 +111,14 @@ The implementation order is:
 2. Basic TP>1 MLA: replicated G1, striped/deduplicated G2, owner copies, and
    broadcast reload.
 3. Hybrid models: classify cache regions by attention and retention behavior,
-   then compose managers without erasing those semantics.
+   then compose managers without erasing those semantics. Resource-owned local
+   transfer and proactive offload are implemented; multi-resource restoration
+   and live DSV4 TP/EP validation remain.
 
-Hybrid support should be expressed as typed resources rather than one generic
-pool with flags. A model registration should produce a cache schema whose regions
-carry at least their layout, replication/sharding mode, and retention policy.
-Narwhal can then schedule against aggregate resource capacities while KVBM keeps
-RAII ownership of each region's blocks.
+Hybrid support is expressed as typed resources rather than one generic pool
+with flags. Model registration produces a cache schema whose regions retain
+their layout and replication/sharding mode. Narwhal schedules model-ordered
+resource groups while KVBM keeps RAII ownership of each resource's blocks.
 
 ## Sliding-window retention TODO
 
@@ -117,13 +128,12 @@ Eviction and offload are different decisions. A G1 block can be:
 - **moved**: worth retaining, but a G2 copy must be created before releasing G1;
 - **dropped**: outside the model's useful window and safe to recompute or discard.
 
-KVBM's existing inactive-pool eviction policies choose a victim, but they do not
-yet encode model-aware sliding-window retention or select among these actions.
-Add a policy layer that consumes block position/lineage, attention-region class,
-window bounds, reuse/frequency, and current tier residency. Its output should be
-an explicit `Mirror`, `Move`, or `Drop` action. The initial mirror target can be
-configurable (for example 10–25% of G1), but policy and transfer execution should
-remain separate and independently testable.
+Narwhal now emits explicit `Mirror`, `Move`, or `Drop` actions from each
+attention policy. Full attention never drops; sliding-window attention drops
+blocks fully outside its useful window. The proactive mirror target is
+configurable and transfer execution remains separate. Remaining policy work is
+to tune that target from live pressure/reuse signals and extend the same
+resource semantics to lower tiers beyond G2.
 
 ## Remote-search direction
 

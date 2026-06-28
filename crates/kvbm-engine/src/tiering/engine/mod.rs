@@ -47,6 +47,7 @@ pub use worker::{PassOffload, PassOnboard, WorkerEngine, WorkerPassPlan};
 
 use std::sync::Arc;
 
+use kvbm_common::LogicalResourceId;
 use kvbm_protocols::connector::{EngineWorkerSink, LeaderEngine, WorkerEngineDriver};
 
 use crate::leader::InstanceLeader;
@@ -79,6 +80,44 @@ pub fn build_local_connector_engine(
     sink: Arc<dyn EngineWorkerSink>,
     config: ConnectorEngineConfig,
     offload: Option<Arc<OffloadEngine>>,
+) -> (Arc<dyn LeaderEngine>, Arc<dyn WorkerEngineDriver>) {
+    let primary_offload = offload.clone();
+    let offload_submit: Arc<dyn offload::OffloadSubmit> = match offload {
+        Some(offload) => Arc::new(OffloadEngineSubmit::new(offload)),
+        None => Arc::new(DisabledOffloadSubmit),
+    };
+    build_local_connector_engine_inner(leader, sink, config, primary_offload, offload_submit)
+}
+
+/// Build one connector engine with independently owned offload pipelines for
+/// every logical model resource.
+///
+/// Legacy offload calls route to `primary_resource`; explicit resource calls
+/// fail closed unless the supplied set owns that exact resource.
+pub fn build_local_connector_engine_with_resources(
+    leader: Arc<InstanceLeader>,
+    sink: Arc<dyn EngineWorkerSink>,
+    config: ConnectorEngineConfig,
+    primary_resource: LogicalResourceId,
+    offloads: Vec<(LogicalResourceId, Arc<OffloadEngine>)>,
+) -> anyhow::Result<(Arc<dyn LeaderEngine>, Arc<dyn WorkerEngineDriver>)> {
+    let submit = OffloadEngineSubmit::from_resources(primary_resource, offloads)?;
+    let primary_offload = Some(Arc::clone(submit.primary_engine()));
+    Ok(build_local_connector_engine_inner(
+        leader,
+        sink,
+        config,
+        primary_offload,
+        Arc::new(submit),
+    ))
+}
+
+fn build_local_connector_engine_inner(
+    leader: Arc<InstanceLeader>,
+    sink: Arc<dyn EngineWorkerSink>,
+    config: ConnectorEngineConfig,
+    primary_offload: Option<Arc<OffloadEngine>>,
+    offload_submit: Arc<dyn offload::OffloadSubmit>,
 ) -> (Arc<dyn LeaderEngine>, Arc<dyn WorkerEngineDriver>) {
     let ConnectorEngineConfig { block_size, remote } = config;
     let RemoteOps { search, disagg } = remote;
@@ -115,7 +154,7 @@ pub fn build_local_connector_engine(
     // must not fail construction — a decode-only deployment works without it
     // — but a prefill-role engine without it cannot produce remote-prefill
     // output, so warn loudly.
-    if let (Some(cd), Some(offload)) = (cd.as_ref(), offload.as_ref()) {
+    if let (Some(cd), Some(offload)) = (cd.as_ref(), primary_offload.as_ref()) {
         let observer = Arc::clone(&cd.output);
         if let Err(e) = offload.add_g1_to_g2_register_observer(Arc::new(
             move |blocks: &[kvbm_logical::blocks::ImmutableBlock<crate::G2>]| {
@@ -131,10 +170,6 @@ pub fn build_local_connector_engine(
         }
     }
 
-    let offload_submit: Arc<dyn offload::OffloadSubmit> = match offload {
-        Some(offload) => Arc::new(OffloadEngineSubmit::new(offload)),
-        None => Arc::new(DisabledOffloadSubmit),
-    };
     let engine = LocalConnectorEngine::with_offload_submit(
         leader,
         sink,

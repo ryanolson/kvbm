@@ -91,6 +91,7 @@ Pipeline behavior is controlled via `PipelineConfig`:
 
 | Option | Default | Description |
 |--------|---------|-------------|
+| `resource` | `None` | Logical model resource whose physical tier layouts execute this pipeline; `None` uses the leader primary compatibility route |
 | `batch_config.max_batch_size` | 64 | Maximum blocks per batch |
 | `batch_config.min_batch_size` | 8 | Minimum blocks before flush |
 | `batch_config.flush_interval` | 10ms | Time before flushing partial batch |
@@ -123,7 +124,6 @@ handle.cancel().await;
 ## Related Documentation
 
 - [offload-developer.md](offload-developer.md) - Implementation details and extension rules
-
 
 
 

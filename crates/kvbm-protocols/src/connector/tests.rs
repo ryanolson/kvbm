@@ -16,6 +16,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use kvbm_common::LogicalResourceId;
+
 use crate::disagg::RemotePrefillParams;
 
 use super::actions::{EngineWorkerSink, WorkerEngineDriver};
@@ -64,6 +66,24 @@ fn noop_offload_handle_is_immediately_terminal() {
         .unwrap();
     assert!(offload.is_complete());
     assert_eq!(offload.outcome(), Some(SaveOutcome::Done));
+}
+
+#[test]
+fn legacy_engine_accepts_default_resource_and_rejects_other_resources() {
+    let engine = engine();
+    let offload = Arc::clone(&engine)
+        .offload_for_resource(LogicalResourceId::default(), &"r1".to_string(), vec![])
+        .unwrap();
+    assert!(offload.is_complete());
+
+    assert_eq!(
+        Arc::clone(&engine)
+            .offload_for_resource(LogicalResourceId(7), &"r1".to_string(), vec![])
+            .unwrap_err(),
+        LeaderEngineError::ResourceOffloadNotConfigured {
+            resource: LogicalResourceId(7)
+        }
+    );
 }
 
 #[test]

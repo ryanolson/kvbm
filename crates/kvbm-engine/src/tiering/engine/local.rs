@@ -629,18 +629,19 @@ pub(super) fn perform_refresh(
 // LeaderEngine impl
 // ============================================================================
 
-impl LeaderEngine for LocalConnectorEngine {
-    fn offload(
+impl LocalConnectorEngine {
+    fn buffer_offload(
         self: Arc<Self>,
+        resource: Option<kvbm_common::LogicalResourceId>,
         req: &RequestId,
         pairs: Vec<(SequenceHash, BlockId)>,
     ) -> Result<OffloadHandle, LeaderEngineError> {
+        if let Some(resource) = resource
+            && !self.offload_submit.supports_resource(resource)
+        {
+            return Err(LeaderEngineError::ResourceOffloadNotConfigured { resource });
+        }
         let action_id = ActionId::new();
-        // Completion cell: the engine keeps a `Weak` in `actions` (the by-id
-        // `poll_action` path + `evict`'s pending check); the handle owns the
-        // strong, so the cell frees by RAII on handle drop. Mirrors onboard —
-        // insert the in-flight record BEFORE returning the handle so `evict` and
-        // the by-id path observe a live `Pending` action.
         let cell = Arc::new(Mutex::new(ActionStatus::Pending));
         self.actions.insert(
             action_id,
@@ -650,30 +651,40 @@ impl LeaderEngine for LocalConnectorEngine {
             .entry(req.clone())
             .or_default()
             .push(action_id);
-        // Register the request for its once-only `finished_sending` drain.
         self.offload_drains.insert(req.clone(), ());
 
-        // DECISION A: buffer the pairs; the `enqueue_g1_to_g2_with_precondition`
-        // flush happens in `finish_forward_pass` (eager enqueue would read G1
-        // mid-GPU-write → corruption). Entries are stamped with the current
-        // iteration so a late pass-`n` flush cannot submit pass-`n+1`'s
-        // mid-pass buffer. The `ExternalBlock` arg-order reversal happens at
-        // flush time (see `offload::build_external_blocks`).
         self.offload_buffer
             .lock()
             .expect("offload-buffer mutex poisoned")
             .push(BufferedOffload {
                 action_id,
                 request_id: req.clone(),
+                resource,
                 pairs,
                 iteration: self.current_iteration.load(Ordering::Relaxed),
             });
 
-        // The handle owns the strong cell and a `Weak` back-ref; its RAII drop
-        // fires `release_action` to prune both `actions` and `by_request` for
-        // this action (the action analogue of search-handle drop).
         let me: Arc<dyn LeaderEngine> = self;
         Ok(OffloadHandle::new(action_id, Arc::downgrade(&me), cell))
+    }
+}
+
+impl LeaderEngine for LocalConnectorEngine {
+    fn offload(
+        self: Arc<Self>,
+        req: &RequestId,
+        pairs: Vec<(SequenceHash, BlockId)>,
+    ) -> Result<OffloadHandle, LeaderEngineError> {
+        self.buffer_offload(None, req, pairs)
+    }
+
+    fn offload_for_resource(
+        self: Arc<Self>,
+        resource: kvbm_common::LogicalResourceId,
+        req: &RequestId,
+        pairs: Vec<(SequenceHash, BlockId)>,
+    ) -> Result<OffloadHandle, LeaderEngineError> {
+        self.buffer_offload(Some(resource), req, pairs)
     }
 
     fn evict(&self, req: &RequestId) -> EvictionOutcome {
@@ -1806,7 +1817,10 @@ impl LocalConnectorEngine {
             let blocks = offload::build_external_blocks(&b.pairs);
             let action_id = b.action_id;
             let request_id = b.request_id;
-            match self.offload_submit.submit_g1_to_g2(blocks, precondition) {
+            match self
+                .offload_submit
+                .submit_g1_to_g2(b.resource, blocks, precondition)
+            {
                 Ok(transfer) => {
                     let driver = this.clone();
                     self.leader.runtime().spawn(async move {
@@ -1899,6 +1913,7 @@ mod tests {
     /// was provided, then hands back a transfer pre-set to a configured terminal.
     struct MockOffloadSubmit {
         submits: StdMutex<Vec<Vec<(BlockId, SequenceHash)>>>,
+        resources: StdMutex<Vec<Option<kvbm_common::LogicalResourceId>>>,
         preconditions: StdMutex<Vec<bool>>,
         terminal: TransferStatus,
         failed: Vec<BlockId>,
@@ -1907,6 +1922,7 @@ mod tests {
         fn new(terminal: TransferStatus, failed: Vec<BlockId>) -> Arc<Self> {
             Arc::new(Self {
                 submits: StdMutex::new(Vec::new()),
+                resources: StdMutex::new(Vec::new()),
                 preconditions: StdMutex::new(Vec::new()),
                 terminal,
                 failed,
@@ -1923,6 +1939,9 @@ mod tests {
                 .cloned()
                 .unwrap_or_default()
         }
+        fn last_resource(&self) -> Option<kvbm_common::LogicalResourceId> {
+            self.resources.lock().unwrap().last().copied().flatten()
+        }
         fn last_precondition_present(&self) -> bool {
             self.preconditions
                 .lock()
@@ -1933,11 +1952,17 @@ mod tests {
         }
     }
     impl OffloadSubmit for MockOffloadSubmit {
+        fn supports_resource(&self, _resource: kvbm_common::LogicalResourceId) -> bool {
+            true
+        }
+
         fn submit_g1_to_g2(
             &self,
+            resource: Option<kvbm_common::LogicalResourceId>,
             blocks: Vec<ExternalBlock<crate::G1>>,
             precondition: Option<velo::EventHandle>,
         ) -> Result<Box<dyn OffloadTransfer>> {
+            self.resources.lock().unwrap().push(resource);
             self.submits.lock().unwrap().push(
                 blocks
                     .iter()
@@ -3217,6 +3242,56 @@ mod tests {
         // The completion driver drives the handle to terminal.
         wait_offload_complete(&handle).await;
         assert_eq!(handle.outcome(), Some(SaveOutcome::Done));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resource_offload_buffers_and_flushes_through_the_connector_engine() -> Result<()> {
+        let leader = Arc::new(build_test_leader().await?);
+        let sink = RecordingSink::new();
+        let submit = MockOffloadSubmit::new(TransferStatus::Complete, vec![]);
+        let engine =
+            LocalConnectorEngine::with_offload_submit(leader, sink, BS, true, submit.clone(), None);
+
+        let handle = engine
+            .clone()
+            .offload_for_resource(
+                kvbm_common::LogicalResourceId(7),
+                &"resource-rq".into(),
+                vec![(h(4), 13usize)],
+            )
+            .unwrap();
+        assert_eq!(submit.submit_count(), 0);
+
+        engine.finish_forward_pass(0);
+
+        assert_eq!(submit.submit_count(), 1);
+        assert_eq!(submit.last_submit(), vec![(13, h(4))]);
+        assert_eq!(
+            submit.last_resource(),
+            Some(kvbm_common::LogicalResourceId(7))
+        );
+        wait_offload_complete(&handle).await;
+        assert_eq!(handle.outcome(), Some(SaveOutcome::Done));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resource_offload_without_a_route_fails_before_buffering() -> Result<()> {
+        let leader = Arc::new(build_test_leader().await?);
+        let engine = LocalConnectorEngine::new(leader, RecordingSink::new(), BS, true);
+        let resource = kvbm_common::LogicalResourceId(9);
+
+        let error = engine
+            .clone()
+            .offload_for_resource(resource, &"missing-route".into(), vec![(h(4), 13usize)])
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            LeaderEngineError::ResourceOffloadNotConfigured { resource }
+        );
+        assert!(engine.offload_buffer.lock().unwrap().is_empty());
         Ok(())
     }
 
