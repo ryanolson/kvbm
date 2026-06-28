@@ -29,7 +29,7 @@ use super::noop::NoopWorkerSink;
 use super::protocol::RequestId;
 use super::protocol::{
     AcceptId, ActionFailure, ActionId, ActionStatus, EvictionFence, EvictionOutcome, FenceToken,
-    FindBlocksOutcome, FindBlocksRequest, LeaderEngineError, SearchId,
+    FindBlocksOutcome, FindBlocksRequest, LeaderEngineError, ResourceOnboard, SearchId,
 };
 
 fn engine() -> Arc<dyn LeaderEngine> {
@@ -225,6 +225,26 @@ fn noop_onboard_blocks_is_immediately_terminal() {
         .unwrap();
     assert!(onboard.is_complete());
     assert_eq!(onboard.outcome(), Some(LoadOutcome::Done));
+}
+
+#[test]
+fn legacy_engine_rejects_resource_batched_onboard() {
+    let engine = engine();
+    let resource = LogicalResourceId(7);
+
+    assert_eq!(
+        engine
+            .onboard_resources(
+                &"r1".to_string(),
+                vec![ResourceOnboard {
+                    resource,
+                    source_block_ids: vec![2],
+                    destination_block_ids: vec![5],
+                }],
+            )
+            .unwrap_err(),
+        LeaderEngineError::ResourceOnboardNotConfigured { resource }
+    );
 }
 
 /// `find_blocks` carries the shared hash chain + counts + the WHOLE parsed

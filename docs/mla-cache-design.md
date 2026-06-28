@@ -85,6 +85,10 @@ Implemented and tested:
   mirrors to the matching KVBM pipeline, and acquires resource-specific G2
   RAII pins for `Mirror` and `Move` blocks while allowing `Drop` blocks to be
   released without a lower-tier copy.
+- Same-request restoration preserves each retained block's logical resource,
+  logical position, and exact pinned G2 source ID. After Narwhal allocates new
+  G1 pages, one request-scoped KVBM action dispatches the corresponding
+  G2-to-G1 transfers through every resource's own physical placement policy.
 
 Not yet production-wired:
 
@@ -93,9 +97,9 @@ Not yet production-wired:
 - Replicated remote search has owner-routed G2→G2 planning and dispatch, but
   still needs a real two-instance, two-GPU NIXL validation.
 - Replicated G2↔G3 placement.
-- Multi-resource same-request G2-to-G1 restoration. Proactive offload and the
-  eviction-safety gate are resource-complete, while external-prefix onboard is
-  still the selected primary resource compatibility path.
+- Multi-resource external-prefix discovery. Same-request restoration is
+  resource-complete, while a new request still discovers and onboards only the
+  selected primary resource's shared prefix.
 - Pipelined per-layer replicated onboard; the first implementation completes
   replicated onboard before model execution for correctness.
 
@@ -112,8 +116,9 @@ The implementation order is:
    broadcast reload.
 3. Hybrid models: classify cache regions by attention and retention behavior,
    then compose managers without erasing those semantics. Resource-owned local
-   transfer and proactive offload are implemented; multi-resource restoration
-   and live DSV4 TP/EP validation remain.
+   transfer, proactive offload, and same-request multi-resource restoration are
+   implemented; external-prefix discovery across resources and live DSV4 TP/EP
+   validation remain.
 
 Hybrid support is expressed as typed resources rather than one generic pool
 with flags. Model registration produces a cache schema whose regions retain

@@ -131,6 +131,14 @@ pub struct FindBlocksRequest {
     pub transfer_params: Option<TransferParams>,
 }
 
+/// One exact G2-to-G1 restore within a logical model resource.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceOnboard {
+    pub resource: kvbm_common::LogicalResourceId,
+    pub source_block_ids: Vec<BlockId>,
+    pub destination_block_ids: Vec<BlockId>,
+}
+
 /// Outcome of [`super::engine::LeaderEngine::find_blocks`]. Encodes everything
 /// the connector needs without exposing handle internals.
 #[derive(Debug)]
@@ -208,6 +216,14 @@ pub enum LeaderEngineError {
     ResourceOffloadNotConfigured {
         resource: kvbm_common::LogicalResourceId,
     },
+    /// An explicit resource has no G2-to-G1 execution route.
+    #[error("G2-to-G1 onboard is not configured for logical resource {resource:?}")]
+    ResourceOnboardNotConfigured {
+        resource: kvbm_common::LogicalResourceId,
+    },
+    /// A resource-batched restore request is structurally invalid.
+    #[error("invalid resource onboard: {reason}")]
+    InvalidResourceOnboard { reason: String },
     /// `onboard_blocks` routed to a local search whose pin is no longer live.
     #[error("search not matched (pin lost or still pending)")]
     SearchNotMatched,

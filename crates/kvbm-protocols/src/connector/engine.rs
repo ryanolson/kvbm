@@ -22,7 +22,7 @@ use super::protocol::{
     AcceptId, ActionId, ActionStatus, EvictionOutcome, FindBlocksOutcome, FindBlocksRequest,
     LeaderEngineError, SearchId,
 };
-use super::protocol::{BlockId, RequestId, SequenceHash};
+use super::protocol::{BlockId, RequestId, ResourceOnboard, SequenceHash};
 
 /// Leader-side block-engine contract. The connector drives unified match and
 /// onboard, legacy or resource-explicit offload, eviction, and the request
@@ -104,6 +104,24 @@ pub trait LeaderEngine: Send + Sync + 'static {
         dest: &[BlockId],
         num_external_tokens: usize,
     ) -> Result<OnboardHandle, LeaderEngineError>;
+
+    /// ONBOARD exact G2 blocks for multiple logical model resources under one
+    /// request-scoped completion handle.
+    fn onboard_resources(
+        self: Arc<Self>,
+        req: &RequestId,
+        resources: Vec<ResourceOnboard>,
+    ) -> Result<OnboardHandle, LeaderEngineError> {
+        let Some(first) = resources.first() else {
+            return Err(LeaderEngineError::InvalidResourceOnboard {
+                reason: "at least one resource is required".to_owned(),
+            });
+        };
+        let _ = req;
+        Err(LeaderEngineError::ResourceOnboardNotConfigured {
+            resource: first.resource,
+        })
+    }
 
     /// Hand the leader the consume-once [`RequestOffloadDrain`] for a
     /// *finishing* request whose offloads have started. The leader commits it

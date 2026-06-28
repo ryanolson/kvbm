@@ -13,6 +13,8 @@
 //!   delegates, fence-keyed by [`FenceToken`].
 //! - [`LoadOutcome`] / [`SaveOutcome`] — the terminal onboard/offload outcomes
 //!   the engine publishes to the worker sink.
+//! - [`ResourceOnboard`] — exact G2 sources and G1 destinations for one
+//!   logical resource within a request-scoped multi-resource restore.
 //! - [`FinishedStatus`] — the leader's request-finish / eviction gate.
 //! - [`NoopBlockEngine`] — a caches-nothing engine used as a stand-in and test
 //!   double.
@@ -35,5 +37,5 @@ pub use noop::{NoopBlockEngine, NoopWorkerSink};
 pub use protocol::{
     AcceptId, ActionFailure, ActionId, ActionStatus, BlockId, EvictionFence, EvictionOutcome,
     FenceToken, FindBlocksOutcome, FindBlocksRequest, FinishedStatus, LeaderEngineError, RequestId,
-    SearchId, SequenceHash, WorkerRank,
+    ResourceOnboard, SearchId, SequenceHash, WorkerRank,
 };

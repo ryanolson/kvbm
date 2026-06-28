@@ -54,8 +54,8 @@ use dashmap::DashMap;
 use kvbm_protocols::connector::{
     AcceptId, ActionFailure, ActionId, ActionStatus, EngineWorkerSink, EvictionFence,
     EvictionOutcome, FenceToken, FindBlocksHandle, FindBlocksOutcome, FindBlocksRequest,
-    LeaderEngine, LeaderEngineError, OffloadHandle, OnboardHandle, RequestOffloadDrain, SearchId,
-    WorkerEngineDriver,
+    LeaderEngine, LeaderEngineError, OffloadHandle, OnboardHandle, RequestOffloadDrain,
+    ResourceOnboard, SearchId, WorkerEngineDriver,
 };
 use kvbm_protocols::connector::{BlockId, RequestId, SequenceHash};
 
@@ -887,6 +887,103 @@ impl LeaderEngine for LocalConnectorEngine {
         num_external_tokens: usize,
     ) -> Result<OnboardHandle, LeaderEngineError> {
         self.route_onboard_blocks(handle, dest, num_external_tokens)
+    }
+
+    fn onboard_resources(
+        self: Arc<Self>,
+        req: &RequestId,
+        resources: Vec<ResourceOnboard>,
+    ) -> Result<OnboardHandle, LeaderEngineError> {
+        if resources.is_empty() {
+            return Err(LeaderEngineError::InvalidResourceOnboard {
+                reason: "at least one resource is required".to_owned(),
+            });
+        }
+        let mut seen = std::collections::HashSet::new();
+        for transfer in &resources {
+            if !seen.insert(transfer.resource) {
+                return Err(LeaderEngineError::InvalidResourceOnboard {
+                    reason: format!("duplicate logical resource {:?}", transfer.resource),
+                });
+            }
+            if transfer.source_block_ids.is_empty()
+                || transfer.source_block_ids.len() != transfer.destination_block_ids.len()
+            {
+                return Err(LeaderEngineError::InvalidResourceOnboard {
+                    reason: format!(
+                        "resource {:?} has {} G2 sources and {} G1 destinations",
+                        transfer.resource,
+                        transfer.source_block_ids.len(),
+                        transfer.destination_block_ids.len()
+                    ),
+                });
+            }
+            if self.leader.g2_manager_for(transfer.resource).is_none() {
+                return Err(LeaderEngineError::ResourceOnboardNotConfigured {
+                    resource: transfer.resource,
+                });
+            }
+        }
+
+        let action_id = ActionId::new();
+        let cell = Arc::new(Mutex::new(ActionStatus::Pending));
+        self.actions.insert(
+            action_id,
+            ActionRecord::new(req.clone(), Arc::downgrade(&cell)),
+        );
+        self.by_request
+            .entry(req.clone())
+            .or_default()
+            .push(action_id);
+        let handle_dest_ids = resources
+            .iter()
+            .flat_map(|transfer| transfer.destination_block_ids.iter().copied())
+            .collect::<Vec<_>>();
+        let request_id = req.clone();
+        let driver = Arc::clone(&self);
+        let terminal_dest_ids = handle_dest_ids.clone();
+        self.leader.runtime().spawn(async move {
+            let mut outcome = ActionStatus::Complete;
+            for transfer in resources {
+                let notification = match driver.leader.execute_local_transfer_for_resource(
+                    transfer.resource,
+                    kvbm_common::LogicalLayoutHandle::G2,
+                    kvbm_common::LogicalLayoutHandle::G1,
+                    transfer.source_block_ids,
+                    transfer.destination_block_ids,
+                    kvbm_physical::TransferOptions::default(),
+                ) {
+                    Ok(notification) => notification,
+                    Err(error) => {
+                        tracing::error!(
+                            error = %error,
+                            resource = ?transfer.resource,
+                            "resource onboard dispatch failed"
+                        );
+                        outcome = ActionStatus::Failed(ActionFailure::AllBlocks);
+                        break;
+                    }
+                };
+                if let Err(error) = notification.await {
+                    tracing::error!(
+                        error = %error,
+                        resource = ?transfer.resource,
+                        "resource onboard transfer failed"
+                    );
+                    outcome = ActionStatus::Failed(ActionFailure::AllBlocks);
+                    break;
+                }
+            }
+            driver.finish_load_action(action_id, &request_id, outcome, terminal_dest_ids);
+        });
+
+        let engine: Arc<dyn LeaderEngine> = self;
+        Ok(OnboardHandle::new(
+            action_id,
+            Arc::downgrade(&engine),
+            cell,
+            handle_dest_ids,
+        ))
     }
 
     fn release_prefill_session(&self, request_id: &RequestId, accept_id: AcceptId) {
@@ -1901,7 +1998,7 @@ mod tests {
     };
     use crate::offload::{ExternalBlock, TransferStatus};
     use kvbm_protocols::connector::NoopWorkerSink;
-    use kvbm_protocols::connector::{LoadOutcome, SaveOutcome};
+    use kvbm_protocols::connector::{LoadOutcome, ResourceOnboard, SaveOutcome};
     use std::sync::Mutex as StdMutex;
     use tokio::sync::{Mutex as TokioMutex, watch};
     use uuid::Uuid;
@@ -3181,6 +3278,32 @@ mod tests {
     }
 
     // ----- offload tests -----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resource_batched_onboard_mints_one_request_action() -> Result<()> {
+        let leader = Arc::new(build_test_leader().await?);
+        let engine = LocalConnectorEngine::new(leader, RecordingSink::new(), BS, true);
+
+        let onboard = engine
+            .clone()
+            .onboard_resources(
+                &"resource-restore".into(),
+                vec![ResourceOnboard {
+                    resource: kvbm_common::LogicalResourceId::default(),
+                    source_block_ids: vec![0],
+                    destination_block_ids: vec![5],
+                }],
+            )
+            .unwrap();
+
+        wait_complete(&onboard).await;
+        assert_eq!(
+            onboard.outcome(),
+            Some(LoadOutcome::FailedPartial { block_ids: vec![5] }),
+            "the test leader has no physical worker, but the resource action must run to terminal"
+        );
+        Ok(())
+    }
 
     /// The highest-value test: `(SequenceHash, BlockId)` pairs map to
     /// `ExternalBlock::new(block_id, sequence_hash)` — REVERSED. A naive splat
