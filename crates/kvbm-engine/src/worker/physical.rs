@@ -997,13 +997,6 @@ impl WorkerTransfers for PhysicalWorker {
                 )
             })?;
 
-        let local_physical = self.manager.get_physical_layout(local_handle).ok_or_else(|| {
-            anyhow::anyhow!(
-                "execute_remote_pull_plan: local handle {local_handle:?} not in manager registry"
-            )
-        })?;
-        let local_view = local_physical.layout().layout_view()?;
-
         // Block-pair list is shared across every shard in this plan.
         let block_pairs: Vec<(usize, usize)> = plan
             .src_block_ids
@@ -1014,9 +1007,10 @@ impl WorkerTransfers for PhysicalWorker {
 
         // Project WirePullOptions onto TransferOptions. The wire subset
         // intentionally omits bounce_buffer / cuda_stream / kv_layout
-        // overrides / use_planner / layer_range; execute_transfer_selection
-        // forces use_planner=true internally, and layer_range is the PP
-        // story.
+        // overrides / use_planner / layer_range. Sliced tensor-parallel plans
+        // force the planner through execute_transfer_selection; full-block
+        // replicated plans use execute_transfer so ragged MLA layouts do not
+        // need an axis projection. layer_range is the PP story.
         let mut options = TransferOptions::default();
         options.nixl_write_notification = plan.options.nixl_write_notification;
         options.metric_route = plan.options.metric_route;
@@ -1052,6 +1046,23 @@ impl WorkerTransfers for PhysicalWorker {
                     })?
             };
 
+            if shard.local_slice.is_full() && shard.remote_slice.is_full() {
+                notifications.push(self.manager.execute_transfer(
+                    remote_handle,
+                    &plan.src_block_ids,
+                    local_handle,
+                    &plan.dst_block_ids,
+                    options.clone(),
+                )?);
+                continue;
+            }
+
+            let local_physical = self.manager.get_physical_layout(local_handle).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "execute_remote_pull_plan: local handle {local_handle:?} not in manager registry"
+                )
+            })?;
+            let local_view = local_physical.layout().layout_view()?;
             let remote_physical = self
                 .manager
                 .get_physical_layout(remote_handle)

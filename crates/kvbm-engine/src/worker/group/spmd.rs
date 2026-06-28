@@ -2126,6 +2126,38 @@ mod tests {
             .expect("operational must accept identical layouts");
     }
 
+    #[test]
+    fn connect_remote_operational_accepts_matching_unknown_layouts() {
+        let local = vec![build_compat_worker(
+            100,
+            1,
+            0,
+            KvBlockLayout::Unknown,
+            3,
+            1,
+            32,
+            64,
+            1,
+            1,
+        )];
+        let remote = vec![build_compat_worker(
+            200,
+            1,
+            0,
+            KvBlockLayout::Unknown,
+            3,
+            1,
+            32,
+            64,
+            1,
+            1,
+        )];
+        let spmd = make_compat_spmd_with(kvbm_common::BlockLayoutMode::Operational, local);
+
+        spmd.connect_remote(InstanceId::new_v4(), remote)
+            .expect("operational ragged/MLA layouts do not require universal axis labels");
+    }
+
     /// Operational mode rejects when canonical `num_heads_total`
     /// differs (this catches both per-worker shape mismatch and
     /// canonical aggregate mismatch in one test).

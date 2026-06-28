@@ -80,5 +80,9 @@ the movement selected for replicated resources.
 ## Validation boundary
 
 Pure placement, wire compatibility, placement-consistency, and dispatch tests
-cover the implementation. A real two-instance, two-GPU NIXL test remains
+cover the implementation. A live one-GPU test now runs two independent KVBM
+instances with two logical replicated ranks each: consecutive global blocks
+route through different source and destination owners, transfer by NIXL READ
+into striped requester G2, and onboard plus broadcast byte-for-byte into every
+requester G1 replica. A real two-instance, two-GPU NCCL/NIXL test remains
 required before calling replicated remote search production-ready.
