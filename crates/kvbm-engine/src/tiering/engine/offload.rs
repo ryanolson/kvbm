@@ -17,10 +17,12 @@
 //! [`ActionStatus`]; the engine records that into the handle's cell with no
 //! engine lock held (see [`super::driver::LocalConnectorEngine::finish_save_action`]).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::Result;
 use futures::future::BoxFuture;
+use kvbm_common::LogicalResourceId;
 use velo::EventHandle;
 
 use kvbm_protocols::connector::{ActionFailure, ActionId, ActionStatus};
@@ -42,6 +44,7 @@ use crate::offload::{ExternalBlock, OffloadEngine, TransferHandle, TransferStatu
 pub(super) struct BufferedOffload {
     pub(super) action_id: ActionId,
     pub(super) request_id: RequestId,
+    pub(super) resource: Option<LogicalResourceId>,
     pub(super) pairs: Vec<(SequenceHash, BlockId)>,
     pub(super) iteration: usize,
 }
@@ -53,11 +56,15 @@ pub(super) struct BufferedOffload {
 /// inside `offload/` — abstracting it keeps the GPU/velo-bound engine mockable
 /// (and serves the future swappable-`BlockManager` goal).
 pub(super) trait OffloadSubmit: Send + Sync {
+    /// Whether an explicit logical resource has a configured submission route.
+    fn supports_resource(&self, resource: LogicalResourceId) -> bool;
+
     /// Enqueue a G1→G2 offload, gated on `precondition` (the forward-pass
     /// completion event minted at flush). Mirrors
     /// [`OffloadEngine::enqueue_g1_to_g2_with_precondition`].
     fn submit_g1_to_g2(
         &self,
+        resource: Option<LogicalResourceId>,
         blocks: Vec<ExternalBlock<G1>>,
         precondition: Option<EventHandle>,
     ) -> Result<Box<dyn OffloadTransfer>>;
@@ -116,24 +123,58 @@ impl OffloadTransfer for TransferHandle {
 /// Constructed by the `tiering::engine` factory `build_local_connector_engine`
 /// when the connector wires the real [`OffloadEngine`], via [`Self::new`].
 pub(super) struct OffloadEngineSubmit {
-    engine: Arc<OffloadEngine>,
+    primary: LogicalResourceId,
+    engines: BTreeMap<LogicalResourceId, Arc<OffloadEngine>>,
 }
 
 impl OffloadEngineSubmit {
     pub(super) fn new(engine: Arc<OffloadEngine>) -> Self {
-        Self { engine }
+        Self {
+            primary: LogicalResourceId::default(),
+            engines: BTreeMap::from([(LogicalResourceId::default(), engine)]),
+        }
+    }
+
+    pub(super) fn from_resources(
+        primary: LogicalResourceId,
+        engines: Vec<(LogicalResourceId, Arc<OffloadEngine>)>,
+    ) -> Result<Self> {
+        let expected_len = engines.len();
+        let engines = engines.into_iter().collect::<BTreeMap<_, _>>();
+        anyhow::ensure!(
+            engines.len() == expected_len,
+            "duplicate resource offload engine"
+        );
+        anyhow::ensure!(
+            engines.contains_key(&primary),
+            "primary logical resource {primary:?} has no offload engine"
+        );
+        Ok(Self { primary, engines })
+    }
+
+    pub(super) fn primary_engine(&self) -> &Arc<OffloadEngine> {
+        self.engines
+            .get(&self.primary)
+            .expect("resource offload routes validate their primary")
     }
 }
 
 impl OffloadSubmit for OffloadEngineSubmit {
+    fn supports_resource(&self, resource: LogicalResourceId) -> bool {
+        self.engines.contains_key(&resource)
+    }
+
     fn submit_g1_to_g2(
         &self,
+        resource: Option<LogicalResourceId>,
         blocks: Vec<ExternalBlock<G1>>,
         precondition: Option<EventHandle>,
     ) -> Result<Box<dyn OffloadTransfer>> {
-        let handle = self
-            .engine
-            .enqueue_g1_to_g2_with_precondition(blocks, precondition)?;
+        let resource = resource.unwrap_or(self.primary);
+        let engine = self.engines.get(&resource).ok_or_else(|| {
+            anyhow::anyhow!("offload submit has no route for logical resource {resource:?}")
+        })?;
+        let handle = engine.enqueue_g1_to_g2_with_precondition(blocks, precondition)?;
         Ok(Box::new(handle))
     }
 }
@@ -146,8 +187,13 @@ impl OffloadSubmit for OffloadEngineSubmit {
 pub(super) struct DisabledOffloadSubmit;
 
 impl OffloadSubmit for DisabledOffloadSubmit {
+    fn supports_resource(&self, _resource: LogicalResourceId) -> bool {
+        false
+    }
+
     fn submit_g1_to_g2(
         &self,
+        _resource: Option<LogicalResourceId>,
         _blocks: Vec<ExternalBlock<G1>>,
         _precondition: Option<EventHandle>,
     ) -> Result<Box<dyn OffloadTransfer>> {

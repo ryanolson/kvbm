@@ -52,22 +52,21 @@ pub(in super::super) fn build_layout_compat_payload(
     num_workers: usize,
 ) -> Result<LayoutCompatPayload> {
     let block_layout_mode = runtime.config().block_layout;
-    let template = if reference_config.num_heads.is_some() {
-        Some(
-            kvbm_engine::leader::parallelism::ParallelismTemplate::from_layout_config(
-                reference_config,
-                runtime.config().cache.parallelism,
-                num_workers,
-            )
-            .context("building ParallelismTemplate for hub registration payload")?,
-        )
+    let parallelism = if reference_config.num_heads.is_none() {
+        kvbm_config::ParallelismMode::ReplicatedData
     } else {
-        None
+        runtime.config().cache.parallelism
     };
+    let template = kvbm_engine::leader::parallelism::ParallelismTemplate::from_layout_config(
+        reference_config,
+        parallelism,
+        num_workers,
+    )
+    .context("building ParallelismTemplate for hub registration payload")?;
     kvbm_engine::leader::layout_compat::build_layout_compat_payload_with_template(
         block_layout_mode,
         worker_metadata,
-        template.as_ref(),
+        Some(&template),
     )
     .context("building layout_compat payload for hub registration")
 }

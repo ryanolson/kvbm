@@ -8,13 +8,17 @@ mod handle;
 mod local;
 mod metadata;
 mod remote;
+mod resources;
 
 pub use canonical::canonical_shape_from_worker;
 pub use handle::LayoutHandle;
 pub use metadata::{
-    LogicalLayoutDescriptor, ParallelismDescriptor, RdmaLayoutDescriptors, SerializedLayout,
-    WorkerAddress, select_transfer_canonical_layout, select_transfer_canonical_tier,
+    LogicalLayoutDescriptor, ParallelismDescriptor, RdmaLayoutDescriptors,
+    ResourceLayoutDescriptor, ResourceLayouts, ResourceParallelismDescriptor,
+    ResourceParallelismDescriptors, SerializedLayout, WorkerAddress, WorkerDataPlacement,
+    select_transfer_canonical_layout, select_transfer_canonical_tier,
 };
+pub use resources::{ResourceLayoutHandles, TierLayoutHandles};
 
 pub(crate) use local::LocalLayout;
 pub(crate) use metadata::LocalLayoutDescriptor;
@@ -626,17 +630,15 @@ impl TransferManager {
         self.context.d2h_stream()
     }
 
-    /// Get the CUDA context (for testing only).
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) fn cuda_context(&self) -> &std::sync::Arc<cudarc::driver::CudaContext> {
+    /// Get the CUDA context used by transfer and collective streams.
+    #[doc(hidden)]
+    pub fn cuda_context(&self) -> &std::sync::Arc<cudarc::driver::CudaContext> {
         self.context.cuda_context()
     }
 
-    /// Register a CUDA event for completion (for testing only).
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) fn register_cuda_event(
+    /// Register a CUDA event with the manager's shared completion poller.
+    #[doc(hidden)]
+    pub fn register_cuda_event(
         &self,
         event: cudarc::driver::CudaEvent,
     ) -> TransferCompleteNotification {
@@ -819,7 +821,11 @@ impl LayoutRegistry {
         // Treating the duplicate as a no-op matches the function's
         // `ensure_*` semantic and is what every caller already wanted.
         if self.loaded_remotes.contains(&remote_key) {
-            let handles: Vec<LayoutHandle> = inner.layouts.iter().map(|l| l.handle).collect();
+            let handles = inner
+                .all_layouts()
+                .into_iter()
+                .map(|layout| layout.handle)
+                .collect();
             return Ok(handles);
         }
 
@@ -840,7 +846,8 @@ impl LayoutRegistry {
 
         // Reconstruct layouts
         let mut imported_handles = Vec::new();
-        for serialized_with_handle in inner.layouts {
+        let descriptors = inner.all_layouts().into_iter().cloned().collect::<Vec<_>>();
+        for serialized_with_handle in descriptors {
             let handle = serialized_with_handle.handle;
             let layout = PhysicalLayout::from_descriptor(serialized_with_handle.layout)
                 .map_err(|e| anyhow!("failed to reconstruct layout {}: {}", handle, e))?;

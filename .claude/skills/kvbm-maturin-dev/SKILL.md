@@ -84,10 +84,23 @@ uv pip install --force-reinstall --no-deps 'nvidia-nccl-cu13>=2.29'
 Verify:
 
 ```bash
-python -c "import torch; print('nccl', torch.cuda.nccl.version())"
+python - <<'PY'
+import ctypes
+import site
+from pathlib import Path
+
+path = Path(site.getsitepackages()[0]) / "nvidia/nccl/lib/libnccl.so.2"
+library = ctypes.CDLL(str(path))
+version = ctypes.c_int()
+assert library.ncclGetVersion(ctypes.byref(version)) == 0
+print("NCCL runtime:", version.value)
+assert version.value >= 22900
+PY
 ```
 
-Expect `(2, 29, 7)` or newer. If you see `(2, 28, 9)`, re-run the install.
+Expect `22900` or newer. Do not use `torch.cuda.nccl.version()` for this
+check: it reports the NCCL version PyTorch was compiled against, which can
+remain `(2, 28, 9)` even while the dynamically loaded runtime is newer.
 
 ## Step 6: Smoke Verification
 

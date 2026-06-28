@@ -15,7 +15,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use kvbm_common::SequenceHash;
+use kvbm_common::{LogicalResourceId, SequenceHash};
 use kvbm_engine::leader::ControlPlane;
 use kvbm_engine::leader::InstanceLeader;
 use kvbm_engine::leader::control::TransferModule;
@@ -25,6 +25,7 @@ use kvbm_engine::p2p::session::{
 };
 use kvbm_engine::testing::managers::{TestManagerBuilder, TestRegistryBuilder};
 use kvbm_engine::{G2, G3};
+use kvbm_logical::BlockManagerSet;
 use kvbm_logical::blocks::BlockRegistry;
 use kvbm_logical::manager::BlockManager;
 use kvbm_observability::KvbmObservability;
@@ -218,6 +219,84 @@ async fn transfer_module_opens_session_on_match() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn open_transfer_session_selects_requested_resource_manager() {
+    let fx = fixture().await;
+    let known = hashes(3);
+    let primary_registry = BlockRegistry::new();
+    let primary = Arc::new(
+        TestManagerBuilder::<G2>::new()
+            .block_count(G2_BLOCK_COUNT)
+            .block_size(BLOCK_SIZE)
+            .registry(primary_registry.clone())
+            .build(),
+    );
+    let secondary = Arc::new(
+        TestManagerBuilder::<G2>::new()
+            .block_count(G2_BLOCK_COUNT)
+            .block_size(BLOCK_SIZE)
+            .registry(BlockRegistry::new())
+            .build(),
+    );
+    populate_g2(&secondary, &known);
+
+    let mut managers = BlockManagerSet::new();
+    managers
+        .insert(LogicalResourceId(1), Arc::clone(&primary))
+        .unwrap();
+    managers
+        .insert(LogicalResourceId(7), Arc::clone(&secondary))
+        .unwrap();
+    let leader = Arc::new(
+        InstanceLeader::builder()
+            .messenger(fx.server.messenger().clone())
+            .registry(primary_registry)
+            .g2_manager_set(Arc::new(managers), LogicalResourceId(1))
+            .workers(vec![])
+            .build()
+            .unwrap(),
+    );
+    assert!(leader.set_session_factory(MockSessionFactory::new()));
+
+    let response = leader
+        .open_transfer_session(OpenTransferSessionRequest {
+            sequence_hashes: known.clone(),
+            search_mode: SearchMode::Prefix,
+            find_mode: FindMode::Sync,
+            tiers: TierSelection::default(),
+            resource: Some(LogicalResourceId(7)),
+            watchdog_ms: None,
+        })
+        .await
+        .unwrap();
+    let OpenTransferSessionResponse::Sync {
+        capability,
+        committed,
+        ..
+    } = response
+    else {
+        panic!("secondary resource should contain the requested prefix")
+    };
+    assert_eq!(capability.resource, LogicalResourceId(7));
+    assert_eq!(committed, known);
+
+    let primary_response = leader
+        .open_transfer_session(OpenTransferSessionRequest {
+            sequence_hashes: known,
+            search_mode: SearchMode::Prefix,
+            find_mode: FindMode::Sync,
+            tiers: TierSelection::default(),
+            resource: None,
+            watchdog_ms: None,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        primary_response,
+        OpenTransferSessionResponse::NoBlocksFound
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn open_transfer_session_sync_returns_committed_inline() {
     let fx = fixture().await;
 
@@ -240,6 +319,7 @@ async fn open_transfer_session_sync_returns_committed_inline() {
             search_mode: SearchMode::Prefix,
             find_mode: FindMode::Sync,
             tiers: TierSelection::default(),
+            resource: None,
             watchdog_ms: None,
         })
         .await
@@ -282,6 +362,7 @@ async fn open_transfer_session_sync_no_match_returns_no_blocks_found() {
             search_mode: SearchMode::Prefix,
             find_mode: FindMode::Sync,
             tiers: TierSelection::default(),
+            resource: None,
             watchdog_ms: None,
         })
         .await
@@ -314,6 +395,7 @@ async fn open_transfer_session_async_opens_session_with_no_matches() {
             search_mode: SearchMode::Prefix,
             find_mode: FindMode::Async,
             tiers: TierSelection::default(),
+            resource: None,
             watchdog_ms: None,
         })
         .await
@@ -373,6 +455,7 @@ async fn open_transfer_session_async_populates_then_watchdog_evicts() {
             search_mode: SearchMode::Prefix,
             find_mode: FindMode::Async,
             tiers: TierSelection::default(),
+            resource: None,
             watchdog_ms: None,
         })
         .await
@@ -429,6 +512,7 @@ async fn open_transfer_session_scatter_finds_disjoint_hits() {
             search_mode: SearchMode::Scatter,
             find_mode: FindMode::Sync,
             tiers: TierSelection::default(),
+            resource: None,
             watchdog_ms: None,
         })
         .await
@@ -517,6 +601,7 @@ async fn pull_from_session_drains_full_committed_set() {
             search_mode: SearchMode::Prefix,
             find_mode: FindMode::Sync,
             tiers: TierSelection::default(),
+            resource: None,
             watchdog_ms: None,
         })
         .await
@@ -531,6 +616,7 @@ async fn pull_from_session_drains_full_committed_set() {
             source_instance_id: cap.instance_id,
             endpoint: Some(cap.endpoint),
             selector: None,
+            resource: None,
         })
         .await
         .expect("pull_from_session");
@@ -548,6 +634,108 @@ async fn pull_from_session_drains_full_committed_set() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pull_from_session_registers_into_requested_resource_manager() {
+    let fx = fixture().await;
+    let known = hashes(4);
+    let (holder_factory, puller_factory) = MockSessionFactory::make_paired();
+
+    let holder_primary_registry = BlockRegistry::new();
+    let holder_primary = Arc::new(
+        TestManagerBuilder::<G2>::new()
+            .block_count(G2_BLOCK_COUNT)
+            .block_size(BLOCK_SIZE)
+            .registry(holder_primary_registry.clone())
+            .build(),
+    );
+    let holder_secondary = Arc::new(
+        TestManagerBuilder::<G2>::new()
+            .block_count(G2_BLOCK_COUNT)
+            .block_size(BLOCK_SIZE)
+            .registry(BlockRegistry::new())
+            .build(),
+    );
+    populate_g2(&holder_secondary, &known);
+    let mut holder_managers = BlockManagerSet::new();
+    holder_managers
+        .insert(LogicalResourceId(1), holder_primary)
+        .unwrap();
+    holder_managers
+        .insert(LogicalResourceId(7), holder_secondary)
+        .unwrap();
+    let holder = Arc::new(
+        InstanceLeader::builder()
+            .messenger(fx.server.messenger().clone())
+            .registry(holder_primary_registry)
+            .g2_manager_set(Arc::new(holder_managers), LogicalResourceId(1))
+            .workers(vec![])
+            .build()
+            .unwrap(),
+    );
+    assert!(holder.set_session_factory(holder_factory));
+
+    let puller_primary_registry = BlockRegistry::new();
+    let puller_primary = Arc::new(
+        TestManagerBuilder::<G2>::new()
+            .block_count(G2_BLOCK_COUNT)
+            .block_size(BLOCK_SIZE)
+            .registry(puller_primary_registry.clone())
+            .build(),
+    );
+    let puller_secondary = Arc::new(
+        TestManagerBuilder::<G2>::new()
+            .block_count(G2_BLOCK_COUNT)
+            .block_size(BLOCK_SIZE)
+            .registry(BlockRegistry::new())
+            .build(),
+    );
+    let mut puller_managers = BlockManagerSet::new();
+    puller_managers
+        .insert(LogicalResourceId(1), Arc::clone(&puller_primary))
+        .unwrap();
+    puller_managers
+        .insert(LogicalResourceId(7), Arc::clone(&puller_secondary))
+        .unwrap();
+    let puller = Arc::new(
+        InstanceLeader::builder()
+            .messenger(fx.client.messenger().clone())
+            .registry(puller_primary_registry)
+            .g2_manager_set(Arc::new(puller_managers), LogicalResourceId(1))
+            .workers(vec![])
+            .build()
+            .unwrap(),
+    );
+    assert!(puller.set_session_factory(puller_factory));
+
+    let capability = holder
+        .open_transfer_session(OpenTransferSessionRequest {
+            sequence_hashes: known.clone(),
+            search_mode: SearchMode::Prefix,
+            find_mode: FindMode::Sync,
+            tiers: TierSelection::default(),
+            resource: Some(LogicalResourceId(7)),
+            watchdog_ms: None,
+        })
+        .await
+        .unwrap()
+        .capability()
+        .cloned()
+        .unwrap();
+    puller
+        .pull_from_session(PullFromSessionRequest {
+            session_id: capability.session_id,
+            source_instance_id: capability.instance_id,
+            endpoint: Some(capability.endpoint),
+            selector: None,
+            resource: Some(capability.resource),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(puller_secondary.match_blocks(&known).len(), known.len());
+    assert!(puller_primary.match_blocks(&known).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pull_from_session_with_selector_pulls_subset() {
     let fx = fixture().await;
     let known = hashes(5);
@@ -559,6 +747,7 @@ async fn pull_from_session_with_selector_pulls_subset() {
             search_mode: SearchMode::Prefix,
             find_mode: FindMode::Sync,
             tiers: TierSelection::default(),
+            resource: None,
             watchdog_ms: None,
         })
         .await
@@ -575,6 +764,7 @@ async fn pull_from_session_with_selector_pulls_subset() {
             source_instance_id: cap.instance_id,
             endpoint: Some(cap.endpoint),
             selector: Some(selector.clone()),
+            resource: None,
         })
         .await
         .expect("pull_from_session");
@@ -602,6 +792,7 @@ async fn pull_from_session_selector_with_uncommitted_hash_errors() {
             search_mode: SearchMode::Prefix,
             find_mode: FindMode::Sync,
             tiers: TierSelection::default(),
+            resource: None,
             watchdog_ms: None,
         })
         .await
@@ -620,6 +811,7 @@ async fn pull_from_session_selector_with_uncommitted_hash_errors() {
             source_instance_id: cap.instance_id,
             endpoint: Some(cap.endpoint),
             selector: Some(selector),
+            resource: None,
         })
         .await
         .expect_err("expected error");
@@ -642,6 +834,7 @@ async fn pull_from_session_endpoint_required_in_v1() {
             source_instance_id: fx.server.instance_id(),
             endpoint: None,
             selector: None,
+            resource: None,
         })
         .await
         .expect_err("expected endpoint_required error");
@@ -706,6 +899,7 @@ async fn open_transfer_session_g3_without_parallel_worker_errors() {
                 g3: false,
                 g4: false,
             },
+            resource: None,
             watchdog_ms: None,
         })
         .await
@@ -724,6 +918,7 @@ async fn open_transfer_session_g3_without_parallel_worker_errors() {
                 g3: true,
                 g4: false,
             },
+            resource: None,
             watchdog_ms: None,
         })
         .await
@@ -785,6 +980,7 @@ async fn open_transfer_session_g3_ignored_in_prefix_mode() {
                 g3: true,
                 g4: false,
             },
+            resource: None,
             watchdog_ms: None,
         })
         .await
@@ -815,6 +1011,7 @@ async fn close_transfer_session_is_idempotent() {
             search_mode: SearchMode::Prefix,
             find_mode: FindMode::Sync,
             tiers: TierSelection::default(),
+            resource: None,
             watchdog_ms: None,
         })
         .await

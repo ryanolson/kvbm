@@ -42,7 +42,7 @@ use tokio::task::JoinHandle;
 use crate::leader::InstanceLeader;
 use crate::object::ObjectBlockOps;
 use crate::{BlockId, SequenceHash};
-use kvbm_common::LogicalLayoutHandle;
+use kvbm_common::{LogicalLayoutHandle, LogicalResourceId};
 use kvbm_logical::blocks::{BlockMetadata, BlockRegistry, ImmutableBlock};
 use kvbm_logical::manager::BlockManager;
 use kvbm_physical::transfer::TransferOptions;
@@ -60,6 +60,9 @@ use crate::object::ObjectLockManager;
 /// Configuration for a pipeline.
 #[derive(Clone)]
 pub struct PipelineConfig<Src: BlockMetadata, Dst: BlockMetadata> {
+    /// Logical resource whose physical layouts this pipeline transfers.
+    /// `None` preserves the leader's selected primary compatibility path.
+    pub resource: Option<LogicalResourceId>,
     /// Policies to evaluate (all must pass)
     pub policies: Vec<Arc<dyn OffloadPolicy<Src>>>,
     /// Batch configuration
@@ -102,6 +105,7 @@ pub struct PipelineConfig<Src: BlockMetadata, Dst: BlockMetadata> {
 impl<Src: BlockMetadata, Dst: BlockMetadata> Default for PipelineConfig<Src, Dst> {
     fn default() -> Self {
         Self {
+            resource: None,
             policies: Vec::new(),
             batch_config: BatchConfig::default(),
             policy_timeout: Duration::from_millis(100),
@@ -135,6 +139,12 @@ impl<Src: BlockMetadata, Dst: BlockMetadata> PipelineBuilder<Src, Dst> {
     /// Add a policy to the pipeline.
     pub fn policy(mut self, policy: Arc<dyn OffloadPolicy<Src>>) -> Self {
         self.config.policies.push(policy);
+        self
+    }
+
+    /// Route physical transfers through one logical resource.
+    pub fn resource(mut self, resource: LogicalResourceId) -> Self {
+        self.config.resource = Some(resource);
         self
     }
 
@@ -382,6 +392,7 @@ impl<Src: BlockMetadata, Dst: BlockMetadata> Pipeline<Src, Dst> {
             input_rx: precond_rx,
             leader,
             dst_manager,
+            resource: config.resource,
             src_layout,
             dst_layout,
             skip_transfers: config.skip_transfers,
@@ -1343,6 +1354,7 @@ struct BlockTransferExecutor<Src: BlockMetadata, Dst: BlockMetadata> {
     input_rx: BatchOutputRx<Src>,
     leader: Arc<InstanceLeader>,
     dst_manager: Arc<BlockManager<Dst>>,
+    resource: Option<LogicalResourceId>,
     src_layout: LogicalLayoutHandle,
     dst_layout: LogicalLayoutHandle,
     /// Skip actual transfers (for testing)
@@ -1360,6 +1372,7 @@ struct BlockTransferExecutor<Src: BlockMetadata, Dst: BlockMetadata> {
 struct SharedBlockExecutorState<Dst: BlockMetadata> {
     leader: Arc<InstanceLeader>,
     dst_manager: Arc<BlockManager<Dst>>,
+    resource: Option<LogicalResourceId>,
     src_layout: LogicalLayoutHandle,
     dst_layout: LogicalLayoutHandle,
     skip_transfers: bool,
@@ -1378,6 +1391,7 @@ impl<Src: BlockMetadata, Dst: BlockMetadata> BlockTransferExecutor<Src, Dst> {
         let shared = Arc::new(SharedBlockExecutorState {
             leader: self.leader.clone(),
             dst_manager: self.dst_manager.clone(),
+            resource: self.resource,
             src_layout: self.src_layout,
             dst_layout: self.dst_layout,
             skip_transfers: self.skip_transfers,
@@ -1478,13 +1492,23 @@ impl<Src: BlockMetadata, Dst: BlockMetadata> BlockTransferExecutor<Src, Dst> {
 
             // Execute transfer via leader
             let start_xfer = Instant::now();
-            let notification = shared.leader.execute_local_transfer(
-                shared.src_layout,
-                shared.dst_layout,
-                src_block_ids.clone(),
-                dst_block_ids.clone(),
-                TransferOptions::default(),
-            )?;
+            let notification = match shared.resource {
+                Some(resource) => shared.leader.execute_local_transfer_for_resource(
+                    resource,
+                    shared.src_layout,
+                    shared.dst_layout,
+                    src_block_ids.clone(),
+                    dst_block_ids.clone(),
+                    TransferOptions::default(),
+                )?,
+                None => shared.leader.execute_local_transfer(
+                    shared.src_layout,
+                    shared.dst_layout,
+                    src_block_ids.clone(),
+                    dst_block_ids.clone(),
+                    TransferOptions::default(),
+                )?,
+            };
 
             // `execute_local_transfer` reserves the physical/simulated
             // transfer synchronously and returns an awaitable completion
@@ -2060,6 +2084,13 @@ mod tests {
         assert_eq!(config.policy_timeout, Duration::from_millis(50));
         assert!(config.auto_chain);
         assert_eq!(config.sweep_interval, Duration::from_millis(5));
+    }
+
+    #[test]
+    fn pipeline_builder_records_logical_resource() {
+        let resource = kvbm_common::LogicalResourceId(9);
+        let config = PipelineBuilder::<(), ()>::new().resource(resource).build();
+        assert_eq!(config.resource, Some(resource));
     }
 
     #[test]

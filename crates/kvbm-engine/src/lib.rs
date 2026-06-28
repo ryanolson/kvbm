@@ -32,7 +32,7 @@ pub mod collectives;
 /// `LocalConnectorEngine` itself stays internal.
 pub use tiering::engine::{
     ConnectorEngineConfig, PassOffload, PassOnboard, RemoteOps, WorkerEngine, WorkerPassPlan,
-    build_local_connector_engine,
+    build_local_connector_engine, build_local_connector_engine_with_resources,
 };
 
 /// Conditional-disagg transport seam consumed by the connector's CD wiring:

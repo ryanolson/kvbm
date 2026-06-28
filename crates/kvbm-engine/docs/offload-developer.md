@@ -73,6 +73,23 @@ impl<T: BlockMetadata> OffloadBatch<T> {
 
 ---
 
+## Resource-Owned Pipelines
+
+`PipelineConfig::resource` binds a pipeline to one logical model resource.
+The transfer executor passes that ID to `InstanceLeader`, which resolves the
+matching G1 and destination-tier physical layouts. Multi-resource runtimes
+construct one `OffloadEngine` per resource and install them through
+`build_local_connector_engine_with_resources`; the connector engine records the
+resource on each buffered action and selects the corresponding engine only at
+the forward-pass flush boundary.
+
+Resource routing does not change the cancellation contract. Each selected
+pipeline still receives its own `OffloadContainer`, carries its token through
+the same stages, sweeps before upgrade, and loses container identity only after
+the commitment boundary described by P1-P6.
+
+---
+
 ## Token-Based Cancellation
 
 ### Token Lifecycle
@@ -512,7 +529,6 @@ When modifying the pipeline:
 - Measure overhead of cancellation checks
 - Benchmark sweep operation at scale
 - Profile upgrade → flat map → transfer path
-
 
 
 

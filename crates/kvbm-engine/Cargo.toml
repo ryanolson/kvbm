@@ -31,6 +31,7 @@ dashmap = { workspace = true }
 derive_builder = { workspace = true }
 futures = { workspace = true }
 parking_lot = { workspace = true }
+libloading = { workspace = true }
 rmp-serde = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -79,7 +80,7 @@ default = ["s3", "testing"]
 s3 = ["dep:aws-sdk-s3", "dep:aws-config", "dep:rayon", "dep:tokio-rayon", "dep:chrono"]
 collectives = ["nccl"]
 nccl = []
-testing-nccl = ["collectives"]
+testing-nccl = ["collectives", "cudarc/nccl"]
 nats = ["dep:async-nats", "dep:flume"]
 testing = ["kvbm-logical/testing", "kvbm-physical/testing"]
 testing-s3 = ["s3", "testing"]

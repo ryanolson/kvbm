@@ -28,6 +28,7 @@ use futures::Stream;
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 
+use kvbm_common::LogicalResourceId;
 use kvbm_logical::blocks::{ImmutableBlock, MutableBlock};
 
 use super::SessionEndpoint;
@@ -288,6 +289,23 @@ pub trait Session: Send + Sync {
         hashes: Vec<SequenceHash>,
         dst: Vec<MutableBlock<G2>>,
     ) -> BoxFuture<'static, Result<Vec<MutableBlock<G2>>>>;
+
+    /// Resource-aware pull. Implementations that own physical transfer state
+    /// override this; the default preserves the legacy resource-0 behavior.
+    fn pull_resource(
+        &self,
+        resource: LogicalResourceId,
+        hashes: Vec<SequenceHash>,
+        dst: Vec<MutableBlock<G2>>,
+    ) -> BoxFuture<'static, Result<Vec<MutableBlock<G2>>>> {
+        if resource == LogicalResourceId::default() {
+            self.pull(hashes, dst)
+        } else {
+            Box::pin(async move {
+                anyhow::bail!("session does not support logical resource {resource:?}")
+            })
+        }
+    }
 
     // --------------------------------------------------------
     // Either side.

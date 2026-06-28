@@ -19,11 +19,20 @@
 
 use std::sync::{Arc, OnceLock};
 
+#[cfg(feature = "nccl")]
+use anyhow::Context;
 use anyhow::{Result, bail};
 use parking_lot::Mutex;
 
 use kvbm_engine::WorkerEngine;
-use kvbm_engine::worker::{LeaderLayoutConfig, VeloWorkerService, WorkerLayoutResponse};
+#[cfg(feature = "nccl")]
+use kvbm_engine::collectives::{NcclBootstrap, NcclCollectives};
+#[cfg(feature = "nccl")]
+use kvbm_engine::worker::ReplicatedDataWorker;
+use kvbm_engine::worker::{
+    CollectiveBootstrap, LeaderLayoutConfig, VeloWorkerService, WorkerLayoutResponse,
+    WorkerTransfers,
+};
 use kvbm_physical::layout::LayoutConfig;
 use kvbm_protocols::connector::EngineWorkerSink;
 
@@ -81,6 +90,10 @@ impl GpuState {
             "Completing deferred NIXL initialization (connector)"
         );
 
+        let parallelism = config.parallelism;
+        let worker_count = config.worker_count;
+        let collective_bootstrap = config.collective.clone();
+
         let (worker, response) = pending
             .complete_initialization(runtime, config)
             .map_err(|e| {
@@ -93,18 +106,41 @@ impl GpuState {
             .get()
             .ok_or_else(|| anyhow::anyhow!("Worker details not set"))?;
 
-        let engine = WorkerEngine::build(
+        let transfers = build_replicated_transfers(
+            runtime,
             worker.clone(),
-            num_layers,
-            completion,
-            runtime.messenger().clone(),
-            runtime.tokio(),
+            parallelism,
+            worker_count,
+            collective_bootstrap,
         )?;
+
+        let engine = if let Some(transfers) = transfers.clone() {
+            WorkerEngine::build_replicated(
+                worker.clone(),
+                transfers,
+                num_layers,
+                completion,
+                runtime.messenger().clone(),
+                runtime.tokio(),
+            )?
+        } else {
+            WorkerEngine::build(
+                worker.clone(),
+                num_layers,
+                completion,
+                runtime.messenger().clone(),
+                runtime.tokio(),
+            )?
+        };
         self.engine
             .set(engine)
             .map_err(|_| anyhow::anyhow!("worker engine already set (race condition)"))?;
 
-        let service = VeloWorkerService::new(runtime.messenger().clone(), worker)?;
+        let service = if let Some(transfers) = transfers {
+            VeloWorkerService::new_with_transfers(runtime.messenger().clone(), worker, transfers)?
+        } else {
+            VeloWorkerService::new(runtime.messenger().clone(), worker)?
+        };
         self.service
             .set(service)
             .map_err(|_| anyhow::anyhow!("service already initialized (race condition)"))?;
@@ -169,5 +205,60 @@ impl GpuState {
     /// The GPU pass engine, `Some` once [`Self::initialize`] has run.
     pub(crate) fn engine(&self) -> Option<&Arc<WorkerEngine>> {
         self.engine.get()
+    }
+}
+
+fn build_replicated_transfers(
+    runtime: &Arc<KvbmRuntime>,
+    worker: Arc<kvbm_engine::worker::DirectWorker>,
+    parallelism: kvbm_config::ParallelismMode,
+    worker_count: usize,
+    bootstrap: Option<CollectiveBootstrap>,
+) -> Result<Option<Arc<dyn WorkerTransfers>>> {
+    let collective_required =
+        parallelism == kvbm_config::ParallelismMode::ReplicatedData && worker_count > 1;
+    if !collective_required {
+        anyhow::ensure!(
+            bootstrap.is_none(),
+            "collective bootstrap supplied for non-replicated or single-worker cache"
+        );
+        return Ok(None);
+    }
+
+    let bootstrap = bootstrap.ok_or_else(|| {
+        anyhow::anyhow!(
+            "replicated cache data with {worker_count} workers requires a collective bootstrap"
+        )
+    })?;
+
+    #[cfg(feature = "nccl")]
+    {
+        let CollectiveBootstrap::Nccl { serialized } = bootstrap;
+        let bootstrap = NcclBootstrap::deserialize(&serialized)
+            .context("decoding KVBM NCCL collective bootstrap")?;
+        anyhow::ensure!(
+            bootstrap.world_size() == worker_count,
+            "NCCL bootstrap world size {} does not match worker count {worker_count}",
+            bootstrap.world_size()
+        );
+        let collective = Arc::new(NcclCollectives::from_worker_bootstrap(
+            &bootstrap,
+            worker.clone(),
+            runtime,
+        )?);
+        let transfers = Arc::new(ReplicatedDataWorker::new(
+            worker,
+            runtime.clone(),
+            collective,
+        )?);
+        Ok(Some(transfers))
+    }
+
+    #[cfg(not(feature = "nccl"))]
+    {
+        let _ = (runtime, worker, bootstrap);
+        anyhow::bail!(
+            "replicated cache data with {worker_count} workers requires the kvbm-connector `nccl` feature"
+        )
     }
 }

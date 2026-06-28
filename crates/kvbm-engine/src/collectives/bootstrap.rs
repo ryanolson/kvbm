@@ -49,11 +49,11 @@ use std::mem::MaybeUninit;
 /// `c_char` is `i8` on x86_64 and `u8` on aarch64.
 type NcclByte = c_char;
 
+use super::nccl_ffi::{
+    NCCL_SUCCESS, NcclComm, NcclResult, NcclUniqueId, comm_init_rank, error_string, get_unique_id,
+};
 use anyhow::{Context, Result};
 use cudarc::driver::sys::CUstream;
-use cudarc::nccl::sys::{
-    ncclComm_t, ncclCommInitRank, ncclGetUniqueId, ncclResult_t, ncclUniqueId,
-};
 
 /// Bootstrap for creating NCCL communicators from scratch.
 ///
@@ -74,7 +74,7 @@ use cudarc::nccl::sys::{
 /// communicators on different devices.
 #[derive(Clone)]
 pub struct NcclBootstrap {
-    nccl_id: ncclUniqueId,
+    nccl_id: NcclUniqueId,
     world_size: usize,
 }
 
@@ -99,10 +99,10 @@ impl NcclBootstrap {
             i32::MAX,
             world_size
         );
-        let mut nccl_id = MaybeUninit::<ncclUniqueId>::uninit();
+        let mut nccl_id = MaybeUninit::<NcclUniqueId>::uninit();
 
         // SAFETY: ncclGetUniqueId initializes the ncclUniqueId struct
-        let result = unsafe { ncclGetUniqueId(nccl_id.as_mut_ptr()) };
+        let result = get_unique_id(nccl_id.as_mut_ptr())?;
         check_nccl_result(result).context("Failed to generate NCCL unique ID")?;
 
         // SAFETY: ncclGetUniqueId has initialized the struct
@@ -157,7 +157,7 @@ impl NcclBootstrap {
 
         let world_size = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
 
-        let mut nccl_id = ncclUniqueId {
+        let mut nccl_id = NcclUniqueId {
             internal: [0 as NcclByte; 128],
         };
         // Copy bytes into internal array
@@ -192,7 +192,7 @@ impl NcclBootstrap {
     /// - `rank` is >= `world_size`
     /// - NCCL initialization fails (e.g., network issues, GPU errors)
     /// - Not all ranks call this method (will hang)
-    pub fn init_communicator(&self, rank: usize, _stream: CUstream) -> Result<ncclComm_t> {
+    pub fn init_communicator(&self, rank: usize, _stream: CUstream) -> Result<NcclComm> {
         if rank >= self.world_size {
             anyhow::bail!(
                 "Rank {} is invalid for world_size {}",
@@ -206,24 +206,22 @@ impl NcclBootstrap {
             self.world_size
         );
 
-        let mut comm = MaybeUninit::<ncclComm_t>::uninit();
+        let mut comm = MaybeUninit::<NcclComm>::uninit();
 
         // SAFETY: ncclCommInitRank is a collective call that initializes the communicator.
         // All ranks must call this with the same nccl_id for it to complete.
-        let result = unsafe {
-            ncclCommInitRank(
-                comm.as_mut_ptr(),
-                self.world_size as i32,
-                self.nccl_id,
-                rank as i32,
-            )
-        };
+        let result = comm_init_rank(
+            comm.as_mut_ptr(),
+            self.world_size as i32,
+            self.nccl_id,
+            rank as i32,
+        )?;
         check_nccl_result(result).context("Failed to initialize NCCL communicator")?;
 
         // SAFETY: ncclCommInitRank has initialized the communicator
         let comm = unsafe { comm.assume_init() };
 
-        tracing::debug!(
+        tracing::info!(
             rank,
             world_size = self.world_size,
             "NCCL communicator initialized"
@@ -234,11 +232,14 @@ impl NcclBootstrap {
 }
 
 /// Check an NCCL result and convert to anyhow::Result.
-pub(crate) fn check_nccl_result(result: ncclResult_t) -> Result<()> {
-    if result == ncclResult_t::ncclSuccess {
+pub(crate) fn check_nccl_result(result: NcclResult) -> Result<()> {
+    if result == NCCL_SUCCESS {
         Ok(())
     } else {
-        anyhow::bail!("NCCL error: {:?}", result)
+        anyhow::bail!(
+            "NCCL operation failed: {} (code {result})",
+            error_string(result)
+        )
     }
 }
 
@@ -254,7 +255,7 @@ mod tests {
 
         // Create a bootstrap with a dummy ID (we can't call ncclGetUniqueId without NCCL)
         let original = NcclBootstrap {
-            nccl_id: ncclUniqueId {
+            nccl_id: NcclUniqueId {
                 internal: [42 as NcclByte; 128],
             },
             world_size,
@@ -273,5 +274,21 @@ mod tests {
         let bytes = vec![0u8; 10]; // Wrong length
         let result = NcclBootstrap::deserialize(&bytes);
         assert!(result.is_err());
+    }
+
+    #[cfg(feature = "testing-nccl")]
+    #[test]
+    fn world_one_communicator_initializes_and_destroys() {
+        use cudarc::driver::CudaContext;
+
+        let context = CudaContext::new(0).expect("CUDA device 0");
+        context.bind_to_thread().expect("bind CUDA context");
+        let stream = context.new_stream().expect("create CUDA stream");
+        let bootstrap = NcclBootstrap::generate(1).expect("generate NCCL ID");
+        let comm = bootstrap
+            .init_communicator(0, stream.cu_stream())
+            .expect("initialize rank 0 communicator");
+        let result = super::super::nccl_ffi::comm_destroy(comm).expect("load NCCL destroy");
+        check_nccl_result(result).expect("destroy communicator");
     }
 }

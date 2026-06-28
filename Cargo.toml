@@ -41,7 +41,7 @@ hub = [
 [dependencies]
 # Connector deps — path deps into the crates/ workspace
 kvbm-common = { path = "crates/kvbm-common" }
-kvbm-connector = { path = "crates/kvbm-connector", features = ["static-kernels"] }
+kvbm-connector = { path = "crates/kvbm-connector", features = ["static-kernels", "nccl"] }
 
 # kernels deps (optional)
 kvbm-kernels = { path = "crates/kvbm-kernels", optional = true }

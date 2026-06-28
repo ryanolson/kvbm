@@ -53,12 +53,9 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use cudarc::driver::sys::CUstream;
 use cudarc::driver::{CudaContext, CudaEvent, CudaStream};
-use cudarc::nccl::sys::{
-    ncclBcast, ncclComm_t, ncclCommDestroy, ncclDataType_t, ncclGroupEnd, ncclGroupStart,
-};
 use velo::EventManager;
 
 use crate::BlockId;
@@ -68,6 +65,7 @@ use kvbm_physical::transfer::TransferCompleteNotification;
 
 use super::CollectiveOps;
 use super::bootstrap::{NcclBootstrap, check_nccl_result};
+use super::nccl_ffi::{NCCL_INT8, NcclComm, bcast, comm_destroy, group_end, group_start};
 
 /// Trait for resolving logical layout handles to physical layouts.
 ///
@@ -82,6 +80,18 @@ pub trait LayoutResolver: Send + Sync {
     /// # Returns
     /// The physical layout for the given logical handle, or an error if not found.
     fn resolve_layout(&self, logical: LogicalLayoutHandle) -> Result<PhysicalLayout>;
+
+    /// Resolve a logical tier within one model resource.
+    fn resolve_layout_for_resource(
+        &self,
+        resource: kvbm_common::LogicalResourceId,
+        logical: LogicalLayoutHandle,
+    ) -> Result<PhysicalLayout> {
+        if resource != kvbm_common::LogicalResourceId::default() {
+            anyhow::bail!("layout resolver does not implement non-default resource {resource:?}");
+        }
+        self.resolve_layout(logical)
+    }
 }
 
 /// Trait for registering CUDA events for completion notification.
@@ -155,7 +165,7 @@ impl NcclStream {
 /// overhead.
 pub struct NcclCollectives {
     /// NCCL communicator handle
-    comm: ncclComm_t,
+    comm: NcclComm,
 
     /// Whether we own the communicator (and must destroy it on drop)
     ownership: CommOwnership,
@@ -174,7 +184,7 @@ pub struct NcclCollectives {
     cuda_context: Arc<CudaContext>,
 
     /// Event system for completion notifications (used for borrowed stream fallback)
-    event_system: EventManager,
+    event_system: Arc<EventManager>,
 
     /// CUDA event registrar for efficient completion notification
     event_registrar: Arc<dyn CudaEventRegistrar>,
@@ -210,7 +220,7 @@ impl NcclCollectives {
         bootstrap: &NcclBootstrap,
         rank: usize,
         cuda_context: Arc<CudaContext>,
-        event_system: EventManager,
+        event_system: Arc<EventManager>,
         event_registrar: Arc<dyn CudaEventRegistrar>,
         layout_resolver: Arc<dyn LayoutResolver>,
     ) -> Result<Self> {
@@ -235,14 +245,89 @@ impl NcclCollectives {
         })
     }
 
+    /// Create a KVBM-owned communicator and stream for one physical worker.
+    ///
+    /// The bootstrap is shared by the leader, while layout resolution and CUDA
+    /// completion polling are delegated to the worker's transfer manager.
+    pub fn from_worker_bootstrap(
+        bootstrap: &NcclBootstrap,
+        worker: Arc<crate::worker::PhysicalWorker>,
+        runtime: &crate::KvbmRuntime,
+    ) -> Result<Self> {
+        let rank = worker
+            .rank()
+            .context("NCCL collective worker requires a rank")?;
+        let cuda_context = worker.transfer_manager().cuda_context().clone();
+        let event_registrar: Arc<dyn CudaEventRegistrar> = worker.clone();
+        let layout_resolver: Arc<dyn LayoutResolver> = worker;
+
+        Self::from_bootstrap(
+            bootstrap,
+            rank,
+            cuda_context,
+            runtime.event_system(),
+            event_registrar,
+            layout_resolver,
+        )
+    }
+
+    /// Initialize one KVBM-owned communicator per in-process physical worker.
+    ///
+    /// `ncclCommInitRank` is collective, so rank initialization runs
+    /// concurrently even when a host process owns every Rhino worker. Workers
+    /// must be supplied in rank order with contiguous rank IDs.
+    pub fn from_worker_group(
+        bootstrap: &NcclBootstrap,
+        workers: &[Arc<crate::worker::PhysicalWorker>],
+        runtime: &crate::KvbmRuntime,
+    ) -> Result<Vec<Arc<Self>>> {
+        ensure!(
+            workers.len() == bootstrap.world_size(),
+            "NCCL worker count {} does not match bootstrap world size {}",
+            workers.len(),
+            bootstrap.world_size()
+        );
+        for (rank, worker) in workers.iter().enumerate() {
+            ensure!(
+                worker.rank() == Some(rank),
+                "NCCL worker at position {rank} reports rank {:?}",
+                worker.rank()
+            );
+        }
+
+        std::thread::scope(|scope| {
+            let initializers = workers
+                .iter()
+                .map(|worker| {
+                    scope.spawn(move || {
+                        Self::from_worker_bootstrap(bootstrap, Arc::clone(worker), runtime)
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            initializers
+                .into_iter()
+                .enumerate()
+                .map(|(rank, initializer)| {
+                    initializer
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("NCCL rank {rank} initializer panicked"))?
+                        .with_context(|| format!("initialize KVBM NCCL rank {rank}"))
+                        .map(Arc::new)
+                })
+                .collect()
+        })
+    }
+
     // =========================================================================
     // Path B: Borrow existing communicator (production use with Python/C/C++)
     // =========================================================================
 
     /// Create from borrowed NCCL handles passed from external code.
     ///
-    /// This is the primary production path when the NCCL communicator is
-    /// initialized by Python (torch.distributed), C++, or another runtime.
+    /// This compatibility path is available when an external runtime owns the
+    /// communicator. Connector workers prefer [`Self::from_worker_bootstrap`]
+    /// so KVBM owns an isolated communicator and completion-safe stream.
     ///
     /// # Arguments
     /// * `comm_ptr` - Raw pointer to `ncclComm_t` handle (cast to usize)
@@ -293,12 +378,12 @@ impl NcclCollectives {
         rank: usize,
         world_size: usize,
         cuda_context: Arc<CudaContext>,
-        event_system: EventManager,
+        event_system: Arc<EventManager>,
         event_registrar: Arc<dyn CudaEventRegistrar>,
         layout_resolver: Arc<dyn LayoutResolver>,
     ) -> Self {
         Self {
-            comm: comm_ptr as ncclComm_t,
+            comm: comm_ptr as NcclComm,
             ownership: CommOwnership::Borrowed,
             rank,
             world_size,
@@ -326,7 +411,7 @@ impl NcclCollectives {
         let stream = self.nccl_stream.raw();
 
         // Start NCCL group - batches operations for efficiency
-        let result = unsafe { ncclGroupStart() };
+        let result = group_start()?;
         check_nccl_result(result).context("ncclGroupStart failed")?;
 
         // Queue all broadcasts within the group
@@ -334,21 +419,19 @@ impl NcclCollectives {
             // SAFETY: We're calling NCCL with valid pointers within a group operation.
             // The stream cast is safe because both cudarc::driver::sys::CUstream and
             // cudarc::nccl::sys::CUstream are the same underlying CUDA type (*mut CUstream_st).
-            let result = unsafe {
-                ncclBcast(
-                    *ptr as *mut std::ffi::c_void,
-                    *size,
-                    ncclDataType_t::ncclChar, // byte-level transfer
-                    root,
-                    self.comm,
-                    stream.cast(),
-                )
-            };
+            let result = bcast(
+                *ptr as *mut std::ffi::c_void,
+                *size,
+                NCCL_INT8,
+                root,
+                self.comm,
+                stream.cast(),
+            )?;
             check_nccl_result(result).context("ncclBcast failed")?;
         }
 
         // End group - submits all queued ops to GPU
-        let result = unsafe { ncclGroupEnd() };
+        let result = group_end()?;
         check_nccl_result(result).context("ncclGroupEnd failed")?;
 
         Ok(())
@@ -417,48 +500,102 @@ impl NcclCollectives {
     }
 }
 
-impl CollectiveOps for NcclCollectives {
-    fn broadcast(
+impl NcclCollectives {
+    #[allow(clippy::too_many_arguments)]
+    fn broadcast_with_layouts(
         &self,
-        src: LogicalLayoutHandle,
-        dst: LogicalLayoutHandle,
+        root_rank: usize,
+        src_layout: &PhysicalLayout,
+        dst_layout: &PhysicalLayout,
         src_block_ids: &[BlockId],
         dst_block_ids: &[BlockId],
         layer_range: Option<Range<usize>>,
     ) -> Result<TransferCompleteNotification> {
-        // Resolve layouts
-        let src_layout = self.layout_resolver.resolve_layout(src)?;
-        let dst_layout = self.layout_resolver.resolve_layout(dst)?;
-
-        // For broadcast, rank 0 uses src, other ranks use dst
-        let layout = if self.rank == 0 {
-            &src_layout
+        let layout = if self.rank == root_rank {
+            src_layout
         } else {
-            &dst_layout
+            dst_layout
         };
-
-        let block_ids = if self.rank == 0 {
+        let block_ids = if self.rank == root_rank {
             src_block_ids
         } else {
             dst_block_ids
         };
-
-        // Collect memory regions for the broadcast
         let regions = self.collect_regions(layout, block_ids, layer_range)?;
 
         tracing::debug!(
             rank = self.rank,
+            root_rank,
             world_size = self.world_size,
             num_regions = regions.len(),
             total_bytes = regions.iter().map(|(_, size)| size).sum::<usize>(),
             "Starting NCCL broadcast"
         );
 
-        // Execute grouped broadcast (rank 0 is always root for broadcast)
-        self.broadcast_regions(&regions, 0)?;
-
-        // Create completion notification
+        let root = i32::try_from(root_rank).context("NCCL broadcast root does not fit in i32")?;
+        self.broadcast_regions(&regions, root)?;
         self.create_completion_notification()
+    }
+}
+
+impl CollectiveOps for NcclCollectives {
+    fn broadcast(
+        &self,
+        root_rank: usize,
+        src: LogicalLayoutHandle,
+        dst: LogicalLayoutHandle,
+        src_block_ids: &[BlockId],
+        dst_block_ids: &[BlockId],
+        layer_range: Option<Range<usize>>,
+    ) -> Result<TransferCompleteNotification> {
+        ensure!(
+            root_rank < self.world_size,
+            "broadcast root {root_rank} is outside collective world size {}",
+            self.world_size
+        );
+        // Resolve layouts
+        let src_layout = self.layout_resolver.resolve_layout(src)?;
+        let dst_layout = self.layout_resolver.resolve_layout(dst)?;
+
+        self.broadcast_with_layouts(
+            root_rank,
+            &src_layout,
+            &dst_layout,
+            src_block_ids,
+            dst_block_ids,
+            layer_range,
+        )
+    }
+
+    fn broadcast_for_resource(
+        &self,
+        resource: kvbm_common::LogicalResourceId,
+        root_rank: usize,
+        src: LogicalLayoutHandle,
+        dst: LogicalLayoutHandle,
+        src_block_ids: &[BlockId],
+        dst_block_ids: &[BlockId],
+        layer_range: Option<Range<usize>>,
+    ) -> Result<TransferCompleteNotification> {
+        ensure!(
+            root_rank < self.world_size,
+            "broadcast root {root_rank} is outside collective world size {}",
+            self.world_size
+        );
+        let src_layout = self
+            .layout_resolver
+            .resolve_layout_for_resource(resource, src)?;
+        let dst_layout = self
+            .layout_resolver
+            .resolve_layout_for_resource(resource, dst)?;
+        self.broadcast_with_layouts(
+            root_rank,
+            &src_layout,
+            &dst_layout,
+            src_block_ids,
+            dst_block_ids,
+            layer_range,
+        )
     }
 
     fn rank(&self) -> usize {
@@ -474,9 +611,11 @@ impl Drop for NcclCollectives {
     fn drop(&mut self) {
         if self.ownership == CommOwnership::Owned {
             // SAFETY: We own this communicator and it's valid
-            let result = unsafe { ncclCommDestroy(self.comm) };
-            if let Err(e) = check_nccl_result(result) {
-                tracing::warn!("Failed to destroy NCCL communicator: {:?}", e);
+            match comm_destroy(self.comm).and_then(check_nccl_result) {
+                Ok(()) => {}
+                Err(error) => {
+                    tracing::warn!("Failed to destroy NCCL communicator: {error:?}");
+                }
             }
         }
     }
@@ -492,14 +631,25 @@ unsafe impl Send for NcclCollectives {}
 // operations are thread-safe when using the same stream.
 unsafe impl Sync for NcclCollectives {}
 
-#[cfg(test)]
+#[cfg(all(test, feature = "testing-nccl"))]
 mod tests {
     use super::*;
     use cudarc::driver::{CudaContext, CudaSlice, DevicePtr};
-    use cudarc::nccl::sys::{ncclCommDestroy, ncclCommInitAll};
+    use cudarc::nccl::sys::{
+        ncclBcast, ncclComm_t, ncclCommDestroy, ncclCommInitAll, ncclDataType_t, ncclGroupEnd,
+        ncclGroupStart, ncclResult_t,
+    };
     use std::ffi::c_int;
     use std::sync::{Arc, Barrier};
     use std::thread;
+
+    fn check_test_nccl_result(result: ncclResult_t) -> Result<()> {
+        if result == ncclResult_t::ncclSuccess {
+            Ok(())
+        } else {
+            anyhow::bail!("NCCL test operation failed: {result:?}")
+        }
+    }
 
     /// Get the number of CUDA devices available.
     fn cuda_device_count() -> usize {
@@ -518,7 +668,7 @@ mod tests {
         let result =
             unsafe { ncclCommInitAll(comms.as_mut_ptr(), num_devices as c_int, devices.as_ptr()) };
 
-        check_nccl_result(result).context("ncclCommInitAll failed")?;
+        check_test_nccl_result(result).context("ncclCommInitAll failed")?;
         // Convert to usize for Send
         Ok(comms.into_iter().map(|c| c as usize).collect())
     }
@@ -545,7 +695,6 @@ mod tests {
     // If tests fail with "undefined symbol: ncclAlltoAll", install official NVIDIA NCCL.
 
     #[test]
-    #[cfg(feature = "testing-nccl")]
     fn test_nccl_broadcast_multi_gpu_raw() {
         // Skip if < 2 GPUs available
         let num_devices = cuda_device_count();
@@ -645,7 +794,7 @@ mod tests {
                         )
                     };
 
-                    check_nccl_result(result).expect("ncclBcast failed");
+                    check_test_nccl_result(result).expect("ncclBcast failed");
 
                     // Synchronize stream
                     stream.synchronize().expect("Stream sync failed");
@@ -702,7 +851,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "testing-nccl")]
     fn test_nccl_grouped_broadcast_multi_gpu() {
         // Skip if < 2 GPUs available
         let num_devices = cuda_device_count();
@@ -798,7 +946,7 @@ mod tests {
 
                     // Use NCCL group for multiple broadcasts
                     unsafe {
-                        check_nccl_result(ncclGroupStart()).expect("ncclGroupStart failed");
+                        check_test_nccl_result(ncclGroupStart()).expect("ncclGroupStart failed");
 
                         for ptr in &ptrs {
                             let result = ncclBcast(
@@ -809,10 +957,10 @@ mod tests {
                                 comm as ncclComm_t,
                                 stream.cu_stream().cast(),
                             );
-                            check_nccl_result(result).expect("ncclBcast failed");
+                            check_test_nccl_result(result).expect("ncclBcast failed");
                         }
 
-                        check_nccl_result(ncclGroupEnd()).expect("ncclGroupEnd failed");
+                        check_test_nccl_result(ncclGroupEnd()).expect("ncclGroupEnd failed");
                     }
 
                     stream.synchronize().expect("Stream sync failed");
@@ -851,7 +999,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "testing-nccl")]
     fn test_nccl_broadcast_large_transfer() {
         // Skip if < 2 GPUs available
         let num_devices = cuda_device_count();
@@ -943,7 +1090,7 @@ mod tests {
                             stream.cu_stream().cast(),
                         )
                     };
-                    check_nccl_result(result).expect("ncclBcast failed");
+                    check_test_nccl_result(result).expect("ncclBcast failed");
                     stream.synchronize().expect("Stream sync failed");
                 })
             })

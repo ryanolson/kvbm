@@ -106,15 +106,20 @@ pub fn build_layout_compat_payload_with_template(
     //      register path — worker metadata is raw / unstamped).
     //   2. SerializedLayout's stamped ParallelismDescriptor (engine's
     //      per-import defence-in-depth — workers are wire-mirrored and
-    //      already stamped).
-    //   3. None — fall through; universal mode then relies on the
-    //      hub-side predicate to reject if neither side could derive a
-    //      canonical, while operational mode degrades gracefully to
-    //      per-worker comparison.
+    //      already stamped), provided the layout has labeled axes.
+    //   3. None — operational Unknown/ragged layouts intentionally have no
+    //      canonical axis projection and compare exact per-worker geometry.
+    //      Universal mode rejects Unknown above.
     let (canonical, tp_size, pp_size) = if let Some(t) = template {
         (t.canonical_block_shape(), t.tp_size, t.pp_size)
     } else {
         match unpacked.parallelism.as_ref() {
+            Some(p)
+                if mode == BlockLayoutMode::Operational
+                    && matches!(kv_layout, KvBlockLayout::Unknown) =>
+            {
+                (None, p.tp_size, p.pp_size)
+            }
             Some(p) => (
                 Some(canonical_shape_from_worker(worker)?),
                 p.tp_size,
