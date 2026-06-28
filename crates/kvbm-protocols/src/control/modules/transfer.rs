@@ -25,7 +25,7 @@
 
 use std::time::Duration;
 
-use kvbm_common::SequenceHash;
+use kvbm_common::{LogicalResourceId, SequenceHash};
 use serde::{Deserialize, Serialize};
 use velo_ext::InstanceId;
 
@@ -139,6 +139,9 @@ pub struct TransferSessionCapability {
     pub session_id: SessionId,
     pub instance_id: InstanceId,
     pub endpoint: SessionEndpoint,
+    /// Resolved logical resource served by this session.
+    #[serde(default)]
+    pub resource: LogicalResourceId,
 }
 
 /// Request for [`OPEN_SESSION_HANDLER`].
@@ -156,6 +159,11 @@ pub struct OpenTransferSessionRequest {
 
     #[serde(default)]
     pub tiers: TierSelection,
+
+    /// Logical resource to search. `None` selects the holder's primary
+    /// resource for compatibility with pre-resource-aware callers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<LogicalResourceId>,
 
     /// Per-session watchdog override (milliseconds). `None` → the
     /// `SessionManager`'s default. Carried as `u64` ms rather than
@@ -234,6 +242,11 @@ pub struct PullFromSessionRequest {
     /// closes its commits stream.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selector: Option<Vec<SequenceHash>>,
+    /// Logical resource served by the holder and receiving blocks locally.
+    /// Callers should copy this from [`TransferSessionCapability::resource`].
+    /// `None` selects the puller's primary resource for legacy callers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<LogicalResourceId>,
 }
 
 /// Response for [`PULL_FROM_SESSION_HANDLER`].
@@ -401,6 +414,7 @@ mod tests {
         let back: OpenTransferSessionRequest = serde_json::from_str(&s).unwrap();
         assert!(back.sequence_hashes.is_empty());
         assert!(matches!(back.find_mode, FindMode::Async));
+        assert!(back.resource.is_none());
     }
 
     #[test]
@@ -422,6 +436,7 @@ mod tests {
                 kind: "kvbm_cd_session".into(),
                 payload: serde_json::Value::Null,
             },
+            resource: LogicalResourceId(7),
         };
         let resp = OpenTransferSessionResponse::Async {
             capability: cap.clone(),
@@ -439,6 +454,7 @@ mod tests {
             source_instance_id: InstanceId::new_v4(),
             endpoint: None,
             selector: None,
+            resource: Some(LogicalResourceId(7)),
         };
         let s = serde_json::to_string(&req).unwrap();
         let back: PullFromSessionRequest = serde_json::from_str(&s).unwrap();
@@ -446,6 +462,17 @@ mod tests {
         assert_eq!(back.source_instance_id, req.source_instance_id);
         assert!(back.endpoint.is_none());
         assert!(back.selector.is_none());
+        assert_eq!(back.resource, Some(LogicalResourceId(7)));
+    }
+
+    #[test]
+    fn old_pull_request_defaults_to_primary_resource() {
+        let wire = serde_json::json!({
+            "session_id": uuid::Uuid::new_v4(),
+            "source_instance_id": InstanceId::new_v4()
+        });
+        let decoded: PullFromSessionRequest = serde_json::from_value(wire).unwrap();
+        assert!(decoded.resource.is_none());
     }
 
     #[test]

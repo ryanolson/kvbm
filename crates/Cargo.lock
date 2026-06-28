@@ -2716,6 +2716,7 @@ dependencies = [
  "dynamo-tokens",
  "futures",
  "indexmap",
+ "kvbm-common",
  "kvbm-observability",
  "lru 0.16.4",
  "parking_lot",

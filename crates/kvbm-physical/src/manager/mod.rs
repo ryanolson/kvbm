@@ -8,14 +8,16 @@ mod handle;
 mod local;
 mod metadata;
 mod remote;
+mod resources;
 
 pub use canonical::canonical_shape_from_worker;
 pub use handle::LayoutHandle;
 pub use metadata::{
-    LogicalLayoutDescriptor, ParallelismDescriptor, RdmaLayoutDescriptors, SerializedLayout,
-    WorkerAddress, WorkerDataPlacement, select_transfer_canonical_layout,
-    select_transfer_canonical_tier,
+    LogicalLayoutDescriptor, ParallelismDescriptor, RdmaLayoutDescriptors,
+    ResourceLayoutDescriptor, ResourceLayouts, SerializedLayout, WorkerAddress,
+    WorkerDataPlacement, select_transfer_canonical_layout, select_transfer_canonical_tier,
 };
+pub use resources::{ResourceLayoutHandles, TierLayoutHandles};
 
 pub(crate) use local::LocalLayout;
 pub(crate) use metadata::LocalLayoutDescriptor;
@@ -818,7 +820,11 @@ impl LayoutRegistry {
         // Treating the duplicate as a no-op matches the function's
         // `ensure_*` semantic and is what every caller already wanted.
         if self.loaded_remotes.contains(&remote_key) {
-            let handles: Vec<LayoutHandle> = inner.layouts.iter().map(|l| l.handle).collect();
+            let handles = inner
+                .all_layouts()
+                .into_iter()
+                .map(|layout| layout.handle)
+                .collect();
             return Ok(handles);
         }
 
@@ -839,7 +845,8 @@ impl LayoutRegistry {
 
         // Reconstruct layouts
         let mut imported_handles = Vec::new();
-        for serialized_with_handle in inner.layouts {
+        let descriptors = inner.all_layouts().into_iter().cloned().collect::<Vec<_>>();
+        for serialized_with_handle in descriptors {
             let handle = serialized_with_handle.handle;
             let layout = PhysicalLayout::from_descriptor(serialized_with_handle.layout)
                 .map_err(|e| anyhow!("failed to reconstruct layout {}: {}", handle, e))?;

@@ -21,10 +21,13 @@ use derive_builder::Builder;
 use futures::future::BoxFuture;
 
 use crate::object::ObjectBlockOps;
-use kvbm_common::KvbmTransferRoute;
+use kvbm_common::{KvbmTransferRoute, LogicalResourceId};
 use kvbm_physical::layout::PhysicalLayout;
 use kvbm_physical::{
-    manager::{SerializedLayout, TransferManager},
+    manager::{
+        ResourceLayoutDescriptor, ResourceLayoutHandles, ResourceLayouts, SerializedLayout,
+        TierLayoutHandles, TransferManager,
+    },
     transfer::{BounceBuffer, TransferOptions, context::TransferCompleteNotification},
 };
 
@@ -44,6 +47,7 @@ use super::*;
 /// | `g1_handle` | no | GPU KV cache layout handle (for GPU transfers) |
 /// | `g2_handle` | no | Host/pinned cache layout handle (for host transfers) |
 /// | `g3_handle` | no | Disk cache layout handle (for disk-tier transfers) |
+/// | `resource_handles` | no | Resource-owned G1/G2/G3 handles; overrides legacy handles |
 /// | `rank` | no | Worker rank for object-key prefixing in SPMD setups |
 /// | `object_client` | no | Object storage client for G4 tier (S3, etc.) |
 ///
@@ -94,6 +98,13 @@ pub struct PhysicalWorker {
     #[builder(default, setter(strip_option))]
     g3_handle: Option<LayoutHandle>,
 
+    /// Resource-owned physical tier handles.
+    ///
+    /// When configured, the selected primary resource backs the legacy G1/G2/G3
+    /// accessors and all resources are exported in physical metadata.
+    #[builder(default, setter(strip_option))]
+    resource_handles: Option<ResourceLayoutHandles>,
+
     /// Remote handle mappings for peer-to-peer transfers (legacy, no rank).
     /// Key: (InstanceId, LogicalLayoutHandle) → remote LayoutHandle
     ///
@@ -118,6 +129,12 @@ pub struct PhysicalWorker {
     /// for callers that haven't yet adopted rank-aware dispatch.
     #[builder(default = "RwLock::new(HashMap::new())")]
     remote_handles_rank: RwLock<HashMap<(InstanceId, usize, LogicalLayoutHandle), LayoutHandle>>,
+
+    /// Rank- and resource-aware remote mappings for cross-parallelism pulls.
+    /// Key: (InstanceId, remote rank, resource, logical tier) → handle.
+    #[builder(default = "RwLock::new(HashMap::new())")]
+    remote_resource_handles_rank:
+        RwLock<HashMap<(InstanceId, usize, LogicalResourceId, LogicalLayoutHandle), LayoutHandle>>,
 
     // =========================================================================
     // Object Storage State
@@ -175,17 +192,52 @@ impl PhysicalWorker {
 
     /// Get the G1 layout handle (if set).
     pub fn g1_handle(&self) -> Option<LayoutHandle> {
-        self.g1_handle
+        select_primary_layout_handle(
+            self.resource_handles.as_ref(),
+            LogicalLayoutHandle::G1,
+            self.g1_handle,
+        )
     }
 
     /// Get the G2 layout handle (if set).
     pub fn g2_handle(&self) -> Option<LayoutHandle> {
-        self.g2_handle
+        select_primary_layout_handle(
+            self.resource_handles.as_ref(),
+            LogicalLayoutHandle::G2,
+            self.g2_handle,
+        )
     }
 
     /// Get the G3 layout handle (if set).
     pub fn g3_handle(&self) -> Option<LayoutHandle> {
-        self.g3_handle
+        select_primary_layout_handle(
+            self.resource_handles.as_ref(),
+            LogicalLayoutHandle::G3,
+            self.g3_handle,
+        )
+    }
+
+    /// Get the resource-owned physical handles, when configured.
+    pub fn resource_handles(&self) -> Option<&ResourceLayoutHandles> {
+        self.resource_handles.as_ref()
+    }
+
+    /// Resolve one resource/tier pair to its physical handle.
+    pub fn layout_handle_for(
+        &self,
+        resource: LogicalResourceId,
+        tier: LogicalLayoutHandle,
+    ) -> Option<LayoutHandle> {
+        match self.resource_handles.as_ref() {
+            Some(resources) => resources.handle(resource, tier),
+            None if resource == LogicalResourceId::default() => match tier {
+                LogicalLayoutHandle::G1 => self.g1_handle,
+                LogicalLayoutHandle::G2 => self.g2_handle,
+                LogicalLayoutHandle::G3 => self.g3_handle,
+                LogicalLayoutHandle::G4 => None,
+            },
+            None => None,
+        }
     }
 
     /// Get a reference to the TransferManager.
@@ -325,27 +377,31 @@ impl PhysicalWorker {
 
     /// Export metadata with logical type annotations for each registered handle.
     fn export_metadata_with_logical_types(&self) -> Result<SerializedLayout> {
-        let mut descriptors = Vec::new();
-
-        // Build descriptors for each registered logical handle
-        if let Some(handle) = self.g1_handle() {
-            descriptors.push(
-                self.manager
-                    .build_logical_descriptor(handle, LogicalLayoutHandle::G1)?,
-            );
-        }
-        if let Some(handle) = self.g2_handle() {
-            descriptors.push(
-                self.manager
-                    .build_logical_descriptor(handle, LogicalLayoutHandle::G2)?,
-            );
-        }
-        if let Some(handle) = self.g3_handle() {
-            descriptors.push(
-                self.manager
-                    .build_logical_descriptor(handle, LogicalLayoutHandle::G3)?,
-            );
-        }
+        let (descriptors, resource_layouts) = match self.resource_handles.as_ref() {
+            Some(resources) => {
+                let grouped = resources
+                    .iter()
+                    .map(|(resource, handles)| {
+                        self.build_resource_descriptors(handles)
+                            .map(|layouts| ResourceLayoutDescriptor::new(resource, layouts))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let grouped = ResourceLayouts::new(resources.primary(), grouped)?;
+                let primary = grouped
+                    .get(grouped.primary())
+                    .expect("validated resource layouts contain their primary")
+                    .to_vec();
+                (primary, Some(grouped))
+            }
+            None => (
+                self.build_resource_descriptors(&TierLayoutHandles::new(
+                    self.g1_handle,
+                    self.g2_handle,
+                    self.g3_handle,
+                ))?,
+                None,
+            ),
+        };
 
         // Pack with worker address and NIXL metadata.
         // AB-1a: ParallelismDescriptor populated by the leader at the
@@ -354,7 +410,29 @@ impl PhysicalWorker {
         let worker_address = self.manager.worker_address();
         let nixl_metadata = self.manager.get_nixl_metadata()?;
 
-        SerializedLayout::pack(worker_address, nixl_metadata, descriptors, None)
+        SerializedLayout::pack_with_resources(
+            worker_address,
+            nixl_metadata,
+            descriptors,
+            None,
+            None,
+            resource_layouts,
+        )
+    }
+
+    fn build_resource_descriptors(
+        &self,
+        handles: &TierLayoutHandles,
+    ) -> Result<Vec<kvbm_physical::manager::LogicalLayoutDescriptor>> {
+        [
+            LogicalLayoutHandle::G1,
+            LogicalLayoutHandle::G2,
+            LogicalLayoutHandle::G3,
+        ]
+        .into_iter()
+        .filter_map(|tier| handles.handle(tier).map(|handle| (handle, tier)))
+        .map(|(handle, tier)| self.manager.build_logical_descriptor(handle, tier))
+        .collect()
     }
 
     /// Import serialized layout metadata into the transfer manager.
@@ -727,14 +805,49 @@ impl WorkerTransfers for PhysicalWorker {
             }
         }
 
+        if let Some(parallelism) = unpacked.parallelism.as_ref() {
+            let mut by_rank = self.remote_resource_handles_rank.write().unwrap();
+            match unpacked.resource_layouts.as_ref() {
+                Some(resources) => {
+                    for (resource, layouts) in resources.iter() {
+                        for descriptor in layouts {
+                            by_rank.insert(
+                                (
+                                    instance_id,
+                                    parallelism.rank,
+                                    resource,
+                                    descriptor.logical_type,
+                                ),
+                                descriptor.handle,
+                            );
+                        }
+                    }
+                }
+                None => {
+                    for descriptor in &unpacked.layouts {
+                        by_rank.insert(
+                            (
+                                instance_id,
+                                parallelism.rank,
+                                LogicalResourceId::default(),
+                                descriptor.logical_type,
+                            ),
+                            descriptor.handle,
+                        );
+                    }
+                }
+            }
+        }
+
         // Import so NIXL knows about the remote (repack to pass ownership).
         // Preserve the inbound parallelism descriptor across the repack.
-        let repacked = SerializedLayout::pack_with_placement(
+        let repacked = SerializedLayout::pack_with_resources(
             unpacked.worker_address,
             unpacked.nixl_metadata,
             unpacked.layouts,
             unpacked.parallelism,
             unpacked.worker_data_placement,
+            unpacked.resource_layouts,
         )?;
         self.manager.import_metadata(repacked)?;
 
@@ -835,20 +948,18 @@ impl WorkerTransfers for PhysicalWorker {
 
         // Resolve the local destination handle. G4 isn't a valid pull
         // target — the cross-parallelism path is for RDMA-backed tiers.
-        let local_handle = match plan.dst_layout {
-            LogicalLayoutHandle::G1 => self.g1_handle(),
-            LogicalLayoutHandle::G2 => self.g2_handle(),
-            LogicalLayoutHandle::G3 => self.g3_handle(),
-            LogicalLayoutHandle::G4 => {
-                anyhow::bail!("execute_remote_pull_plan: G4 cannot be a dst for RDMA pulls");
-            }
+        if plan.dst_layout == LogicalLayoutHandle::G4 {
+            anyhow::bail!("execute_remote_pull_plan: G4 cannot be a dst for RDMA pulls");
         }
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "execute_remote_pull_plan: no local handle registered for {:?}",
-                plan.dst_layout
-            )
-        })?;
+        let local_handle = self
+            .layout_handle_for(plan.dst_resource, plan.dst_layout)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "execute_remote_pull_plan: no local handle registered for resource {:?} {:?}",
+                    plan.dst_resource,
+                    plan.dst_layout,
+                )
+            })?;
 
         let local_physical = self.manager.get_physical_layout(local_handle).ok_or_else(|| {
             anyhow::anyhow!(
@@ -883,15 +994,21 @@ impl WorkerTransfers for PhysicalWorker {
         let mut notifications = Vec::with_capacity(plan.shards.len());
         for shard in &plan.shards {
             let remote_handle = {
-                let handles = self.remote_handles_rank.read().unwrap();
+                let handles = self.remote_resource_handles_rank.read().unwrap();
                 handles
-                    .get(&(plan.remote_instance, shard.remote_rank, plan.source_layout))
+                    .get(&(
+                        plan.remote_instance,
+                        shard.remote_rank,
+                        plan.source_resource,
+                        plan.source_layout,
+                    ))
                     .copied()
                     .ok_or_else(|| {
                         anyhow::anyhow!(
-                            "execute_remote_pull_plan: no remote {:?} handle for \
+                            "execute_remote_pull_plan: no remote resource {:?} {:?} handle for \
                              (instance={}, rank={}); peer must have stamped a \
                              ParallelismDescriptor and connect_remote must have completed",
+                            plan.source_resource,
                             plan.source_layout,
                             plan.remote_instance,
                             shard.remote_rank,
@@ -938,15 +1055,15 @@ impl WorkerTransfers for PhysicalWorker {
 
 impl Worker for PhysicalWorker {
     fn g1_handle(&self) -> Option<LayoutHandle> {
-        self.g1_handle
+        PhysicalWorker::g1_handle(self)
     }
 
     fn g2_handle(&self) -> Option<LayoutHandle> {
-        self.g2_handle
+        PhysicalWorker::g2_handle(self)
     }
 
     fn g3_handle(&self) -> Option<LayoutHandle> {
-        self.g3_handle
+        PhysicalWorker::g3_handle(self)
     }
 
     fn export_metadata(&self) -> Result<SerializedLayoutResponse> {
@@ -1058,5 +1175,53 @@ impl ObjectBlockOps for PhysicalWorker {
             tracing::warn!("get_blocks called but no object client configured");
             Box::pin(async move { keys.into_iter().map(Err).collect() })
         }
+    }
+}
+
+fn select_primary_layout_handle(
+    resources: Option<&ResourceLayoutHandles>,
+    tier: LogicalLayoutHandle,
+    legacy: Option<LayoutHandle>,
+) -> Option<LayoutHandle> {
+    match resources {
+        Some(resources) => resources.handle(resources.primary(), tier),
+        None => legacy,
+    }
+}
+
+#[cfg(test)]
+mod resource_handle_tests {
+    use super::*;
+    use kvbm_common::LogicalResourceId;
+    use kvbm_physical::manager::{ResourceLayoutHandles, TierLayoutHandles};
+
+    #[test]
+    fn resource_primary_handle_overrides_legacy_handle() {
+        let resource_g1 = LayoutHandle::new(8, 4);
+        let resources = ResourceLayoutHandles::new(
+            LogicalResourceId(3),
+            vec![(
+                LogicalResourceId(3),
+                TierLayoutHandles::new(Some(resource_g1), None, None),
+            )],
+        )
+        .unwrap();
+
+        assert_eq!(
+            select_primary_layout_handle(
+                Some(&resources),
+                LogicalLayoutHandle::G1,
+                Some(LayoutHandle::new(8, 1)),
+            ),
+            Some(resource_g1)
+        );
+        assert_eq!(
+            select_primary_layout_handle(
+                None,
+                LogicalLayoutHandle::G1,
+                Some(LayoutHandle::new(8, 1))
+            ),
+            Some(LayoutHandle::new(8, 1))
+        );
     }
 }

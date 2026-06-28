@@ -565,12 +565,13 @@ pub fn stamp_parallelism_descriptors(
     for (rank, layout) in metadata.into_iter().enumerate() {
         let unpacked = layout.unpack()?;
         let descriptor = template.descriptor_for(rank)?;
-        let repacked = SerializedLayout::pack_with_placement(
+        let repacked = SerializedLayout::pack_with_resources(
             unpacked.worker_address,
             unpacked.nixl_metadata,
             unpacked.layouts,
             Some(descriptor),
             Some(template.worker_data_placement()),
+            unpacked.resource_layouts,
         )?;
         out.push(repacked);
     }
@@ -580,7 +581,10 @@ pub fn stamp_parallelism_descriptors(
 #[cfg(all(test, feature = "testing"))]
 mod tests {
     use super::*;
-    use kvbm_physical::manager::{LogicalLayoutDescriptor, WorkerAddress};
+    use kvbm_common::LogicalResourceId;
+    use kvbm_physical::manager::{
+        LogicalLayoutDescriptor, ResourceLayoutDescriptor, ResourceLayouts, WorkerAddress,
+    };
 
     fn empty_layout_for(worker_id: u64) -> SerializedLayout {
         SerializedLayout::pack(
@@ -652,6 +656,39 @@ mod tests {
         let unpacked1 = stamped[1].unpack().unwrap();
         assert_eq!(unpacked1.worker_address.worker_id, 7);
         assert_eq!(unpacked1.parallelism.unwrap().rank, 1);
+    }
+
+    #[test]
+    fn stamping_preserves_resource_layouts() {
+        let resources = ResourceLayouts::new(
+            LogicalResourceId(1),
+            vec![
+                ResourceLayoutDescriptor::new(LogicalResourceId(1), Vec::new()),
+                ResourceLayoutDescriptor::new(LogicalResourceId(7), Vec::new()),
+            ],
+        )
+        .unwrap();
+        let metadata = vec![
+            SerializedLayout::pack_with_resources(
+                WorkerAddress::new(42, "agent-42".to_string()),
+                Vec::new(),
+                Vec::new(),
+                None,
+                None,
+                Some(resources),
+            )
+            .unwrap(),
+        ];
+
+        let stamped = stamp_parallelism_descriptors(&make_template(1), metadata).unwrap();
+        let resources = stamped[0]
+            .unpack()
+            .unwrap()
+            .resource_layouts
+            .expect("parallelism stamping must preserve resource layouts");
+
+        assert_eq!(resources.primary(), LogicalResourceId(1));
+        assert!(resources.get(LogicalResourceId(7)).is_some());
     }
 
     #[test]

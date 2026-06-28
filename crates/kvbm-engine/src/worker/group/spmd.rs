@@ -465,12 +465,13 @@ impl WorkerTransfers for SpmdParallelWorkers {
             ImportStrategy::Strict => {
                 for worker in &self.workers {
                     for u in &unpacked {
-                        let repacked = SerializedLayout::pack_with_placement(
+                        let repacked = SerializedLayout::pack_with_resources(
                             u.worker_address.clone(),
                             u.nixl_metadata.clone(),
                             u.layouts.clone(),
                             u.parallelism.clone(),
                             u.worker_data_placement,
+                            u.resource_layouts.clone(),
                         )?;
                         // Collect responses for downstream aggregation.
                         // `PhysicalWorker` returns synchronously-ready,
@@ -485,12 +486,13 @@ impl WorkerTransfers for SpmdParallelWorkers {
             }
             ImportStrategy::Legacy => {
                 for (worker, u) in self.workers.iter().zip(unpacked.iter()) {
-                    let repacked = SerializedLayout::pack_with_placement(
+                    let repacked = SerializedLayout::pack_with_resources(
                         u.worker_address.clone(),
                         u.nixl_metadata.clone(),
                         u.layouts.clone(),
                         u.parallelism.clone(),
                         u.worker_data_placement,
+                        u.resource_layouts.clone(),
                     )?;
                     import_responses.push(worker.import_metadata(repacked)?);
                 }

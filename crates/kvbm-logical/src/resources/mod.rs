@@ -6,28 +6,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use bincode::{Decode, Encode};
-use serde::{Deserialize, Serialize};
-
 use crate::{BlockManager, BlockMetadata};
-
-/// Stable model-local identity for one logical KV resource.
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    Default,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    Encode,
-    Decode,
-    Serialize,
-    Deserialize,
-)]
-pub struct LogicalResourceId(pub u16);
+pub use kvbm_common::LogicalResourceId;
 
 /// KVBM-owned logical managers keyed by model resource identity.
 ///

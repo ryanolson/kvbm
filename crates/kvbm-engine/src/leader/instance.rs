@@ -48,7 +48,10 @@ use super::{
     composer,
     consolidator::{ConsolidatorCell, ConsolidatorParams, new_cell, spawn_into_cell},
     discovery::RemoteDiscoveryHandle,
-    dispatch::{PullRef, WirePullOptions, plan_pull, plan_replicated_worker_pulls},
+    dispatch::{
+        PullRef, WirePullOptions, plan_pull_for_resources,
+        plan_replicated_worker_pulls_for_resources,
+    },
     parallelism::{ParallelismTemplate, stamp_parallelism_descriptors},
     velo::{ExportMetadataCallback, VeloLeaderService},
 };
@@ -1464,6 +1467,21 @@ impl InstanceLeader {
         refs: Vec<PullRef>,
         opts: WirePullOptions,
     ) -> Result<()> {
+        self.rdma_pull_resource_with_opts(self.primary_g2_resource, remote_instance, refs, opts)
+            .await
+    }
+
+    /// Resource-aware RDMA pull into the matching local G2 manager.
+    pub async fn rdma_pull_resource_with_opts(
+        &self,
+        resource: LogicalResourceId,
+        remote_instance: InstanceId,
+        refs: Vec<PullRef>,
+        opts: WirePullOptions,
+    ) -> Result<()> {
+        if self.g2_manager_for(resource).is_none() {
+            anyhow::bail!("rdma_pull: no local G2 manager for resource {resource:?}");
+        }
         if refs.is_empty() {
             return Ok(());
         }
@@ -1480,6 +1498,11 @@ impl InstanceLeader {
         // enforces same-rank symmetry for them, so the per-worker
         // execute_remote_onboard fan-out is correct.
         let Some(descriptors) = parallel_worker.remote_descriptors_for(remote_instance) else {
+            if resource != self.primary_g2_resource {
+                anyhow::bail!(
+                    "rdma_pull: non-primary resource {resource:?} requires stamped peer metadata"
+                );
+            }
             return self
                 .rdma_pull_legacy_fallback(parallel_worker.as_ref(), remote_instance, refs, opts)
                 .await;
@@ -1515,6 +1538,7 @@ impl InstanceLeader {
                 return self
                     .rdma_pull_replicated(
                         parallel_worker.as_ref(),
+                        resource,
                         remote_instance,
                         &descriptors,
                         refs,
@@ -1546,11 +1570,13 @@ impl InstanceLeader {
             (ParallelismMode::TensorParallel, _) => {}
         }
 
-        let plans = plan_pull(
+        let plans = plan_pull_for_resources(
             &template,
             &descriptors,
             remote_instance,
+            resource,
             LogicalLayoutHandle::G2,
+            resource,
             LogicalLayoutHandle::G2,
             &refs,
             &opts,
@@ -1590,6 +1616,7 @@ impl InstanceLeader {
     async fn rdma_pull_replicated(
         &self,
         parallel_worker: &dyn ParallelWorkers,
+        resource: LogicalResourceId,
         remote_instance: InstanceId,
         descriptors: &[kvbm_physical::manager::ParallelismDescriptor],
         refs: Vec<PullRef>,
@@ -1599,11 +1626,13 @@ impl InstanceLeader {
             .first()
             .ok_or_else(|| anyhow::anyhow!("replicated pull has no remote descriptors"))?
             .tp_size;
-        let plans = plan_replicated_worker_pulls(
+        let plans = plan_replicated_worker_pulls_for_resources(
             parallel_worker.worker_count(),
             remote_world_size,
             remote_instance,
+            resource,
             LogicalLayoutHandle::G2,
+            resource,
             LogicalLayoutHandle::G2,
             &refs,
             &opts,
