@@ -83,7 +83,9 @@ Not yet production-wired:
 
 - A TP=2 multi-process MLA end-to-end test exists, but has not yet been run on
   a two-GPU host.
-- Replicated remote-search transfers and G2↔G3 placement.
+- Replicated remote search has owner-routed G2→G2 planning and dispatch, but
+  still needs a real two-instance, two-GPU NIXL validation.
+- Replicated G2↔G3 placement.
 - Pipelined per-layer replicated onboard; the first implementation completes
   replicated onboard before model execution for correctness.
 
@@ -123,11 +125,13 @@ an explicit `Mirror`, `Move`, or `Drop` action. The initial mirror target can be
 configurable (for example 10–25% of G1), but policy and transfer execution should
 remain separate and independently testable.
 
-## Deferred remote-search direction
+## Remote-search direction
 
-Remote search currently follows requester-driven pull/RDMA GET semantics, which
-requires the requester to know the owner and remote source layout. A future
-push/PUT session may be a better fit for replicated MLA: the requester supplies
-destination IDs/addresses and owners push their shards, followed by local
-replication. Do not change this protocol until TP=1 and local TP>1 ownership are
-stable; the placement contract above should be reusable by either transport.
+Remote search keeps requester-driven pull/RDMA GET semantics. The holder
+session supplies each hash's global source block ID, so deterministic striping
+resolves the physical owner without indexing hashes by worker rank. A future
+push/PUT session remains useful for opaque or topology-selected placement, but
+it requires destination leases and a larger completion protocol.
+
+See [Remote transfers for replicated MLA caches](remote-mla-transfer-design.md)
+for the owner-routing and pull-versus-push decision.

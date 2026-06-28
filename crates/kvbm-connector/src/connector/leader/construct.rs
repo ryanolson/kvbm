@@ -446,14 +446,12 @@ pub(super) async fn build_engine_stack(c: &Construction) -> Result<EngineStack> 
     if let Some(disagg_cfg) = runtime.config().disagg.as_ref() {
         leader_builder = leader_builder.role(disagg_cfg.role);
     }
-    if reference_config.num_heads.is_some() {
-        let template = kvbm_engine::leader::parallelism::ParallelismTemplate::from_layout_config(
-            &reference_config,
-            parallelism,
-            num_workers,
-        )?;
-        leader_builder = leader_builder.parallelism_template(template);
-    }
+    let template = kvbm_engine::leader::parallelism::ParallelismTemplate::from_layout_config(
+        &reference_config,
+        parallelism,
+        num_workers,
+    )?;
+    leader_builder = leader_builder.parallelism_template(template);
     if let Some(g3_mgr) = g3_manager {
         leader_builder = leader_builder.g3_manager(g3_mgr);
     }

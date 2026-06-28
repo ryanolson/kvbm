@@ -216,6 +216,20 @@ impl WorkerTransfers for ReplicatedDataWorker {
     ) -> Result<TransferCompleteNotification> {
         bail!("replicated data worker instance remote onboard is not yet implemented")
     }
+
+    fn execute_remote_pull_plan(
+        &self,
+        plan: crate::leader::dispatch::WorkerPullPlan,
+    ) -> Result<TransferCompleteNotification> {
+        ensure!(
+            plan.source_layout == LogicalLayoutHandle::G2
+                && plan.dst_layout == LogicalLayoutHandle::G2,
+            "replicated remote pull must land once in striped G2; got {:?} -> {:?}",
+            plan.source_layout,
+            plan.dst_layout
+        );
+        self.inner.execute_remote_pull_plan(plan)
+    }
 }
 
 impl Worker for ReplicatedDataWorker {

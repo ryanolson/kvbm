@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use std::sync::{Arc, OnceLock};
 
-use kvbm_config::DisaggregationRole;
+use kvbm_config::{DisaggregationRole, ParallelismMode};
 use kvbm_protocols::control::{
     ControlError, HostInfo, InstanceDescription, LayoutDescription, ModuleId, TierCapacity,
     TierKind, WorkerInfo,
@@ -36,7 +36,7 @@ use kvbm_logical::{
 use kvbm_observability::SharedKvbmObservability;
 use kvbm_physical::transfer::{TransferCompleteNotification, TransferOptions};
 
-use kvbm_physical::manager::SerializedLayout;
+use kvbm_physical::manager::{SerializedLayout, WorkerDataPlacement};
 
 use super::{
     super::worker::Worker,
@@ -47,7 +47,10 @@ use super::{
     composer,
     consolidator::{ConsolidatorCell, ConsolidatorParams, new_cell, spawn_into_cell},
     discovery::RemoteDiscoveryHandle,
-    dispatch::{PullRef, WirePullOptions, plan_pull},
+    dispatch::{
+        LayoutSlice, PullRef, PullShard, WirePullOptions, WorkerPullPlan, plan_pull,
+        plan_replicated_pull,
+    },
     parallelism::{ParallelismTemplate, stamp_parallelism_descriptors},
     velo::{ExportMetadataCallback, VeloLeaderService},
 };
@@ -1439,6 +1442,46 @@ impl InstanceLeader {
             );
         }
 
+        let remote_placement = parallel_worker.remote_worker_data_placement(remote_instance);
+        match (template.parallelism_mode, remote_placement) {
+            (
+                ParallelismMode::ReplicatedData,
+                Some(WorkerDataPlacement::ReplicatedG1StripedLower),
+            ) => {
+                return self
+                    .rdma_pull_replicated(
+                        parallel_worker.as_ref(),
+                        remote_instance,
+                        &descriptors,
+                        refs,
+                        opts,
+                    )
+                    .await;
+            }
+            (ParallelismMode::ReplicatedData, None) => {
+                anyhow::bail!(
+                    "rdma_pull: replicated local cache requires the peer to advertise \
+                     ReplicatedG1StripedLower placement; upgrade or restamp peer metadata"
+                );
+            }
+            (ParallelismMode::ReplicatedData, Some(other)) => {
+                anyhow::bail!(
+                    "rdma_pull: cache placement mismatch: local is replicated G1 / striped \
+                     lower tier, peer advertises {other:?}"
+                );
+            }
+            (
+                ParallelismMode::TensorParallel,
+                Some(WorkerDataPlacement::ReplicatedG1StripedLower),
+            ) => {
+                anyhow::bail!(
+                    "rdma_pull: cache placement mismatch: local is tensor-sharded, peer \
+                     advertises replicated G1 / striped lower tier"
+                );
+            }
+            (ParallelismMode::TensorParallel, _) => {}
+        }
+
         let plans = plan_pull(
             &template,
             &descriptors,
@@ -1468,6 +1511,56 @@ impl InstanceLeader {
                 )
             })?;
             notifications.push(worker.execute_remote_pull_plan(plan)?);
+        }
+
+        let events = Arc::new(self.messenger.event_manager());
+        let aggregated = TransferCompleteNotification::aggregate(
+            notifications,
+            &events,
+            &tokio::runtime::Handle::current(),
+        )?;
+        aggregated.await?;
+        Ok(())
+    }
+
+    async fn rdma_pull_replicated(
+        &self,
+        parallel_worker: &dyn ParallelWorkers,
+        remote_instance: InstanceId,
+        descriptors: &[kvbm_physical::manager::ParallelismDescriptor],
+        refs: Vec<PullRef>,
+        opts: WirePullOptions,
+    ) -> Result<()> {
+        let remote_world_size = descriptors
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("replicated pull has no remote descriptors"))?
+            .tp_size;
+        let batches =
+            plan_replicated_pull(parallel_worker.worker_count(), remote_world_size, &refs)?;
+        let workers = parallel_worker.workers();
+        let mut notifications = Vec::with_capacity(batches.len());
+
+        for batch in batches {
+            let worker = workers.get(batch.local_rank).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "replicated pull selected local rank {} but only {} workers are registered",
+                    batch.local_rank,
+                    workers.len()
+                )
+            })?;
+            notifications.push(worker.execute_remote_pull_plan(WorkerPullPlan {
+                remote_instance,
+                source_layout: LogicalLayoutHandle::G2,
+                dst_layout: LogicalLayoutHandle::G2,
+                src_block_ids: batch.src_block_ids,
+                dst_block_ids: batch.dst_block_ids,
+                shards: vec![PullShard {
+                    remote_rank: batch.remote_rank,
+                    local_slice: LayoutSlice::full(),
+                    remote_slice: LayoutSlice::full(),
+                }],
+                options: opts.clone(),
+            })?);
         }
 
         let events = Arc::new(self.messenger.event_manager());

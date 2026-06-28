@@ -12,6 +12,20 @@ use std::ops::Range;
 
 use kvbm_common::{KvDim, LogicalLayoutHandle};
 
+/// How one logical cache resource is distributed across its worker group.
+///
+/// This is separate from tensor layout: replicated MLA has a full G1 copy on
+/// every worker, but stores each logical lower-tier block on exactly one
+/// worker. Peers need this marker to select block-owner routing instead of
+/// tensor-axis resharding.
+#[derive(Debug, Clone, Copy, Encode, Decode, PartialEq, Eq)]
+pub enum WorkerDataPlacement {
+    /// Every worker owns one tensor-axis shard of every logical block.
+    TensorSharded,
+    /// G1 is replicated while G2/G3 logical blocks are striped by block ID.
+    ReplicatedG1StripedLower,
+}
+
 /// Worker identification combining worker_id and NIXL agent name.
 #[derive(Debug, Clone, Encode, Decode, PartialEq, Eq)]
 pub struct WorkerAddress {
@@ -132,12 +146,10 @@ impl ParallelismDescriptor {
 /// about the layouts and the NIXL RDMA metadata required to reconstruct the layouts and access
 /// the memory via NIXL RDMA.
 ///
-/// `Decode` is implemented manually (not derived) so that the trailing
-/// `parallelism` field is forward-compatible: legacy bytes encoded
-/// before AB-1a (without the `parallelism` field) decode to
-/// `parallelism = None` rather than failing with an EOF error. This
-/// supports rolling upgrades where one side is still emitting the
-/// pre-AB-1a wire shape.
+/// Decoding is field-wise so both trailing optional fields are
+/// forward-compatible. Pre-AB-1a bytes decode with no parallelism or placement;
+/// bytes from before worker placement was introduced retain their parallelism
+/// descriptor and decode placement as `None`.
 #[derive(Debug, Encode)]
 pub struct RdmaLayoutDescriptors {
     /// Worker identification
@@ -153,6 +165,11 @@ pub struct RdmaLayoutDescriptors {
     /// (2) bytes encoded before AB-1a never carried this field, and
     /// the manual `unpack` synthesises `None` for them.
     pub parallelism: Option<ParallelismDescriptor>,
+    /// Physical ownership strategy used by this worker group.
+    ///
+    /// Appended after `parallelism` so metadata emitted before this field was
+    /// introduced remains decodable as `None` during rolling upgrades.
+    pub worker_data_placement: Option<WorkerDataPlacement>,
 }
 
 /// Managed memory metadata package for export/import.
@@ -183,11 +200,23 @@ impl SerializedLayout {
         layouts: Vec<LogicalLayoutDescriptor>,
         parallelism: Option<ParallelismDescriptor>,
     ) -> Result<Self> {
+        Self::pack_with_placement(worker_address, nixl_metadata, layouts, parallelism, None)
+    }
+
+    /// Pack metadata with an explicit worker-group data placement.
+    pub fn pack_with_placement(
+        worker_address: WorkerAddress,
+        nixl_metadata: Vec<u8>,
+        layouts: Vec<LogicalLayoutDescriptor>,
+        parallelism: Option<ParallelismDescriptor>,
+        worker_data_placement: Option<WorkerDataPlacement>,
+    ) -> Result<Self> {
         let inner = RdmaLayoutDescriptors {
             worker_address,
             nixl_metadata,
             layouts,
             parallelism,
+            worker_data_placement,
         };
         let bytes = bincode::encode_to_vec(&inner, bincode::config::standard())
             .map_err(|e| anyhow::anyhow!("failed to encode managed memory metadata: {}", e))?;
@@ -196,11 +225,8 @@ impl SerializedLayout {
 
     /// Unpack metadata from serialized form.
     ///
-    /// Decodes field-by-field rather than via a derived `Decode` impl so
-    /// that the trailing `parallelism` field is forward-compatible:
-    /// legacy bytes encoded before AB-1a stop after `layouts`, and we
-    /// synthesise `parallelism = None` for them. New bytes always carry
-    /// at least the `Option` discriminant.
+    /// Decodes field-by-field rather than via a derived `Decode` impl so each
+    /// trailing optional field can be absent in older metadata.
     ///
     /// # Returns
     /// Unpacked metadata structure
@@ -222,15 +248,25 @@ impl SerializedLayout {
                 .map_err(|e| anyhow::anyhow!("failed to decode layouts: {}", e))?;
         let rest = &rest[c3..];
 
-        let parallelism = if rest.is_empty() {
+        let (parallelism, rest) = if rest.is_empty() {
             // Pre-AB-1a wire shape — trailing field absent.
-            None
+            (None, rest)
         } else {
-            let (p, _): (Option<ParallelismDescriptor>, usize) =
+            let (p, consumed): (Option<ParallelismDescriptor>, usize) =
                 bincode::decode_from_slice(rest, cfg).map_err(|e| {
                     anyhow::anyhow!("failed to decode parallelism descriptor: {}", e)
                 })?;
-            p
+            (p, &rest[consumed..])
+        };
+
+        let worker_data_placement = if rest.is_empty() {
+            None
+        } else {
+            let (placement, _): (Option<WorkerDataPlacement>, usize) =
+                bincode::decode_from_slice(rest, cfg).map_err(|e| {
+                    anyhow::anyhow!("failed to decode worker data placement: {}", e)
+                })?;
+            placement
         };
 
         Ok(RdmaLayoutDescriptors {
@@ -238,6 +274,7 @@ impl SerializedLayout {
             nixl_metadata,
             layouts,
             parallelism,
+            worker_data_placement,
         })
     }
 
@@ -606,6 +643,24 @@ mod tests {
         assert_eq!(unpacked.parallelism.as_ref(), Some(&parallelism));
     }
 
+    #[test]
+    fn test_worker_data_placement_roundtrip() {
+        let packed = SerializedLayout::pack_with_placement(
+            WorkerAddress::new(9, "replicated-worker".to_string()),
+            Vec::new(),
+            Vec::new(),
+            Some(ParallelismDescriptor::single_worker(1)),
+            Some(WorkerDataPlacement::ReplicatedG1StripedLower),
+        )
+        .unwrap();
+
+        let unpacked = packed.unpack().unwrap();
+        assert_eq!(
+            unpacked.worker_data_placement,
+            Some(WorkerDataPlacement::ReplicatedG1StripedLower)
+        );
+    }
+
     /// Legacy wire shape — pre-AB-1a bytes had only three fields and no
     /// trailing parallelism. A new decoder must read these and synthesise
     /// `parallelism = None`, not fail with an EOF error.
@@ -614,6 +669,14 @@ mod tests {
         worker_address: WorkerAddress,
         nixl_metadata: Vec<u8>,
         layouts: Vec<LogicalLayoutDescriptor>,
+    }
+
+    #[derive(bincode::Encode)]
+    struct PrePlacementRdmaLayoutDescriptors {
+        worker_address: WorkerAddress,
+        nixl_metadata: Vec<u8>,
+        layouts: Vec<LogicalLayoutDescriptor>,
+        parallelism: Option<ParallelismDescriptor>,
     }
 
     #[test]
@@ -644,6 +707,23 @@ mod tests {
         assert_eq!(unpacked.nixl_metadata, nixl_metadata);
         assert_eq!(unpacked.layouts.len(), 1);
         assert!(unpacked.parallelism.is_none());
+        assert!(unpacked.worker_data_placement.is_none());
+    }
+
+    #[test]
+    fn test_pre_placement_bytes_keep_parallelism_and_decode_placement_to_none() {
+        let parallelism = ParallelismDescriptor::single_worker(2);
+        let old = PrePlacementRdmaLayoutDescriptors {
+            worker_address: WorkerAddress::new(12, "pre-placement".to_string()),
+            nixl_metadata: Vec::new(),
+            layouts: Vec::new(),
+            parallelism: Some(parallelism.clone()),
+        };
+        let bytes = bincode::encode_to_vec(&old, bincode::config::standard()).unwrap();
+
+        let unpacked = SerializedLayout::from_bytes(bytes).unpack().unwrap();
+        assert_eq!(unpacked.parallelism, Some(parallelism));
+        assert!(unpacked.worker_data_placement.is_none());
     }
 
     #[test]

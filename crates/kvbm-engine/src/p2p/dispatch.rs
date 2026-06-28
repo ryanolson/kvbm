@@ -47,11 +47,14 @@
 //! [`LayoutSlice::axes`] for each shard whose remote rank only owns a
 //! sub-range of layers. The wire format already reserves this room.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
 
 use anyhow::{Result, bail};
-use kvbm_common::{AxisIntersection, BlockId, KvDim, KvbmTransferRoute, LogicalLayoutHandle};
+use kvbm_common::{
+    AxisIntersection, BlockId, KvDim, KvbmTransferRoute, LogicalLayoutHandle,
+    placement::StripedBlockPlacement,
+};
 use kvbm_physical::manager::ParallelismDescriptor;
 use serde::{Deserialize, Serialize};
 use velo::InstanceId;
@@ -70,6 +73,54 @@ use crate::p2p::parallelism::ParallelismTemplate;
 pub struct PullRef {
     pub src_block_id: BlockId,
     pub dst_block_id: BlockId,
+}
+
+/// One owner-to-owner batch for a replicated-cache remote pull.
+///
+/// IDs are worker-local on both sides. The surrounding session retains the
+/// original hash identity and global block IDs; this batch is only the
+/// physical placement projection used to issue RDMA.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReplicatedPullBatch {
+    pub local_rank: usize,
+    pub remote_rank: usize,
+    pub src_block_ids: Vec<BlockId>,
+    pub dst_block_ids: Vec<BlockId>,
+}
+
+/// Project global replicated-cache block pairs onto their physical owners.
+///
+/// The holder session already reports each hash's global source block ID and
+/// the requester allocates each global destination block ID. Deterministic
+/// striped placement therefore resolves both ranks without a separate
+/// `SequenceHash -> worker` index. Results are grouped and sorted by
+/// `(local_rank, remote_rank)` for deterministic dispatch.
+pub(crate) fn plan_replicated_pull(
+    local_world_size: usize,
+    remote_world_size: usize,
+    refs: &[PullRef],
+) -> Result<Vec<ReplicatedPullBatch>> {
+    let local = StripedBlockPlacement::new(local_world_size)?;
+    let remote = StripedBlockPlacement::new(remote_world_size)?;
+    let mut batches = BTreeMap::<(usize, usize), ReplicatedPullBatch>::new();
+
+    for pair in refs {
+        let (remote_rank, src_block_id) = remote.resolve(pair.src_block_id);
+        let (local_rank, dst_block_id) = local.resolve(pair.dst_block_id);
+        let batch =
+            batches
+                .entry((local_rank, remote_rank))
+                .or_insert_with(|| ReplicatedPullBatch {
+                    local_rank,
+                    remote_rank,
+                    src_block_ids: Vec::new(),
+                    dst_block_ids: Vec::new(),
+                });
+        batch.src_block_ids.push(src_block_id);
+        batch.dst_block_ids.push(dst_block_id);
+    }
+
+    Ok(batches.into_values().collect())
 }
 
 /// Coordinate-space slice over a block tensor's local axes.
@@ -462,6 +513,65 @@ mod tests {
     use kvbm_config::ParallelismMode;
 
     const GLOBAL_HEADS: usize = 32;
+
+    #[test]
+    fn replicated_pull_resolves_one_remote_and_local_owner_per_pair() {
+        let refs = vec![
+            PullRef {
+                src_block_id: 0,
+                dst_block_id: 3,
+            },
+            PullRef {
+                src_block_id: 1,
+                dst_block_id: 4,
+            },
+            PullRef {
+                src_block_id: 2,
+                dst_block_id: 5,
+            },
+            PullRef {
+                src_block_id: 3,
+                dst_block_id: 6,
+            },
+        ];
+
+        assert_eq!(
+            plan_replicated_pull(2, 4, &refs).unwrap(),
+            vec![
+                ReplicatedPullBatch {
+                    local_rank: 0,
+                    remote_rank: 1,
+                    src_block_ids: vec![0],
+                    dst_block_ids: vec![2],
+                },
+                ReplicatedPullBatch {
+                    local_rank: 0,
+                    remote_rank: 3,
+                    src_block_ids: vec![0],
+                    dst_block_ids: vec![3],
+                },
+                ReplicatedPullBatch {
+                    local_rank: 1,
+                    remote_rank: 0,
+                    src_block_ids: vec![0],
+                    dst_block_ids: vec![1],
+                },
+                ReplicatedPullBatch {
+                    local_rank: 1,
+                    remote_rank: 2,
+                    src_block_ids: vec![0],
+                    dst_block_ids: vec![2],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn replicated_pull_rejects_empty_worker_groups() {
+        assert!(plan_replicated_pull(0, 2, &[]).is_err());
+        assert!(plan_replicated_pull(2, 0, &[]).is_err());
+        assert!(plan_replicated_pull(2, 2, &[]).unwrap().is_empty());
+    }
 
     fn make_local(tp_size: usize) -> ParallelismTemplate {
         ParallelismTemplate {

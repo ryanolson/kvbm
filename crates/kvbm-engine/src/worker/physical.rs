@@ -729,11 +729,12 @@ impl WorkerTransfers for PhysicalWorker {
 
         // Import so NIXL knows about the remote (repack to pass ownership).
         // Preserve the inbound parallelism descriptor across the repack.
-        let repacked = SerializedLayout::pack(
+        let repacked = SerializedLayout::pack_with_placement(
             unpacked.worker_address,
             unpacked.nixl_metadata,
             unpacked.layouts,
             unpacked.parallelism,
+            unpacked.worker_data_placement,
         )?;
         self.manager.import_metadata(repacked)?;
 

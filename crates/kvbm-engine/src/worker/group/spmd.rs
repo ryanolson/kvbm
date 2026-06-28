@@ -4,10 +4,12 @@
 use super::*;
 
 use crate::leader::dispatch::{PullRef, WirePullOptions, plan_pull};
-use crate::leader::parallelism::{ParallelismTemplate, validate_remote_metadata};
+use crate::leader::parallelism::{
+    ParallelismTemplate, validate_remote_metadata, validate_replicated_remote_metadata,
+};
 use crate::object::ObjectBlockOps;
 use anyhow::{Context, Result};
-use kvbm_physical::manager::ParallelismDescriptor;
+use kvbm_physical::manager::{ParallelismDescriptor, WorkerDataPlacement};
 // velo event types used via fully-qualified paths (::velo::Event, ::velo::EventManager)
 use futures::future::BoxFuture;
 
@@ -67,6 +69,11 @@ pub struct SpmdParallelWorkers {
     /// the cache as a stand-in for "compatibility verified".
     remote_descriptors: RwLock<HashMap<InstanceId, Vec<ParallelismDescriptor>>>,
 
+    /// Per-instance cache ownership strategy advertised alongside metadata.
+    /// Replicated MLA routing requires this to avoid treating full latent
+    /// blocks as tensor shards.
+    remote_worker_data_placements: RwLock<HashMap<InstanceId, WorkerDataPlacement>>,
+
     /// Local parallelism template for cross-leader compatibility gating
     /// in `connect_remote`. When unset (pre-AB-1a behaviour), gates are
     /// skipped and the import falls back to the same-rank zip path; when
@@ -116,6 +123,7 @@ impl SpmdParallelWorkers {
             remote_handles: RwLock::new(HashMap::new()),
             remote_tp_sizes: RwLock::new(HashMap::new()),
             remote_descriptors: RwLock::new(HashMap::new()),
+            remote_worker_data_placements: RwLock::new(HashMap::new()),
             local_template: RwLock::new(None),
             block_layout_mode: kvbm_common::BlockLayoutMode::Operational,
             local_metadata: Vec::new(),
@@ -349,6 +357,8 @@ impl WorkerTransfers for SpmdParallelWorkers {
             unpacked.push(meta.unpack()?);
         }
 
+        let remote_placement = consistent_worker_data_placement(&unpacked)?;
+
         // Decide between strict (all-stamped) and legacy (same-rank
         // zip) paths via a pure helper so the routing decision is
         // testable in isolation.
@@ -377,12 +387,35 @@ impl WorkerTransfers for SpmdParallelWorkers {
                 // gate. select_transfer_canonical_tier exists alongside
                 // for the future caller that drops the G2 dependency in
                 // both gate and pull paths together.
-                validate_remote_metadata(
-                    template,
-                    &descriptors,
-                    &tier_refs,
-                    LogicalLayoutHandle::G2,
-                )
+                match (template.worker_data_placement(), remote_placement) {
+                    (
+                        WorkerDataPlacement::ReplicatedG1StripedLower,
+                        Some(WorkerDataPlacement::ReplicatedG1StripedLower),
+                    ) => validate_replicated_remote_metadata(
+                        template,
+                        &descriptors,
+                        &tier_refs,
+                        LogicalLayoutHandle::G2,
+                    ),
+                    (WorkerDataPlacement::ReplicatedG1StripedLower, None) => {
+                        anyhow::bail!(
+                            "connect_remote: replicated local cache requires peer worker data \
+                             placement metadata"
+                        );
+                    }
+                    (local, Some(remote)) if local != remote => {
+                        anyhow::bail!(
+                            "connect_remote: worker data placement mismatch: local {local:?}, \
+                             remote {remote:?}"
+                        );
+                    }
+                    _ => validate_remote_metadata(
+                        template,
+                        &descriptors,
+                        &tier_refs,
+                        LogicalLayoutHandle::G2,
+                    ),
+                }
                 .context(
                     "connect_remote: cross-leader compatibility gate rejected peer metadata",
                 )?;
@@ -432,11 +465,12 @@ impl WorkerTransfers for SpmdParallelWorkers {
             ImportStrategy::Strict => {
                 for worker in &self.workers {
                     for u in &unpacked {
-                        let repacked = SerializedLayout::pack(
+                        let repacked = SerializedLayout::pack_with_placement(
                             u.worker_address.clone(),
                             u.nixl_metadata.clone(),
                             u.layouts.clone(),
                             u.parallelism.clone(),
+                            u.worker_data_placement,
                         )?;
                         // Collect responses for downstream aggregation.
                         // `PhysicalWorker` returns synchronously-ready,
@@ -451,11 +485,12 @@ impl WorkerTransfers for SpmdParallelWorkers {
             }
             ImportStrategy::Legacy => {
                 for (worker, u) in self.workers.iter().zip(unpacked.iter()) {
-                    let repacked = SerializedLayout::pack(
+                    let repacked = SerializedLayout::pack_with_placement(
                         u.worker_address.clone(),
                         u.nixl_metadata.clone(),
                         u.layouts.clone(),
                         u.parallelism.clone(),
+                        u.worker_data_placement,
                     )?;
                     import_responses.push(worker.import_metadata(repacked)?);
                 }
@@ -480,8 +515,14 @@ impl WorkerTransfers for SpmdParallelWorkers {
         {
             let mut tp_map = self.remote_tp_sizes.write().unwrap();
             let mut desc_map = self.remote_descriptors.write().unwrap();
+            let mut placement_map = self.remote_worker_data_placements.write().unwrap();
             tp_map.remove(&instance_id);
             desc_map.remove(&instance_id);
+            placement_map.remove(&instance_id);
+
+            if let Some(placement) = remote_placement {
+                placement_map.insert(instance_id, placement);
+            }
 
             match strategy {
                 ImportStrategy::Strict => {
@@ -716,6 +757,40 @@ impl SpmdParallelWorkers {
     }
 }
 
+fn consistent_worker_data_placement(
+    metadata: &[kvbm_physical::manager::RdmaLayoutDescriptors],
+) -> Result<Option<WorkerDataPlacement>> {
+    let mut placement = None;
+    for (rank, worker) in metadata.iter().enumerate() {
+        match (placement, worker.worker_data_placement) {
+            (None, Some(value)) => placement = Some(value),
+            (Some(expected), Some(value)) if expected != value => {
+                anyhow::bail!(
+                    "connect_remote: worker data placement mismatch at remote rank {rank}: \
+                     expected {expected:?}, got {value:?}"
+                );
+            }
+            (Some(_), None) => {
+                anyhow::bail!(
+                    "connect_remote: mixed worker data placement metadata; remote rank {rank} \
+                     has no placement marker"
+                );
+            }
+            _ => {}
+        }
+    }
+    if placement.is_some()
+        && metadata
+            .iter()
+            .any(|worker| worker.worker_data_placement.is_none())
+    {
+        anyhow::bail!(
+            "connect_remote: mixed worker data placement metadata; every remote rank must agree"
+        );
+    }
+    Ok(placement)
+}
+
 /// Decision returned by [`decide_import_strategy`] — describes which
 /// import path `connect_remote` should follow.
 #[derive(Debug, PartialEq, Eq)]
@@ -918,6 +993,14 @@ impl ParallelWorkers for SpmdParallelWorkers {
             .unwrap()
             .get(&instance_id)
             .cloned()
+    }
+
+    fn remote_worker_data_placement(&self, instance_id: InstanceId) -> Option<WorkerDataPlacement> {
+        self.remote_worker_data_placements
+            .read()
+            .unwrap()
+            .get(&instance_id)
+            .copied()
     }
 }
 
@@ -1356,6 +1439,87 @@ mod tests {
             <SpmdParallelWorkers as ParallelWorkers>::remote_descriptors_for(&spmd, absent)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn connect_remote_caches_consistent_replicated_placement() {
+        use ::velo::EventManager;
+        use kvbm_physical::manager::{
+            LogicalLayoutDescriptor, SerializedLayout, WorkerAddress, WorkerDataPlacement,
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let spmd = SpmdParallelWorkers::new(
+            Vec::new(),
+            Arc::new(EventManager::local()),
+            rt.handle().clone(),
+        );
+        let instance_id = InstanceId::new_v4();
+        let metadata = (0..2)
+            .map(|rank| {
+                SerializedLayout::pack_with_placement(
+                    WorkerAddress::new(rank as u64, format!("mla-{rank}")),
+                    Vec::new(),
+                    Vec::<LogicalLayoutDescriptor>::new(),
+                    Some(descriptor(rank, 2)),
+                    Some(WorkerDataPlacement::ReplicatedG1StripedLower),
+                )
+                .unwrap()
+            })
+            .collect();
+
+        spmd.connect_remote(instance_id, metadata).unwrap();
+
+        assert_eq!(
+            <SpmdParallelWorkers as ParallelWorkers>::remote_worker_data_placement(
+                &spmd,
+                instance_id
+            ),
+            Some(WorkerDataPlacement::ReplicatedG1StripedLower)
+        );
+    }
+
+    #[test]
+    fn connect_remote_rejects_mixed_worker_placements() {
+        use ::velo::EventManager;
+        use kvbm_physical::manager::{
+            LogicalLayoutDescriptor, SerializedLayout, WorkerAddress, WorkerDataPlacement,
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let spmd = SpmdParallelWorkers::new(
+            Vec::new(),
+            Arc::new(EventManager::local()),
+            rt.handle().clone(),
+        );
+        let metadata = vec![
+            SerializedLayout::pack_with_placement(
+                WorkerAddress::new(0, "mla-0".to_string()),
+                Vec::new(),
+                Vec::<LogicalLayoutDescriptor>::new(),
+                Some(descriptor(0, 2)),
+                Some(WorkerDataPlacement::ReplicatedG1StripedLower),
+            )
+            .unwrap(),
+            SerializedLayout::pack_with_placement(
+                WorkerAddress::new(1, "tp-1".to_string()),
+                Vec::new(),
+                Vec::<LogicalLayoutDescriptor>::new(),
+                Some(descriptor(1, 2)),
+                Some(WorkerDataPlacement::TensorSharded),
+            )
+            .unwrap(),
+        ];
+
+        let error = match spmd.connect_remote(InstanceId::new_v4(), metadata) {
+            Ok(_) => panic!("mixed worker placements must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("placement mismatch"));
     }
 
     /// AB-3: Legacy (unstamped) peer metadata must NOT cache
