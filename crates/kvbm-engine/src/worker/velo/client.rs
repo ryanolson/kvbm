@@ -19,9 +19,11 @@ pub struct VeloWorkerClient {
     connected_instances: Arc<RwLock<HashSet<InstanceId>>>,
 }
 
-impl WorkerTransfers for VeloWorkerClient {
-    fn execute_local_transfer(
+impl VeloWorkerClient {
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_local_transfer(
         &self,
+        resource: Option<LogicalResourceId>,
         src: LogicalLayoutHandle,
         dst: LogicalLayoutHandle,
         src_block_ids: Arc<[BlockId]>,
@@ -44,6 +46,7 @@ impl WorkerTransfers for VeloWorkerClient {
 
         // Create the message
         let message = LocalTransferMessage {
+            resource,
             src,
             dst,
             src_block_ids: src_block_ids.to_vec(),
@@ -76,6 +79,38 @@ impl WorkerTransfers for VeloWorkerClient {
         );
 
         Ok(TransferCompleteNotification::from_awaiter(awaiter))
+    }
+}
+
+impl WorkerTransfers for VeloWorkerClient {
+    fn execute_local_transfer(
+        &self,
+        src: LogicalLayoutHandle,
+        dst: LogicalLayoutHandle,
+        src_block_ids: Arc<[BlockId]>,
+        dst_block_ids: Arc<[BlockId]>,
+        options: TransferOptions,
+    ) -> Result<TransferCompleteNotification> {
+        self.dispatch_local_transfer(None, src, dst, src_block_ids, dst_block_ids, options)
+    }
+
+    fn execute_local_transfer_for_resource(
+        &self,
+        resource: LogicalResourceId,
+        src: LogicalLayoutHandle,
+        dst: LogicalLayoutHandle,
+        src_block_ids: Arc<[BlockId]>,
+        dst_block_ids: Arc<[BlockId]>,
+        options: TransferOptions,
+    ) -> Result<TransferCompleteNotification> {
+        self.dispatch_local_transfer(
+            Some(resource),
+            src,
+            dst,
+            src_block_ids,
+            dst_block_ids,
+            options,
+        )
     }
 
     fn execute_remote_onboard(

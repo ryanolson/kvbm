@@ -113,6 +113,26 @@ impl CollectiveOps for StubCollectiveOps {
         self.rank
     }
 
+    fn broadcast_for_resource(
+        &self,
+        _resource: kvbm_common::LogicalResourceId,
+        root_rank: usize,
+        src: LogicalLayoutHandle,
+        dst: LogicalLayoutHandle,
+        src_block_ids: &[BlockId],
+        dst_block_ids: &[BlockId],
+        layer_range: Option<Range<usize>>,
+    ) -> Result<TransferCompleteNotification> {
+        self.broadcast(
+            root_rank,
+            src,
+            dst,
+            src_block_ids,
+            dst_block_ids,
+            layer_range,
+        )
+    }
+
     fn world_size(&self) -> usize {
         self.world_size
     }

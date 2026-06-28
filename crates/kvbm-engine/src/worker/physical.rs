@@ -10,8 +10,12 @@
 #[cfg(feature = "collectives")]
 mod replicated;
 #[cfg(feature = "collectives")]
+mod resources;
+#[cfg(feature = "collectives")]
 #[allow(unused_imports)]
 pub use replicated::ReplicatedDataWorker;
+#[cfg(feature = "collectives")]
+pub use resources::ResourceDispatchWorker;
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -155,6 +159,19 @@ impl crate::collectives::LayoutResolver for PhysicalWorker {
     fn resolve_layout(&self, logical: LogicalLayoutHandle) -> Result<PhysicalLayout> {
         PhysicalWorker::resolve_layout(self, logical)
     }
+
+    fn resolve_layout_for_resource(
+        &self,
+        resource: LogicalResourceId,
+        logical: LogicalLayoutHandle,
+    ) -> Result<PhysicalLayout> {
+        let handle = self.layout_handle_for(resource, logical).ok_or_else(|| {
+            anyhow::anyhow!("no {logical:?} layout for logical resource {resource:?}")
+        })?;
+        self.manager
+            .get_physical_layout(handle)
+            .ok_or_else(|| anyhow::anyhow!("layout handle {handle:?} not found"))
+    }
 }
 
 #[cfg(feature = "collectives")]
@@ -228,16 +245,20 @@ impl PhysicalWorker {
         resource: LogicalResourceId,
         tier: LogicalLayoutHandle,
     ) -> Option<LayoutHandle> {
-        match self.resource_handles.as_ref() {
-            Some(resources) => resources.handle(resource, tier),
-            None if resource == LogicalResourceId::default() => match tier {
-                LogicalLayoutHandle::G1 => self.g1_handle,
-                LogicalLayoutHandle::G2 => self.g2_handle,
-                LogicalLayoutHandle::G3 => self.g3_handle,
-                LogicalLayoutHandle::G4 => None,
-            },
-            None => None,
-        }
+        let legacy = match tier {
+            LogicalLayoutHandle::G1 => self.g1_handle,
+            LogicalLayoutHandle::G2 => self.g2_handle,
+            LogicalLayoutHandle::G3 => self.g3_handle,
+            LogicalLayoutHandle::G4 => None,
+        };
+        resolve_local_layout_handle(self.resource_handles.as_ref(), resource, tier, legacy)
+    }
+
+    fn primary_resource_id(&self) -> LogicalResourceId {
+        self.resource_handles
+            .as_ref()
+            .map(ResourceLayoutHandles::primary)
+            .unwrap_or_default()
     }
 
     /// Get a reference to the TransferManager.
@@ -568,23 +589,37 @@ impl WorkerTransfers for PhysicalWorker {
         dst_block_ids: Arc<[BlockId]>,
         options: TransferOptions,
     ) -> Result<TransferCompleteNotification> {
-        use LogicalLayoutHandle::*;
+        self.execute_local_transfer_for_resource(
+            self.primary_resource_id(),
+            src,
+            dst,
+            src_block_ids,
+            dst_block_ids,
+            options,
+        )
+    }
 
-        let src_layout = match &src {
-            G1 => self.g1_handle(),
-            G2 => self.g2_handle(),
-            G3 => self.g3_handle(),
-            G4 => return Err(anyhow::anyhow!("G4 is not supported for local transfers")),
+    fn execute_local_transfer_for_resource(
+        &self,
+        resource: LogicalResourceId,
+        src: LogicalLayoutHandle,
+        dst: LogicalLayoutHandle,
+        src_block_ids: Arc<[BlockId]>,
+        dst_block_ids: Arc<[BlockId]>,
+        options: TransferOptions,
+    ) -> Result<TransferCompleteNotification> {
+        if matches!(src, LogicalLayoutHandle::G4) || matches!(dst, LogicalLayoutHandle::G4) {
+            anyhow::bail!("G4 is not supported for local transfers");
         }
-        .ok_or_else(|| anyhow::anyhow!("Source layout not registered: {:?}", src))?;
 
-        let dst_layout = match &dst {
-            G1 => self.g1_handle(),
-            G2 => self.g2_handle(),
-            G3 => self.g3_handle(),
-            G4 => return Err(anyhow::anyhow!("G4 is not supported for local transfers")),
-        }
-        .ok_or_else(|| anyhow::anyhow!("Destination layout not registered: {:?}", dst))?;
+        let src_layout = self.layout_handle_for(resource, src).ok_or_else(|| {
+            anyhow::anyhow!("source layout {src:?} is not registered for resource {resource:?}")
+        })?;
+        let dst_layout = self.layout_handle_for(resource, dst).ok_or_else(|| {
+            anyhow::anyhow!(
+                "destination layout {dst:?} is not registered for resource {resource:?}"
+            )
+        })?;
 
         self.manager.execute_transfer(
             src_layout,
@@ -1190,6 +1225,19 @@ fn select_primary_layout_handle(
     }
 }
 
+fn resolve_local_layout_handle(
+    resources: Option<&ResourceLayoutHandles>,
+    resource: LogicalResourceId,
+    tier: LogicalLayoutHandle,
+    legacy: Option<LayoutHandle>,
+) -> Option<LayoutHandle> {
+    match resources {
+        Some(resources) => resources.handle(resource, tier),
+        None if resource == LogicalResourceId::default() => legacy,
+        None => None,
+    }
+}
+
 #[cfg(test)]
 mod resource_handle_tests {
     use super::*;
@@ -1223,6 +1271,43 @@ mod resource_handle_tests {
                 Some(LayoutHandle::new(8, 1))
             ),
             Some(LayoutHandle::new(8, 1))
+        );
+    }
+
+    #[test]
+    fn local_transfer_handle_resolves_requested_resource() {
+        let primary = LogicalResourceId(3);
+        let secondary = LogicalResourceId(7);
+        let primary_g2 = LayoutHandle::new(8, 4);
+        let secondary_g2 = LayoutHandle::new(8, 9);
+        let resources = ResourceLayoutHandles::new(
+            primary,
+            vec![
+                (
+                    primary,
+                    TierLayoutHandles::new(None, Some(primary_g2), None),
+                ),
+                (
+                    secondary,
+                    TierLayoutHandles::new(None, Some(secondary_g2), None),
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_local_layout_handle(
+                Some(&resources),
+                secondary,
+                LogicalLayoutHandle::G2,
+                Some(primary_g2),
+            ),
+            Some(secondary_g2)
+        );
+        assert_eq!(
+            resolve_local_layout_handle(None, secondary, LogicalLayoutHandle::G2, Some(primary_g2),),
+            None,
+            "legacy handles must not masquerade as a non-default resource"
         );
     }
 }

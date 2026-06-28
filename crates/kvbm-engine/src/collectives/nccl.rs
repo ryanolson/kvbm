@@ -80,6 +80,18 @@ pub trait LayoutResolver: Send + Sync {
     /// # Returns
     /// The physical layout for the given logical handle, or an error if not found.
     fn resolve_layout(&self, logical: LogicalLayoutHandle) -> Result<PhysicalLayout>;
+
+    /// Resolve a logical tier within one model resource.
+    fn resolve_layout_for_resource(
+        &self,
+        resource: kvbm_common::LogicalResourceId,
+        logical: LogicalLayoutHandle,
+    ) -> Result<PhysicalLayout> {
+        if resource != kvbm_common::LogicalResourceId::default() {
+            anyhow::bail!("layout resolver does not implement non-default resource {resource:?}");
+        }
+        self.resolve_layout(logical)
+    }
 }
 
 /// Trait for registering CUDA events for completion notification.
@@ -488,6 +500,44 @@ impl NcclCollectives {
     }
 }
 
+impl NcclCollectives {
+    #[allow(clippy::too_many_arguments)]
+    fn broadcast_with_layouts(
+        &self,
+        root_rank: usize,
+        src_layout: &PhysicalLayout,
+        dst_layout: &PhysicalLayout,
+        src_block_ids: &[BlockId],
+        dst_block_ids: &[BlockId],
+        layer_range: Option<Range<usize>>,
+    ) -> Result<TransferCompleteNotification> {
+        let layout = if self.rank == root_rank {
+            src_layout
+        } else {
+            dst_layout
+        };
+        let block_ids = if self.rank == root_rank {
+            src_block_ids
+        } else {
+            dst_block_ids
+        };
+        let regions = self.collect_regions(layout, block_ids, layer_range)?;
+
+        tracing::debug!(
+            rank = self.rank,
+            root_rank,
+            world_size = self.world_size,
+            num_regions = regions.len(),
+            total_bytes = regions.iter().map(|(_, size)| size).sum::<usize>(),
+            "Starting NCCL broadcast"
+        );
+
+        let root = i32::try_from(root_rank).context("NCCL broadcast root does not fit in i32")?;
+        self.broadcast_regions(&regions, root)?;
+        self.create_completion_notification()
+    }
+}
+
 impl CollectiveOps for NcclCollectives {
     fn broadcast(
         &self,
@@ -507,36 +557,45 @@ impl CollectiveOps for NcclCollectives {
         let src_layout = self.layout_resolver.resolve_layout(src)?;
         let dst_layout = self.layout_resolver.resolve_layout(dst)?;
 
-        // The selected root uses src; every other rank receives into dst.
-        let layout = if self.rank == root_rank {
-            &src_layout
-        } else {
-            &dst_layout
-        };
-
-        let block_ids = if self.rank == root_rank {
-            src_block_ids
-        } else {
-            dst_block_ids
-        };
-
-        // Collect memory regions for the broadcast
-        let regions = self.collect_regions(layout, block_ids, layer_range)?;
-
-        tracing::debug!(
-            rank = self.rank,
+        self.broadcast_with_layouts(
             root_rank,
-            world_size = self.world_size,
-            num_regions = regions.len(),
-            total_bytes = regions.iter().map(|(_, size)| size).sum::<usize>(),
-            "Starting NCCL broadcast"
+            &src_layout,
+            &dst_layout,
+            src_block_ids,
+            dst_block_ids,
+            layer_range,
+        )
+    }
+
+    fn broadcast_for_resource(
+        &self,
+        resource: kvbm_common::LogicalResourceId,
+        root_rank: usize,
+        src: LogicalLayoutHandle,
+        dst: LogicalLayoutHandle,
+        src_block_ids: &[BlockId],
+        dst_block_ids: &[BlockId],
+        layer_range: Option<Range<usize>>,
+    ) -> Result<TransferCompleteNotification> {
+        ensure!(
+            root_rank < self.world_size,
+            "broadcast root {root_rank} is outside collective world size {}",
+            self.world_size
         );
-
-        let root = i32::try_from(root_rank).context("NCCL broadcast root does not fit in i32")?;
-        self.broadcast_regions(&regions, root)?;
-
-        // Create completion notification
-        self.create_completion_notification()
+        let src_layout = self
+            .layout_resolver
+            .resolve_layout_for_resource(resource, src)?;
+        let dst_layout = self
+            .layout_resolver
+            .resolve_layout_for_resource(resource, dst)?;
+        self.broadcast_with_layouts(
+            root_rank,
+            &src_layout,
+            &dst_layout,
+            src_block_ids,
+            dst_block_ids,
+            layer_range,
+        )
     }
 
     fn rank(&self) -> usize {

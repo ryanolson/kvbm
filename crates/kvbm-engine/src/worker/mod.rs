@@ -9,9 +9,9 @@ mod protocol;
 pub mod velo;
 
 pub use coordinated::CoordinatedWorker;
-#[cfg(feature = "collectives")]
-pub use physical::ReplicatedDataWorker;
 pub use physical::{PhysicalWorker, PhysicalWorkerBuilder};
+#[cfg(feature = "collectives")]
+pub use physical::{ReplicatedDataWorker, ResourceDispatchWorker};
 
 /// Compatibility alias for [`PhysicalWorker`].
 pub use physical::PhysicalWorker as DirectWorker;
@@ -21,7 +21,7 @@ use std::{pin::Pin, sync::Arc};
 
 use crate::object::ObjectBlockOps;
 pub use crate::{BlockId, InstanceId, SequenceHash};
-pub use kvbm_common::LogicalLayoutHandle;
+pub use kvbm_common::{LogicalLayoutHandle, LogicalResourceId};
 pub use kvbm_physical::{
     manager::{LayoutHandle, SerializedLayout},
     transfer::TransferCompleteNotification,
@@ -57,6 +57,28 @@ pub trait WorkerTransfers: Send + Sync {
         dst_block_ids: Arc<[BlockId]>,
         options: kvbm_physical::transfer::TransferOptions,
     ) -> Result<TransferCompleteNotification>;
+
+    /// Execute a local transfer for one logical KV resource.
+    ///
+    /// The default preserves pre-resource workers for resource zero and fails
+    /// closed for every non-default resource. Resource-aware physical and
+    /// parallel workers override this method.
+    fn execute_local_transfer_for_resource(
+        &self,
+        resource: LogicalResourceId,
+        src: LogicalLayoutHandle,
+        dst: LogicalLayoutHandle,
+        src_block_ids: Arc<[BlockId]>,
+        dst_block_ids: Arc<[BlockId]>,
+        options: kvbm_physical::transfer::TransferOptions,
+    ) -> Result<TransferCompleteNotification> {
+        if resource != LogicalResourceId::default() {
+            anyhow::bail!(
+                "local transfer for non-default resource {resource:?} is not implemented by this worker"
+            );
+        }
+        self.execute_local_transfer(src, dst, src_block_ids, dst_block_ids, options)
+    }
 
     /// Execute a remote transfer from a remote layout to a local logical layout.
     ///

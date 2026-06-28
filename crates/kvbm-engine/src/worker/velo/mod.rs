@@ -144,11 +144,51 @@ impl From<TransferOptions> for SerializableTransferOptions {
 // Message types for remote worker operations
 #[derive(Serialize, Deserialize)]
 struct LocalTransferMessage {
+    #[serde(default)]
+    resource: Option<kvbm_common::LogicalResourceId>,
     src: LogicalLayoutHandle,
     dst: LogicalLayoutHandle,
     src_block_ids: Vec<BlockId>,
     dst_block_ids: Vec<BlockId>,
     options: SerializableTransferOptions,
+}
+
+#[cfg(test)]
+mod local_transfer_message_tests {
+    use super::*;
+    use kvbm_common::LogicalResourceId;
+
+    fn message(resource: LogicalResourceId) -> LocalTransferMessage {
+        LocalTransferMessage {
+            resource: Some(resource),
+            src: LogicalLayoutHandle::G1,
+            dst: LogicalLayoutHandle::G2,
+            src_block_ids: vec![1],
+            dst_block_ids: vec![2],
+            options: SerializableTransferOptions {
+                layer_range: None,
+                nixl_write_notification: None,
+                bounce_buffer_handle: None,
+                bounce_buffer_block_ids: None,
+                metric_route: None,
+            },
+        }
+    }
+
+    #[test]
+    fn local_transfer_message_round_trips_resource() {
+        let encoded = serde_json::to_vec(&message(LogicalResourceId(7))).unwrap();
+        let decoded: LocalTransferMessage = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.resource, Some(LogicalResourceId(7)));
+    }
+
+    #[test]
+    fn legacy_local_transfer_message_omits_resource_routing() {
+        let mut encoded = serde_json::to_value(message(LogicalResourceId(7))).unwrap();
+        encoded.as_object_mut().unwrap().remove("resource");
+        let decoded: LocalTransferMessage = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.resource, None);
+    }
 }
 
 #[derive(Serialize, Deserialize)]

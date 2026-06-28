@@ -1850,12 +1850,36 @@ impl InstanceLeader {
         dst_block_ids: Vec<BlockId>,
         options: TransferOptions,
     ) -> Result<TransferCompleteNotification> {
+        self.execute_local_transfer_for_resource(
+            self.primary_g2_resource,
+            src,
+            dst,
+            src_block_ids,
+            dst_block_ids,
+            options,
+        )
+    }
+
+    /// Execute a local transfer across all workers for one logical resource.
+    pub(crate) fn execute_local_transfer_for_resource(
+        &self,
+        resource: LogicalResourceId,
+        src: LogicalLayoutHandle,
+        dst: LogicalLayoutHandle,
+        src_block_ids: Vec<BlockId>,
+        dst_block_ids: Vec<BlockId>,
+        options: TransferOptions,
+    ) -> Result<TransferCompleteNotification> {
+        if self.g2_manager_for(resource).is_none() {
+            anyhow::bail!("No G2 manager configured for resource {resource:?}");
+        }
         let parallel_worker = self
             .parallel_worker
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No parallel worker configured"))?;
 
-        parallel_worker.execute_local_transfer(
+        parallel_worker.execute_local_transfer_for_resource(
+            resource,
             src,
             dst,
             Arc::from(src_block_ids),

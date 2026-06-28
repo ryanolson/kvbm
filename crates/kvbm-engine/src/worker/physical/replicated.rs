@@ -109,10 +109,41 @@ impl WorkerTransfers for ReplicatedDataWorker {
         dst_block_ids: Arc<[BlockId]>,
         options: kvbm_physical::transfer::TransferOptions,
     ) -> Result<TransferCompleteNotification> {
+        let resource = self
+            .inner
+            .resource_handles()
+            .map(ResourceLayoutHandles::primary)
+            .unwrap_or_default();
+        self.execute_local_transfer_for_resource(
+            resource,
+            src,
+            dst,
+            src_block_ids,
+            dst_block_ids,
+            options,
+        )
+    }
+
+    fn execute_local_transfer_for_resource(
+        &self,
+        resource: LogicalResourceId,
+        src: LogicalLayoutHandle,
+        dst: LogicalLayoutHandle,
+        src_block_ids: Arc<[BlockId]>,
+        dst_block_ids: Arc<[BlockId]>,
+        options: kvbm_physical::transfer::TransferOptions,
+    ) -> Result<TransferCompleteNotification> {
         match (src, dst) {
-            (LogicalLayoutHandle::G1, LogicalLayoutHandle::G1) => self
-                .inner
-                .execute_local_transfer(src, dst, src_block_ids, dst_block_ids, options),
+            (LogicalLayoutHandle::G1, LogicalLayoutHandle::G1) => {
+                self.inner.execute_local_transfer_for_resource(
+                    resource,
+                    src,
+                    dst,
+                    src_block_ids,
+                    dst_block_ids,
+                    options,
+                )
+            }
             (LogicalLayoutHandle::G1, LogicalLayoutHandle::G2) => {
                 let plan = self.planner.plan_offload(
                     self.rank(),
@@ -123,7 +154,8 @@ impl WorkerTransfers for ReplicatedDataWorker {
                     return Ok(TransferCompleteNotification::completed());
                 }
 
-                self.inner.execute_local_transfer(
+                self.inner.execute_local_transfer_for_resource(
+                    resource,
                     src,
                     dst,
                     Arc::from(plan.g1_block_ids()),
@@ -148,9 +180,16 @@ impl WorkerTransfers for ReplicatedDataWorker {
                 let layer_range = options.layer_range.clone();
 
                 self.runtime.tokio().spawn(async move {
-                    let result =
-                        execute_onboard_plans(inner, collective, rank, plans, options, layer_range)
-                            .await;
+                    let result = execute_onboard_plans(
+                        inner,
+                        collective,
+                        rank,
+                        resource,
+                        plans,
+                        options,
+                        layer_range,
+                    )
+                    .await;
                     match result {
                         Ok(()) => {
                             let _ = event.trigger();
@@ -285,6 +324,7 @@ async fn execute_onboard_plans(
     inner: Arc<PhysicalWorker>,
     collective: Arc<dyn CollectiveOps>,
     rank: usize,
+    resource: LogicalResourceId,
     plans: Vec<planner::ReplicaOnboardPlan>,
     options: kvbm_physical::transfer::TransferOptions,
     layer_range: Option<std::ops::Range<usize>>,
@@ -294,7 +334,8 @@ async fn execute_onboard_plans(
 
         if rank == plan.root_rank() {
             inner
-                .execute_local_transfer(
+                .execute_local_transfer_for_resource(
+                    resource,
                     LogicalLayoutHandle::G2,
                     LogicalLayoutHandle::G1,
                     Arc::from(plan.local_g2_block_ids()),
@@ -308,7 +349,8 @@ async fn execute_onboard_plans(
         }
 
         collective
-            .broadcast(
+            .broadcast_for_resource(
+                resource,
                 plan.root_rank(),
                 LogicalLayoutHandle::G1,
                 LogicalLayoutHandle::G1,

@@ -62,7 +62,7 @@ use std::ops::Range;
 use anyhow::Result;
 
 use crate::BlockId;
-use kvbm_common::LogicalLayoutHandle;
+use kvbm_common::{LogicalLayoutHandle, LogicalResourceId};
 use kvbm_physical::transfer::TransferCompleteNotification;
 
 /// Collective communication operations for distributed workers.
@@ -110,6 +110,32 @@ pub trait CollectiveOps: Send + Sync {
         dst_block_ids: &[BlockId],
         layer_range: Option<Range<usize>>,
     ) -> Result<TransferCompleteNotification>;
+
+    /// Broadcast blocks within one logical resource's physical G1 layout.
+    fn broadcast_for_resource(
+        &self,
+        resource: LogicalResourceId,
+        root_rank: usize,
+        src: LogicalLayoutHandle,
+        dst: LogicalLayoutHandle,
+        src_block_ids: &[BlockId],
+        dst_block_ids: &[BlockId],
+        layer_range: Option<Range<usize>>,
+    ) -> Result<TransferCompleteNotification> {
+        if resource != LogicalResourceId::default() {
+            anyhow::bail!(
+                "collective does not implement broadcasts for non-default resource {resource:?}"
+            );
+        }
+        self.broadcast(
+            root_rank,
+            src,
+            dst,
+            src_block_ids,
+            dst_block_ids,
+            layer_range,
+        )
+    }
 
     /// Get the rank of this worker in the collective group.
     fn rank(&self) -> usize;

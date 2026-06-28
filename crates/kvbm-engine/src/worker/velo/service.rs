@@ -116,13 +116,23 @@ impl VeloWorkerService {
                         Some(physical_worker.create_bounce_buffer(handle, block_ids)?);
                 }
 
-                let notification = transfers.execute_local_transfer(
-                    message.src,
-                    message.dst,
-                    Arc::from(message.src_block_ids),
-                    Arc::from(message.dst_block_ids),
-                    options,
-                )?;
+                let notification = match message.resource {
+                    Some(resource) => transfers.execute_local_transfer_for_resource(
+                        resource,
+                        message.src,
+                        message.dst,
+                        Arc::from(message.src_block_ids),
+                        Arc::from(message.dst_block_ids),
+                        options,
+                    )?,
+                    None => transfers.execute_local_transfer(
+                        message.src,
+                        message.dst,
+                        Arc::from(message.src_block_ids),
+                        Arc::from(message.dst_block_ids),
+                        options,
+                    )?,
+                };
 
                 // Await the transfer completion
                 notification.await?;

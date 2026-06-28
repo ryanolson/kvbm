@@ -230,6 +230,33 @@ impl WorkerTransfers for SpmdParallelWorkers {
         TransferCompleteNotification::aggregate(notifications, &self.events, &self.runtime)
     }
 
+    fn execute_local_transfer_for_resource(
+        &self,
+        resource: LogicalResourceId,
+        src: LogicalLayoutHandle,
+        dst: LogicalLayoutHandle,
+        src_block_ids: Arc<[BlockId]>,
+        dst_block_ids: Arc<[BlockId]>,
+        options: kvbm_physical::transfer::TransferOptions,
+    ) -> Result<TransferCompleteNotification> {
+        let notifications = self
+            .workers
+            .iter()
+            .map(|worker| {
+                worker.execute_local_transfer_for_resource(
+                    resource,
+                    src,
+                    dst,
+                    src_block_ids.clone(),
+                    dst_block_ids.clone(),
+                    options.clone(),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        TransferCompleteNotification::aggregate(notifications, &self.events, &self.runtime)
+    }
+
     fn execute_remote_onboard(
         &self,
         src: RemoteDescriptor,
