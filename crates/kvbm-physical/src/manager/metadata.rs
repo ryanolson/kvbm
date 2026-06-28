@@ -3,6 +3,10 @@
 
 //! Serialization types for exporting/importing layout metadata with NIXL integration.
 
+mod resource_parallelism;
+
+pub use resource_parallelism::{ResourceParallelismDescriptor, ResourceParallelismDescriptors};
+
 use super::handle::LayoutHandle;
 use crate::layout::LayoutDescriptor;
 use anyhow::Result;
@@ -175,6 +179,45 @@ impl ResourceLayouts {
     }
 }
 
+fn validate_resource_parallelism(
+    parallelism: Option<&ParallelismDescriptor>,
+    placement: Option<WorkerDataPlacement>,
+    layouts: Option<&ResourceLayouts>,
+    resources: Option<&ResourceParallelismDescriptors>,
+) -> Result<()> {
+    let Some(resources) = resources else {
+        return Ok(());
+    };
+    resources.validate()?;
+    let primary = resources
+        .get(resources.primary())
+        .expect("validated resource parallelism contains its primary");
+    anyhow::ensure!(
+        parallelism == Some(&primary.parallelism) && placement == Some(primary.placement),
+        "primary resource parallelism does not match the compatibility parallelism view"
+    );
+
+    if let Some(layouts) = layouts {
+        anyhow::ensure!(
+            layouts.primary() == resources.primary(),
+            "resource layout and parallelism metadata select different primaries"
+        );
+        let layout_ids = layouts
+            .iter()
+            .map(|(resource, _)| resource)
+            .collect::<Vec<_>>();
+        let parallelism_ids = resources
+            .iter()
+            .map(|entry| entry.resource)
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            layout_ids == parallelism_ids,
+            "resource layout and parallelism metadata describe different resources"
+        );
+    }
+    Ok(())
+}
+
 /// Type alias for backwards compatibility.
 pub type LocalLayoutDescriptor = LogicalLayoutDescriptor;
 
@@ -259,6 +302,11 @@ pub struct RdmaLayoutDescriptors {
     /// resource-aware physical registration and [`Self::layouts`] is the only
     /// available resource view.
     pub resource_layouts: Option<ResourceLayouts>,
+    /// Per-resource parallelism and physical placement.
+    ///
+    /// Appended after resource layouts. The legacy `parallelism` and
+    /// `worker_data_placement` fields remain the selected primary view.
+    pub resource_parallelism: Option<ResourceParallelismDescriptors>,
 }
 
 impl RdmaLayoutDescriptors {
@@ -345,6 +393,28 @@ impl SerializedLayout {
         worker_data_placement: Option<WorkerDataPlacement>,
         resource_layouts: Option<ResourceLayouts>,
     ) -> Result<Self> {
+        Self::pack_with_resource_parallelism(
+            worker_address,
+            nixl_metadata,
+            layouts,
+            parallelism,
+            worker_data_placement,
+            resource_layouts,
+            None,
+        )
+    }
+
+    /// Pack metadata with resource-specific parallelism and placement.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pack_with_resource_parallelism(
+        worker_address: WorkerAddress,
+        nixl_metadata: Vec<u8>,
+        layouts: Vec<LogicalLayoutDescriptor>,
+        parallelism: Option<ParallelismDescriptor>,
+        worker_data_placement: Option<WorkerDataPlacement>,
+        resource_layouts: Option<ResourceLayouts>,
+        resource_parallelism: Option<ResourceParallelismDescriptors>,
+    ) -> Result<Self> {
         if let Some(resources) = resource_layouts.as_ref() {
             resources.validate()?;
             let primary = resources
@@ -362,6 +432,12 @@ impl SerializedLayout {
                 "primary resource layouts do not match the compatibility layout view"
             );
         }
+        validate_resource_parallelism(
+            parallelism.as_ref(),
+            worker_data_placement,
+            resource_layouts.as_ref(),
+            resource_parallelism.as_ref(),
+        )?;
         let inner = RdmaLayoutDescriptors {
             worker_address,
             nixl_metadata,
@@ -369,6 +445,7 @@ impl SerializedLayout {
             parallelism,
             worker_data_placement,
             resource_layouts,
+            resource_parallelism,
         };
         let bytes = bincode::encode_to_vec(&inner, bincode::config::standard())
             .map_err(|e| anyhow::anyhow!("failed to encode managed memory metadata: {}", e))?;
@@ -421,17 +498,36 @@ impl SerializedLayout {
             (placement, &rest[consumed..])
         };
 
-        let resource_layouts = if rest.is_empty() {
-            None
+        let (resource_layouts, rest) = if rest.is_empty() {
+            (None, rest)
         } else {
-            let (resources, _): (Option<ResourceLayouts>, usize) =
+            let (resources, consumed): (Option<ResourceLayouts>, usize) =
                 bincode::decode_from_slice(rest, cfg)
                     .map_err(|e| anyhow::anyhow!("failed to decode resource layouts: {}", e))?;
             if let Some(resources) = resources.as_ref() {
                 resources.validate()?;
             }
+            (resources, &rest[consumed..])
+        };
+
+        let resource_parallelism = if rest.is_empty() {
+            None
+        } else {
+            let (resources, _): (Option<ResourceParallelismDescriptors>, usize) =
+                bincode::decode_from_slice(rest, cfg)
+                    .map_err(|e| anyhow::anyhow!("failed to decode resource parallelism: {}", e))?;
+            if let Some(resources) = resources.as_ref() {
+                resources.validate()?;
+            }
             resources
         };
+
+        validate_resource_parallelism(
+            parallelism.as_ref(),
+            worker_data_placement,
+            resource_layouts.as_ref(),
+            resource_parallelism.as_ref(),
+        )?;
 
         Ok(RdmaLayoutDescriptors {
             worker_address,
@@ -440,6 +536,7 @@ impl SerializedLayout {
             parallelism,
             worker_data_placement,
             resource_layouts,
+            resource_parallelism,
         })
     }
 
@@ -875,6 +972,84 @@ mod tests {
     }
 
     #[test]
+    fn resource_parallelism_round_trips_mixed_worker_placement() {
+        let primary = ParallelismDescriptor::single_worker(3);
+        let replicated = ParallelismDescriptor {
+            tp_size: 2,
+            pp_size: 1,
+            rank: 0,
+            shard_axis: KvDim::HeadCount,
+            global_extents: vec![(KvDim::Layer, 3), (KvDim::HeadSize, 64)],
+            layer_ownership: 0..3,
+        };
+        let resources = ResourceParallelismDescriptors::new(
+            LogicalResourceId(0),
+            vec![
+                ResourceParallelismDescriptor::new(
+                    LogicalResourceId(0),
+                    primary.clone(),
+                    WorkerDataPlacement::TensorSharded,
+                ),
+                ResourceParallelismDescriptor::new(
+                    LogicalResourceId(1),
+                    replicated.clone(),
+                    WorkerDataPlacement::ReplicatedG1StripedLower,
+                ),
+            ],
+        )
+        .unwrap();
+
+        let packed = SerializedLayout::pack_with_resource_parallelism(
+            WorkerAddress::new(31, "mixed-resource-worker".to_string()),
+            Vec::new(),
+            Vec::new(),
+            Some(primary),
+            Some(WorkerDataPlacement::TensorSharded),
+            None,
+            Some(resources),
+        )
+        .unwrap();
+        let unpacked = packed.unpack().unwrap();
+        let resources = unpacked.resource_parallelism.unwrap();
+
+        assert_eq!(resources.primary(), LogicalResourceId(0));
+        assert_eq!(
+            resources.get(LogicalResourceId(1)).unwrap().parallelism,
+            replicated
+        );
+        assert_eq!(
+            resources.get(LogicalResourceId(1)).unwrap().placement,
+            WorkerDataPlacement::ReplicatedG1StripedLower
+        );
+    }
+
+    #[test]
+    fn resource_parallelism_rejects_primary_compatibility_mismatch() {
+        let resources = ResourceParallelismDescriptors::new(
+            LogicalResourceId(1),
+            vec![ResourceParallelismDescriptor::new(
+                LogicalResourceId(1),
+                ParallelismDescriptor::single_worker(1),
+                WorkerDataPlacement::ReplicatedG1StripedLower,
+            )],
+        )
+        .unwrap();
+
+        let error = SerializedLayout::pack_with_resource_parallelism(
+            WorkerAddress::new(32, "mismatched-resource-worker".to_string()),
+            Vec::new(),
+            Vec::new(),
+            Some(ParallelismDescriptor::single_worker(1)),
+            Some(WorkerDataPlacement::TensorSharded),
+            None,
+            Some(resources),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("primary resource parallelism"));
+    }
+
+    #[test]
     fn resource_layouts_reject_duplicate_resource_ids() {
         let error = ResourceLayouts::new(
             LogicalResourceId(1),
@@ -936,6 +1111,7 @@ mod tests {
         assert!(unpacked.parallelism.is_none());
         assert!(unpacked.worker_data_placement.is_none());
         assert!(unpacked.resource_layouts.is_none());
+        assert!(unpacked.resource_parallelism.is_none());
     }
 
     #[test]
@@ -953,6 +1129,7 @@ mod tests {
         assert_eq!(unpacked.parallelism, Some(parallelism));
         assert!(unpacked.worker_data_placement.is_none());
         assert!(unpacked.resource_layouts.is_none());
+        assert!(unpacked.resource_parallelism.is_none());
     }
 
     #[test]

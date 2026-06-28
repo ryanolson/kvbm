@@ -14,8 +14,9 @@ pub use canonical::canonical_shape_from_worker;
 pub use handle::LayoutHandle;
 pub use metadata::{
     LogicalLayoutDescriptor, ParallelismDescriptor, RdmaLayoutDescriptors,
-    ResourceLayoutDescriptor, ResourceLayouts, SerializedLayout, WorkerAddress,
-    WorkerDataPlacement, select_transfer_canonical_layout, select_transfer_canonical_tier,
+    ResourceLayoutDescriptor, ResourceLayouts, ResourceParallelismDescriptor,
+    ResourceParallelismDescriptors, SerializedLayout, WorkerAddress, WorkerDataPlacement,
+    select_transfer_canonical_layout, select_transfer_canonical_tier,
 };
 pub use resources::{ResourceLayoutHandles, TierLayoutHandles};
 

@@ -3,12 +3,16 @@
 
 use super::*;
 
+mod resources;
+
 use crate::leader::dispatch::{PullRef, WirePullOptions, plan_pull};
 use crate::leader::parallelism::{
-    ParallelismTemplate, validate_remote_metadata, validate_replicated_remote_metadata,
+    ParallelismTemplate, ParallelismTemplateSet, validate_remote_metadata,
+    validate_replicated_remote_metadata,
 };
 use crate::object::ObjectBlockOps;
 use anyhow::{Context, Result};
+use kvbm_common::LogicalResourceId;
 use kvbm_physical::manager::{ParallelismDescriptor, WorkerDataPlacement};
 // velo event types used via fully-qualified paths (::velo::Event, ::velo::EventManager)
 use futures::future::BoxFuture;
@@ -74,12 +78,23 @@ pub struct SpmdParallelWorkers {
     /// blocks as tensor shards.
     remote_worker_data_placements: RwLock<HashMap<InstanceId, WorkerDataPlacement>>,
 
+    /// Per-resource peer descriptors and placement. These are authoritative
+    /// for mixed-resource models; the instance-only caches above remain the
+    /// selected primary compatibility view.
+    remote_resource_descriptors:
+        RwLock<HashMap<(InstanceId, LogicalResourceId), Vec<ParallelismDescriptor>>>,
+    remote_resource_placements:
+        RwLock<HashMap<(InstanceId, LogicalResourceId), WorkerDataPlacement>>,
+
     /// Local parallelism template for cross-leader compatibility gating
     /// in `connect_remote`. When unset (pre-AB-1a behaviour), gates are
     /// skipped and the import falls back to the same-rank zip path; when
     /// set, every remote rank must carry a stamped `ParallelismDescriptor`
     /// and the gates in [`validate_remote_metadata`] apply.
     local_template: RwLock<Option<ParallelismTemplate>>,
+
+    /// Resource-keyed templates for mixed MHA/MLA models.
+    local_template_set: RwLock<Option<ParallelismTemplateSet>>,
 
     /// Block-layout compatibility policy applied at `connect_remote`.
     ///
@@ -124,7 +139,10 @@ impl SpmdParallelWorkers {
             remote_tp_sizes: RwLock::new(HashMap::new()),
             remote_descriptors: RwLock::new(HashMap::new()),
             remote_worker_data_placements: RwLock::new(HashMap::new()),
+            remote_resource_descriptors: RwLock::new(HashMap::new()),
+            remote_resource_placements: RwLock::new(HashMap::new()),
             local_template: RwLock::new(None),
+            local_template_set: RwLock::new(None),
             block_layout_mode: kvbm_common::BlockLayoutMode::Operational,
             local_metadata: Vec::new(),
         }
@@ -162,6 +180,18 @@ impl SpmdParallelWorkers {
     /// reject incompatible peer metadata up front.
     pub fn with_local_template(self, template: ParallelismTemplate) -> Self {
         *self.local_template.write().unwrap() = Some(template);
+        self
+    }
+
+    /// Builder-style: install resource-keyed templates. The selected primary
+    /// also populates the compatibility template used by legacy paths.
+    pub fn with_local_template_set(self, templates: ParallelismTemplateSet) -> Self {
+        let primary = templates
+            .get(templates.primary())
+            .expect("validated template set retains its primary")
+            .clone();
+        *self.local_template.write().unwrap() = Some(primary);
+        *self.local_template_set.write().unwrap() = Some(templates);
         self
     }
 
@@ -358,6 +388,7 @@ impl WorkerTransfers for SpmdParallelWorkers {
         }
 
         let remote_placement = consistent_worker_data_placement(&unpacked)?;
+        let remote_resources = resources::collect_remote_resource_metadata(&unpacked)?;
 
         // Decide between strict (all-stamped) and legacy (same-rank
         // zip) paths via a pure helper so the routing decision is
@@ -366,8 +397,24 @@ impl WorkerTransfers for SpmdParallelWorkers {
         let strategy = decide_import_strategy(descriptor_count, unpacked.len());
 
         let local_template = self.local_template.read().unwrap().clone();
+        let local_template_set = self.local_template_set.read().unwrap().clone();
         if strategy == ImportStrategy::Strict {
-            if let Some(template) = local_template.as_ref() {
+            if let Some(templates) = local_template_set.as_ref() {
+                let remote_resources = remote_resources.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "connect_remote: local mixed-resource templates require peer resource parallelism metadata"
+                    )
+                })?;
+                resources::validate_remote_resource_metadata(
+                    templates,
+                    remote_resources,
+                    &unpacked,
+                    LogicalLayoutHandle::G2,
+                )
+                .context(
+                    "connect_remote: resource parallelism compatibility gate rejected peer metadata",
+                )?;
+            } else if let Some(template) = local_template.as_ref() {
                 let descriptors: Vec<_> = unpacked
                     .iter()
                     .map(|u| u.parallelism.clone().expect("strict path: all stamped"))
@@ -465,13 +512,14 @@ impl WorkerTransfers for SpmdParallelWorkers {
             ImportStrategy::Strict => {
                 for worker in &self.workers {
                     for u in &unpacked {
-                        let repacked = SerializedLayout::pack_with_resources(
+                        let repacked = SerializedLayout::pack_with_resource_parallelism(
                             u.worker_address.clone(),
                             u.nixl_metadata.clone(),
                             u.layouts.clone(),
                             u.parallelism.clone(),
                             u.worker_data_placement,
                             u.resource_layouts.clone(),
+                            u.resource_parallelism.clone(),
                         )?;
                         // Collect responses for downstream aggregation.
                         // `PhysicalWorker` returns synchronously-ready,
@@ -486,13 +534,14 @@ impl WorkerTransfers for SpmdParallelWorkers {
             }
             ImportStrategy::Legacy => {
                 for (worker, u) in self.workers.iter().zip(unpacked.iter()) {
-                    let repacked = SerializedLayout::pack_with_resources(
+                    let repacked = SerializedLayout::pack_with_resource_parallelism(
                         u.worker_address.clone(),
                         u.nixl_metadata.clone(),
                         u.layouts.clone(),
                         u.parallelism.clone(),
                         u.worker_data_placement,
                         u.resource_layouts.clone(),
+                        u.resource_parallelism.clone(),
                     )?;
                     import_responses.push(worker.import_metadata(repacked)?);
                 }
@@ -518,12 +567,22 @@ impl WorkerTransfers for SpmdParallelWorkers {
             let mut tp_map = self.remote_tp_sizes.write().unwrap();
             let mut desc_map = self.remote_descriptors.write().unwrap();
             let mut placement_map = self.remote_worker_data_placements.write().unwrap();
+            let mut resource_desc_map = self.remote_resource_descriptors.write().unwrap();
+            let mut resource_placement_map = self.remote_resource_placements.write().unwrap();
             tp_map.remove(&instance_id);
             desc_map.remove(&instance_id);
             placement_map.remove(&instance_id);
+            resource_desc_map.retain(|(peer, _), _| *peer != instance_id);
+            resource_placement_map.retain(|(peer, _), _| *peer != instance_id);
 
             if let Some(placement) = remote_placement {
                 placement_map.insert(instance_id, placement);
+            }
+            if let Some(resources) = remote_resources.as_ref() {
+                for (resource, descriptors, placement) in resources.iter() {
+                    resource_desc_map.insert((instance_id, resource), descriptors.to_vec());
+                    resource_placement_map.insert((instance_id, resource), placement);
+                }
             }
 
             match strategy {
@@ -1004,6 +1063,30 @@ impl ParallelWorkers for SpmdParallelWorkers {
             .get(&instance_id)
             .copied()
     }
+
+    fn remote_descriptors_for_resource(
+        &self,
+        instance_id: InstanceId,
+        resource: LogicalResourceId,
+    ) -> Option<Vec<ParallelismDescriptor>> {
+        self.remote_resource_descriptors
+            .read()
+            .unwrap()
+            .get(&(instance_id, resource))
+            .cloned()
+    }
+
+    fn remote_worker_data_placement_for_resource(
+        &self,
+        instance_id: InstanceId,
+        resource: LogicalResourceId,
+    ) -> Option<WorkerDataPlacement> {
+        self.remote_resource_placements
+            .read()
+            .unwrap()
+            .get(&(instance_id, resource))
+            .copied()
+    }
 }
 
 impl ObjectBlockOps for SpmdParallelWorkers {
@@ -1444,6 +1527,153 @@ mod tests {
     }
 
     #[test]
+    fn resource_accessors_return_each_resources_parallelism_and_placement() {
+        use ::velo::EventManager;
+        use kvbm_common::LogicalResourceId;
+        use kvbm_physical::manager::{
+            LogicalLayoutDescriptor, ResourceParallelismDescriptor, ResourceParallelismDescriptors,
+            SerializedLayout, WorkerAddress, WorkerDataPlacement,
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let spmd = SpmdParallelWorkers::new(
+            Vec::new(),
+            Arc::new(EventManager::local()),
+            rt.handle().clone(),
+        );
+        let instance_id = InstanceId::new_v4();
+        let primary = LogicalResourceId(2);
+        let mla = LogicalResourceId(5);
+        let metadata = (0..2)
+            .map(|rank| {
+                let resources = ResourceParallelismDescriptors::new(
+                    primary,
+                    vec![
+                        ResourceParallelismDescriptor::new(
+                            primary,
+                            descriptor(rank, 2),
+                            WorkerDataPlacement::TensorSharded,
+                        ),
+                        ResourceParallelismDescriptor::new(
+                            mla,
+                            descriptor(rank, 2),
+                            WorkerDataPlacement::ReplicatedG1StripedLower,
+                        ),
+                    ],
+                )
+                .unwrap();
+                let primary_descriptor = resources.get(primary).unwrap();
+                SerializedLayout::pack_with_resource_parallelism(
+                    WorkerAddress::new(rank as u64, format!("resource-{rank}")),
+                    Vec::new(),
+                    Vec::<LogicalLayoutDescriptor>::new(),
+                    Some(primary_descriptor.parallelism.clone()),
+                    Some(primary_descriptor.placement),
+                    None,
+                    Some(resources),
+                )
+                .unwrap()
+            })
+            .collect();
+
+        spmd.connect_remote(instance_id, metadata).unwrap();
+
+        let mla_descriptors =
+            <SpmdParallelWorkers as ParallelWorkers>::remote_descriptors_for_resource(
+                &spmd,
+                instance_id,
+                mla,
+            )
+            .expect("MLA resource descriptors must be cached");
+        assert_eq!(
+            mla_descriptors
+                .iter()
+                .map(|descriptor| descriptor.rank)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            <SpmdParallelWorkers as ParallelWorkers>::remote_worker_data_placement_for_resource(
+                &spmd,
+                instance_id,
+                primary,
+            ),
+            Some(WorkerDataPlacement::TensorSharded)
+        );
+        assert_eq!(
+            <SpmdParallelWorkers as ParallelWorkers>::remote_worker_data_placement_for_resource(
+                &spmd,
+                instance_id,
+                mla,
+            ),
+            Some(WorkerDataPlacement::ReplicatedG1StripedLower)
+        );
+    }
+
+    #[test]
+    fn connect_remote_rejects_resource_rank_remap() {
+        use ::velo::EventManager;
+        use kvbm_common::LogicalResourceId;
+        use kvbm_physical::manager::{
+            LogicalLayoutDescriptor, ResourceParallelismDescriptor, ResourceParallelismDescriptors,
+            SerializedLayout, WorkerAddress, WorkerDataPlacement,
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let spmd = SpmdParallelWorkers::new(
+            Vec::new(),
+            Arc::new(EventManager::local()),
+            rt.handle().clone(),
+        );
+        let primary = LogicalResourceId(2);
+        let secondary = LogicalResourceId(5);
+        let metadata = (0..2)
+            .map(|rank| {
+                let resources = ResourceParallelismDescriptors::new(
+                    primary,
+                    vec![
+                        ResourceParallelismDescriptor::new(
+                            primary,
+                            descriptor(rank, 2),
+                            WorkerDataPlacement::TensorSharded,
+                        ),
+                        ResourceParallelismDescriptor::new(
+                            secondary,
+                            descriptor(1 - rank, 2),
+                            WorkerDataPlacement::ReplicatedG1StripedLower,
+                        ),
+                    ],
+                )
+                .unwrap();
+                let primary_descriptor = resources.get(primary).unwrap();
+                SerializedLayout::pack_with_resource_parallelism(
+                    WorkerAddress::new(rank as u64, format!("rank-remap-{rank}")),
+                    Vec::new(),
+                    Vec::<LogicalLayoutDescriptor>::new(),
+                    Some(primary_descriptor.parallelism.clone()),
+                    Some(primary_descriptor.placement),
+                    None,
+                    Some(resources),
+                )
+                .unwrap()
+            })
+            .collect();
+
+        let error = match spmd.connect_remote(InstanceId::new_v4(), metadata) {
+            Ok(_) => panic!("resource rank remapping must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("physical rank"),
+            "expected physical-rank invariant error, got: {error:#}"
+        );
+    }
+
+    #[test]
     fn connect_remote_caches_consistent_replicated_placement() {
         use ::velo::EventManager;
         use kvbm_physical::manager::{
@@ -1665,6 +1895,116 @@ mod tests {
             Some(parallelism),
         )
         .unwrap()
+    }
+
+    fn build_resource_compat_worker(
+        worker_id: u64,
+        tp_size: usize,
+        rank: usize,
+        primary: LogicalResourceId,
+        mla: LogicalResourceId,
+    ) -> SerializedLayout {
+        use kvbm_physical::manager::{
+            ResourceLayoutDescriptor, ResourceLayouts, ResourceParallelismDescriptor,
+            ResourceParallelismDescriptors, WorkerDataPlacement,
+        };
+
+        let worker = build_compat_worker(
+            worker_id,
+            tp_size,
+            rank,
+            KvBlockLayout::OperationalNHD,
+            32,
+            64,
+            64,
+            16,
+            2,
+            2,
+        )
+        .unpack()
+        .unwrap();
+        let parallelism = worker.parallelism.clone().unwrap();
+        let resource_layouts = ResourceLayouts::new(
+            primary,
+            vec![
+                ResourceLayoutDescriptor::new(primary, worker.layouts.clone()),
+                ResourceLayoutDescriptor::new(mla, worker.layouts.clone()),
+            ],
+        )
+        .unwrap();
+        let resource_parallelism = ResourceParallelismDescriptors::new(
+            primary,
+            vec![
+                ResourceParallelismDescriptor::new(
+                    primary,
+                    parallelism.clone(),
+                    WorkerDataPlacement::TensorSharded,
+                ),
+                ResourceParallelismDescriptor::new(
+                    mla,
+                    parallelism.clone(),
+                    WorkerDataPlacement::ReplicatedG1StripedLower,
+                ),
+            ],
+        )
+        .unwrap();
+
+        SerializedLayout::pack_with_resource_parallelism(
+            worker.worker_address,
+            worker.nixl_metadata,
+            worker.layouts,
+            Some(parallelism),
+            Some(WorkerDataPlacement::TensorSharded),
+            Some(resource_layouts),
+            Some(resource_parallelism),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn connect_remote_accepts_mixed_resource_parallelism() {
+        use ::velo::EventManager;
+        use kvbm_config::ParallelismMode;
+
+        let primary = LogicalResourceId(2);
+        let mla = LogicalResourceId(5);
+        let tensor_template = ParallelismTemplate {
+            tp_size: 2,
+            pp_size: 1,
+            parallelism_mode: ParallelismMode::TensorParallel,
+            shard_axis: KvDim::HeadCount,
+            global_extents: vec![
+                (KvDim::Layer, 32),
+                (KvDim::Outer, 2),
+                (KvDim::Page, 16),
+                (KvDim::HeadCount, 64),
+                (KvDim::HeadSize, 64),
+            ],
+            num_layers: 32,
+            dtype_width_bytes: 2,
+        };
+        let mut mla_template = tensor_template.clone();
+        mla_template.parallelism_mode = ParallelismMode::ReplicatedData;
+        let templates = ParallelismTemplateSet::new(
+            primary,
+            vec![(primary, tensor_template), (mla, mla_template)],
+        )
+        .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let spmd = SpmdParallelWorkers::new(
+            Vec::new(),
+            Arc::new(EventManager::local()),
+            rt.handle().clone(),
+        )
+        .with_local_template_set(templates);
+        let metadata = (0..2)
+            .map(|rank| build_resource_compat_worker(rank as u64, 2, rank, primary, mla))
+            .collect();
+
+        spmd.connect_remote(InstanceId::new_v4(), metadata)
+            .expect("tensor-sharded and replicated resources should validate independently");
     }
 
     fn make_compat_spmd_with(

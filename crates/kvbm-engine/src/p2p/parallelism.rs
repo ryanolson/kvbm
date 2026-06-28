@@ -16,11 +16,18 @@
 //! AB-1a step 2: this module is the computation. Wiring into the
 //! `export_metadata_callback` is a separate step.
 
+mod resources;
+
+pub use resources::ParallelismTemplateSet;
+
 use anyhow::{Result, bail};
 use kvbm_common::{KvDim, LogicalLayoutHandle};
 use kvbm_config::ParallelismMode;
 use kvbm_physical::layout::LayoutConfig;
-use kvbm_physical::manager::{ParallelismDescriptor, SerializedLayout, WorkerDataPlacement};
+use kvbm_physical::manager::{
+    ParallelismDescriptor, ResourceParallelismDescriptor, ResourceParallelismDescriptors,
+    SerializedLayout, WorkerDataPlacement,
+};
 
 /// Per-leader parallelism template — the knobs the leader applies when
 /// stamping per-worker descriptors. PP is reserved (must be 1 for now).
@@ -565,17 +572,66 @@ pub fn stamp_parallelism_descriptors(
     for (rank, layout) in metadata.into_iter().enumerate() {
         let unpacked = layout.unpack()?;
         let descriptor = template.descriptor_for(rank)?;
-        let repacked = SerializedLayout::pack_with_resources(
+        let repacked = SerializedLayout::pack_with_resource_parallelism(
             unpacked.worker_address,
             unpacked.nixl_metadata,
             unpacked.layouts,
             Some(descriptor),
             Some(template.worker_data_placement()),
             unpacked.resource_layouts,
+            unpacked.resource_parallelism,
         )?;
         out.push(repacked);
     }
     Ok(out)
+}
+
+/// Stamp every logical resource with its own parallelism and placement.
+pub fn stamp_resource_parallelism_descriptors(
+    templates: &ParallelismTemplateSet,
+    metadata: Vec<SerializedLayout>,
+) -> Result<Vec<SerializedLayout>> {
+    let expected = templates.worker_count();
+    if metadata.len() != expected {
+        bail!(
+            "stamp_resource_parallelism_descriptors: metadata length {} does not match worker grid size {}",
+            metadata.len(),
+            expected
+        );
+    }
+
+    metadata
+        .into_iter()
+        .enumerate()
+        .map(|(rank, layout)| {
+            let unpacked = layout.unpack()?;
+            let descriptors = templates
+                .iter()
+                .map(|(resource, template)| {
+                    Ok(ResourceParallelismDescriptor::new(
+                        resource,
+                        template.descriptor_for(rank)?,
+                        template.worker_data_placement(),
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let descriptors =
+                ResourceParallelismDescriptors::new(templates.primary(), descriptors)?;
+            let primary = descriptors
+                .get(templates.primary())
+                .expect("validated resource descriptors retain their primary");
+
+            SerializedLayout::pack_with_resource_parallelism(
+                unpacked.worker_address,
+                unpacked.nixl_metadata,
+                unpacked.layouts,
+                Some(primary.parallelism.clone()),
+                Some(primary.placement),
+                unpacked.resource_layouts,
+                Some(descriptors),
+            )
+        })
+        .collect()
 }
 
 #[cfg(all(test, feature = "testing"))]
@@ -689,6 +745,84 @@ mod tests {
 
         assert_eq!(resources.primary(), LogicalResourceId(1));
         assert!(resources.get(LogicalResourceId(7)).is_some());
+    }
+
+    #[test]
+    fn stamps_mixed_parallelism_per_resource() {
+        let tensor = make_template(2);
+        let mut replicated = make_template(2);
+        replicated.parallelism_mode = ParallelismMode::ReplicatedData;
+        replicated.global_extents = vec![(KvDim::Layer, 24), (KvDim::HeadSize, 64)];
+        let templates = ParallelismTemplateSet::new(
+            LogicalResourceId(0),
+            vec![
+                (LogicalResourceId(0), tensor),
+                (LogicalResourceId(1), replicated),
+            ],
+        )
+        .unwrap();
+        let metadata = (0..2)
+            .map(|rank| {
+                let resources = ResourceLayouts::new(
+                    LogicalResourceId(0),
+                    vec![
+                        ResourceLayoutDescriptor::new(LogicalResourceId(0), Vec::new()),
+                        ResourceLayoutDescriptor::new(LogicalResourceId(1), Vec::new()),
+                    ],
+                )
+                .unwrap();
+                SerializedLayout::pack_with_resources(
+                    WorkerAddress::new(rank, format!("mixed-{rank}")),
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                    None,
+                    Some(resources),
+                )
+                .unwrap()
+            })
+            .collect();
+
+        let stamped = stamp_resource_parallelism_descriptors(&templates, metadata).unwrap();
+        for (rank, metadata) in stamped.iter().enumerate() {
+            let unpacked = metadata.unpack().unwrap();
+            assert_eq!(unpacked.parallelism.as_ref().unwrap().rank, rank);
+            assert_eq!(
+                unpacked.worker_data_placement,
+                Some(WorkerDataPlacement::TensorSharded)
+            );
+            let resources = unpacked.resource_parallelism.unwrap();
+            assert_eq!(
+                resources.get(LogicalResourceId(0)).unwrap().placement,
+                WorkerDataPlacement::TensorSharded
+            );
+            assert_eq!(
+                resources.get(LogicalResourceId(1)).unwrap().placement,
+                WorkerDataPlacement::ReplicatedG1StripedLower
+            );
+            assert_eq!(
+                resources
+                    .get(LogicalResourceId(1))
+                    .unwrap()
+                    .parallelism
+                    .rank,
+                rank
+            );
+        }
+    }
+
+    #[test]
+    fn resource_templates_require_one_worker_grid() {
+        let error = ParallelismTemplateSet::new(
+            LogicalResourceId(0),
+            vec![
+                (LogicalResourceId(0), make_template(2)),
+                (LogicalResourceId(1), make_template(4)),
+            ],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("worker grid"));
     }
 
     #[test]

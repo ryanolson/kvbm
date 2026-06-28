@@ -17,6 +17,7 @@ use super::{
 };
 use crate::object::ObjectBlockOps;
 use anyhow::Result;
+use kvbm_common::LogicalResourceId;
 use kvbm_physical::manager::{ParallelismDescriptor, WorkerDataPlacement};
 
 pub use spmd::SpmdParallelWorkers;
@@ -79,6 +80,26 @@ pub trait ParallelWorkers: WorkerTransfers + ObjectBlockOps + Send + Sync {
     /// Return the peer's explicit cache ownership strategy, when advertised.
     fn remote_worker_data_placement(&self, instance_id: InstanceId) -> Option<WorkerDataPlacement> {
         let _ = instance_id;
+        None
+    }
+
+    /// Return the peer descriptors for one logical KV resource.
+    fn remote_descriptors_for_resource(
+        &self,
+        instance_id: InstanceId,
+        resource: LogicalResourceId,
+    ) -> Option<Vec<ParallelismDescriptor>> {
+        let _ = (instance_id, resource);
+        None
+    }
+
+    /// Return the peer placement strategy for one logical KV resource.
+    fn remote_worker_data_placement_for_resource(
+        &self,
+        instance_id: InstanceId,
+        resource: LogicalResourceId,
+    ) -> Option<WorkerDataPlacement> {
+        let _ = (instance_id, resource);
         None
     }
 }
