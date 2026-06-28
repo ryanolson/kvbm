@@ -81,7 +81,7 @@ pub struct PullRef {
 /// original hash identity and global block IDs; this batch is only the
 /// physical placement projection used to issue RDMA.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ReplicatedPullBatch {
+struct ReplicatedPullBatch {
     pub local_rank: usize,
     pub remote_rank: usize,
     pub src_block_ids: Vec<BlockId>,
@@ -95,7 +95,7 @@ pub(crate) struct ReplicatedPullBatch {
 /// striped placement therefore resolves both ranks without a separate
 /// `SequenceHash -> worker` index. Results are grouped and sorted by
 /// `(local_rank, remote_rank)` for deterministic dispatch.
-pub(crate) fn plan_replicated_pull(
+fn plan_replicated_pull(
     local_world_size: usize,
     remote_world_size: usize,
     refs: &[PullRef],
@@ -121,6 +121,41 @@ pub(crate) fn plan_replicated_pull(
     }
 
     Ok(batches.into_values().collect())
+}
+
+/// Build full-block worker plans for replicated G1 / striped lower tiers.
+pub(crate) fn plan_replicated_worker_pulls(
+    local_world_size: usize,
+    remote_world_size: usize,
+    remote_instance: InstanceId,
+    source_layout: LogicalLayoutHandle,
+    dst_layout: LogicalLayoutHandle,
+    refs: &[PullRef],
+    opts: &WirePullOptions,
+) -> Result<Vec<(usize, WorkerPullPlan)>> {
+    plan_replicated_pull(local_world_size, remote_world_size, refs).map(|batches| {
+        batches
+            .into_iter()
+            .map(|batch| {
+                (
+                    batch.local_rank,
+                    WorkerPullPlan {
+                        remote_instance,
+                        source_layout,
+                        dst_layout,
+                        src_block_ids: batch.src_block_ids,
+                        dst_block_ids: batch.dst_block_ids,
+                        shards: vec![PullShard {
+                            remote_rank: batch.remote_rank,
+                            local_slice: LayoutSlice::full(),
+                            remote_slice: LayoutSlice::full(),
+                        }],
+                        options: opts.clone(),
+                    },
+                )
+            })
+            .collect()
+    })
 }
 
 /// Coordinate-space slice over a block tensor's local axes.
@@ -571,6 +606,43 @@ mod tests {
         assert!(plan_replicated_pull(0, 2, &[]).is_err());
         assert!(plan_replicated_pull(2, 0, &[]).is_err());
         assert!(plan_replicated_pull(2, 2, &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn replicated_worker_plans_use_full_blocks_and_owner_ranks() {
+        let remote_instance = instance();
+        let plans = plan_replicated_worker_pulls(
+            2,
+            3,
+            remote_instance,
+            LogicalLayoutHandle::G2,
+            LogicalLayoutHandle::G2,
+            &[
+                PullRef {
+                    src_block_id: 5,
+                    dst_block_id: 2,
+                },
+                PullRef {
+                    src_block_id: 7,
+                    dst_block_id: 3,
+                },
+            ],
+            &opts(),
+        )
+        .unwrap();
+
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].0, 0);
+        assert_eq!(plans[0].1.remote_instance, remote_instance);
+        assert_eq!(plans[0].1.src_block_ids, vec![1]);
+        assert_eq!(plans[0].1.dst_block_ids, vec![1]);
+        assert_eq!(plans[0].1.shards[0].remote_rank, 2);
+        assert!(plans[0].1.shards[0].local_slice.axes.is_empty());
+        assert!(plans[0].1.shards[0].remote_slice.axes.is_empty());
+        assert_eq!(plans[1].0, 1);
+        assert_eq!(plans[1].1.src_block_ids, vec![2]);
+        assert_eq!(plans[1].1.dst_block_ids, vec![1]);
+        assert_eq!(plans[1].1.shards[0].remote_rank, 1);
     }
 
     fn make_local(tp_size: usize) -> ParallelismTemplate {
