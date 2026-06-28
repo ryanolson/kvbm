@@ -13,7 +13,19 @@ use crate::{BlockManager, BlockMetadata};
 
 /// Stable model-local identity for one logical KV resource.
 #[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode, Serialize, Deserialize,
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Encode,
+    Decode,
+    Serialize,
+    Deserialize,
 )]
 pub struct LogicalResourceId(pub u16);
 

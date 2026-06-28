@@ -30,6 +30,7 @@ use crate::{
 };
 use kvbm_common::LogicalLayoutHandle;
 use kvbm_logical::{
+    BlockManagerSet, LogicalResourceId,
     blocks::{BlockRegistry, ImmutableBlock},
     manager::BlockManager,
 };
@@ -89,6 +90,12 @@ pub struct InstanceLeader {
 
     /// G2 (host memory) block manager (wrapped in Arc since BlockManager doesn't implement Clone).
     pub(crate) g2_manager: Arc<BlockManager<G2>>,
+
+    /// All model-owned G2 managers keyed by stable logical resource identity.
+    g2_managers: Arc<BlockManagerSet<G2>>,
+
+    /// Resource selected by compatibility APIs that do not yet carry an ID.
+    primary_g2_resource: LogicalResourceId,
 
     /// Optional G3 (disk) block manager
     pub(crate) g3_manager: Option<Arc<BlockManager<G3>>>,
@@ -247,6 +254,8 @@ pub struct InstanceLeaderBuilder {
     velo: Option<Arc<velo::Velo>>,
     registry: Option<BlockRegistry>,
     g2_manager: Option<Arc<BlockManager<G2>>>,
+    g2_managers: Option<Arc<BlockManagerSet<G2>>>,
+    primary_g2_resource: LogicalResourceId,
     g3_manager: Option<Arc<BlockManager<G3>>>,
     workers: Vec<Arc<dyn Worker>>,
     /// Direct injection of a [`ParallelWorkers`] implementation. When set,
@@ -315,6 +324,17 @@ impl InstanceLeaderBuilder {
 
     pub fn g2_manager(mut self, manager: Arc<BlockManager<G2>>) -> Self {
         self.g2_manager = Some(manager);
+        self
+    }
+
+    /// Install all G2 resource managers and select the compatibility primary.
+    pub fn g2_manager_set(
+        mut self,
+        managers: Arc<BlockManagerSet<G2>>,
+        primary: LogicalResourceId,
+    ) -> Self {
+        self.g2_managers = Some(managers);
+        self.primary_g2_resource = primary;
         self
     }
 
@@ -463,15 +483,18 @@ impl InstanceLeaderBuilder {
             None
         };
 
+        let resolved_g2 =
+            resolve_g2_managers(self.g2_manager, self.g2_managers, self.primary_g2_resource)?;
+
         Ok(InstanceLeader {
             messenger,
             velo: self.velo,
             registry: self
                 .registry
                 .ok_or_else(|| anyhow::anyhow!("block registry required"))?,
-            g2_manager: self
-                .g2_manager
-                .ok_or_else(|| anyhow::anyhow!("g2_manager required"))?,
+            g2_manager: resolved_g2.primary,
+            g2_managers: resolved_g2.all,
+            primary_g2_resource: self.primary_g2_resource,
             g3_manager: self.g3_manager,
             workers: self.workers,
             parallel_worker,
@@ -495,6 +518,41 @@ impl InstanceLeaderBuilder {
             remote_discovery: Arc::new(OnceLock::new()),
             min_remote_blocks: self.min_remote_blocks,
         })
+    }
+}
+
+struct ResolvedG2Managers {
+    primary: Arc<BlockManager<G2>>,
+    all: Arc<BlockManagerSet<G2>>,
+}
+
+fn resolve_g2_managers(
+    single: Option<Arc<BlockManager<G2>>>,
+    managers: Option<Arc<BlockManagerSet<G2>>>,
+    primary: LogicalResourceId,
+) -> Result<ResolvedG2Managers> {
+    match (single, managers) {
+        (Some(_), Some(_)) => {
+            anyhow::bail!("configure either g2_manager or g2_manager_set, not both")
+        }
+        (None, Some(managers)) => {
+            let selected = managers.get(primary).cloned().ok_or_else(|| {
+                anyhow::anyhow!("primary G2 resource {primary:?} is absent from the manager set")
+            })?;
+            Ok(ResolvedG2Managers {
+                primary: selected,
+                all: managers,
+            })
+        }
+        (Some(manager), None) => {
+            let mut managers = BlockManagerSet::new();
+            managers.insert(primary, Arc::clone(&manager))?;
+            Ok(ResolvedG2Managers {
+                primary: manager,
+                all: Arc::new(managers),
+            })
+        }
+        (None, None) => anyhow::bail!("g2_manager or g2_manager_set required"),
     }
 }
 
@@ -532,6 +590,15 @@ impl InstanceLeader {
     /// Get a reference to the G2 BlockManager.
     pub fn g2_manager(&self) -> &Arc<BlockManager<G2>> {
         &self.g2_manager
+    }
+
+    /// Get the G2 manager that owns a specific model resource.
+    pub fn g2_manager_for(&self, resource: LogicalResourceId) -> Option<&Arc<BlockManager<G2>>> {
+        self.g2_managers.get(resource)
+    }
+
+    pub fn primary_g2_resource(&self) -> LogicalResourceId {
+        self.primary_g2_resource
     }
 
     /// Get a reference to the optional G3 BlockManager.
@@ -2137,6 +2204,49 @@ mod tests {
             num_layers: 12,
             dtype_width_bytes: 2,
         }
+    }
+
+    fn g2_manager(block_count: usize) -> Arc<BlockManager<G2>> {
+        Arc::new(
+            TestManagerBuilder::<G2>::new()
+                .block_count(block_count)
+                .block_size(4)
+                .registry(BlockRegistry::new())
+                .build(),
+        )
+    }
+
+    #[test]
+    fn legacy_g2_manager_becomes_primary_resource_set() {
+        let manager = g2_manager(4);
+        let resolved =
+            resolve_g2_managers(Some(Arc::clone(&manager)), None, LogicalResourceId(7)).unwrap();
+
+        assert_eq!(resolved.primary.id(), manager.id());
+        assert_eq!(
+            resolved.all.get(LogicalResourceId(7)).unwrap().id(),
+            manager.id()
+        );
+    }
+
+    #[test]
+    fn explicit_g2_manager_set_selects_primary_and_rejects_ambiguity() {
+        let primary = g2_manager(4);
+        let secondary = g2_manager(8);
+        let mut managers = BlockManagerSet::new();
+        managers
+            .insert(LogicalResourceId(2), Arc::clone(&primary))
+            .unwrap();
+        managers
+            .insert(LogicalResourceId(9), Arc::clone(&secondary))
+            .unwrap();
+        let managers = Arc::new(managers);
+
+        let resolved =
+            resolve_g2_managers(None, Some(Arc::clone(&managers)), LogicalResourceId(9)).unwrap();
+        assert_eq!(resolved.primary.id(), secondary.id());
+        assert_eq!(resolved.all.len(), 2);
+        assert!(resolve_g2_managers(Some(primary), Some(managers), LogicalResourceId(2)).is_err());
     }
 
     /// Regression: `find_matches` must never report more matched blocks than it
