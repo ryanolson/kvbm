@@ -2303,6 +2303,7 @@ name = "kvbm-common"
 version = "1.2.0"
 dependencies = [
  "anyhow",
+ "bincode 2.0.1",
  "dynamo-tokens",
  "serde",
  "tracing",
@@ -2470,6 +2471,7 @@ dependencies = [
  "dynamo-tokens",
  "futures",
  "indexmap",
+ "kvbm-common",
  "kvbm-observability",
  "lru 0.16.4",
  "parking_lot",
