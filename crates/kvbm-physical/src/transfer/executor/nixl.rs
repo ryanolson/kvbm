@@ -291,7 +291,7 @@ impl<'a> NixlTransferBuilder<'a, Set, Set, Set, Set, Set> {
 
         // Build descriptor lists - use whole-block or layer-wise depending on layout
         if use_whole_block {
-            let bytes_per_block = src_layout.config().bytes_per_block();
+            let bytes_per_block = src_layout.bytes_per_block();
             tracing::debug!(
                 num_blocks = src_block_ids.len(),
                 bytes_per_block,

@@ -250,6 +250,64 @@ fn test_layer_separate_layout_serialization_roundtrip() {
 }
 
 #[test]
+fn ragged_layout_preserves_segment_sizes_and_addresses() {
+    let agent = NixlAgent::new("test-ragged-serialize").expect("failed to create agent");
+    let config = LayoutConfig::builder()
+        .num_blocks(3)
+        .num_layers(3)
+        .outer_dim(1)
+        .page_size(128)
+        .inner_dim(1)
+        .dtype_width_bytes(1)
+        .num_heads(Some(1))
+        .build()
+        .expect("failed to build config");
+    let bytes_per_layer_block = vec![16, 24, 40];
+    let bases = [0x10000, 0x20000, 0x30000];
+    let regions = bases
+        .iter()
+        .zip(&bytes_per_layer_block)
+        .map(|(&addr, &bytes)| {
+            Buffer::from_arc(TestMemoryRegion::new(
+                addr,
+                config.num_blocks * bytes,
+                StorageKind::System,
+            ) as Arc<dyn MemoryDescriptor>)
+        })
+        .collect();
+
+    let layout = PhysicalLayout::builder(agent)
+        .with_config(config.clone())
+        .ragged_layer_separate(bytes_per_layer_block.clone())
+        .with_registered_regions(regions)
+        .expect("failed to provide regions")
+        .build()
+        .expect("failed to build ragged layout");
+
+    assert_eq!(layout.layout().bytes_per_block(), 80);
+    assert_eq!(layout.layout().block_region_sizes(), bytes_per_layer_block);
+    for (layer, (&base, &bytes)) in bases.iter().zip(&bytes_per_layer_block).enumerate() {
+        let region = layout
+            .memory_region(2, layer, 0)
+            .expect("failed to resolve ragged segment");
+        assert_eq!(region.addr, base + 2 * bytes);
+        assert_eq!(region.size, bytes);
+    }
+
+    let descriptor = layout
+        .to_descriptor()
+        .expect("failed to serialize ragged layout");
+    let reconstructed =
+        PhysicalLayout::from_descriptor(descriptor).expect("failed to reconstruct ragged layout");
+    assert_eq!(reconstructed.layout().bytes_per_block(), 80);
+    let region = reconstructed
+        .memory_region(1, 1, 0)
+        .expect("failed to resolve reconstructed segment");
+    assert_eq!(region.addr, bases[1] + bytes_per_layer_block[1]);
+    assert_eq!(region.size, bytes_per_layer_block[1]);
+}
+
+#[test]
 fn test_memory_region_calculation_after_deserialization() {
     let agent = NixlAgent::new("test-memory-calc").expect("failed to create agent");
     let config = LayoutConfig::builder()

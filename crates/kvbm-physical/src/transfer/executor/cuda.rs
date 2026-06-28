@@ -108,14 +108,14 @@ pub fn execute_cuda_transfer(
     let log_inner_dim = src_layout.inner_dim();
     let log_dtype_width = src_layout.dtype_width_bytes();
     let log_fc_lw_num_pairs = log_num_blocks * log_num_layers * log_outer_dim;
-    let log_fc_lw_chunk_bytes = log_page_size * log_inner_dim * log_dtype_width;
-    let log_fc_lw_bytes_from_pairs = log_fc_lw_num_pairs * log_fc_lw_chunk_bytes;
-    let log_expected_bytes = log_num_blocks
-        * log_num_layers
-        * log_outer_dim
-        * log_page_size
-        * log_inner_dim
-        * log_dtype_width;
+    let region_sizes = src_layout.block_region_sizes();
+    let uniform_chunk_bytes = region_sizes
+        .first()
+        .copied()
+        .filter(|first| region_sizes.iter().all(|bytes| bytes == first));
+    let log_fc_lw_chunk_bytes = uniform_chunk_bytes.unwrap_or(0);
+    let log_fc_lw_bytes_from_pairs = log_num_blocks * src_layout.bytes_per_block();
+    let log_expected_bytes = log_fc_lw_bytes_from_pairs;
     tracing::info!(
         strategy = strategy_name,
         selected_path = if use_whole_block {
@@ -148,27 +148,47 @@ pub fn execute_cuda_transfer(
                 tracing::debug!(
                     strategy = strategy_name,
                     num_blocks = src_block_ids.len(),
-                    bytes_per_block = src_layout.config().bytes_per_block(),
+                    bytes_per_block = src_layout.bytes_per_block(),
                     "Using whole-block transfer (auto direction)"
                 );
                 execute_whole_block_cuda(src, dst, src_block_ids, dst_block_ids, stream.as_ref())?;
             } else {
-                // FC↔LW: Use vectorized_copy kernel directly
-                tracing::debug!(
-                    strategy = strategy_name,
-                    num_blocks = src_block_ids.len(),
-                    num_layers = layers.len(),
-                    "Using vectorized_copy for FC↔LW transfer"
-                );
-                execute_fc_lw_vectorized(
-                    src,
-                    dst,
-                    src_block_ids,
-                    dst_block_ids,
-                    layers.clone(),
-                    stream.as_ref(),
-                    ctx.cuda_pool(),
-                )?;
+                match uniform_chunk_bytes {
+                    Some(chunk_size) => {
+                        tracing::debug!(
+                            strategy = strategy_name,
+                            num_blocks = src_block_ids.len(),
+                            num_layers = layers.len(),
+                            "Using vectorized_copy for uniform layer-wise transfer"
+                        );
+                        execute_fc_lw_vectorized(
+                            src,
+                            dst,
+                            src_block_ids,
+                            dst_block_ids,
+                            layers.clone(),
+                            chunk_size,
+                            stream.as_ref(),
+                            ctx.cuda_pool(),
+                        )?;
+                    }
+                    None => {
+                        tracing::debug!(
+                            strategy = strategy_name,
+                            num_blocks = src_block_ids.len(),
+                            num_layers = layers.len(),
+                            "Using segmented CUDA copies for ragged layer-wise transfer"
+                        );
+                        execute_ragged_layer_wise_cuda(
+                            src,
+                            dst,
+                            src_block_ids,
+                            dst_block_ids,
+                            layers.clone(),
+                            stream.as_ref(),
+                        )?;
+                    }
+                }
             }
         }
         _ => {
@@ -214,7 +234,7 @@ fn execute_whole_block_cuda(
     dst_block_ids: &[BlockId],
     stream: &cudarc::driver::CudaStream,
 ) -> Result<()> {
-    let bytes_per_block = src.layout().config().bytes_per_block();
+    let bytes_per_block = src.layout().bytes_per_block();
     let num_blocks = src_block_ids.len();
 
     if num_blocks == 0 {
@@ -278,6 +298,7 @@ fn execute_fc_lw_vectorized(
     src_block_ids: &[BlockId],
     dst_block_ids: &[BlockId],
     layers: Range<usize>,
+    chunk_size: usize,
     stream: &CudaStream,
     pool: &CudaMemPool,
 ) -> Result<()> {
@@ -287,8 +308,6 @@ fn execute_fc_lw_vectorized(
     let src_layout = src.layout();
     let nl = layers.len();
     let no = src_layout.outer_dim();
-    let chunk_size =
-        src_layout.page_size() * src_layout.inner_dim() * src_layout.dtype_width_bytes();
     let num_blocks = src_block_ids.len();
     let total_chunks = num_blocks * nl * no;
 
@@ -364,5 +383,48 @@ fn execute_fc_lw_vectorized(
 
     pointers_transfered_event.synchronize()?;
 
+    Ok(())
+}
+
+fn execute_ragged_layer_wise_cuda(
+    src: &PhysicalLayout,
+    dst: &PhysicalLayout,
+    src_block_ids: &[BlockId],
+    dst_block_ids: &[BlockId],
+    layers: Range<usize>,
+    stream: &CudaStream,
+) -> Result<()> {
+    stream.context().bind_to_thread()?;
+    let outer_dim = src.layout().outer_dim();
+
+    for (&src_block_id, &dst_block_id) in src_block_ids.iter().zip(dst_block_ids.iter()) {
+        for layer_id in layers.clone() {
+            for outer_id in 0..outer_dim {
+                let src_region = src.memory_region(src_block_id, layer_id, outer_id)?;
+                let dst_region = dst.memory_region(dst_block_id, layer_id, outer_id)?;
+                if src_region.size() != dst_region.size() {
+                    return Err(anyhow!(
+                        "ragged CUDA region size mismatch at block=({src_block_id},{dst_block_id}), layer={layer_id}, outer={outer_id}: src={}, dst={}",
+                        src_region.size(),
+                        dst_region.size()
+                    ));
+                }
+                let status = unsafe {
+                    cudarc::runtime::sys::cudaMemcpyAsync(
+                        dst_region.addr() as *mut c_void,
+                        src_region.addr() as *const c_void,
+                        src_region.size(),
+                        cudarc::runtime::sys::cudaMemcpyKind::cudaMemcpyDefault,
+                        stream.cu_stream() as cudaStream_t,
+                    )
+                };
+                if status != cudarc::runtime::sys::cudaError::cudaSuccess {
+                    return Err(anyhow!(
+                        "ragged cudaMemcpyAsync failed for layer {layer_id}: {status:?}"
+                    ));
+                }
+            }
+        }
+    }
     Ok(())
 }

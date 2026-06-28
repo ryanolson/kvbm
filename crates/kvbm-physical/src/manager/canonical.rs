@@ -69,6 +69,7 @@ pub fn canonical_shape_from_worker(layout: &SerializedLayout) -> Result<Canonica
     let kv_block_layout = match &canonical_layout.layout.layout_type_details {
         LayoutTypeDetails::FullyContiguous(d) => d.kv_block_layout,
         LayoutTypeDetails::LayerSeparate(d) => d.kv_block_layout,
+        LayoutTypeDetails::RaggedLayerSeparate(d) => d.kv_block_layout,
     };
     if matches!(kv_block_layout, KvBlockLayout::Unknown) {
         bail!(

@@ -16,6 +16,7 @@ mod fully_contiguous;
 mod kv_block_layout;
 mod layer_separate;
 mod physical;
+mod ragged_layer_separate;
 mod serialize;
 mod validation;
 mod view;
@@ -36,8 +37,10 @@ pub use kvbm_kernels::TensorDataType;
 pub(crate) use layer_separate::LayerSeparateLayout;
 pub use physical::NixlMetadata;
 pub use physical::PhysicalLayout;
+pub(crate) use ragged_layer_separate::RaggedLayerSeparateLayout;
 pub use serialize::{
     BlockFormat, FullyContiguousDetails, LayerSeparateDetails, LayoutDescriptor, LayoutTypeDetails,
+    RaggedLayerSeparateDetails,
 };
 // `intersect_views` is exposed for planner / executor wiring (PR-5+).
 // Today only view.rs's tests call it directly.
@@ -113,6 +116,12 @@ pub trait Layout: Any + Send + Sync + std::fmt::Debug {
 
     /// Get the configuration for this layout.
     fn config(&self) -> &LayoutConfig;
+
+    /// Total bytes contributed by every physical segment of one logical block.
+    fn bytes_per_block(&self) -> usize;
+
+    /// Byte widths of the independently addressable regions in one block.
+    fn block_region_sizes(&self) -> Vec<usize>;
 
     /// Get the root memory regions backing this layout.
     ///

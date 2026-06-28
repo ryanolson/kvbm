@@ -90,7 +90,9 @@ pub fn build_layout_compat_payload_with_template(
             )
         })?;
 
-    let kv_layout = kv_block_layout_of(&canonical_layout.layout.layout_type_details);
+    let layout_details = &canonical_layout.layout.layout_type_details;
+    let kv_layout = kv_block_layout_of(layout_details);
+    let block_region_sizes = block_region_sizes_of(layout_details);
     if mode == BlockLayoutMode::Universal && matches!(kv_layout, KvBlockLayout::Unknown) {
         bail!(
             "build_layout_compat_payload: worker {} has KvBlockLayout::Unknown; \
@@ -137,6 +139,7 @@ pub fn build_layout_compat_payload_with_template(
         canonical,
         per_worker_layout: kv_layout,
         per_worker_config,
+        block_region_sizes,
         tp_size,
         pp_size,
     })
@@ -226,6 +229,16 @@ fn kv_block_layout_of(details: &LayoutTypeDetails) -> KvBlockLayout {
     match details {
         LayoutTypeDetails::FullyContiguous(d) => d.kv_block_layout,
         LayoutTypeDetails::LayerSeparate(d) => d.kv_block_layout,
+        LayoutTypeDetails::RaggedLayerSeparate(d) => d.kv_block_layout,
+    }
+}
+
+fn block_region_sizes_of(details: &LayoutTypeDetails) -> Option<Vec<usize>> {
+    match details {
+        LayoutTypeDetails::RaggedLayerSeparate(details) => {
+            Some(details.bytes_per_layer_block.clone())
+        }
+        LayoutTypeDetails::FullyContiguous(_) | LayoutTypeDetails::LayerSeparate(_) => None,
     }
 }
 

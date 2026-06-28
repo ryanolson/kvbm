@@ -44,6 +44,16 @@ pub struct LayerSeparateDetails {
     pub kv_block_layout: KvBlockLayout,
 }
 
+/// Details specific to a layer-separated layout with variable segment widths.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RaggedLayerSeparateDetails {
+    /// Bytes contributed to one logical block by each layer/segment.
+    pub bytes_per_layer_block: Vec<usize>,
+    /// Opaque layouts currently carry `Unknown` and use direct byte copies.
+    #[serde(default)]
+    pub kv_block_layout: KvBlockLayout,
+}
+
 /// Layout-type-specific details.
 ///
 /// This enum captures the information that differs between layout types
@@ -54,6 +64,8 @@ pub enum LayoutTypeDetails {
     FullyContiguous(FullyContiguousDetails),
     /// Layer-separate layout details
     LayerSeparate(LayerSeparateDetails),
+    /// Variable-width layer-separate layout details
+    RaggedLayerSeparate(RaggedLayerSeparateDetails),
 }
 
 /// Serializable representation of a physical layout.

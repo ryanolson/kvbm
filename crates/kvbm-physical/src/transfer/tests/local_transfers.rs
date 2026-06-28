@@ -40,6 +40,95 @@ pub(super) fn build_layout(
     }
 }
 
+fn build_ragged_layout(
+    agent: NixlAgent,
+    storage_kind: StorageKind,
+    num_blocks: usize,
+) -> PhysicalLayout {
+    let bytes_per_layer_block = vec![16, 24, 40];
+    let config = LayoutConfig::builder()
+        .num_blocks(num_blocks)
+        .num_layers(bytes_per_layer_block.len())
+        .outer_dim(1)
+        .page_size(128)
+        .inner_dim(1)
+        .dtype_width_bytes(1)
+        .num_heads(Some(1))
+        .build()
+        .unwrap();
+    let builder = PhysicalLayout::builder(agent)
+        .with_config(config)
+        .ragged_layer_separate(bytes_per_layer_block);
+    match storage_kind {
+        StorageKind::System => builder.allocate_system().build().unwrap(),
+        StorageKind::Pinned => builder.allocate_pinned(None).build().unwrap(),
+        StorageKind::Device(device_id) => builder.allocate_device(device_id).build().unwrap(),
+        StorageKind::Disk(_) => builder.allocate_disk(None).build().unwrap(),
+    }
+}
+
+#[tokio::test]
+async fn ragged_system_transfer_copies_every_segment() -> Result<()> {
+    storage_serial!(StorageKind::System, StorageKind::System);
+    let agent = build_agent_for_kinds(&[StorageKind::System])?;
+    let src = build_ragged_layout(agent.clone(), StorageKind::System, 4);
+    let dst = build_ragged_layout(agent.clone(), StorageKind::System, 4);
+    let src_blocks = vec![0, 1];
+    let dst_blocks = vec![2, 3];
+    let checksums = fill_and_checksum(&src, &src_blocks, FillPattern::Sequential)?;
+    let ctx = create_transfer_context(agent, None)?;
+
+    execute_transfer(
+        &src,
+        &dst,
+        &src_blocks,
+        &dst_blocks,
+        TransferOptionsInternal::default(),
+        ctx.context(),
+    )?
+    .await?;
+
+    verify_checksums_by_position(&checksums, &src_blocks, &dst, &dst_blocks)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn ragged_pinned_device_roundtrip_copies_every_segment() -> Result<()> {
+    skip_if_stubs_and_device!(StorageKind::Pinned, StorageKind::Device(0));
+    gpu_serial!();
+    let agent = build_agent_for_kinds(&[StorageKind::Pinned, StorageKind::Device(0)])?;
+    let src = build_ragged_layout(agent.clone(), StorageKind::Pinned, 4);
+    let device = build_ragged_layout(agent.clone(), StorageKind::Device(0), 4);
+    let dst = build_ragged_layout(agent.clone(), StorageKind::Pinned, 4);
+    let src_blocks = vec![0, 1];
+    let device_blocks = vec![1, 2];
+    let dst_blocks = vec![2, 3];
+    let checksums = fill_and_checksum(&src, &src_blocks, FillPattern::Sequential)?;
+    let ctx = create_transfer_context(agent, None)?;
+
+    execute_transfer(
+        &src,
+        &device,
+        &src_blocks,
+        &device_blocks,
+        TransferOptionsInternal::default(),
+        ctx.context(),
+    )?
+    .await?;
+    execute_transfer(
+        &device,
+        &dst,
+        &device_blocks,
+        &dst_blocks,
+        TransferOptionsInternal::default(),
+        ctx.context(),
+    )?
+    .await?;
+
+    verify_checksums_by_position(&checksums, &src_blocks, &dst, &dst_blocks)?;
+    Ok(())
+}
+
 /// Check if a transfer between two storage kinds requires GDS_MT (Device ↔ Disk direct).
 fn requires_gds(src_kind: StorageKind, dst_kind: StorageKind) -> bool {
     matches!(

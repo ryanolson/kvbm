@@ -398,6 +398,14 @@ impl Layout for FullyContiguousLayout {
         &self.config
     }
 
+    fn bytes_per_block(&self) -> usize {
+        self.block_stride
+    }
+
+    fn block_region_sizes(&self) -> Vec<usize> {
+        vec![self.region_size; self.config.num_layers * self.config.outer_dim]
+    }
+
     fn memory_regions(&self) -> &[Buffer] {
         std::slice::from_ref(&self.memory)
     }

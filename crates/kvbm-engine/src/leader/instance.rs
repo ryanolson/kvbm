@@ -1677,6 +1677,7 @@ fn layout_type_name(details: &kvbm_physical::layout::LayoutTypeDetails) -> &'sta
     match details {
         LayoutTypeDetails::FullyContiguous(_) => "fully_contiguous",
         LayoutTypeDetails::LayerSeparate(_) => "layer_separate",
+        LayoutTypeDetails::RaggedLayerSeparate(_) => "ragged_layer_separate",
     }
 }
 
@@ -1689,6 +1690,7 @@ fn kv_block_layout_name(details: &kvbm_physical::layout::LayoutTypeDetails) -> S
     let kbl: KvBlockLayout = match details {
         LayoutTypeDetails::FullyContiguous(d) => d.kv_block_layout,
         LayoutTypeDetails::LayerSeparate(d) => d.kv_block_layout,
+        LayoutTypeDetails::RaggedLayerSeparate(d) => d.kv_block_layout,
     };
     match kbl {
         KvBlockLayout::Universal => "universal".to_owned(),
