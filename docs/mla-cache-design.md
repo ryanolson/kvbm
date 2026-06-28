@@ -74,6 +74,10 @@ Implemented and tested:
 - A replicated transfer policy used by both RPC and intra-pass worker-engine transfers.
 - Leader-distributed, KVBM-owned NCCL bootstrap with a dedicated communicator
   and CUDA stream on every worker.
+- The replicated policy is a complete KVBM `Worker`, so in-process runtimes
+  such as Rhino can install the same owner routing directly in
+  `InstanceLeader`. KVBM can initialize an ordered in-process worker group
+  concurrently because `ncclCommInitRank` is collective.
 
 Not yet production-wired:
 

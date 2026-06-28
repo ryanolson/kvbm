@@ -52,6 +52,13 @@ impl StripedBlockPlacement {
             .ok_or_else(|| anyhow::anyhow!("striped block ID overflow"))
     }
 
+    /// Logical capacity contributed by equal physical storage on every rank.
+    pub fn global_capacity(self, per_rank_capacity: usize) -> Result<usize> {
+        per_rank_capacity
+            .checked_mul(self.world_size)
+            .ok_or_else(|| anyhow::anyhow!("striped block capacity overflow"))
+    }
+
     /// Physical slots required on one rank for a global logical capacity.
     pub fn local_capacity(self, global_capacity: usize, rank: usize) -> Result<usize> {
         self.validate_rank(rank)?;

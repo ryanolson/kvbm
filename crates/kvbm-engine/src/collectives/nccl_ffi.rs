@@ -142,34 +142,6 @@ fn loaded_nccl_path() -> Option<PathBuf> {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn path_deduplication_preserves_explicit_priority() {
-        let explicit = PathBuf::from("/explicit/libnccl.so.2");
-        let loaded = PathBuf::from("/loaded/libnccl.so.2");
-        let mut paths = vec![
-            explicit.clone(),
-            loaded.clone(),
-            explicit,
-            PathBuf::from("libnccl.so.2"),
-        ];
-
-        deduplicate_paths(&mut paths);
-
-        assert_eq!(
-            paths,
-            vec![
-                PathBuf::from("/explicit/libnccl.so.2"),
-                loaded,
-                PathBuf::from("libnccl.so.2"),
-            ]
-        );
-    }
-}
-
 pub(super) fn get_unique_id(output: *mut NcclUniqueId) -> Result<NcclResult> {
     Ok(unsafe { (library()?.get_unique_id)(output) })
 }
@@ -217,5 +189,33 @@ pub(super) fn error_string(result: NcclResult) -> String {
         unsafe { CStr::from_ptr(ptr) }
             .to_string_lossy()
             .into_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_deduplication_preserves_explicit_priority() {
+        let explicit = PathBuf::from("/explicit/libnccl.so.2");
+        let loaded = PathBuf::from("/loaded/libnccl.so.2");
+        let mut paths = vec![
+            explicit.clone(),
+            loaded.clone(),
+            explicit,
+            PathBuf::from("libnccl.so.2"),
+        ];
+
+        deduplicate_paths(&mut paths);
+
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/explicit/libnccl.so.2"),
+                loaded,
+                PathBuf::from("libnccl.so.2"),
+            ]
+        );
     }
 }

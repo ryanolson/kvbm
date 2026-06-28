@@ -50,7 +50,6 @@ use std::sync::Arc;
 /// # Trait Implementations
 ///
 /// - [`WorkerTransfers`]: Specialized routing based on source/destination tiers
-#[allow(dead_code)]
 pub struct ReplicatedDataWorker {
     inner: Arc<PhysicalWorker>,
     runtime: Arc<KvbmRuntime>,
@@ -59,7 +58,6 @@ pub struct ReplicatedDataWorker {
     rank: usize,
 }
 
-#[allow(dead_code)]
 impl ReplicatedDataWorker {
     /// Create a new ReplicatedDataWorker.
     ///
@@ -220,6 +218,55 @@ impl WorkerTransfers for ReplicatedDataWorker {
     }
 }
 
+impl Worker for ReplicatedDataWorker {
+    fn g1_handle(&self) -> Option<LayoutHandle> {
+        self.inner.g1_handle()
+    }
+
+    fn g2_handle(&self) -> Option<LayoutHandle> {
+        self.inner.g2_handle()
+    }
+
+    fn g3_handle(&self) -> Option<LayoutHandle> {
+        self.inner.g3_handle()
+    }
+
+    fn export_metadata(&self) -> Result<SerializedLayoutResponse> {
+        Worker::export_metadata(self.inner.as_ref())
+    }
+
+    fn import_metadata(&self, metadata: SerializedLayout) -> Result<ImportMetadataResponse> {
+        Worker::import_metadata(self.inner.as_ref(), metadata)
+    }
+}
+
+impl ObjectBlockOps for ReplicatedDataWorker {
+    fn has_blocks(
+        &self,
+        keys: Vec<SequenceHash>,
+    ) -> BoxFuture<'static, Vec<(SequenceHash, Option<usize>)>> {
+        ObjectBlockOps::has_blocks(self.inner.as_ref(), keys)
+    }
+
+    fn put_blocks(
+        &self,
+        keys: Vec<SequenceHash>,
+        src_layout: LogicalLayoutHandle,
+        block_ids: Vec<BlockId>,
+    ) -> BoxFuture<'static, Vec<Result<SequenceHash, SequenceHash>>> {
+        ObjectBlockOps::put_blocks(self.inner.as_ref(), keys, src_layout, block_ids)
+    }
+
+    fn get_blocks(
+        &self,
+        keys: Vec<SequenceHash>,
+        dst_layout: LogicalLayoutHandle,
+        block_ids: Vec<BlockId>,
+    ) -> BoxFuture<'static, Vec<Result<SequenceHash, SequenceHash>>> {
+        ObjectBlockOps::get_blocks(self.inner.as_ref(), keys, dst_layout, block_ids)
+    }
+}
+
 async fn execute_onboard_plans(
     inner: Arc<PhysicalWorker>,
     collective: Arc<dyn CollectiveOps>,
@@ -265,4 +312,16 @@ async fn execute_onboard_plans(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod trait_tests {
+    use super::*;
+
+    fn assert_worker<T: Worker>() {}
+
+    #[test]
+    fn replicated_data_policy_is_a_complete_worker() {
+        assert_worker::<ReplicatedDataWorker>();
+    }
 }

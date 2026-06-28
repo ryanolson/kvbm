@@ -259,6 +259,54 @@ impl NcclCollectives {
         )
     }
 
+    /// Initialize one KVBM-owned communicator per in-process physical worker.
+    ///
+    /// `ncclCommInitRank` is collective, so rank initialization runs
+    /// concurrently even when a host process owns every Rhino worker. Workers
+    /// must be supplied in rank order with contiguous rank IDs.
+    pub fn from_worker_group(
+        bootstrap: &NcclBootstrap,
+        workers: &[Arc<crate::worker::PhysicalWorker>],
+        runtime: &crate::KvbmRuntime,
+    ) -> Result<Vec<Arc<Self>>> {
+        ensure!(
+            workers.len() == bootstrap.world_size(),
+            "NCCL worker count {} does not match bootstrap world size {}",
+            workers.len(),
+            bootstrap.world_size()
+        );
+        for (rank, worker) in workers.iter().enumerate() {
+            ensure!(
+                worker.rank() == Some(rank),
+                "NCCL worker at position {rank} reports rank {:?}",
+                worker.rank()
+            );
+        }
+
+        std::thread::scope(|scope| {
+            let initializers = workers
+                .iter()
+                .map(|worker| {
+                    scope.spawn(move || {
+                        Self::from_worker_bootstrap(bootstrap, Arc::clone(worker), runtime)
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            initializers
+                .into_iter()
+                .enumerate()
+                .map(|(rank, initializer)| {
+                    initializer
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("NCCL rank {rank} initializer panicked"))?
+                        .with_context(|| format!("initialize KVBM NCCL rank {rank}"))
+                        .map(Arc::new)
+                })
+                .collect()
+        })
+    }
+
     // =========================================================================
     // Path B: Borrow existing communicator (production use with Python/C/C++)
     // =========================================================================

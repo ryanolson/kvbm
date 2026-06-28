@@ -35,3 +35,11 @@ fn rejects_invalid_world_or_rank() {
     assert!(placement.local_capacity(8, 2).is_err());
     assert!(placement.global(2, 0).is_err());
 }
+
+#[test]
+fn aggregates_equal_per_rank_capacity() {
+    let placement = StripedBlockPlacement::new(2).unwrap();
+
+    assert_eq!(placement.global_capacity(512).unwrap(), 1024);
+    assert!(placement.global_capacity(usize::MAX).is_err());
+}

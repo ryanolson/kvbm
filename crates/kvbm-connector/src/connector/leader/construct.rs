@@ -29,6 +29,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use kvbm_common::placement::StripedBlockPlacement;
 use kvbm_engine::leader::{ConsolidatorParams, InstanceLeader};
 use kvbm_engine::object::{ObjectLockManager, create_lock_manager, create_object_client};
 use kvbm_engine::offload::{
@@ -744,9 +745,9 @@ fn logical_tier_block_count(
     }
     match parallelism {
         kvbm_config::ParallelismMode::TensorParallel => Ok(per_worker_blocks),
-        kvbm_config::ParallelismMode::ReplicatedData => per_worker_blocks
-            .checked_mul(worker_count)
-            .ok_or_else(|| anyhow!("replicated tier block capacity overflow")),
+        kvbm_config::ParallelismMode::ReplicatedData => {
+            StripedBlockPlacement::new(worker_count)?.global_capacity(per_worker_blocks)
+        }
     }
 }
 
