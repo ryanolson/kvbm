@@ -70,8 +70,8 @@ testing = [
 # Non-default so the CPU pre-merge job (`cargo test --all-targets`) skips them;
 # run them in the GPU job via `cargo test -p kvbm-connector --features testing-nixl`.
 testing-nixl = []
-# Gates NCCL-accelerated intra-pass layer-wise onboard (G2→G1 via cudarc).
-nccl = ["kvbm-engine/nccl"]
+# Enables the KVBM-owned NCCL communicator used for replicated MLA G1.
+nccl = ["kvbm-engine/collectives"]
 # Opt-in S3 object-storage integration tests against MinIO.
 # Forwards to kvbm-engine/s3 so the S3ObjectBlockClient surface is available.
 s3 = ["kvbm-engine/s3"]

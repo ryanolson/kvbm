@@ -2397,6 +2397,7 @@ dependencies = [
  "kvbm-physical",
  "kvbm-protocols",
  "kvbm-runtime",
+ "libloading 0.8.9",
  "oneshot",
  "parking_lot",
  "prometheus",

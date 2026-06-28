@@ -20,6 +20,10 @@ The fast local iteration loop for KVBM: iterate the eval without re-spawning vll
 - **--attach URL**: Skip the server shell entirely; run only the eval shell against a server already running at URL. Pairs with `KVBM_EXTERNAL_METRICS_PORT`.
 - **--enable-mla**: Set `KVBM_ENABLE_MLA=1` for MLA specs (DeepSeek-V2-Lite).
 
+Set `KVBM_MLA_MODEL_ID` to replace DeepSeek-V2-Lite with another compatible
+DeepSeek MLA model. For the smallest validated local path, prefer the monolithic
+`test_mla_smoke.py`; the decomposed flow targets the determinism matrix.
+
 ## Spec ID Reference
 
 Authoritative source: `_CACHE_RESET_SPECS` in `tests/kvbm_integration/test_determinism_agg.py`.

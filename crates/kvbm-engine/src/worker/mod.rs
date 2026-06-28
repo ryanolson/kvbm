@@ -9,6 +9,8 @@ mod protocol;
 pub mod velo;
 
 pub use coordinated::CoordinatedWorker;
+#[cfg(feature = "collectives")]
+pub use physical::ReplicatedDataWorker;
 pub use physical::{PhysicalWorker, PhysicalWorkerBuilder};
 
 /// Compatibility alias for [`PhysicalWorker`].

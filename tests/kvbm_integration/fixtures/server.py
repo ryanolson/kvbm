@@ -42,6 +42,7 @@ class KvbmModelConfig:
     """Describes a model and the vLLM serving flags needed for KVBM testing."""
 
     model_id: str
+    tensor_parallel_size: int = 1
     block_size: Optional[int] = None  # None = let vllm decide
     attention_backend: Optional[str] = None  # None = let vllm decide
     max_model_len: int = 8000
@@ -57,6 +58,10 @@ class KvbmModelConfig:
     def use_mla(self) -> bool:
         """True when the model uses Multi-head Latent Attention (e.g. TRITON_MLA)."""
         return self.attention_backend is not None and "MLA" in self.attention_backend
+
+    def __post_init__(self) -> None:
+        if self.tensor_parallel_size < 1:
+            raise ValueError("tensor_parallel_size must be at least 1")
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +178,8 @@ class KvbmServerSpec:
         """
         base = self.model_config.short_name
         parts = [self.onboard_mode]
+        if self.model_config.tensor_parallel_size != 1:
+            parts.append(f"tp{self.model_config.tensor_parallel_size}")
         if self.block_layout is not None:
             parts.append(f"g2{self.block_layout[:3]}")  # g2op | g2uni
         if self.prefer_fc is not None:
@@ -296,6 +303,14 @@ class KvbmServerManager:
         if self.model_config.attention_backend is not None:
             self.server_cmd.extend(
                 ["--attention-config.backend", self.model_config.attention_backend]
+            )
+
+        if self.model_config.tensor_parallel_size != 1:
+            self.server_cmd.extend(
+                [
+                    "--tensor-parallel-size",
+                    str(self.model_config.tensor_parallel_size),
+                ]
             )
 
         if self.gpu_cache_blocks is not None:

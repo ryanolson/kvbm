@@ -54,7 +54,7 @@ Leaders own block metadata and make placement decisions. Workers execute data tr
 - **`object/`** — `ObjectBlockOps` trait for G4 storage. S3 implementation with concurrent uploads/downloads. `ObjectLockManager` for distributed locking via conditional S3 PUTs.
 - **`runtime/`** — `KvbmRuntime` bundles tokio, Velo messenger, NixlAgent (RDMA), and EventManager. Built via `KvbmRuntimeBuilder` or quick constructors (`from_env_leader`, `from_env_worker`).
 - **`pubsub/`** — Publisher/Subscriber traits with NATS and in-memory stub implementations.
-- **`collectives/`** — `CollectiveOps` trait for multi-GPU sync. NCCL implementation and stub for testing. MLA pattern: only rank 0 needs G2/G3; others receive via broadcast.
+- **`collectives/`** — `CollectiveOps` trait for multi-GPU sync. NCCL implementation and stub for testing. MLA pattern: replicated G1, striped lower tiers, and owner-selected broadcast roots.
 - **`testing/`** — Feature-gated test utilities: `TestManagerBuilder`, `MessengerPair`, `TestSession`, `EventsPipelineFixture`, `MultiInstancePopulator`, `TestAgent`.
 
 ### Documentation

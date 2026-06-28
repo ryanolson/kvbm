@@ -5,7 +5,12 @@
 
 import pytest
 
-from .server import KvbmModelConfig, build_kv_transfer_config
+from .server import (
+    KvbmModelConfig,
+    KvbmServerManager,
+    KvbmServerSpec,
+    build_kv_transfer_config,
+)
 
 pytestmark = [
     pytest.mark.pre_merge,
@@ -83,3 +88,24 @@ def test_payload_has_required_worker_blocks(model_config: KvbmModelConfig) -> No
 def test_unknown_onboard_mode_raises(model_config: KvbmModelConfig) -> None:
     with pytest.raises(ValueError, match="unknown onboard_mode"):
         build_kv_transfer_config(model_config, onboard_mode="bogus")
+
+
+def test_tp2_spec_id_names_parallelism() -> None:
+    spec = KvbmServerSpec(
+        model_config=KvbmModelConfig(model_id="example/mla", tensor_parallel_size=2)
+    )
+
+    assert spec.id == "mla-intra-tp2"
+
+
+def test_tp2_server_command_enables_tensor_parallelism(tmp_path) -> None:
+    spec = KvbmServerSpec(
+        model_config=KvbmModelConfig(model_id="example/mla", tensor_parallel_size=2)
+    )
+    manager = KvbmServerManager(spec=spec, log_dir=tmp_path)
+
+    try:
+        flag = manager.server_cmd.index("--tensor-parallel-size")
+        assert manager.server_cmd[flag + 1] == "2"
+    finally:
+        manager.stop_server()

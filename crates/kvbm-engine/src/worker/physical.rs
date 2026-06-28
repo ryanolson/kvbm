@@ -133,6 +133,20 @@ pub struct PhysicalWorker {
     object_client: Option<Arc<dyn ObjectBlockOps>>,
 }
 
+#[cfg(feature = "collectives")]
+impl crate::collectives::LayoutResolver for PhysicalWorker {
+    fn resolve_layout(&self, logical: LogicalLayoutHandle) -> Result<PhysicalLayout> {
+        PhysicalWorker::resolve_layout(self, logical)
+    }
+}
+
+#[cfg(feature = "collectives")]
+impl crate::collectives::CudaEventRegistrar for PhysicalWorker {
+    fn register_cuda_event(&self, event: CudaEvent) -> TransferCompleteNotification {
+        self.manager.register_cuda_event(event)
+    }
+}
+
 impl PhysicalWorker {
     /// Create a new builder for PhysicalWorker.
     ///

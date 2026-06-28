@@ -1,0 +1,129 @@
+# MLA cache ownership and placement
+
+This document records the incremental design for making KVBM the logical and
+physical owner of Rhino's MLA KV cache. Narwhal decides which logical blocks are
+needed; KVBM owns their identities, lifetimes, tier placement, and transfers;
+Rhino supplies model tensors and executes attention.
+
+## Identity is separate from placement
+
+`SequenceHash` is the stable content identity used for matching and deduplication.
+It should not encode a worker rank or memory tier. A `BlockId` is an allocation
+handle within a logical tier. Physical placement translates that logical ID into
+a worker and a worker-local slot.
+
+For replicated MLA with tensor-parallel size `W`, G1 is replicated and G2 is
+striped:
+
+```text
+global G2 id = local slot * W + owner rank
+owner rank   = global G2 id % W
+local slot   = global G2 id / W
+```
+
+For TP=2, global G2 IDs `0, 1, 2, 3, 4` map to:
+
+| Global G2 ID | Owner | Local G2 slot |
+|---:|---:|---:|
+| 0 | 0 | 0 |
+| 1 | 1 | 0 |
+| 2 | 0 | 1 |
+| 3 | 1 | 1 |
+| 4 | 0 | 2 |
+
+Each process still allocates only its configured local G2 capacity. The logical
+G2 `BlockManager` exposes the aggregate capacity, so TP=2 has twice the deduplicated
+lower-tier capacity of one worker. G1 allocation must assign the same logical
+destination block IDs on every replica.
+
+## Transfer bookkeeping
+
+Offload takes paired `(replicated G1 ID, global G2 ID)` values. Each rank keeps
+only pairs whose G2 owner is that rank, translates the global G2 ID to its local
+slot, and performs those copies. Other G1 replicas do no work for those blocks.
+
+Onboard groups `(global G2 ID, replicated G1 ID)` pairs by owner. For each owner,
+in rank order:
+
+1. The owner copies its local G2 slots into its G1 destination IDs.
+2. Every rank enters the same broadcast with that owner as the root.
+3. The next owner batch starts only after the prior batch completes.
+
+The rank ordering is deliberately conservative. It prevents mismatched collective
+call order across processes. Pipelining can be added after the contract is covered
+by multi-process tests.
+
+`CollectiveOps` is the transport seam. NCCL is the first practical implementation.
+NIXL can implement the same contract. Direct `cudaMemcpyAsync` across worker
+processes requires CUDA IPC/peer access plus explicit handle and lifetime
+management; it is not an ordinary same-process device-to-device copy.
+
+The connector uses a KVBM-owned NCCL communicator rather than borrowing vLLM's
+model-parallel communicator. This isolates collective ordering: attention
+all-reduces cannot interleave differently with cache broadcasts across ranks.
+The leader generates one NCCL ID and distributes it with worker initialization.
+
+## Current implementation boundary
+
+Implemented and tested:
+
+- TP=1 DeepSeek MLA registration with `[Block, Page, HeadSize]` and no head axis.
+- TP=1 G1↔G2 offload/onboard using `v2ray/DeepSeek-V3-1B-Test`.
+- Global-to-striped lower-tier placement and aggregate logical capacity.
+- Owner-only offload planning and dynamic-root onboard planning.
+- A replicated transfer policy used by both RPC and intra-pass worker-engine transfers.
+- Leader-distributed, KVBM-owned NCCL bootstrap with a dedicated communicator
+  and CUDA stream on every worker.
+
+Not yet production-wired:
+
+- A TP=2 multi-process MLA end-to-end test exists, but has not yet been run on
+  a two-GPU host.
+- Replicated remote-search transfers and G2↔G3 placement.
+- Pipelined per-layer replicated onboard; the first implementation completes
+  replicated onboard before model execution for correctness.
+
+Until those items are complete, `ReplicatedData` must not be described as a
+working TP>1 connector mode.
+
+## Progression to hybrid MLA
+
+The implementation order is:
+
+1. Basic TP=1 MLA: detect MLA, register the latent-cache dimensions, and prove
+   local tier movement.
+2. Basic TP>1 MLA: replicated G1, striped/deduplicated G2, owner copies, and
+   broadcast reload.
+3. Hybrid models: classify cache regions by attention and retention behavior,
+   then compose managers without erasing those semantics.
+
+Hybrid support should be expressed as typed resources rather than one generic
+pool with flags. A model registration should produce a cache schema whose regions
+carry at least their layout, replication/sharding mode, and retention policy.
+Narwhal can then schedule against aggregate resource capacities while KVBM keeps
+RAII ownership of each region's blocks.
+
+## Sliding-window retention TODO
+
+Eviction and offload are different decisions. A G1 block can be:
+
+- **mirrored**: already present in G2, so G1 eviction requires no copy;
+- **moved**: worth retaining, but a G2 copy must be created before releasing G1;
+- **dropped**: outside the model's useful window and safe to recompute or discard.
+
+KVBM's existing inactive-pool eviction policies choose a victim, but they do not
+yet encode model-aware sliding-window retention or select among these actions.
+Add a policy layer that consumes block position/lineage, attention-region class,
+window bounds, reuse/frequency, and current tier residency. Its output should be
+an explicit `Mirror`, `Move`, or `Drop` action. The initial mirror target can be
+configurable (for example 10–25% of G1), but policy and transfer execution should
+remain separate and independently testable.
+
+## Deferred remote-search direction
+
+Remote search currently follows requester-driven pull/RDMA GET semantics, which
+requires the requester to know the owner and remote source layout. A future
+push/PUT session may be a better fit for replicated MLA: the requester supplies
+destination IDs/addresses and owners push their shards, followed by local
+replication. Do not change this protocol until TP=1 and local TP>1 ownership are
+stable; the placement contract above should be reusable by either transport.

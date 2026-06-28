@@ -33,13 +33,13 @@ pub enum ParallelismMode {
 
     /// Replicated data: all workers have full KV blocks (MLA scenario).
     ///
-    /// In MLA (Multi-head Latent Attention) architectures, KV blocks are
-    /// replicated rather than sharded. Only rank 0 has G2/G3 storage;
-    /// data is broadcast to other ranks after loading to G1.
+    /// In MLA (Multi-head Latent Attention) architectures, G1 KV blocks are
+    /// replicated rather than sharded. Every rank contributes a disjoint
+    /// stripe of canonical G2/G3 blocks. On load, the owning rank restores a
+    /// block to G1 and broadcasts it to the other ranks.
     ///
-    /// This reduces storage requirements on non-rank-0 workers and is
-    /// suitable when the model's KV representation is the same across
-    /// all attention heads.
+    /// This makes aggregate lower-tier capacity scale with worker count while
+    /// storing only one lower-tier copy of each logical block.
     ReplicatedData,
 }
 
@@ -207,7 +207,7 @@ pub struct CacheConfig {
     /// Parallelism mode for distributed workers.
     ///
     /// - `TensorParallel` (default): Each worker has a shard of each KV block
-    /// - `ReplicatedData`: Only rank 0 has G2/G3; data is broadcast on load
+    /// - `ReplicatedData`: G1 is replicated; G2/G3 are striped by block
     ///
     /// Can be set via env var: `KVBM_CACHE_PARALLELISM=tensor_parallel|replicated_data`
     #[serde(default)]

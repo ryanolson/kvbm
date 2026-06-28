@@ -3,54 +3,60 @@
 
 //! Replicated data worker for MLA (Multi-head Latent Attention) scenarios.
 //!
-//! In MLA architectures, KV blocks are replicated across all workers rather than
-//! sharded. This means only rank 0 needs G2/G3 storage - other ranks receive
-//! data via broadcast from rank 0 after it loads from G2/G3.
+//! In MLA architectures, G1 KV blocks are replicated across all workers rather
+//! than sharded. Lower tiers are striped across the worker group so each logical
+//! block has exactly one lower-tier owner.
 //!
 //! # Architecture
 //!
 //! ```text
-//! Rank 0:   G3 (disk) ←→ G2 (host) ←→ G1 (GPU) ───broadcast──→ Other ranks G1
-//! Rank 1-N: [no G2/G3]                G1 (GPU) ←──────────────────────┘
+//! Global G2 block N ──→ owner = N % world_size, local = N / world_size
+//! Owner G2          ──→ owner G1 ───broadcast(root=owner)──→ every G1 replica
 //! ```
 //!
 //! # Transfer Semantics
 //!
 //! | Operation | Behavior |
 //! |-----------|----------|
-//! | G2/G3 → G1 (onboard) | Rank 0 transfers, then broadcasts to all ranks |
-//! | G1 → G2/G3 (offload) | Rank 0 only (other ranks don't have G2/G3) |
-//! | G2 ↔ G3 | Rank 0 only |
+//! | G2 → G1 (onboard) | Each G2 owner transfers its batch, then broadcasts from that owner |
+//! | G1 → G2 (offload) | Each rank writes only the global G2 blocks it owns |
+//! | G2 ↔ G3 | Not yet supported by this worker |
 //! | G1 → G1 (local) | All ranks execute (data is replicated) |
+
+mod planner;
+
+use planner::ReplicatedTransferPlanner;
 
 use super::*;
 
 use crate::KvbmRuntime;
 use crate::collectives::CollectiveOps;
-use anyhow::Result;
+use anyhow::{Context, Result, bail, ensure};
 
 use std::sync::Arc;
 
 /// Replicated data worker for MLA scenarios.
 ///
-/// Only rank 0 has G2/G3 storage. When loading data to G1, rank 0 transfers
-/// from G2/G3 and then broadcasts to all other ranks via collective operations.
+/// G1 is replicated on every rank while G2 is striped across ranks. When loading
+/// data to G1, each G2 owner transfers its local batch and broadcasts that batch
+/// to the same G1 block IDs on every other rank.
 ///
 /// # Requirements
 ///
-/// - Workers must be initialized such that only rank 0 has G2/G3 handles
+/// - Every worker must have equal-sized local G2 storage
+/// - Replicated G1 allocators must assign the same destination IDs on every rank
 /// - A [`CollectiveOps`] implementation must be provided for broadcasting
 ///
 /// # Trait Implementations
 ///
 /// - [`WorkerTransfers`]: Specialized routing based on source/destination tiers
-/// - [`ParallelWorker`]: Delegates to inner SpmdWorker
-/// - [`ObjectBlockOps`]: Routes to rank 0 only (it has the G2 layout for resolution)
 #[allow(dead_code)]
 pub struct ReplicatedDataWorker {
     inner: Arc<PhysicalWorker>,
     runtime: Arc<KvbmRuntime>,
     collective: Arc<dyn CollectiveOps>,
+    planner: ReplicatedTransferPlanner,
+    rank: usize,
 }
 
 #[allow(dead_code)]
@@ -58,26 +64,31 @@ impl ReplicatedDataWorker {
     /// Create a new ReplicatedDataWorker.
     ///
     /// # Arguments
-    /// * `workers` - The underlying workers (one per rank). Only workers[0] should have G2/G3.
-    /// * `events` - The event system for aggregating completion notifications
-    /// * `runtime` - The tokio runtime handle for spawning aggregation tasks
+    /// * `worker` - The rank-local physical worker with G1 and G2 layouts
+    /// * `runtime` - Runtime used to sequence owner copies and collectives
     /// * `collective` - The collective ops implementation for broadcasting
-    ///
-    /// # Panics
-    ///
-    /// Debug builds will panic if workers.len() < 1.
     pub fn new(
-        worker: Arc<PhysicalWorker>, // perhaps use a trait to abstract this
+        worker: Arc<PhysicalWorker>,
         runtime: Arc<KvbmRuntime>,
         collective: Arc<dyn CollectiveOps>,
-    ) -> Self {
-        // todo: ensure worker has a rank
+    ) -> Result<Self> {
+        let rank = worker
+            .rank()
+            .context("replicated data worker requires a physical worker rank")?;
+        ensure!(
+            rank == collective.rank(),
+            "physical worker rank {rank} does not match collective rank {}",
+            collective.rank()
+        );
+        let planner = ReplicatedTransferPlanner::new(collective.world_size())?;
 
-        Self {
+        Ok(Self {
             inner: worker,
             runtime,
             collective,
-        }
+            planner,
+            rank,
+        })
     }
 
     /// Get access to the underlying SpmdWorker.
@@ -87,18 +98,7 @@ impl ReplicatedDataWorker {
 
     /// Get the rank of the underlying worker.
     pub fn rank(&self) -> usize {
-        self.inner.rank().expect("Worker must have a rank")
-    }
-
-    #[expect(unused_variables)]
-    fn broadcast(
-        &self,
-        xfer_completion: TransferCompleteNotification,
-        dst: LogicalLayoutHandle,
-        dst_block_ids: Arc<[BlockId]>,
-        options: kvbm_physical::transfer::TransferOptions,
-    ) -> Result<TransferCompleteNotification> {
-        unimplemented!()
+        self.rank
     }
 }
 
@@ -111,38 +111,63 @@ impl WorkerTransfers for ReplicatedDataWorker {
         dst_block_ids: Arc<[BlockId]>,
         options: kvbm_physical::transfer::TransferOptions,
     ) -> Result<TransferCompleteNotification> {
-        let is_rank0 = self.rank() == 0;
-        let use_bcast = dst == LogicalLayoutHandle::G1;
+        match (src, dst) {
+            (LogicalLayoutHandle::G1, LogicalLayoutHandle::G1) => self
+                .inner
+                .execute_local_transfer(src, dst, src_block_ids, dst_block_ids, options),
+            (LogicalLayoutHandle::G1, LogicalLayoutHandle::G2) => {
+                let plan = self.planner.plan_offload(
+                    self.rank(),
+                    src_block_ids.as_ref(),
+                    dst_block_ids.as_ref(),
+                )?;
+                if plan.g1_block_ids().is_empty() {
+                    return Ok(TransferCompleteNotification::completed());
+                }
 
-        if src == LogicalLayoutHandle::G1 && dst == LogicalLayoutHandle::G1 {
-            return self.inner.execute_local_transfer(
-                src,
-                dst,
-                src_block_ids,
-                dst_block_ids.clone(),
-                options,
-            );
-        }
-
-        if !is_rank0 && !use_bcast {
-            Ok(TransferCompleteNotification::completed())
-        } else if is_rank0 {
-            let xfer_completion = self.inner.execute_local_transfer(
-                src,
-                dst,
-                src_block_ids,
-                dst_block_ids.clone(),
-                options.clone(),
-            )?;
-
-            if use_bcast {
-                self.broadcast(xfer_completion, dst, dst_block_ids, options)
-            } else {
-                Ok(xfer_completion)
+                self.inner.execute_local_transfer(
+                    src,
+                    dst,
+                    Arc::from(plan.g1_block_ids()),
+                    Arc::from(plan.local_g2_block_ids()),
+                    options,
+                )
             }
-        } else {
-            let xfer_completion = TransferCompleteNotification::completed();
-            self.broadcast(xfer_completion, dst, dst_block_ids, options)
+            (LogicalLayoutHandle::G2, LogicalLayoutHandle::G1) => {
+                let plans = self
+                    .planner
+                    .plan_onboard(src_block_ids.as_ref(), dst_block_ids.as_ref())?;
+                if plans.is_empty() {
+                    return Ok(TransferCompleteNotification::completed());
+                }
+
+                let event_system = self.runtime.event_system();
+                let event = event_system.new_event()?;
+                let awaiter = event_system.awaiter(event.handle())?;
+                let inner = Arc::clone(&self.inner);
+                let collective = Arc::clone(&self.collective);
+                let rank = self.rank();
+                let layer_range = options.layer_range.clone();
+
+                self.runtime.tokio().spawn(async move {
+                    let result =
+                        execute_onboard_plans(inner, collective, rank, plans, options, layer_range)
+                            .await;
+                    match result {
+                        Ok(()) => {
+                            let _ = event.trigger();
+                        }
+                        Err(error) => {
+                            let _ = event.poison(error.to_string());
+                        }
+                    }
+                });
+
+                Ok(TransferCompleteNotification::from_awaiter(awaiter))
+            }
+            _ => bail!(
+                "replicated data worker does not yet support local transfer {src:?} -> {dst:?}"
+            ),
         }
     }
 
@@ -154,7 +179,7 @@ impl WorkerTransfers for ReplicatedDataWorker {
         dst_block_ids: Arc<[BlockId]>,
         options: kvbm_physical::transfer::TransferOptions,
     ) -> Result<TransferCompleteNotification> {
-        unimplemented!()
+        bail!("replicated data worker remote onboard is not yet implemented")
     }
 
     #[expect(unused_variables)]
@@ -165,7 +190,7 @@ impl WorkerTransfers for ReplicatedDataWorker {
         dst: RemoteDescriptor,
         options: kvbm_physical::transfer::TransferOptions,
     ) -> Result<TransferCompleteNotification> {
-        unimplemented!()
+        bail!("replicated data worker remote offload is not yet implemented")
     }
 
     fn connect_remote(
@@ -191,6 +216,53 @@ impl WorkerTransfers for ReplicatedDataWorker {
         dst_block_ids: Arc<[BlockId]>,
         options: kvbm_physical::transfer::TransferOptions,
     ) -> Result<TransferCompleteNotification> {
-        unimplemented!()
+        bail!("replicated data worker instance remote onboard is not yet implemented")
     }
+}
+
+async fn execute_onboard_plans(
+    inner: Arc<PhysicalWorker>,
+    collective: Arc<dyn CollectiveOps>,
+    rank: usize,
+    plans: Vec<planner::ReplicaOnboardPlan>,
+    options: kvbm_physical::transfer::TransferOptions,
+    layer_range: Option<std::ops::Range<usize>>,
+) -> Result<()> {
+    for plan in plans {
+        let g1_block_ids: Arc<[BlockId]> = Arc::from(plan.g1_block_ids());
+
+        if rank == plan.root_rank() {
+            inner
+                .execute_local_transfer(
+                    LogicalLayoutHandle::G2,
+                    LogicalLayoutHandle::G1,
+                    Arc::from(plan.local_g2_block_ids()),
+                    Arc::clone(&g1_block_ids),
+                    options.clone(),
+                )?
+                .await
+                .with_context(|| {
+                    format!("rank {rank} failed to load its striped G2 batch before broadcast")
+                })?;
+        }
+
+        collective
+            .broadcast(
+                plan.root_rank(),
+                LogicalLayoutHandle::G1,
+                LogicalLayoutHandle::G1,
+                g1_block_ids.as_ref(),
+                g1_block_ids.as_ref(),
+                layer_range.clone(),
+            )?
+            .await
+            .with_context(|| {
+                format!(
+                    "replicated G1 broadcast from rank {} failed",
+                    plan.root_rank()
+                )
+            })?;
+    }
+
+    Ok(())
 }

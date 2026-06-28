@@ -12,13 +12,14 @@
 //!
 //! # Architecture
 //!
-//! In MLA (Multi-head Latent Attention) scenarios, KV blocks are replicated across
-//! all workers rather than sharded. This means only rank 0 needs G2/G3 storage -
-//! other ranks receive data via broadcast from rank 0 after it loads from G2/G3.
+//! In MLA (Multi-head Latent Attention) scenarios, G1 KV blocks are replicated
+//! across workers while lower-tier blocks are striped across the worker group.
+//! The rank that owns a lower-tier block loads it, then broadcasts from a
+//! dynamically selected root.
 //!
 //! ```text
-//! Rank 0:   G3 (disk) ←→ G2 (host) ←→ G1 (GPU) ───broadcast──→ Other ranks G1
-//! Rank 1-N: [no G2/G3]                G1 (GPU) ←──────────────────────┘
+//! Global G2 block N ──→ owner = N % world_size
+//! Owner G2 ──→ owner G1 ───broadcast(root=owner)──→ every G1 replica
 //! ```
 //!
 //! # Example
@@ -30,6 +31,7 @@
 //!
 //! // Broadcast G1 blocks from rank 0 to all ranks
 //! let notification = collective.broadcast(
+//!     0,
 //!     LogicalLayoutHandle::G1,
 //!     LogicalLayoutHandle::G1,
 //!     &src_block_ids,
@@ -45,6 +47,8 @@ mod stub;
 mod bootstrap;
 #[cfg(feature = "nccl")]
 mod nccl;
+#[cfg(feature = "nccl")]
+mod nccl_ffi;
 
 pub use stub::StubCollectiveOps;
 
@@ -73,15 +77,16 @@ use kvbm_physical::transfer::TransferCompleteNotification;
 /// NCCL operations are inherently thread-safe when used correctly (one stream
 /// per communicator per thread).
 pub trait CollectiveOps: Send + Sync {
-    /// Broadcast blocks from rank 0 to all other ranks.
+    /// Broadcast blocks from the selected root to all other ranks.
     ///
     /// This operation transfers the specified blocks from the source layout on
-    /// rank 0 to the destination layout on all other ranks. Optionally, a layer
+    /// root rank to the destination layout on all other ranks. Optionally, a layer
     /// range can be specified to transfer only a subset of layers (for pipelined
     /// loading).
     ///
     /// # Arguments
-    /// * `src` - The source logical layout (typically G1 on rank 0)
+    /// * `root_rank` - Rank whose source blocks contain the canonical data
+    /// * `src` - The source logical layout (typically G1 on the selected root)
     /// * `dst` - The destination logical layout (typically G1 on all ranks)
     /// * `src_block_ids` - The block IDs to read from on the source
     /// * `dst_block_ids` - The block IDs to write to on the destination
@@ -98,6 +103,7 @@ pub trait CollectiveOps: Send + Sync {
     /// by the collective semantics of the underlying implementation.
     fn broadcast(
         &self,
+        root_rank: usize,
         src: LogicalLayoutHandle,
         dst: LogicalLayoutHandle,
         src_block_ids: &[BlockId],

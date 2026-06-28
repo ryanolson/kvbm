@@ -626,17 +626,15 @@ impl TransferManager {
         self.context.d2h_stream()
     }
 
-    /// Get the CUDA context (for testing only).
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) fn cuda_context(&self) -> &std::sync::Arc<cudarc::driver::CudaContext> {
+    /// Get the CUDA context used by transfer and collective streams.
+    #[doc(hidden)]
+    pub fn cuda_context(&self) -> &std::sync::Arc<cudarc::driver::CudaContext> {
         self.context.cuda_context()
     }
 
-    /// Register a CUDA event for completion (for testing only).
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) fn register_cuda_event(
+    /// Register a CUDA event with the manager's shared completion poller.
+    #[doc(hidden)]
+    pub fn register_cuda_event(
         &self,
         event: cudarc::driver::CudaEvent,
     ) -> TransferCompleteNotification {

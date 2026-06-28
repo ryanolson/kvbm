@@ -2633,6 +2633,7 @@ dependencies = [
  "kvbm-protocols",
  "kvbm-runtime",
  "libc",
+ "libloading 0.8.9",
  "nvtx",
  "oneshot",
  "parking_lot",
