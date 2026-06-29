@@ -26,6 +26,8 @@ For the faster three-shell local iteration flow (deps / server / eval — skip t
 
 - **scope** (default: `quick`):
   - `quick` — Pre-merge marker (`-m "kvbm and pre_merge"`). 1 GPU. ~5 min.
+  - `mla-smoke` — Small TP=1 MLA registration and G1↔G2 round trip. 1 GPU. ~1 min after download.
+  - `mla-tp2` — Replicated MLA G1 with striped G2 and NCCL onboard broadcast. 2 GPUs. ~1 min after download.
   - `agg-intra` — connector intra-onboard determinism only. ~15 min.
   - `agg-inter` — connector inter-onboard determinism only. ~15 min.
   - `agg` — all connector (intra + inter) determinism specs. ~45 min.
@@ -63,6 +65,8 @@ PY
 | Scope | Pytest args | GPUs | Est. time |
 |---|---|---|---|
 | `quick` | `tests/kvbm_integration/ --continue-on-collection-errors -m "kvbm and pre_merge"` | 1 | ~5 min |
+| `mla-smoke` | `tests/kvbm_integration/test_mla_smoke.py` | 1 | ~1 min after download |
+| `mla-tp2` | `tests/kvbm_integration/test_mla_tp2.py` | 2 | ~1 min after download |
 | `agg-intra` | `tests/kvbm_integration/test_determinism_agg.py -k "intra"` | 1 | ~15 min / ~3 min |
 | `agg-inter` | `tests/kvbm_integration/test_determinism_agg.py -k "inter"` | 1 | ~15 min / ~3 min |
 | `agg` | `tests/kvbm_integration/test_determinism_agg.py` | 1 | ~45 min / ~10 min |
@@ -137,9 +141,12 @@ Timeouts:
 - single file/spec: 900s
 
 ```bash
-RUST_BACKTRACE=1 <env_vars> \
+PATH="$(pwd)/.sandbox/bin:$PATH" RUST_BACKTRACE=1 <env_vars> \
     timeout <timeout> .sandbox/bin/python -m pytest <pytest_args> -v --tb=short -s
 ```
+
+The `PATH` prefix is required because the integration fixture launches the
+`vllm` console script as a subprocess.
 
 Tests reuse host NATS/etcd on defaults (4222 / 2379) if reachable (aligned with `conftest.py:runtime_services`). Otherwise fixtures spawn them.
 
@@ -178,6 +185,8 @@ Stack health quick-check patterns (grep the newest per-test log under `/tmp/dyna
 | `test_kvbm_vllm_integration.py` | vLLM interface assumptions | kvbm, integration, gpu_0, vllm, nightly, pre_merge | 0 |
 | `test_consolidator_router_e2e.py` | consolidator + router E2E | kvbm, e2e, slow, gpu_1, pre_merge | 1 |
 | `test_determinism_agg.py` | cache_reset, concurrent load | e2e, slow, gpu_1, nightly | 1 |
+| `test_mla_smoke.py` | TP=1 MLA registration and G1↔G2 round trip | kvbm, e2e, gpu_1, pre_merge | 1 |
+| `test_mla_tp2.py` | Replicated G1, striped G2, and owner-root NCCL onboard | kvbm, e2e, gpu_2, pre_merge | 2 |
 | `test_determinism_disagg.py` | disagg determinism | kvbm, vllm, trtllm, e2e, slow, gpu_2, nightly | 2 |
 | `test_cuda_graph.py` | CUDA graph (TRT-LLM only) | kvbm, trtllm, nightly, gpu_1 | 1 |
 
@@ -194,6 +203,8 @@ Stack health quick-check patterns (grep the newest per-test log under `/tmp/dyna
 | `KVBM_NUM_ITERATIONS` | 15 | Number of iterations (concurrent test) |
 | `KVBM_REQUEST_DELAY` | 30 | Delay between iterations (seconds) |
 | `KVBM_ENABLE_MLA` | unset | Unlock DeepSeek-V2-Lite specs |
+| `KVBM_MLA_MODEL_ID` | DeepSeek-V2-Lite | Override the larger determinism-suite MLA model |
+| `KVBM_MLA_SMOKE_MODEL_ID` | v2ray/DeepSeek-V3-1B-Test | Override the small MLA smoke model |
 | `KVBM_SERVER_START_TIMEOUT` | 600 | Server startup timeout |
 | `KVBM_GPU_MEMORY_UTILIZATION` | per-spec | vllm memory fraction |
 | `KVBM_EXTERNAL_BASE_URL` | unset | External-attach mode (set by `run_server.sh`) |

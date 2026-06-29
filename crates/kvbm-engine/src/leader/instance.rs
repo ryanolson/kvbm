@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use std::sync::{Arc, OnceLock};
 
-use kvbm_config::DisaggregationRole;
+use kvbm_config::{DisaggregationRole, ParallelismMode};
 use kvbm_protocols::control::{
     ControlError, HostInfo, InstanceDescription, LayoutDescription, ModuleId, TierCapacity,
     TierKind, WorkerInfo,
@@ -30,13 +30,14 @@ use crate::{
 };
 use kvbm_common::LogicalLayoutHandle;
 use kvbm_logical::{
+    BlockManagerSet, LogicalResourceId,
     blocks::{BlockRegistry, ImmutableBlock},
     manager::BlockManager,
 };
 use kvbm_observability::SharedKvbmObservability;
 use kvbm_physical::transfer::{TransferCompleteNotification, TransferOptions};
 
-use kvbm_physical::manager::SerializedLayout;
+use kvbm_physical::manager::{SerializedLayout, WorkerDataPlacement};
 
 use super::{
     super::worker::Worker,
@@ -47,8 +48,14 @@ use super::{
     composer,
     consolidator::{ConsolidatorCell, ConsolidatorParams, new_cell, spawn_into_cell},
     discovery::RemoteDiscoveryHandle,
-    dispatch::{PullRef, WirePullOptions, plan_pull},
-    parallelism::{ParallelismTemplate, stamp_parallelism_descriptors},
+    dispatch::{
+        PullRef, WirePullOptions, plan_pull_for_resources,
+        plan_replicated_worker_pulls_for_resources,
+    },
+    parallelism::{
+        ParallelismTemplate, ParallelismTemplateSet, stamp_parallelism_descriptors,
+        stamp_resource_parallelism_descriptors,
+    },
     velo::{ExportMetadataCallback, VeloLeaderService},
 };
 
@@ -89,6 +96,12 @@ pub struct InstanceLeader {
 
     /// G2 (host memory) block manager (wrapped in Arc since BlockManager doesn't implement Clone).
     pub(crate) g2_manager: Arc<BlockManager<G2>>,
+
+    /// All model-owned G2 managers keyed by stable logical resource identity.
+    g2_managers: Arc<BlockManagerSet<G2>>,
+
+    /// Resource selected by compatibility APIs that do not yet carry an ID.
+    primary_g2_resource: LogicalResourceId,
 
     /// Optional G3 (disk) block manager
     pub(crate) g3_manager: Option<Arc<BlockManager<G3>>>,
@@ -140,6 +153,9 @@ pub struct InstanceLeader {
     /// metadata unchanged — preserving pre-AB-1a behaviour for callers
     /// that have not yet configured cross-parallelism.
     parallelism_template: Option<ParallelismTemplate>,
+
+    /// Resource-keyed templates for models with multiple KV representations.
+    parallelism_templates: Option<ParallelismTemplateSet>,
 
     /// The block-layout mode this leader operates in (Operational or
     /// Universal). Stored at build time from
@@ -247,6 +263,8 @@ pub struct InstanceLeaderBuilder {
     velo: Option<Arc<velo::Velo>>,
     registry: Option<BlockRegistry>,
     g2_manager: Option<Arc<BlockManager<G2>>>,
+    g2_managers: Option<Arc<BlockManagerSet<G2>>>,
+    primary_g2_resource: LogicalResourceId,
     g3_manager: Option<Arc<BlockManager<G3>>>,
     workers: Vec<Arc<dyn Worker>>,
     /// Direct injection of a [`ParallelWorkers`] implementation. When set,
@@ -256,6 +274,7 @@ pub struct InstanceLeaderBuilder {
     cached_worker_metadata: Option<Vec<SerializedLayout>>,
     object_client: Option<Arc<dyn ObjectBlockOps>>,
     parallelism_template: Option<ParallelismTemplate>,
+    parallelism_templates: Option<ParallelismTemplateSet>,
     role: Option<DisaggregationRole>,
     observability: Option<SharedKvbmObservability>,
     bypass_host: bool,
@@ -315,6 +334,17 @@ impl InstanceLeaderBuilder {
 
     pub fn g2_manager(mut self, manager: Arc<BlockManager<G2>>) -> Self {
         self.g2_manager = Some(manager);
+        self
+    }
+
+    /// Install all G2 resource managers and select the compatibility primary.
+    pub fn g2_manager_set(
+        mut self,
+        managers: Arc<BlockManagerSet<G2>>,
+        primary: LogicalResourceId,
+    ) -> Self {
+        self.g2_managers = Some(managers);
+        self.primary_g2_resource = primary;
         self
     }
 
@@ -382,6 +412,13 @@ impl InstanceLeaderBuilder {
         self
     }
 
+    /// Set resource-keyed parallelism templates for a mixed-resource model.
+    /// Every template must describe the same physical worker grid.
+    pub fn parallelism_template_set(mut self, templates: ParallelismTemplateSet) -> Self {
+        self.parallelism_templates = Some(templates);
+        self
+    }
+
     /// Set the block-layout compatibility policy applied at
     /// `connect_remote`. Defaults to
     /// [`kvbm_common::BlockLayoutMode::Operational`] (strict per-worker
@@ -429,6 +466,24 @@ impl InstanceLeaderBuilder {
         // Get current tokio runtime handle
         let runtime = tokio::runtime::Handle::current();
 
+        anyhow::ensure!(
+            self.parallelism_template.is_none() || self.parallelism_templates.is_none(),
+            "configure either one parallelism template or a resource template set, not both"
+        );
+        if let Some(templates) = self.parallelism_templates.as_ref() {
+            anyhow::ensure!(
+                templates.primary() == self.primary_g2_resource,
+                "parallelism template primary {:?} does not match G2 manager primary {:?}",
+                templates.primary(),
+                self.primary_g2_resource
+            );
+        }
+        let primary_parallelism_template = self
+            .parallelism_templates
+            .as_ref()
+            .and_then(|templates| templates.get(templates.primary()).cloned())
+            .or_else(|| self.parallelism_template.clone());
+
         // // Validate at least one worker
         // if self.workers.is_empty() {
         //     anyhow::bail!("At least one worker required");
@@ -452,7 +507,9 @@ impl InstanceLeaderBuilder {
             let mut spmd =
                 SpmdParallelWorkers::new(self.workers.to_vec(), events.clone(), runtime.clone())
                     .with_block_layout_mode(self.block_layout_mode);
-            if let Some(template) = self.parallelism_template.clone() {
+            if let Some(templates) = self.parallelism_templates.clone() {
+                spmd = spmd.with_local_template_set(templates);
+            } else if let Some(template) = primary_parallelism_template.clone() {
                 spmd = spmd.with_local_template(template);
             }
             if let Some(metadata) = self.cached_worker_metadata.clone() {
@@ -463,15 +520,18 @@ impl InstanceLeaderBuilder {
             None
         };
 
+        let resolved_g2 =
+            resolve_g2_managers(self.g2_manager, self.g2_managers, self.primary_g2_resource)?;
+
         Ok(InstanceLeader {
             messenger,
             velo: self.velo,
             registry: self
                 .registry
                 .ok_or_else(|| anyhow::anyhow!("block registry required"))?,
-            g2_manager: self
-                .g2_manager
-                .ok_or_else(|| anyhow::anyhow!("g2_manager required"))?,
+            g2_manager: resolved_g2.primary,
+            g2_managers: resolved_g2.all,
+            primary_g2_resource: self.primary_g2_resource,
             g3_manager: self.g3_manager,
             workers: self.workers,
             parallel_worker,
@@ -480,7 +540,8 @@ impl InstanceLeaderBuilder {
             transport,
             remote_import_state: Arc::new(std::sync::Mutex::new(HashMap::new())),
             object_client: self.object_client,
-            parallelism_template: self.parallelism_template,
+            parallelism_template: primary_parallelism_template,
+            parallelism_templates: self.parallelism_templates,
             block_layout_mode: self.block_layout_mode,
             session_manager: SessionManager::with_default_watchdog(runtime),
             session_factory: Arc::new(OnceLock::new()),
@@ -495,6 +556,41 @@ impl InstanceLeaderBuilder {
             remote_discovery: Arc::new(OnceLock::new()),
             min_remote_blocks: self.min_remote_blocks,
         })
+    }
+}
+
+struct ResolvedG2Managers {
+    primary: Arc<BlockManager<G2>>,
+    all: Arc<BlockManagerSet<G2>>,
+}
+
+fn resolve_g2_managers(
+    single: Option<Arc<BlockManager<G2>>>,
+    managers: Option<Arc<BlockManagerSet<G2>>>,
+    primary: LogicalResourceId,
+) -> Result<ResolvedG2Managers> {
+    match (single, managers) {
+        (Some(_), Some(_)) => {
+            anyhow::bail!("configure either g2_manager or g2_manager_set, not both")
+        }
+        (None, Some(managers)) => {
+            let selected = managers.get(primary).cloned().ok_or_else(|| {
+                anyhow::anyhow!("primary G2 resource {primary:?} is absent from the manager set")
+            })?;
+            Ok(ResolvedG2Managers {
+                primary: selected,
+                all: managers,
+            })
+        }
+        (Some(manager), None) => {
+            let mut managers = BlockManagerSet::new();
+            managers.insert(primary, Arc::clone(&manager))?;
+            Ok(ResolvedG2Managers {
+                primary: manager,
+                all: Arc::new(managers),
+            })
+        }
+        (None, None) => anyhow::bail!("g2_manager or g2_manager_set required"),
     }
 }
 
@@ -532,6 +628,15 @@ impl InstanceLeader {
     /// Get a reference to the G2 BlockManager.
     pub fn g2_manager(&self) -> &Arc<BlockManager<G2>> {
         &self.g2_manager
+    }
+
+    /// Get the G2 manager that owns a specific model resource.
+    pub fn g2_manager_for(&self, resource: LogicalResourceId) -> Option<&Arc<BlockManager<G2>>> {
+        self.g2_managers.get(resource)
+    }
+
+    pub fn primary_g2_resource(&self) -> LogicalResourceId {
+        self.primary_g2_resource
     }
 
     /// Get a reference to the optional G3 BlockManager.
@@ -1077,9 +1182,10 @@ impl InstanceLeader {
             metadata
         };
 
-        match &self.parallelism_template {
-            Some(template) => stamp_parallelism_descriptors(template, raw),
-            None => Ok(raw),
+        match (&self.parallelism_templates, &self.parallelism_template) {
+            (Some(templates), _) => stamp_resource_parallelism_descriptors(templates, raw),
+            (None, Some(template)) => stamp_parallelism_descriptors(template, raw),
+            (None, None) => Ok(raw),
         }
     }
 
@@ -1397,6 +1503,21 @@ impl InstanceLeader {
         refs: Vec<PullRef>,
         opts: WirePullOptions,
     ) -> Result<()> {
+        self.rdma_pull_resource_with_opts(self.primary_g2_resource, remote_instance, refs, opts)
+            .await
+    }
+
+    /// Resource-aware RDMA pull into the matching local G2 manager.
+    pub async fn rdma_pull_resource_with_opts(
+        &self,
+        resource: LogicalResourceId,
+        remote_instance: InstanceId,
+        refs: Vec<PullRef>,
+        opts: WirePullOptions,
+    ) -> Result<()> {
+        if self.g2_manager_for(resource).is_none() {
+            anyhow::bail!("rdma_pull: no local G2 manager for resource {resource:?}");
+        }
         if refs.is_empty() {
             return Ok(());
         }
@@ -1412,20 +1533,41 @@ impl InstanceLeader {
         // direct-onboard path. `connect_remote`'s rank-count gate
         // enforces same-rank symmetry for them, so the per-worker
         // execute_remote_onboard fan-out is correct.
-        let Some(descriptors) = parallel_worker.remote_descriptors_for(remote_instance) else {
+        let descriptors = parallel_worker
+            .remote_descriptors_for_resource(remote_instance, resource)
+            .or_else(|| {
+                (resource == self.primary_g2_resource)
+                    .then(|| parallel_worker.remote_descriptors_for(remote_instance))
+                    .flatten()
+            });
+        let Some(descriptors) = descriptors else {
+            if resource != self.primary_g2_resource {
+                anyhow::bail!(
+                    "rdma_pull: non-primary resource {resource:?} requires stamped peer metadata"
+                );
+            }
             return self
                 .rdma_pull_legacy_fallback(parallel_worker.as_ref(), remote_instance, refs, opts)
                 .await;
         };
 
-        let template = self.parallelism_template.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "rdma_pull: peer {} has stamped descriptors but no local ParallelismTemplate \
-                 is configured; cross-parallelism transfers require \
-                 InstanceLeaderBuilder::parallelism_template(...)",
-                remote_instance
-            )
-        })?;
+        let template = self
+            .parallelism_templates
+            .as_ref()
+            .and_then(|templates| templates.get(resource).cloned())
+            .or_else(|| {
+                (resource == self.primary_g2_resource)
+                    .then(|| self.parallelism_template.clone())
+                    .flatten()
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "rdma_pull: peer {} has stamped descriptors for resource {:?} but no matching \
+                 local ParallelismTemplate is configured",
+                    remote_instance,
+                    resource
+                )
+            })?;
 
         // Coherence guard: same invariant the asymmetric branch of
         // SpmdParallelWorkers enforces. A template that disagrees with
@@ -1439,11 +1581,60 @@ impl InstanceLeader {
             );
         }
 
-        let plans = plan_pull(
+        let remote_placement = parallel_worker
+            .remote_worker_data_placement_for_resource(remote_instance, resource)
+            .or_else(|| {
+                (resource == self.primary_g2_resource)
+                    .then(|| parallel_worker.remote_worker_data_placement(remote_instance))
+                    .flatten()
+            });
+        match (template.parallelism_mode, remote_placement) {
+            (
+                ParallelismMode::ReplicatedData,
+                Some(WorkerDataPlacement::ReplicatedG1StripedLower),
+            ) => {
+                return self
+                    .rdma_pull_replicated(
+                        parallel_worker.as_ref(),
+                        resource,
+                        remote_instance,
+                        &descriptors,
+                        refs,
+                        opts,
+                    )
+                    .await;
+            }
+            (ParallelismMode::ReplicatedData, None) => {
+                anyhow::bail!(
+                    "rdma_pull: replicated local cache requires the peer to advertise \
+                     ReplicatedG1StripedLower placement; upgrade or restamp peer metadata"
+                );
+            }
+            (ParallelismMode::ReplicatedData, Some(other)) => {
+                anyhow::bail!(
+                    "rdma_pull: cache placement mismatch: local is replicated G1 / striped \
+                     lower tier, peer advertises {other:?}"
+                );
+            }
+            (
+                ParallelismMode::TensorParallel,
+                Some(WorkerDataPlacement::ReplicatedG1StripedLower),
+            ) => {
+                anyhow::bail!(
+                    "rdma_pull: cache placement mismatch: local is tensor-sharded, peer \
+                     advertises replicated G1 / striped lower tier"
+                );
+            }
+            (ParallelismMode::TensorParallel, _) => {}
+        }
+
+        let plans = plan_pull_for_resources(
             &template,
             &descriptors,
             remote_instance,
+            resource,
             LogicalLayoutHandle::G2,
+            resource,
             LogicalLayoutHandle::G2,
             &refs,
             &opts,
@@ -1464,6 +1655,54 @@ impl InstanceLeader {
                 anyhow::anyhow!(
                     "rdma_pull: plan_pull produced a plan for local_rank {local_rank} but only \
                      {} workers are registered",
+                    workers.len()
+                )
+            })?;
+            notifications.push(worker.execute_remote_pull_plan(plan)?);
+        }
+
+        let events = Arc::new(self.messenger.event_manager());
+        let aggregated = TransferCompleteNotification::aggregate(
+            notifications,
+            &events,
+            &tokio::runtime::Handle::current(),
+        )?;
+        aggregated.await?;
+        Ok(())
+    }
+
+    async fn rdma_pull_replicated(
+        &self,
+        parallel_worker: &dyn ParallelWorkers,
+        resource: LogicalResourceId,
+        remote_instance: InstanceId,
+        descriptors: &[kvbm_physical::manager::ParallelismDescriptor],
+        refs: Vec<PullRef>,
+        opts: WirePullOptions,
+    ) -> Result<()> {
+        let remote_world_size = descriptors
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("replicated pull has no remote descriptors"))?
+            .tp_size;
+        let plans = plan_replicated_worker_pulls_for_resources(
+            parallel_worker.worker_count(),
+            remote_world_size,
+            remote_instance,
+            resource,
+            LogicalLayoutHandle::G2,
+            resource,
+            LogicalLayoutHandle::G2,
+            &refs,
+            &opts,
+        )?;
+        let workers = parallel_worker.workers();
+        let mut notifications = Vec::with_capacity(plans.len());
+
+        for (local_rank, plan) in plans {
+            let worker = workers.get(local_rank).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "replicated pull selected local rank {} but only {} workers are registered",
+                    local_rank,
                     workers.len()
                 )
             })?;
@@ -1611,12 +1850,36 @@ impl InstanceLeader {
         dst_block_ids: Vec<BlockId>,
         options: TransferOptions,
     ) -> Result<TransferCompleteNotification> {
+        self.execute_local_transfer_for_resource(
+            self.primary_g2_resource,
+            src,
+            dst,
+            src_block_ids,
+            dst_block_ids,
+            options,
+        )
+    }
+
+    /// Execute a local transfer across all workers for one logical resource.
+    pub(crate) fn execute_local_transfer_for_resource(
+        &self,
+        resource: LogicalResourceId,
+        src: LogicalLayoutHandle,
+        dst: LogicalLayoutHandle,
+        src_block_ids: Vec<BlockId>,
+        dst_block_ids: Vec<BlockId>,
+        options: TransferOptions,
+    ) -> Result<TransferCompleteNotification> {
+        if self.g2_manager_for(resource).is_none() {
+            anyhow::bail!("No G2 manager configured for resource {resource:?}");
+        }
         let parallel_worker = self
             .parallel_worker
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No parallel worker configured"))?;
 
-        parallel_worker.execute_local_transfer(
+        parallel_worker.execute_local_transfer_for_resource(
+            resource,
             src,
             dst,
             Arc::from(src_block_ids),
@@ -2005,7 +2268,10 @@ mod tests {
     use kvbm_common::KvDim;
     use kvbm_config::ParallelismMode;
     use kvbm_logical::blocks::BlockRegistry;
-    use kvbm_physical::manager::{LogicalLayoutDescriptor, WorkerAddress};
+    use kvbm_physical::manager::{
+        LogicalLayoutDescriptor, ResourceLayoutDescriptor, ResourceLayouts, WorkerAddress,
+        WorkerDataPlacement,
+    };
 
     fn stub_metadata_for(worker_id: u64) -> SerializedLayout {
         SerializedLayout::pack(
@@ -2042,6 +2308,36 @@ mod tests {
         builder.build()
     }
 
+    async fn leader_with_cached_resource_metadata(
+        cached: Vec<SerializedLayout>,
+        templates: ParallelismTemplateSet,
+    ) -> Result<InstanceLeader> {
+        let messenger = create_messenger_tcp().await?;
+        let registry = BlockRegistry::builder().build();
+        let primary = templates.primary();
+        let mut managers = BlockManagerSet::new();
+        for (resource, _) in templates.iter() {
+            managers.insert(
+                resource,
+                Arc::new(
+                    TestManagerBuilder::<G2>::new()
+                        .block_count(2)
+                        .block_size(4)
+                        .registry(registry.clone())
+                        .build(),
+                ),
+            )?;
+        }
+
+        InstanceLeader::builder()
+            .messenger(messenger)
+            .registry(registry)
+            .g2_manager_set(Arc::new(managers), primary)
+            .parallelism_template_set(templates)
+            .with_cached_worker_metadata(cached)
+            .build()
+    }
+
     fn template(tp_size: usize) -> ParallelismTemplate {
         ParallelismTemplate {
             tp_size,
@@ -2052,6 +2348,81 @@ mod tests {
             num_layers: 12,
             dtype_width_bytes: 2,
         }
+    }
+
+    fn replicated_template(tp_size: usize) -> ParallelismTemplate {
+        ParallelismTemplate {
+            parallelism_mode: ParallelismMode::ReplicatedData,
+            shard_axis: KvDim::HeadCount,
+            ..template(tp_size)
+        }
+    }
+
+    fn stub_resource_metadata_for(
+        worker_id: u64,
+        primary: LogicalResourceId,
+        secondary: LogicalResourceId,
+    ) -> SerializedLayout {
+        let layouts = ResourceLayouts::new(
+            primary,
+            vec![
+                ResourceLayoutDescriptor::new(primary, Vec::new()),
+                ResourceLayoutDescriptor::new(secondary, Vec::new()),
+            ],
+        )
+        .unwrap();
+        SerializedLayout::pack_with_resources(
+            WorkerAddress::new(worker_id, format!("resource-agent-{worker_id}")),
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            Some(layouts),
+        )
+        .unwrap()
+    }
+
+    fn g2_manager(block_count: usize) -> Arc<BlockManager<G2>> {
+        Arc::new(
+            TestManagerBuilder::<G2>::new()
+                .block_count(block_count)
+                .block_size(4)
+                .registry(BlockRegistry::new())
+                .build(),
+        )
+    }
+
+    #[test]
+    fn legacy_g2_manager_becomes_primary_resource_set() {
+        let manager = g2_manager(4);
+        let resolved =
+            resolve_g2_managers(Some(Arc::clone(&manager)), None, LogicalResourceId(7)).unwrap();
+
+        assert_eq!(resolved.primary.id(), manager.id());
+        assert_eq!(
+            resolved.all.get(LogicalResourceId(7)).unwrap().id(),
+            manager.id()
+        );
+    }
+
+    #[test]
+    fn explicit_g2_manager_set_selects_primary_and_rejects_ambiguity() {
+        let primary = g2_manager(4);
+        let secondary = g2_manager(8);
+        let mut managers = BlockManagerSet::new();
+        managers
+            .insert(LogicalResourceId(2), Arc::clone(&primary))
+            .unwrap();
+        managers
+            .insert(LogicalResourceId(9), Arc::clone(&secondary))
+            .unwrap();
+        let managers = Arc::new(managers);
+
+        let resolved =
+            resolve_g2_managers(None, Some(Arc::clone(&managers)), LogicalResourceId(9)).unwrap();
+        assert_eq!(resolved.primary.id(), secondary.id());
+        assert_eq!(resolved.all.len(), 2);
+        assert!(resolve_g2_managers(Some(primary), Some(managers), LogicalResourceId(2)).is_err());
     }
 
     /// Regression: `find_matches` must never report more matched blocks than it
@@ -2596,6 +2967,44 @@ mod tests {
             assert_eq!(desc.rank, i);
             assert_eq!(desc.tp_size, 2);
             assert_eq!(desc.shard_axis, KvDim::HeadCount);
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn assemble_export_metadata_stamps_each_resource_template() -> Result<()> {
+        let primary = LogicalResourceId(3);
+        let mla = LogicalResourceId(8);
+        let cached = vec![
+            stub_resource_metadata_for(0, primary, mla),
+            stub_resource_metadata_for(1, primary, mla),
+        ];
+        let templates = ParallelismTemplateSet::new(
+            primary,
+            vec![(primary, template(2)), (mla, replicated_template(2))],
+        )?;
+        let leader = leader_with_cached_resource_metadata(cached, templates).await?;
+
+        for (rank, layout) in leader.assemble_export_metadata().await?.iter().enumerate() {
+            let unpacked = layout.unpack()?;
+            let resources = unpacked
+                .resource_parallelism
+                .expect("resource templates must produce resource metadata");
+            assert_eq!(resources.primary(), primary);
+            assert_eq!(resources.get(primary).unwrap().parallelism.rank, rank);
+            assert_eq!(
+                resources.get(primary).unwrap().placement,
+                WorkerDataPlacement::TensorSharded
+            );
+            assert_eq!(resources.get(mla).unwrap().parallelism.rank, rank);
+            assert_eq!(
+                resources.get(mla).unwrap().placement,
+                WorkerDataPlacement::ReplicatedG1StripedLower
+            );
+            assert_eq!(
+                unpacked.parallelism,
+                Some(resources.get(primary).unwrap().parallelism.clone())
+            );
         }
         Ok(())
     }

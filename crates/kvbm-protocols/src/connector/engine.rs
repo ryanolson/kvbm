@@ -15,20 +15,20 @@
 
 use std::sync::Arc;
 
+use kvbm_common::LogicalResourceId;
+
 use super::handles::{FindBlocksHandle, OffloadHandle, OnboardHandle, RequestOffloadDrain};
 use super::protocol::{
     AcceptId, ActionId, ActionStatus, EvictionOutcome, FindBlocksOutcome, FindBlocksRequest,
     LeaderEngineError, SearchId,
 };
-use super::protocol::{BlockId, RequestId, SequenceHash};
+use super::protocol::{BlockId, RequestId, ResourceOnboard, SequenceHash};
 
-/// Leader-side block-engine contract. The connector drives exactly five
-/// methods — [`find_blocks`](Self::find_blocks) (the unified match poll),
-/// [`onboard_blocks`](Self::onboard_blocks) (the unified onboard),
-/// [`offload`](Self::offload), [`evict`](Self::evict), and
-/// [`take_offload_drain`](Self::take_offload_drain) — and the engine routes
-/// everything else internally (local search vs dispatched remote prefill,
-/// fresh vs refresh, window derivation, the inflight-onboard deferral guard).
+/// Leader-side block-engine contract. The connector drives unified match and
+/// onboard, legacy or resource-explicit offload, eviction, and the request
+/// offload drain. The engine routes everything else internally (local search
+/// vs dispatched remote prefill, fresh vs refresh, window derivation, the
+/// inflight-onboard deferral guard, and the selected resource pipeline).
 /// The `poll_action` / `release_*` tail is **engine-internal** — completion and
 /// RAII sources that the handles call on the connector's behalf, not part of
 /// the connector's used surface (the connector only ever reads
@@ -44,6 +44,24 @@ pub trait LeaderEngine: Send + Sync + 'static {
         req: &RequestId,
         pairs: Vec<(SequenceHash, BlockId)>,
     ) -> Result<OffloadHandle, LeaderEngineError>;
+
+    /// OFFLOAD one logical model resource.
+    ///
+    /// Legacy single-resource engines accept resource zero through
+    /// [`Self::offload`] and fail closed for every other resource. Engines that
+    /// own multiple logical resources override this method and route the
+    /// action to the matching G1-to-G2 pipeline.
+    fn offload_for_resource(
+        self: Arc<Self>,
+        resource: LogicalResourceId,
+        req: &RequestId,
+        pairs: Vec<(SequenceHash, BlockId)>,
+    ) -> Result<OffloadHandle, LeaderEngineError> {
+        if resource != LogicalResourceId::default() {
+            return Err(LeaderEngineError::ResourceOffloadNotConfigured { resource });
+        }
+        self.offload(req, pairs)
+    }
 
     /// EVICTION (non-terminal). DRAINS (does not cancel — submitted CUDA copies
     /// still complete) in-flight onboards for `req`, flags each
@@ -86,6 +104,24 @@ pub trait LeaderEngine: Send + Sync + 'static {
         dest: &[BlockId],
         num_external_tokens: usize,
     ) -> Result<OnboardHandle, LeaderEngineError>;
+
+    /// ONBOARD exact G2 blocks for multiple logical model resources under one
+    /// request-scoped completion handle.
+    fn onboard_resources(
+        self: Arc<Self>,
+        req: &RequestId,
+        resources: Vec<ResourceOnboard>,
+    ) -> Result<OnboardHandle, LeaderEngineError> {
+        let Some(first) = resources.first() else {
+            return Err(LeaderEngineError::InvalidResourceOnboard {
+                reason: "at least one resource is required".to_owned(),
+            });
+        };
+        let _ = req;
+        Err(LeaderEngineError::ResourceOnboardNotConfigured {
+            resource: first.resource,
+        })
+    }
 
     /// Hand the leader the consume-once [`RequestOffloadDrain`] for a
     /// *finishing* request whose offloads have started. The leader commits it

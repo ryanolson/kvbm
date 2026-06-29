@@ -1151,10 +1151,20 @@ impl Session for VeloSession {
         hashes: Vec<SequenceHash>,
         dst: Vec<MutableBlock<G2>>,
     ) -> BoxFuture<'static, Result<Vec<MutableBlock<G2>>>> {
+        self.pull_resource(self.inner.leader.primary_g2_resource(), hashes, dst)
+    }
+
+    fn pull_resource(
+        &self,
+        resource: kvbm_common::LogicalResourceId,
+        hashes: Vec<SequenceHash>,
+        dst: Vec<MutableBlock<G2>>,
+    ) -> BoxFuture<'static, Result<Vec<MutableBlock<G2>>>> {
         let session = self.clone();
         crate::engine_audit!(
             "session_pull_request",
             session_id = %self.inner.session_id,
+            resource = ?resource,
             num_hashes = hashes.len(),
             num_dst = dst.len()
         );
@@ -1286,7 +1296,12 @@ impl Session for VeloSession {
             session
                 .inner
                 .leader
-                .rdma_pull_with_opts(peer_instance_id, refs, WirePullOptions::default())
+                .rdma_pull_resource_with_opts(
+                    resource,
+                    peer_instance_id,
+                    refs,
+                    WirePullOptions::default(),
+                )
                 .await
                 .context("rdma_pull_with_opts")?;
             let rdma_elapsed_us = rdma_t0.elapsed().as_micros() as u64;

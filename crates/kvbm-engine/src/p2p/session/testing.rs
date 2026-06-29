@@ -817,6 +817,15 @@ impl Session for MockSession {
         .boxed()
     }
 
+    fn pull_resource(
+        &self,
+        _resource: kvbm_common::LogicalResourceId,
+        hashes: Vec<SequenceHash>,
+        dst: Vec<MutableBlock<G2>>,
+    ) -> BoxFuture<'static, Result<Vec<MutableBlock<G2>>>> {
+        self.pull(hashes, dst)
+    }
+
     fn lifecycle(&self) -> LifecycleStream {
         self.take_lifecycle_stream()
     }

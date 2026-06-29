@@ -159,6 +159,7 @@ pub(super) async fn pull_from(
             search_mode: SearchMode::Prefix,
             find_mode: FindMode::Sync,
             tiers: TierSelection::default(),
+            resource: None,
             watchdog_ms: None,
         })
         .await
@@ -207,12 +208,14 @@ pub(super) async fn pull_from(
 
     // `selector: None` pulls every committed hash — i.e. the holder's
     // contiguous G2 prefix of `target` (its authoritative deepest match).
+    let resource = capability.resource;
     let pull = leader
         .pull_from_session(PullFromSessionRequest {
             session_id: capability.session_id,
             source_instance_id: candidate,
             endpoint: Some(capability.endpoint),
             selector: None,
+            resource: Some(resource),
         })
         .await;
 

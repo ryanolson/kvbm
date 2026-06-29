@@ -47,11 +47,14 @@
 //! [`LayoutSlice::axes`] for each shard whose remote rank only owns a
 //! sub-range of layers. The wire format already reserves this room.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
 
 use anyhow::{Result, bail};
-use kvbm_common::{AxisIntersection, BlockId, KvDim, KvbmTransferRoute, LogicalLayoutHandle};
+use kvbm_common::{
+    AxisIntersection, BlockId, KvDim, KvbmTransferRoute, LogicalLayoutHandle, LogicalResourceId,
+    placement::StripedBlockPlacement,
+};
 use kvbm_physical::manager::ParallelismDescriptor;
 use serde::{Deserialize, Serialize};
 use velo::InstanceId;
@@ -70,6 +73,116 @@ use crate::p2p::parallelism::ParallelismTemplate;
 pub struct PullRef {
     pub src_block_id: BlockId,
     pub dst_block_id: BlockId,
+}
+
+/// One owner-to-owner batch for a replicated-cache remote pull.
+///
+/// IDs are worker-local on both sides. The surrounding session retains the
+/// original hash identity and global block IDs; this batch is only the
+/// physical placement projection used to issue RDMA.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReplicatedPullBatch {
+    pub local_rank: usize,
+    pub remote_rank: usize,
+    pub src_block_ids: Vec<BlockId>,
+    pub dst_block_ids: Vec<BlockId>,
+}
+
+/// Project global replicated-cache block pairs onto their physical owners.
+///
+/// The holder session already reports each hash's global source block ID and
+/// the requester allocates each global destination block ID. Deterministic
+/// striped placement therefore resolves both ranks without a separate
+/// `SequenceHash -> worker` index. Results are grouped and sorted by
+/// `(local_rank, remote_rank)` for deterministic dispatch.
+fn plan_replicated_pull(
+    local_world_size: usize,
+    remote_world_size: usize,
+    refs: &[PullRef],
+) -> Result<Vec<ReplicatedPullBatch>> {
+    let local = StripedBlockPlacement::new(local_world_size)?;
+    let remote = StripedBlockPlacement::new(remote_world_size)?;
+    let mut batches = BTreeMap::<(usize, usize), ReplicatedPullBatch>::new();
+
+    for pair in refs {
+        let (remote_rank, src_block_id) = remote.resolve(pair.src_block_id);
+        let (local_rank, dst_block_id) = local.resolve(pair.dst_block_id);
+        let batch =
+            batches
+                .entry((local_rank, remote_rank))
+                .or_insert_with(|| ReplicatedPullBatch {
+                    local_rank,
+                    remote_rank,
+                    src_block_ids: Vec::new(),
+                    dst_block_ids: Vec::new(),
+                });
+        batch.src_block_ids.push(src_block_id);
+        batch.dst_block_ids.push(dst_block_id);
+    }
+
+    Ok(batches.into_values().collect())
+}
+
+/// Build full-block worker plans for replicated G1 / striped lower tiers.
+#[cfg(test)]
+pub(crate) fn plan_replicated_worker_pulls(
+    local_world_size: usize,
+    remote_world_size: usize,
+    remote_instance: InstanceId,
+    source_layout: LogicalLayoutHandle,
+    dst_layout: LogicalLayoutHandle,
+    refs: &[PullRef],
+    opts: &WirePullOptions,
+) -> Result<Vec<(usize, WorkerPullPlan)>> {
+    plan_replicated_worker_pulls_for_resources(
+        local_world_size,
+        remote_world_size,
+        remote_instance,
+        LogicalResourceId::default(),
+        source_layout,
+        LogicalResourceId::default(),
+        dst_layout,
+        refs,
+        opts,
+    )
+}
+
+pub(crate) fn plan_replicated_worker_pulls_for_resources(
+    local_world_size: usize,
+    remote_world_size: usize,
+    remote_instance: InstanceId,
+    source_resource: LogicalResourceId,
+    source_layout: LogicalLayoutHandle,
+    dst_resource: LogicalResourceId,
+    dst_layout: LogicalLayoutHandle,
+    refs: &[PullRef],
+    opts: &WirePullOptions,
+) -> Result<Vec<(usize, WorkerPullPlan)>> {
+    plan_replicated_pull(local_world_size, remote_world_size, refs).map(|batches| {
+        batches
+            .into_iter()
+            .map(|batch| {
+                (
+                    batch.local_rank,
+                    WorkerPullPlan {
+                        remote_instance,
+                        source_resource,
+                        source_layout,
+                        dst_resource,
+                        dst_layout,
+                        src_block_ids: batch.src_block_ids,
+                        dst_block_ids: batch.dst_block_ids,
+                        shards: vec![PullShard {
+                            remote_rank: batch.remote_rank,
+                            local_slice: LayoutSlice::full(),
+                            remote_slice: LayoutSlice::full(),
+                        }],
+                        options: opts.clone(),
+                    },
+                )
+            })
+            .collect()
+    })
 }
 
 /// Coordinate-space slice over a block tensor's local axes.
@@ -160,7 +273,11 @@ pub struct WirePullOptions {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerPullPlan {
     pub remote_instance: InstanceId,
+    #[serde(default)]
+    pub source_resource: LogicalResourceId,
     pub source_layout: LogicalLayoutHandle,
+    #[serde(default)]
+    pub dst_resource: LogicalResourceId,
     pub dst_layout: LogicalLayoutHandle,
     #[serde(default)]
     pub src_block_ids: Vec<BlockId>,
@@ -197,6 +314,32 @@ pub fn plan_pull(
     remote: &[ParallelismDescriptor],
     remote_instance: InstanceId,
     source_layout: LogicalLayoutHandle,
+    dst_layout: LogicalLayoutHandle,
+    refs: &[PullRef],
+    opts: &WirePullOptions,
+) -> Result<Vec<(usize, WorkerPullPlan)>> {
+    plan_pull_for_resources(
+        local,
+        remote,
+        remote_instance,
+        LogicalResourceId::default(),
+        source_layout,
+        LogicalResourceId::default(),
+        dst_layout,
+        refs,
+        opts,
+    )
+}
+
+/// Resource-aware variant of [`plan_pull`].
+#[allow(clippy::too_many_arguments)]
+pub fn plan_pull_for_resources(
+    local: &ParallelismTemplate,
+    remote: &[ParallelismDescriptor],
+    remote_instance: InstanceId,
+    source_resource: LogicalResourceId,
+    source_layout: LogicalLayoutHandle,
+    dst_resource: LogicalResourceId,
     dst_layout: LogicalLayoutHandle,
     refs: &[PullRef],
     opts: &WirePullOptions,
@@ -307,7 +450,9 @@ pub fn plan_pull(
             local_rank,
             WorkerPullPlan {
                 remote_instance,
+                source_resource,
                 source_layout,
+                dst_resource,
                 dst_layout,
                 src_block_ids: src_block_ids.clone(),
                 dst_block_ids: dst_block_ids.clone(),
@@ -462,6 +607,102 @@ mod tests {
     use kvbm_config::ParallelismMode;
 
     const GLOBAL_HEADS: usize = 32;
+
+    #[test]
+    fn replicated_pull_resolves_one_remote_and_local_owner_per_pair() {
+        let refs = vec![
+            PullRef {
+                src_block_id: 0,
+                dst_block_id: 3,
+            },
+            PullRef {
+                src_block_id: 1,
+                dst_block_id: 4,
+            },
+            PullRef {
+                src_block_id: 2,
+                dst_block_id: 5,
+            },
+            PullRef {
+                src_block_id: 3,
+                dst_block_id: 6,
+            },
+        ];
+
+        assert_eq!(
+            plan_replicated_pull(2, 4, &refs).unwrap(),
+            vec![
+                ReplicatedPullBatch {
+                    local_rank: 0,
+                    remote_rank: 1,
+                    src_block_ids: vec![0],
+                    dst_block_ids: vec![2],
+                },
+                ReplicatedPullBatch {
+                    local_rank: 0,
+                    remote_rank: 3,
+                    src_block_ids: vec![0],
+                    dst_block_ids: vec![3],
+                },
+                ReplicatedPullBatch {
+                    local_rank: 1,
+                    remote_rank: 0,
+                    src_block_ids: vec![0],
+                    dst_block_ids: vec![1],
+                },
+                ReplicatedPullBatch {
+                    local_rank: 1,
+                    remote_rank: 2,
+                    src_block_ids: vec![0],
+                    dst_block_ids: vec![2],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn replicated_pull_rejects_empty_worker_groups() {
+        assert!(plan_replicated_pull(0, 2, &[]).is_err());
+        assert!(plan_replicated_pull(2, 0, &[]).is_err());
+        assert!(plan_replicated_pull(2, 2, &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn replicated_worker_plans_use_full_blocks_and_owner_ranks() {
+        let remote_instance = instance();
+        let plans = plan_replicated_worker_pulls(
+            2,
+            3,
+            remote_instance,
+            LogicalLayoutHandle::G2,
+            LogicalLayoutHandle::G2,
+            &[
+                PullRef {
+                    src_block_id: 5,
+                    dst_block_id: 2,
+                },
+                PullRef {
+                    src_block_id: 7,
+                    dst_block_id: 3,
+                },
+            ],
+            &opts(),
+        )
+        .unwrap();
+
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].0, 0);
+        assert_eq!(plans[0].1.remote_instance, remote_instance);
+        assert_eq!(plans[0].1.src_block_ids, vec![1]);
+        assert_eq!(plans[0].1.dst_block_ids, vec![1]);
+        assert_eq!(plans[0].1.shards[0].remote_rank, 2);
+        assert!(plans[0].1.shards[0].local_slice.axes.is_empty());
+        assert!(plans[0].1.shards[0].remote_slice.axes.is_empty());
+        assert_eq!(plans[1].0, 1);
+        assert_eq!(plans[1].1.src_block_ids, vec![2]);
+        assert_eq!(plans[1].1.dst_block_ids, vec![1]);
+        assert_eq!(plans[1].1.shards[0].remote_rank, 1);
+    }
 
     fn make_local(tp_size: usize) -> ParallelismTemplate {
         ParallelismTemplate {
@@ -733,7 +974,28 @@ mod tests {
             assert_eq!(plan.src_block_ids, vec![100, 101, 102]);
             assert_eq!(plan.dst_block_ids, vec![200, 201, 202]);
             assert_eq!(plan.options, custom_opts);
+            assert_eq!(plan.source_resource, LogicalResourceId::default());
+            assert_eq!(plan.dst_resource, LogicalResourceId::default());
         }
+    }
+
+    #[test]
+    fn resource_aware_planner_stamps_source_and_destination_resources() {
+        let plans = plan_pull_for_resources(
+            &make_local(1),
+            &make_remote(1),
+            instance(),
+            LogicalResourceId(3),
+            handle(),
+            LogicalResourceId(9),
+            handle(),
+            &refs(1),
+            &opts(),
+        )
+        .unwrap();
+
+        assert_eq!(plans[0].1.source_resource, LogicalResourceId(3));
+        assert_eq!(plans[0].1.dst_resource, LogicalResourceId(9));
     }
 
     #[test]

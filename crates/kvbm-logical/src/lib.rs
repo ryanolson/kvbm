@@ -18,6 +18,7 @@ pub mod metrics;
 pub mod pools;
 pub mod pubsub;
 pub mod registry;
+pub mod resources;
 pub mod sequence;
 pub mod tinylfu;
 
@@ -40,6 +41,7 @@ pub use integrations::{
 };
 pub use manager::BlockManager;
 pub use registry::BlockRegistry;
+pub use resources::{BlockManagerSet, DuplicateLogicalResource, LogicalResourceId};
 pub use sequence::{
     BlockSequence, BlockSequenceError, ExternalBlockAssignments, LogicalBlockAssignmentError,
     LogicalBlockAssignments, zip_assigned, zip_assigned_pending,

@@ -39,6 +39,11 @@ pub struct TransferConfig {
     #[builder(default = "Arc::new(EventManager::local())")]
     event_system: Arc<EventManager>,
 
+    /// Optional layout-handle namespace. Defaults to the event-system ID.
+    /// Set this when multiple rank-local managers share one event system.
+    #[builder(default = "None", setter(strip_option))]
+    worker_id: Option<u64>,
+
     /// Optional custom name for the NIXL agent. If not provided, defaults to "worker-{worker_id}"
     #[builder(default = "None", setter(strip_option))]
     nixl_agent_name: Option<String>,
@@ -132,7 +137,9 @@ impl TransferConfigBuilder {
     pub fn build(self) -> Result<TransferManager> {
         let mut config = self.build_internal()?;
 
-        let worker_id = config.event_system.system_id();
+        let worker_id = config
+            .worker_id
+            .unwrap_or_else(|| config.event_system.system_id());
 
         // Merge environment backends if not explicitly configured
         if config.nixl_backend_config.backends().is_empty() {
@@ -174,6 +181,12 @@ impl TransferConfigBuilderWithAgent {
 
     pub fn cuda_device_id(mut self, cuda_device_id: usize) -> Self {
         self.builder = self.builder.cuda_device_id(cuda_device_id);
+        self
+    }
+
+    /// Override the layout-handle namespace after wiring a shared NIXL agent.
+    pub fn worker_id(mut self, worker_id: u64) -> Self {
+        self.builder = self.builder.worker_id(worker_id);
         self
     }
 
@@ -281,6 +294,7 @@ impl TransferContext {
     ) -> Result<Self> {
         let TransferConfig {
             event_system,
+            worker_id,
             tokio_runtime,
             capabilities,
             cuda_pool_reserve_size,
@@ -345,7 +359,7 @@ impl TransferContext {
         let current_h2d_stream = Arc::new(AtomicUsize::new(0));
 
         Ok(Self {
-            worker_id: event_system.system_id(),
+            worker_id: worker_id.unwrap_or_else(|| event_system.system_id()),
             nixl_agent,
             cuda_context: cuda_context.clone(),
             d2h_stream,

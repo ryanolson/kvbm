@@ -29,13 +29,14 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use kvbm_common::placement::StripedBlockPlacement;
 use kvbm_engine::leader::{ConsolidatorParams, InstanceLeader};
 use kvbm_engine::object::{ObjectLockManager, create_lock_manager, create_object_client};
 use kvbm_engine::offload::{
     ObjectPipelineBuilder, ObjectPresenceFilter, OffloadEngine, PendingTracker, PipelineBuilder,
     S3PresenceChecker, create_policy_from_config,
 };
-use kvbm_engine::worker::{LeaderLayoutConfig, Worker};
+use kvbm_engine::worker::{CollectiveBootstrap, LeaderLayoutConfig, Worker};
 use kvbm_hub::HubClient;
 use kvbm_logical::blocks::{BlockDuplicationPolicy, BlockRegistry};
 use kvbm_logical::events::{EventsManager, KvbmCacheEventsPublisher};
@@ -208,6 +209,13 @@ pub(super) async fn build_engine_stack(c: &Construction) -> Result<EngineStack> 
                 reference_config.dtype_width_bytes
             );
         }
+        if config.num_heads != reference_config.num_heads {
+            bail!(
+                "Layout config mismatch: worker {i} has num_heads {:?}, worker 0 has {:?}",
+                config.num_heads,
+                reference_config.num_heads
+            );
+        }
     }
 
     // Step 3: compute G2/G3 block counts + host-bypass sentinel.
@@ -235,15 +243,30 @@ pub(super) async fn build_engine_stack(c: &Construction) -> Result<EngineStack> 
         );
     }
     let host_block_count = host_block_count.unwrap_or(0);
+    let worker_count = c.workers.lock().connector_clients.len();
+    let parallelism = resolve_parallelism(runtime.config().cache.parallelism, &reference_config);
+    if parallelism != runtime.config().cache.parallelism {
+        tracing::info!(
+            configured = ?runtime.config().cache.parallelism,
+            resolved = ?parallelism,
+            "Registered cache has no HeadCount axis; selecting replicated-data placement"
+        );
+    }
+    let logical_host_block_count =
+        logical_tier_block_count(host_block_count, parallelism, worker_count)?;
+    let logical_disk_block_count = disk_block_count
+        .map(|count| logical_tier_block_count(count, parallelism, worker_count))
+        .transpose()?;
+    let collective = build_collective_bootstrap(parallelism, worker_count)?;
 
     // Host-bypass: disk configured, host not — serve disk hits to GPU directly,
     // no G2 staging. InstanceLeader still requires a G2 manager, so build it with
     // a sentinel block_count of 1 (BlockManager rejects 0; it allocates nothing).
     let bypass_host = runtime.config().cache.bypass_host_cache();
     let g2_manager_block_count = if bypass_host {
-        host_block_count.max(1)
+        logical_host_block_count.max(1)
     } else {
-        host_block_count
+        logical_host_block_count
     };
 
     // Step 4: initialize all workers in parallel, collect their metadata, and
@@ -255,10 +278,12 @@ pub(super) async fn build_engine_stack(c: &Construction) -> Result<EngineStack> 
         for (idx, worker) in workers.connector_clients.iter().enumerate() {
             let leader_config = LeaderLayoutConfig {
                 rank: idx,
+                worker_count,
                 host_block_count,
                 disk_block_count,
                 object: object_config.clone(),
-                parallelism: runtime.config().cache.parallelism,
+                parallelism,
+                collective: collective.clone(),
             };
             futures.push(worker.initialize(leader_config)?);
         }
@@ -373,7 +398,7 @@ pub(super) async fn build_engine_stack(c: &Construction) -> Result<EngineStack> 
             .build()
             .expect("Should build G2 manager"),
     );
-    let g3_manager: Option<Arc<BlockManager<G3>>> = disk_block_count.map(|count| {
+    let g3_manager: Option<Arc<BlockManager<G3>>> = logical_disk_block_count.map(|count| {
         Arc::new(
             BlockManager::<G3>::builder()
                 .block_count(count)
@@ -421,14 +446,12 @@ pub(super) async fn build_engine_stack(c: &Construction) -> Result<EngineStack> 
     if let Some(disagg_cfg) = runtime.config().disagg.as_ref() {
         leader_builder = leader_builder.role(disagg_cfg.role);
     }
-    if reference_config.num_heads.is_some() {
-        let template = kvbm_engine::leader::parallelism::ParallelismTemplate::from_layout_config(
-            &reference_config,
-            runtime.config().cache.parallelism,
-            num_workers,
-        )?;
-        leader_builder = leader_builder.parallelism_template(template);
-    }
+    let template = kvbm_engine::leader::parallelism::ParallelismTemplate::from_layout_config(
+        &reference_config,
+        parallelism,
+        num_workers,
+    )?;
+    leader_builder = leader_builder.parallelism_template(template);
     if let Some(g3_mgr) = g3_manager {
         leader_builder = leader_builder.g3_manager(g3_mgr);
     }
@@ -658,4 +681,152 @@ pub(super) async fn build_engine_stack(c: &Construction) -> Result<EngineStack> 
         indexer_publisher,
         indexer_hub_client,
     })
+}
+
+/// Resolve physical cache distribution from the registered tensor schema.
+///
+/// A labelled cache without `HeadCount` has no tensor-parallel shard axis.
+/// This is the latent/payload layout used by MLA, so all G1 ranks contain the
+/// same data and lower tiers must use replicated-data placement. Layouts with
+/// an explicit head axis keep the operator-configured mode.
+fn resolve_parallelism(
+    configured: kvbm_config::ParallelismMode,
+    layout: &LayoutConfig,
+) -> kvbm_config::ParallelismMode {
+    if layout.num_heads.is_none() {
+        kvbm_config::ParallelismMode::ReplicatedData
+    } else {
+        configured
+    }
+}
+
+fn collective_required(parallelism: kvbm_config::ParallelismMode, worker_count: usize) -> bool {
+    parallelism == kvbm_config::ParallelismMode::ReplicatedData && worker_count > 1
+}
+
+fn build_collective_bootstrap(
+    parallelism: kvbm_config::ParallelismMode,
+    worker_count: usize,
+) -> Result<Option<CollectiveBootstrap>> {
+    if !collective_required(parallelism, worker_count) {
+        return Ok(None);
+    }
+
+    #[cfg(feature = "nccl")]
+    {
+        let bootstrap = kvbm_engine::collectives::NcclBootstrap::generate(worker_count)
+            .context("generating KVBM NCCL bootstrap for replicated cache workers")?;
+        Ok(Some(CollectiveBootstrap::Nccl {
+            serialized: bootstrap.serialize(),
+        }))
+    }
+
+    #[cfg(not(feature = "nccl"))]
+    bail!(
+        "replicated cache data with {worker_count} workers requires the kvbm-connector `nccl` feature"
+    )
+}
+
+/// Logical tier capacity represented by equal per-worker physical capacities.
+///
+/// Tensor-parallel blocks are sharded, so one block consumes one slot on every
+/// rank and the logical capacity equals the per-rank capacity. Replicated MLA
+/// blocks have one canonical lower-tier copy, so each rank contributes a
+/// disjoint stripe and the logical capacity is the aggregate across ranks.
+fn logical_tier_block_count(
+    per_worker_blocks: usize,
+    parallelism: kvbm_config::ParallelismMode,
+    worker_count: usize,
+) -> Result<usize> {
+    if worker_count == 0 {
+        bail!("cannot configure cache tiers without workers");
+    }
+    match parallelism {
+        kvbm_config::ParallelismMode::TensorParallel => Ok(per_worker_blocks),
+        kvbm_config::ParallelismMode::ReplicatedData => {
+            StripedBlockPlacement::new(worker_count)?.global_capacity(per_worker_blocks)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_collective_bootstrap, collective_required, logical_tier_block_count,
+        resolve_parallelism,
+    };
+    use kvbm_config::ParallelismMode;
+    use kvbm_physical::layout::LayoutConfig;
+
+    fn layout(num_heads: Option<usize>) -> LayoutConfig {
+        LayoutConfig::builder()
+            .num_blocks(128)
+            .num_layers(2)
+            .outer_dim(if num_heads.is_some() { 2 } else { 1 })
+            .page_size(16)
+            .inner_dim(512)
+            .num_heads(num_heads)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn mla_layout_without_head_axis_selects_replicated_data() {
+        assert_eq!(
+            resolve_parallelism(ParallelismMode::TensorParallel, &layout(None)),
+            ParallelismMode::ReplicatedData
+        );
+    }
+
+    #[test]
+    fn only_multi_worker_replicated_data_requires_a_collective() {
+        assert!(!collective_required(ParallelismMode::ReplicatedData, 1));
+        assert!(collective_required(ParallelismMode::ReplicatedData, 2));
+        assert!(!collective_required(ParallelismMode::TensorParallel, 2));
+    }
+
+    #[cfg(feature = "nccl")]
+    #[test]
+    fn replicated_group_gets_one_decodable_nccl_bootstrap() {
+        let collective = build_collective_bootstrap(ParallelismMode::ReplicatedData, 2)
+            .unwrap()
+            .expect("TP=2 replicated data requires a collective");
+        let kvbm_engine::worker::CollectiveBootstrap::Nccl { serialized } = collective;
+        let bootstrap = kvbm_engine::collectives::NcclBootstrap::deserialize(&serialized).unwrap();
+        assert_eq!(bootstrap.world_size(), 2);
+    }
+
+    #[test]
+    fn mha_layout_keeps_configured_parallelism() {
+        assert_eq!(
+            resolve_parallelism(ParallelismMode::TensorParallel, &layout(Some(4))),
+            ParallelismMode::TensorParallel
+        );
+        assert_eq!(
+            resolve_parallelism(ParallelismMode::ReplicatedData, &layout(Some(4))),
+            ParallelismMode::ReplicatedData
+        );
+    }
+
+    #[test]
+    fn replicated_tiers_aggregate_worker_capacity() {
+        assert_eq!(
+            logical_tier_block_count(2_000, ParallelismMode::ReplicatedData, 2).unwrap(),
+            4_000
+        );
+    }
+
+    #[test]
+    fn tensor_parallel_tiers_keep_per_worker_block_capacity() {
+        assert_eq!(
+            logical_tier_block_count(2_000, ParallelismMode::TensorParallel, 2).unwrap(),
+            2_000
+        );
+    }
+
+    #[test]
+    fn tier_capacity_rejects_empty_groups_and_overflow() {
+        assert!(logical_tier_block_count(1, ParallelismMode::ReplicatedData, 0).is_err());
+        assert!(logical_tier_block_count(usize::MAX, ParallelismMode::ReplicatedData, 2).is_err());
+    }
 }

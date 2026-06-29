@@ -267,11 +267,14 @@ impl CoordinatedWorker {
 
         // Import into the underlying worker so NIXL knows about the remote.
         // Preserve the inbound parallelism descriptor across the repack.
-        let repacked = SerializedLayout::pack(
+        let repacked = SerializedLayout::pack_with_resource_parallelism(
             unpacked.worker_address.clone(),
             unpacked.nixl_metadata.clone(),
             unpacked.layouts.clone(),
             unpacked.parallelism.clone(),
+            unpacked.worker_data_placement,
+            unpacked.resource_layouts.clone(),
+            unpacked.resource_parallelism.clone(),
         )?;
         let response = self.inner.import_metadata(repacked)?;
         let _handles = response.await?;

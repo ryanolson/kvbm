@@ -19,8 +19,10 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use futures::StreamExt;
+use kvbm_common::LogicalResourceId;
 use velo::{Handler, Messenger};
 
+use kvbm_logical::BlockManager;
 use kvbm_logical::blocks::{CompleteBlock, ImmutableBlock};
 
 use crate::G3;
@@ -167,6 +169,7 @@ fn register_search_shim(
                 search_mode: mode,
                 find_mode: FindMode::Sync,
                 tiers: TierSelection::default(),
+                resource: None,
                 watchdog_ms: None,
             };
             let reply: ControlReply<SearchResponse> = leader
@@ -230,14 +233,23 @@ impl FindOutcome {
 /// pay for itself yet.
 async fn find_phase(
     leader: &Arc<InstanceLeader>,
+    g2_manager: &Arc<BlockManager<G2>>,
+    resource: LogicalResourceId,
     hashes: &[SequenceHash],
     search_mode: SearchMode,
     tiers: TierSelection,
-) -> FindOutcome {
+) -> Result<FindOutcome, ControlError> {
+    if search_mode == SearchMode::Scatter && tiers.g3 && resource != leader.primary_g2_resource() {
+        return Err(ControlError::Internal(format!(
+            "resource_g3_unsupported: logical resource {resource:?} requested G3, but G3 is only configured for primary resource {:?}",
+            leader.primary_g2_resource()
+        )));
+    }
+
     match search_mode {
         SearchMode::Prefix => {
             // Contiguous prefix in G2 only. G3/G4 not searched.
-            let g2_blocks = leader.g2_manager().match_blocks(hashes);
+            let g2_blocks = g2_manager.match_blocks(hashes);
             let g2_committed: Vec<SequenceHash> =
                 g2_blocks.iter().map(|b| b.sequence_hash()).collect();
             let breakdown = MatchBreakdown {
@@ -245,16 +257,16 @@ async fn find_phase(
                 disk_blocks: 0,
                 object_blocks: 0,
             };
-            FindOutcome {
+            Ok(FindOutcome {
                 g2_committed,
                 g2_blocks,
                 g3_committed: Vec::new(),
                 g3_blocks: Vec::new(),
                 breakdown,
-            }
+            })
         }
         SearchMode::Scatter => {
-            let g2_map = leader.g2_manager().scan_matches(hashes, /* touch */ false);
+            let g2_map = g2_manager.scan_matches(hashes, /* touch */ false);
             let g2_committed: Vec<SequenceHash> = g2_map.keys().copied().collect();
             let g2_blocks: Vec<ImmutableBlock<G2>> = g2_map.into_values().collect();
 
@@ -285,13 +297,13 @@ async fn find_phase(
                 disk_blocks: g3_blocks.len(),
                 object_blocks: 0,
             };
-            FindOutcome {
+            Ok(FindOutcome {
                 g2_committed,
                 g2_blocks,
                 g3_committed,
                 g3_blocks,
                 breakdown,
-            }
+            })
         }
     }
 }
@@ -306,6 +318,7 @@ async fn find_phase(
 /// `LifecycleEvent::Failed` to the puller.
 async fn stage_phase(
     leader: Arc<InstanceLeader>,
+    g2_manager: Arc<BlockManager<G2>>,
     session: Arc<dyn Session>,
     find: FindOutcome,
 ) -> Result<(), ControlError> {
@@ -340,7 +353,7 @@ async fn stage_phase(
         })?;
 
         let holder = BlockHolder::<G3>::new(g3_blocks);
-        let staged = stage_g3_to_g2(&holder, leader.g2_manager(), &*parallel_worker)
+        let staged = stage_g3_to_g2(&holder, &g2_manager, &*parallel_worker)
             .await
             .map_err(|e| ControlError::Internal(format!("stage_g3_to_g2: {e:#}")))?;
 
@@ -365,7 +378,16 @@ pub(crate) async fn open_transfer_session(
     leader: &Arc<InstanceLeader>,
     req: OpenTransferSessionRequest,
 ) -> Result<OpenTransferSessionResponse, ControlError> {
-    let find = find_phase(leader, &req.sequence_hashes, req.search_mode, req.tiers).await;
+    let (resource, g2_manager) = resolve_g2_manager(leader, req.resource)?;
+    let find = find_phase(
+        leader,
+        &g2_manager,
+        resource,
+        &req.sequence_hashes,
+        req.search_mode,
+        req.tiers,
+    )
+    .await?;
     let committed = find.committed();
     let breakdown = find.breakdown;
 
@@ -416,6 +438,7 @@ pub(crate) async fn open_transfer_session(
         session_id,
         instance_id,
         endpoint,
+        resource,
     };
 
     // Park the session before kicking off the populator. Per-session
@@ -443,7 +466,14 @@ pub(crate) async fn open_transfer_session(
     let leader_for_task = Arc::clone(leader);
     let session_for_task = Arc::clone(&session);
     runtime.spawn(async move {
-        match stage_phase(leader_for_task, Arc::clone(&session_for_task), find).await {
+        match stage_phase(
+            leader_for_task,
+            g2_manager,
+            Arc::clone(&session_for_task),
+            find,
+        )
+        .await
+        {
             Ok(()) => {
                 crate::engine_audit!(
                     "transfer_populator_complete",
@@ -513,6 +543,7 @@ pub(crate) async fn pull_from_session(
     leader: &Arc<InstanceLeader>,
     req: PullFromSessionRequest,
 ) -> Result<PullFromSessionResponse, ControlError> {
+    let (resource, g2_manager) = resolve_g2_manager(leader, req.resource)?;
     let endpoint = req.endpoint.ok_or_else(|| {
         ControlError::Internal(
             "endpoint_required: pull_from_session requires an explicit endpoint in v1 \
@@ -531,6 +562,7 @@ pub(crate) async fn pull_from_session(
         "transfer_pull_started",
         session_id = %req.session_id,
         source = %req.source_instance_id,
+        resource = ?resource,
         selector_present = req.selector.is_some()
     );
 
@@ -585,7 +617,7 @@ pub(crate) async fn pull_from_session(
     let target_set: HashSet<SequenceHash> = target_hashes.iter().copied().collect();
 
     // Drain availability, pulling each chunk.
-    let block_size = leader.g2_manager().block_size();
+    let block_size = g2_manager.block_size();
     let mut pulled_order: Vec<SequenceHash> = Vec::with_capacity(target_set.len());
     let mut pulled_set: HashSet<SequenceHash> = HashSet::new();
 
@@ -609,17 +641,14 @@ pub(crate) async fn pull_from_session(
                 }
 
                 let chunk_len = chunk_hashes.len();
-                let dst = leader
-                    .g2_manager()
-                    .allocate_blocks(chunk_len)
-                    .ok_or_else(|| {
-                        ControlError::Internal(format!(
-                            "pull: failed to allocate {chunk_len} G2 mutable blocks"
-                        ))
-                    })?;
+                let dst = g2_manager.allocate_blocks(chunk_len).ok_or_else(|| {
+                    ControlError::Internal(format!(
+                        "pull: failed to allocate {chunk_len} G2 mutable blocks"
+                    ))
+                })?;
 
                 let filled = session
-                    .pull(chunk_hashes.clone(), dst)
+                    .pull_resource(resource, chunk_hashes.clone(), dst)
                     .await
                     .map_err(|e| ControlError::Internal(format!("session.pull: {e:#}")))?;
 
@@ -640,7 +669,7 @@ pub(crate) async fn pull_from_session(
                     })?;
                     completes.push(complete);
                 }
-                let _registered = leader.g2_manager().register_blocks(completes);
+                let _registered = g2_manager.register_blocks(completes);
 
                 pulled_order.extend(&chunk_hashes);
                 pulled_set.extend(&chunk_hashes);
@@ -686,4 +715,17 @@ pub(crate) async fn pull_from_session(
             object_blocks: 0,
         },
     })
+}
+
+fn resolve_g2_manager(
+    leader: &InstanceLeader,
+    requested: Option<LogicalResourceId>,
+) -> Result<(LogicalResourceId, Arc<BlockManager<G2>>), ControlError> {
+    let resource = requested.unwrap_or_else(|| leader.primary_g2_resource());
+    let manager = leader.g2_manager_for(resource).cloned().ok_or_else(|| {
+        ControlError::Internal(format!(
+            "logical_resource_not_found: no G2 manager for resource {resource:?}"
+        ))
+    })?;
+    Ok((resource, manager))
 }

@@ -130,14 +130,16 @@ For Multi-head Latent Attention (MLA), KV data is replicated rather than sharded
 The `ReplicatedDataWorker` (feature-gated behind `collectives`) implements a
 different strategy:
 
-- **Rank 0** is the only worker with G2 and G3 storage. It performs all
-  tier-to-tier transfers (G3 → G2 → G1).
-- **Ranks 1..N** only have G1. They receive data from rank 0 via NCCL
-  `broadcast`.
+- **Every rank** stores the same G1 block IDs.
+- **G2 is striped** across ranks. A global G2 block ID maps to one owner rank
+  and one owner-local slot.
+- During offload, only the owner copies its G1 replica to G2.
+- During onboard, the owner loads G2 → G1 and then broadcasts that batch from
+  its rank to every other G1 replica.
 
 This means the leader can still say "onboard these blocks" and the group handles
-the asymmetry internally — rank 0 does the heavy lifting, then broadcasts to
-everyone else.
+the asymmetry internally. Every rank derives owner batches in the same rank order
+so collective calls cannot disagree about which rank is the root.
 
 ### The Power of the Abstraction
 

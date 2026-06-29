@@ -92,6 +92,9 @@ struct PassState {
 /// boundaries and exposes the layer-granular hooks inherently.
 pub struct WorkerEngine {
     worker: Arc<DirectWorker>,
+    /// Replicated-data transfer policy. When present, intra-pass transfers
+    /// use owner routing and collectives instead of direct per-rank copies.
+    replicated_transfers: Option<Arc<dyn WorkerTransfers>>,
     num_layers: usize,
     /// One per layer; recorded on the engine's H2D transfer stream during the
     /// intra-pass onboard, waited on by the torch stream per layer.
@@ -127,6 +130,38 @@ impl WorkerEngine {
         messenger: Arc<Messenger>,
         tokio: tokio::runtime::Handle,
     ) -> Result<Arc<Self>> {
+        Self::build_inner(worker, None, num_layers, completion, messenger, tokio)
+    }
+
+    /// Build a worker engine whose transfers use replicated-G1/striped-G2
+    /// routing. Onboard currently completes before model execution begins;
+    /// direct layer-wise overlap remains available on the standard path.
+    pub fn build_replicated(
+        worker: Arc<DirectWorker>,
+        transfers: Arc<dyn WorkerTransfers>,
+        num_layers: usize,
+        completion: Arc<dyn EngineWorkerSink>,
+        messenger: Arc<Messenger>,
+        tokio: tokio::runtime::Handle,
+    ) -> Result<Arc<Self>> {
+        Self::build_inner(
+            worker,
+            Some(transfers),
+            num_layers,
+            completion,
+            messenger,
+            tokio,
+        )
+    }
+
+    fn build_inner(
+        worker: Arc<DirectWorker>,
+        replicated_transfers: Option<Arc<dyn WorkerTransfers>>,
+        num_layers: usize,
+        completion: Arc<dyn EngineWorkerSink>,
+        messenger: Arc<Messenger>,
+        tokio: tokio::runtime::Handle,
+    ) -> Result<Arc<Self>> {
         let transfer_manager = worker.transfer_manager();
 
         // Pre-allocate onboard events (H2D stream).
@@ -152,6 +187,7 @@ impl WorkerEngine {
 
         Ok(Arc::new(Self {
             worker,
+            replicated_transfers,
             num_layers,
             onboard_layer_events,
             compute_layer_events,
@@ -223,6 +259,19 @@ impl WorkerEngine {
             g1_blocks = onboard.g1_dst_block_ids.len(),
             "Starting intra-pass layer-wise onboard from G2 to G1"
         );
+
+        if let Some(transfers) = &self.replicated_transfers {
+            let notification = transfers.execute_local_transfer(
+                LogicalLayoutHandle::G2,
+                LogicalLayoutHandle::G1,
+                Arc::from(onboard.g2_src_block_ids),
+                Arc::from(onboard.g1_dst_block_ids),
+                TransferOptions::builder().build()?,
+            )?;
+            futures::executor::block_on(std::future::IntoFuture::into_future(notification))?;
+            tracing::debug!("Replicated intra-pass onboard completed before model execution");
+            return Ok(());
+        }
 
         self.worker.execute_local_layerwise_onboard(
             &onboard.g2_src_block_ids,
@@ -306,13 +355,23 @@ impl WorkerEngine {
                 .cuda_stream(offload.stream.clone())
                 .build()?;
 
-            self.worker.execute_local_transfer(
-                LogicalLayoutHandle::G1,
-                LogicalLayoutHandle::G2,
-                offload.g1_src_block_ids.clone(),
-                offload.g2_dst_block_ids.clone(),
-                options,
-            )?;
+            if let Some(transfers) = &self.replicated_transfers {
+                transfers.execute_local_transfer(
+                    LogicalLayoutHandle::G1,
+                    LogicalLayoutHandle::G2,
+                    offload.g1_src_block_ids.clone(),
+                    offload.g2_dst_block_ids.clone(),
+                    options,
+                )?;
+            } else {
+                self.worker.execute_local_transfer(
+                    LogicalLayoutHandle::G1,
+                    LogicalLayoutHandle::G2,
+                    offload.g1_src_block_ids.clone(),
+                    offload.g2_dst_block_ids.clone(),
+                    options,
+                )?;
+            }
 
             if is_last_layer {
                 self.offload_complete_event

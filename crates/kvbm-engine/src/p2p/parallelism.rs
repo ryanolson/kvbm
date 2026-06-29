@@ -16,11 +16,18 @@
 //! AB-1a step 2: this module is the computation. Wiring into the
 //! `export_metadata_callback` is a separate step.
 
+mod resources;
+
+pub use resources::ParallelismTemplateSet;
+
 use anyhow::{Result, bail};
 use kvbm_common::{KvDim, LogicalLayoutHandle};
 use kvbm_config::ParallelismMode;
 use kvbm_physical::layout::LayoutConfig;
-use kvbm_physical::manager::{ParallelismDescriptor, SerializedLayout};
+use kvbm_physical::manager::{
+    ParallelismDescriptor, ResourceParallelismDescriptor, ResourceParallelismDescriptors,
+    SerializedLayout, WorkerDataPlacement,
+};
 
 /// Per-leader parallelism template — the knobs the leader applies when
 /// stamping per-worker descriptors. PP is reserved (must be 1 for now).
@@ -57,11 +64,10 @@ impl ParallelismTemplate {
     /// configured [`ParallelismMode`], and the worker count.
     ///
     /// Today PP is unsupported (`pp_size = 1`). The shard axis is
-    /// [`KvDim::HeadCount`] under [`ParallelismMode::TensorParallel`]; under
-    /// [`ParallelismMode::ReplicatedData`] no axis is actually sharded but
-    /// the field is set to [`KvDim::HeadCount`] by convention — the receiver
-    /// disambiguates by comparing per-worker layout extents to
-    /// `global_extents`.
+    /// [`KvDim::HeadCount`] under [`ParallelismMode::TensorParallel`]. Under
+    /// [`ParallelismMode::ReplicatedData`] no tensor axis is sharded; the
+    /// field remains a compatibility placeholder while
+    /// [`WorkerDataPlacement`] selects owner routing.
     pub fn from_layout_config(
         layout: &LayoutConfig,
         mode: ParallelismMode,
@@ -70,33 +76,50 @@ impl ParallelismTemplate {
         if num_workers == 0 {
             bail!("from_layout_config: num_workers must be > 0");
         }
-        let per_worker_heads = layout.num_heads.ok_or_else(|| {
-            anyhow::anyhow!(
-                "from_layout_config: LayoutConfig.num_heads must be set to derive HeadCount extent"
-            )
-        })?;
-        if per_worker_heads == 0 {
-            bail!("from_layout_config: num_heads must be > 0");
+        let mut global_extents = vec![
+            (KvDim::Layer, layout.num_layers),
+            (KvDim::Outer, layout.outer_dim),
+            (KvDim::Page, layout.page_size),
+        ];
+        match layout.num_heads {
+            Some(per_worker_heads) => {
+                if per_worker_heads == 0 {
+                    bail!("from_layout_config: num_heads must be > 0");
+                }
+                // `inner_dim` is the trailing dim of the block tensor and
+                // equals `num_heads * head_size`. Under TensorParallel both
+                // values shard by the same factor, so their ratio is global.
+                if !layout.inner_dim.is_multiple_of(per_worker_heads) {
+                    bail!(
+                        "from_layout_config: inner_dim ({}) is not divisible by num_heads ({}) \
+                         — cannot derive HeadSize extent",
+                        layout.inner_dim,
+                        per_worker_heads,
+                    );
+                }
+                let head_size = layout.inner_dim / per_worker_heads;
+                let global_heads = match mode {
+                    ParallelismMode::TensorParallel => per_worker_heads * num_workers,
+                    ParallelismMode::ReplicatedData => per_worker_heads,
+                };
+                global_extents.extend([
+                    (KvDim::HeadCount, global_heads),
+                    (KvDim::HeadSize, head_size),
+                ]);
+            }
+            None => {
+                if mode == ParallelismMode::TensorParallel {
+                    bail!(
+                        "from_layout_config: tensor-sharded data requires a HeadCount axis; \
+                         headless MLA must use ReplicatedData"
+                    );
+                }
+                // Basic MLA has one latent vector rather than a
+                // HeadCount × HeadSize tensor. Preserve that labelled tail
+                // extent without inventing a fake head count.
+                global_extents.push((KvDim::HeadSize, layout.inner_dim));
+            }
         }
-        // `inner_dim` is the trailing dim of the block tensor and equals
-        // `num_heads * head_size` (see kvbm-physical/src/layout/mod.rs
-        // `resolve_head_dims`). Per-head channel count is the ratio. Under
-        // TensorParallel both `inner_dim` and `num_heads` shard by the same
-        // factor, so the ratio is invariant — `head_size` is a global
-        // constant either way.
-        if !layout.inner_dim.is_multiple_of(per_worker_heads) {
-            bail!(
-                "from_layout_config: inner_dim ({}) is not divisible by num_heads ({}) \
-                 — cannot derive HeadSize extent",
-                layout.inner_dim,
-                per_worker_heads,
-            );
-        }
-        let head_size = layout.inner_dim / per_worker_heads;
-        let global_heads = match mode {
-            ParallelismMode::TensorParallel => per_worker_heads * num_workers,
-            ParallelismMode::ReplicatedData => per_worker_heads,
-        };
         Ok(Self {
             tp_size: num_workers,
             pp_size: 1,
@@ -106,36 +129,44 @@ impl ParallelismTemplate {
             // across leaders running the same model). Block is
             // deliberately omitted — block-id space is per-leader and
             // two leaders can legitimately have different block counts.
-            global_extents: vec![
-                (KvDim::Layer, layout.num_layers),
-                (KvDim::Outer, layout.outer_dim),
-                (KvDim::Page, layout.page_size),
-                (KvDim::HeadCount, global_heads),
-                (KvDim::HeadSize, head_size),
-            ],
+            global_extents,
             num_layers: layout.num_layers,
             dtype_width_bytes: layout.dtype_width_bytes,
         })
     }
 
+    pub(crate) fn worker_data_placement(&self) -> WorkerDataPlacement {
+        match self.parallelism_mode {
+            ParallelismMode::TensorParallel => WorkerDataPlacement::TensorSharded,
+            ParallelismMode::ReplicatedData => WorkerDataPlacement::ReplicatedG1StripedLower,
+        }
+    }
+
     /// Build a [`CanonicalBlockShape`](kvbm_common::CanonicalBlockShape)
     /// from this template.
     ///
-    /// Returns `None` if `global_extents` is missing one of the required
-    /// canonical axes (Layer / Outer / Page / HeadCount / HeadSize). This
-    /// is the local side of the Universal-mode block-layout
-    /// compatibility check in [`SpmdParallelWorkers::connect_remote`].
+    /// Returns `None` if `global_extents` is missing a required canonical
+    /// axis. Headless replicated MLA is normalized to `HeadCount = 1` only in
+    /// this compatibility view; its tensor labels remain headless. This is the
+    /// local side of the Universal-mode block-layout compatibility check in
+    /// [`SpmdParallelWorkers::connect_remote`].
     pub fn canonical_block_shape(&self) -> Option<kvbm_common::CanonicalBlockShape> {
         let extent = |axis: KvDim| -> Option<usize> {
             self.global_extents
                 .iter()
                 .find_map(|(d, n)| if *d == axis { Some(*n) } else { None })
         };
+        // The hub's canonical compatibility shape is a five-axis normalized
+        // representation. Headless MLA has one latent stream rather than a
+        // real HeadCount axis, so normalize only that compatibility view to
+        // one head while keeping the tensor labels themselves headless.
+        let num_heads_total = extent(KvDim::HeadCount)
+            .or_else(|| (self.parallelism_mode == ParallelismMode::ReplicatedData).then_some(1))?;
         Some(kvbm_common::CanonicalBlockShape {
             num_layers_total: extent(KvDim::Layer)?,
             outer_dim: extent(KvDim::Outer)?,
             page_size: extent(KvDim::Page)?,
-            num_heads_total: extent(KvDim::HeadCount)?,
+            num_heads_total,
             head_dim: extent(KvDim::HeadSize)?,
             dtype_width_bytes: self.dtype_width_bytes,
         })
@@ -278,6 +309,37 @@ pub fn validate_remote_metadata(
     remote_tiers: &[&[LogicalLayoutHandle]],
     required_tier: LogicalLayoutHandle,
 ) -> std::result::Result<(), CompatError> {
+    validate_remote_metadata_impl(local, remote_descriptors, remote_tiers, required_tier, true)
+}
+
+/// Validate replicated-data peers without applying tensor-resharding gates.
+///
+/// Replicated G1 / striped lower-tier placement can route between arbitrary
+/// worker counts because block ownership is resolved by block ID. It therefore
+/// does not require TP divisibility or a tensor shard axis, while all rank,
+/// global-shape, PP, and required-tier gates still apply.
+pub(crate) fn validate_replicated_remote_metadata(
+    local: &ParallelismTemplate,
+    remote_descriptors: &[ParallelismDescriptor],
+    remote_tiers: &[&[LogicalLayoutHandle]],
+    required_tier: LogicalLayoutHandle,
+) -> std::result::Result<(), CompatError> {
+    validate_remote_metadata_impl(
+        local,
+        remote_descriptors,
+        remote_tiers,
+        required_tier,
+        false,
+    )
+}
+
+fn validate_remote_metadata_impl(
+    local: &ParallelismTemplate,
+    remote_descriptors: &[ParallelismDescriptor],
+    remote_tiers: &[&[LogicalLayoutHandle]],
+    required_tier: LogicalLayoutHandle,
+    tensor_resharding: bool,
+) -> std::result::Result<(), CompatError> {
     if remote_descriptors.len() != remote_tiers.len() {
         return Err(CompatError::InconsistentRemote {
             reason: format!(
@@ -404,7 +466,10 @@ pub fn validate_remote_metadata(
     // Gate 4: TP divisibility — one tp_size must divide the other.
     let local_tp = local.tp_size;
     let remote_tp = head.tp_size;
-    if !local_tp.is_multiple_of(remote_tp) && !remote_tp.is_multiple_of(local_tp) {
+    if tensor_resharding
+        && !local_tp.is_multiple_of(remote_tp)
+        && !remote_tp.is_multiple_of(local_tp)
+    {
         return Err(CompatError::Coprime {
             local_tp,
             remote_tp,
@@ -412,7 +477,7 @@ pub fn validate_remote_metadata(
     }
 
     // Gate 5: shard axis agreement
-    if local.shard_axis != head.shard_axis {
+    if tensor_resharding && local.shard_axis != head.shard_axis {
         return Err(CompatError::ShardAxisMismatch {
             local: local.shard_axis,
             remote: head.shard_axis,
@@ -507,21 +572,75 @@ pub fn stamp_parallelism_descriptors(
     for (rank, layout) in metadata.into_iter().enumerate() {
         let unpacked = layout.unpack()?;
         let descriptor = template.descriptor_for(rank)?;
-        let repacked = SerializedLayout::pack(
+        let repacked = SerializedLayout::pack_with_resource_parallelism(
             unpacked.worker_address,
             unpacked.nixl_metadata,
             unpacked.layouts,
             Some(descriptor),
+            Some(template.worker_data_placement()),
+            unpacked.resource_layouts,
+            unpacked.resource_parallelism,
         )?;
         out.push(repacked);
     }
     Ok(out)
 }
 
+/// Stamp every logical resource with its own parallelism and placement.
+pub fn stamp_resource_parallelism_descriptors(
+    templates: &ParallelismTemplateSet,
+    metadata: Vec<SerializedLayout>,
+) -> Result<Vec<SerializedLayout>> {
+    let expected = templates.worker_count();
+    if metadata.len() != expected {
+        bail!(
+            "stamp_resource_parallelism_descriptors: metadata length {} does not match worker grid size {}",
+            metadata.len(),
+            expected
+        );
+    }
+
+    metadata
+        .into_iter()
+        .enumerate()
+        .map(|(rank, layout)| {
+            let unpacked = layout.unpack()?;
+            let descriptors = templates
+                .iter()
+                .map(|(resource, template)| {
+                    Ok(ResourceParallelismDescriptor::new(
+                        resource,
+                        template.descriptor_for(rank)?,
+                        template.worker_data_placement(),
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let descriptors =
+                ResourceParallelismDescriptors::new(templates.primary(), descriptors)?;
+            let primary = descriptors
+                .get(templates.primary())
+                .expect("validated resource descriptors retain their primary");
+
+            SerializedLayout::pack_with_resource_parallelism(
+                unpacked.worker_address,
+                unpacked.nixl_metadata,
+                unpacked.layouts,
+                Some(primary.parallelism.clone()),
+                Some(primary.placement),
+                unpacked.resource_layouts,
+                Some(descriptors),
+            )
+        })
+        .collect()
+}
+
 #[cfg(all(test, feature = "testing"))]
 mod tests {
     use super::*;
-    use kvbm_physical::manager::{LogicalLayoutDescriptor, WorkerAddress};
+    use kvbm_common::LogicalResourceId;
+    use kvbm_physical::manager::{
+        LogicalLayoutDescriptor, ResourceLayoutDescriptor, ResourceLayouts, WorkerAddress,
+    };
 
     fn empty_layout_for(worker_id: u64) -> SerializedLayout {
         SerializedLayout::pack(
@@ -555,6 +674,10 @@ mod tests {
         assert_eq!(stamped.len(), 4);
         for (i, layout) in stamped.iter().enumerate() {
             let unpacked = layout.unpack().unwrap();
+            assert_eq!(
+                unpacked.worker_data_placement,
+                Some(WorkerDataPlacement::TensorSharded)
+            );
             let desc = unpacked.parallelism.expect("descriptor must be stamped");
             assert_eq!(desc.tp_size, 4);
             assert_eq!(desc.pp_size, 1);
@@ -592,6 +715,117 @@ mod tests {
     }
 
     #[test]
+    fn stamping_preserves_resource_layouts() {
+        let resources = ResourceLayouts::new(
+            LogicalResourceId(1),
+            vec![
+                ResourceLayoutDescriptor::new(LogicalResourceId(1), Vec::new()),
+                ResourceLayoutDescriptor::new(LogicalResourceId(7), Vec::new()),
+            ],
+        )
+        .unwrap();
+        let metadata = vec![
+            SerializedLayout::pack_with_resources(
+                WorkerAddress::new(42, "agent-42".to_string()),
+                Vec::new(),
+                Vec::new(),
+                None,
+                None,
+                Some(resources),
+            )
+            .unwrap(),
+        ];
+
+        let stamped = stamp_parallelism_descriptors(&make_template(1), metadata).unwrap();
+        let resources = stamped[0]
+            .unpack()
+            .unwrap()
+            .resource_layouts
+            .expect("parallelism stamping must preserve resource layouts");
+
+        assert_eq!(resources.primary(), LogicalResourceId(1));
+        assert!(resources.get(LogicalResourceId(7)).is_some());
+    }
+
+    #[test]
+    fn stamps_mixed_parallelism_per_resource() {
+        let tensor = make_template(2);
+        let mut replicated = make_template(2);
+        replicated.parallelism_mode = ParallelismMode::ReplicatedData;
+        replicated.global_extents = vec![(KvDim::Layer, 24), (KvDim::HeadSize, 64)];
+        let templates = ParallelismTemplateSet::new(
+            LogicalResourceId(0),
+            vec![
+                (LogicalResourceId(0), tensor),
+                (LogicalResourceId(1), replicated),
+            ],
+        )
+        .unwrap();
+        let metadata = (0..2)
+            .map(|rank| {
+                let resources = ResourceLayouts::new(
+                    LogicalResourceId(0),
+                    vec![
+                        ResourceLayoutDescriptor::new(LogicalResourceId(0), Vec::new()),
+                        ResourceLayoutDescriptor::new(LogicalResourceId(1), Vec::new()),
+                    ],
+                )
+                .unwrap();
+                SerializedLayout::pack_with_resources(
+                    WorkerAddress::new(rank, format!("mixed-{rank}")),
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                    None,
+                    Some(resources),
+                )
+                .unwrap()
+            })
+            .collect();
+
+        let stamped = stamp_resource_parallelism_descriptors(&templates, metadata).unwrap();
+        for (rank, metadata) in stamped.iter().enumerate() {
+            let unpacked = metadata.unpack().unwrap();
+            assert_eq!(unpacked.parallelism.as_ref().unwrap().rank, rank);
+            assert_eq!(
+                unpacked.worker_data_placement,
+                Some(WorkerDataPlacement::TensorSharded)
+            );
+            let resources = unpacked.resource_parallelism.unwrap();
+            assert_eq!(
+                resources.get(LogicalResourceId(0)).unwrap().placement,
+                WorkerDataPlacement::TensorSharded
+            );
+            assert_eq!(
+                resources.get(LogicalResourceId(1)).unwrap().placement,
+                WorkerDataPlacement::ReplicatedG1StripedLower
+            );
+            assert_eq!(
+                resources
+                    .get(LogicalResourceId(1))
+                    .unwrap()
+                    .parallelism
+                    .rank,
+                rank
+            );
+        }
+    }
+
+    #[test]
+    fn resource_templates_require_one_worker_grid() {
+        let error = ParallelismTemplateSet::new(
+            LogicalResourceId(0),
+            vec![
+                (LogicalResourceId(0), make_template(2)),
+                (LogicalResourceId(1), make_template(4)),
+            ],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("worker grid"));
+    }
+
+    #[test]
     fn overwrites_any_preexisting_descriptor() {
         let template = make_template(2);
         let metadata = vec![empty_layout_for(0), empty_layout_for(1)];
@@ -619,6 +853,83 @@ mod tests {
             .num_heads(Some(num_heads))
             .build()
             .unwrap()
+    }
+
+    fn headless_mla_layout(latent_size: usize) -> LayoutConfig {
+        LayoutConfig::builder()
+            .num_blocks(128)
+            .num_layers(12)
+            .outer_dim(1)
+            .page_size(16)
+            .inner_dim(latent_size)
+            .num_heads(None)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn headless_mla_builds_replicated_template_without_fake_head_axis() {
+        let template = ParallelismTemplate::from_layout_config(
+            &headless_mla_layout(512),
+            ParallelismMode::ReplicatedData,
+            4,
+        )
+        .unwrap();
+
+        assert_eq!(template.tp_size, 4);
+        assert_eq!(template.parallelism_mode, ParallelismMode::ReplicatedData);
+        assert_eq!(extent_for(&template, KvDim::HeadSize), Some(512));
+        assert_eq!(extent_for(&template, KvDim::HeadCount), None);
+        let canonical = template.canonical_block_shape().unwrap();
+        assert_eq!(canonical.num_heads_total, 1);
+        assert_eq!(canonical.head_dim, 512);
+    }
+
+    #[test]
+    fn headless_layout_cannot_claim_tensor_sharding() {
+        let error = ParallelismTemplate::from_layout_config(
+            &headless_mla_layout(512),
+            ParallelismMode::TensorParallel,
+            2,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("HeadCount"));
+    }
+
+    #[test]
+    fn replicated_metadata_accepts_arbitrary_worker_counts() {
+        let layout = headless_mla_layout(512);
+        let local =
+            ParallelismTemplate::from_layout_config(&layout, ParallelismMode::ReplicatedData, 2)
+                .unwrap();
+        let remote =
+            ParallelismTemplate::from_layout_config(&layout, ParallelismMode::ReplicatedData, 3)
+                .unwrap();
+        let descriptors = (0..3)
+            .map(|rank| remote.descriptor_for(rank).unwrap())
+            .collect::<Vec<_>>();
+        let tiers = [
+            vec![LogicalLayoutHandle::G2],
+            vec![LogicalLayoutHandle::G2],
+            vec![LogicalLayoutHandle::G2],
+        ];
+        let tier_refs = tiers.iter().map(Vec::as_slice).collect::<Vec<_>>();
+
+        validate_replicated_remote_metadata(
+            &local,
+            &descriptors,
+            &tier_refs,
+            LogicalLayoutHandle::G2,
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_remote_metadata(&local, &descriptors, &tier_refs, LogicalLayoutHandle::G2),
+            Err(CompatError::Coprime {
+                local_tp: 2,
+                remote_tp: 3
+            })
+        ));
     }
 
     fn extent_for(tpl: &ParallelismTemplate, axis: KvDim) -> Option<usize> {
@@ -698,7 +1009,7 @@ mod tests {
     }
 
     #[test]
-    fn from_layout_config_rejects_missing_heads() {
+    fn tensor_parallel_from_layout_config_rejects_missing_head_axis() {
         let layout = LayoutConfig::builder()
             .num_blocks(16)
             .num_layers(24)
@@ -711,7 +1022,7 @@ mod tests {
         let err =
             ParallelismTemplate::from_layout_config(&layout, ParallelismMode::TensorParallel, 2)
                 .unwrap_err();
-        assert!(err.to_string().contains("num_heads"));
+        assert!(err.to_string().contains("HeadCount"));
     }
 
     #[test]

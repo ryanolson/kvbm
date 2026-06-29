@@ -14,10 +14,10 @@ keywords.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+bincode = { version = "2.0.1", features = ["serde", "derive"] }
 dynamo-tokens = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-bincode = { version = "2.0.1", features = ["serde", "derive"] }
 serde_json = { workspace = true }

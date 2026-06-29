@@ -48,9 +48,15 @@ _MODEL_CONFIGS: List[KvbmModelConfig] = [
         attention_backend="FLASH_ATTN",
     ),
     KvbmModelConfig(
-        model_id="deepseek-ai/DeepSeek-V2-Lite",
+        # Keep the real V2-Lite coverage as the default while allowing the
+        # same MLA/KVBM path to run against a tiny DeepSeek-V2 checkpoint for
+        # fast registration and transfer development.
+        model_id=os.environ.get(
+            "KVBM_MLA_MODEL_ID", "deepseek-ai/DeepSeek-V2-Lite"
+        ),
         # TRITON_MLA works on all devices; on H100 set KVBM_MLA_BACKEND=FLASH_ATTN_MLA
         attention_backend=os.environ.get("KVBM_MLA_BACKEND", "TRITON_MLA"),
+        max_model_len=int(os.environ.get("KVBM_MLA_MAX_MODEL_LEN", "8000")),
         # VLLM_BATCH_INVARIANT=1 disables prefix caching for TRITON_MLA in vLLM 0.17.1
         batch_invariant=False,
     ),

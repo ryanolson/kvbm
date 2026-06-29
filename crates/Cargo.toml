@@ -78,6 +78,7 @@ humantime = { version = "2.2.0" }
 hyper-util = { version = "=0.1.17" }
 indexmap = { version = "2" }
 libc = { version = "0.2" }
+libloading = "0.8.9"
 oneshot = { version = "0.1.13", features = ["std", "async"] }
 parking_lot = "0.12.5"
 prometheus = { version = "0.14" }

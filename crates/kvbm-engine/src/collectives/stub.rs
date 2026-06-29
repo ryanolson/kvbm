@@ -38,6 +38,7 @@ use super::CollectiveOps;
 ///
 /// // Operations complete immediately without data transfer
 /// let notification = collective.broadcast(
+///     0,
 ///     LogicalLayoutHandle::G1,
 ///     LogicalLayoutHandle::G1,
 ///     &src_block_ids,
@@ -75,14 +76,21 @@ impl StubCollectiveOps {
 impl CollectiveOps for StubCollectiveOps {
     fn broadcast(
         &self,
+        root_rank: usize,
         src: LogicalLayoutHandle,
         dst: LogicalLayoutHandle,
         src_block_ids: &[BlockId],
         dst_block_ids: &[BlockId],
         layer_range: Option<Range<usize>>,
     ) -> Result<TransferCompleteNotification> {
+        anyhow::ensure!(
+            root_rank < self.world_size,
+            "broadcast root {root_rank} is outside collective world size {}",
+            self.world_size
+        );
         tracing::warn!(
             rank = self.rank,
+            root_rank,
             world_size = self.world_size,
             ?src,
             ?dst,
@@ -103,6 +111,26 @@ impl CollectiveOps for StubCollectiveOps {
 
     fn rank(&self) -> usize {
         self.rank
+    }
+
+    fn broadcast_for_resource(
+        &self,
+        _resource: kvbm_common::LogicalResourceId,
+        root_rank: usize,
+        src: LogicalLayoutHandle,
+        dst: LogicalLayoutHandle,
+        src_block_ids: &[BlockId],
+        dst_block_ids: &[BlockId],
+        layer_range: Option<Range<usize>>,
+    ) -> Result<TransferCompleteNotification> {
+        self.broadcast(
+            root_rank,
+            src,
+            dst,
+            src_block_ids,
+            dst_block_ids,
+            layer_range,
+        )
     }
 
     fn world_size(&self) -> usize {

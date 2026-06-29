@@ -65,9 +65,16 @@ filtered by `KVBM_SPEC_ID`. Positional args override the target entirely.
 spec. `KVBM_CPU_BLOCKS` drives `cache.host.num_blocks` directly; the Rust
 leader bails at startup if neither a host nor disk cache tier is configured.
 
-`DeepSeek-V2-Lite` is the suite's MLA model and is currently gated. Set
-`KVBM_ENABLE_MLA=1` in both the server shell and eval shell to opt in. Pytest
-reports it as skipped otherwise.
+For a fast TP=1 MLA check on a small GPU, run
+`test_mla_smoke.py`; it defaults to `v2ray/DeepSeek-V3-1B-Test` and verifies
+MLA registration plus real G1↔G2 traffic. `DeepSeek-V2-Lite` remains the larger
+determinism-suite MLA model and is gated by `KVBM_ENABLE_MLA=1`. Override it
+with `KVBM_MLA_MODEL_ID` when the default model does not fit locally.
+
+On a two-GPU host, `test_mla_tp2.py` runs the same small model with TP=2 and
+additionally requires replicated-data placement plus two KVBM-owned NCCL
+communicators. It skips before server setup when fewer than two CUDA devices
+are visible.
 
 ## External-Attach Mode
 
@@ -85,6 +92,7 @@ is required by `run_eval.sh` to filter pytest to the launched parametrization.
 - `e2e` - end-to-end tests
 - `slow` - long-running tests
 - `gpu_1` - needs one GPU
+- `gpu_2` - needs two GPUs
 - `nightly` - preferred for nightly runs
 
 ## Configuration

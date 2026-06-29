@@ -155,6 +155,12 @@ pub enum RemoteDescriptor {
 ///
 /// This message is sent via Velo RPC during Phase 3 coordination.
 /// Workers use this to create additional cache tiers beyond G1 (GPU KV).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CollectiveBootstrap {
+    /// KVBM-owned NCCL communicator bootstrap serialized by `NcclBootstrap`.
+    Nccl { serialized: Vec<u8> },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaderLayoutConfig {
     /// Leader provided rank of this worker
@@ -164,7 +170,11 @@ pub struct LeaderLayoutConfig {
     /// each worker the rank provided by the Connector framework.
     pub rank: usize,
 
-    /// Number of host/pinned blocks for G2 tier.
+    /// Number of workers participating in this cache-parallel group.
+    #[serde(default = "default_worker_count")]
+    pub worker_count: usize,
+
+    /// Number of physical host/pinned blocks contributed by this worker.
     pub host_block_count: usize,
 
     /// Number of disk blocks for G3 tier (None = no disk tier).
@@ -179,10 +189,18 @@ pub struct LeaderLayoutConfig {
 
     /// Parallelism mode for this worker.
     ///
-    /// When `ReplicatedData` and rank > 0, the worker skips G2/G3 creation
-    /// since only rank 0 has host/disk storage in replicated mode.
+    /// In `ReplicatedData`, every worker contributes a disjoint stripe of
+    /// canonical lower-tier blocks while G1 remains replicated.
     #[serde(default)]
     pub parallelism: kvbm_config::ParallelismMode,
+
+    /// Optional KVBM-owned collective bootstrap for replicated cache data.
+    #[serde(default)]
+    pub collective: Option<CollectiveBootstrap>,
+}
+
+fn default_worker_count() -> usize {
+    1
 }
 
 /// Worker's response after configuring additional layouts (G2, G3).
@@ -195,4 +213,29 @@ pub struct WorkerLayoutResponse {
 
     /// Which logical layouts were successfully created in this operation.
     pub created_layouts: Vec<LogicalLayoutHandle>,
+}
+
+#[cfg(test)]
+mod leader_layout_config_tests {
+    use super::{CollectiveBootstrap, LeaderLayoutConfig};
+
+    #[test]
+    fn collective_bootstrap_round_trips_with_worker_layout_config() {
+        let config = LeaderLayoutConfig {
+            rank: 1,
+            worker_count: 2,
+            host_block_count: 128,
+            disk_block_count: None,
+            object: None,
+            parallelism: kvbm_config::ParallelismMode::ReplicatedData,
+            collective: Some(CollectiveBootstrap::Nccl {
+                serialized: vec![1, 2, 3, 4],
+            }),
+        };
+
+        let wire = serde_json::to_vec(&config).unwrap();
+        let decoded: LeaderLayoutConfig = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(decoded.worker_count, 2);
+        assert_eq!(decoded.collective, config.collective);
+    }
 }
