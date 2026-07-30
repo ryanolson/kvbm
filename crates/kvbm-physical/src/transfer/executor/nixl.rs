@@ -358,6 +358,7 @@ impl<'a> NixlTransferBuilder<'a, Set, Set, Set, Set, Set> {
             XferOp::Read => src_metadata.agent_name(),
         };
 
+        let registration = ctx.reserve_nixl_status()?;
         let xfer_req = nixl_agent.create_xfer_req(
             xfer_op,
             &src_dl,
@@ -375,7 +376,7 @@ impl<'a> NixlTransferBuilder<'a, Set, Set, Set, Set, Set> {
 
         if still_pending {
             // Register for async completion via status polling
-            Ok(ctx.register_nixl_status(xfer_req, None))
+            Ok(ctx.register_nixl_status(xfer_req, None, registration))
         } else {
             // Transfer completed synchronously
             Ok(TransferCompleteNotification::completed())

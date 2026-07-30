@@ -29,17 +29,27 @@
 //!   position. This is the historical lineage-backend behavior and the
 //!   default. Costs O(log n) per hook and B-tree node churn — it is the
 //!   only structure here that is not pre-sized.
+//! - [`Valued`](LeafPolicy::Valued) — a sampled-min value scorer
+//!   (frequency × recency × compaction-discount × fan-out boost) with a
+//!   hard poison FIFO. O(K) per victim, no global order. See
+//!   [`valued`](super::valued).
 //!
-//! A frequency-tiered variant (bucket leaves by TinyLFU count, evict cold
-//! tiers first) is the planned third arm; adding it extends this enum and
-//! `on_node_inserted`'s signature (it would need the `SequenceHash`).
+//! `Fifo`/`Tick` ignore the `seq_hash` on `on_node_inserted` and the
+//! poison hooks; only `Valued` uses them.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use super::valued::{ScorerParams, ValuedPolicy};
+use crate::blocks::SequenceHash;
+use crate::branch_tracker::BranchOracle;
+use crate::tinylfu::FrequencyTracker;
 
 /// Leaf-eviction ordering strategy for `LineageBackend`. See the module docs.
 pub(crate) enum LeafPolicy {
     Fifo(FifoPolicy),
     Tick(TickPolicy),
+    Valued(ValuedPolicy),
 }
 
 impl LeafPolicy {
@@ -53,11 +63,24 @@ impl LeafPolicy {
         Self::Tick(TickPolicy::with_capacity(capacity))
     }
 
-    /// A slot just became a `Real` node (fresh insert or ghost promotion).
-    pub(crate) fn on_node_inserted(&mut self, idx: u32) {
+    /// Sampled-min valued policy, pre-sized for `capacity` slots. `sketch`/`oracle` are
+    /// optional — with neither, the score degenerates to pure recency (LRU).
+    pub(crate) fn valued(
+        capacity: usize,
+        sketch: Option<Arc<dyn FrequencyTracker<u128>>>,
+        oracle: Option<Arc<dyn BranchOracle>>,
+        params: ScorerParams,
+    ) -> Self {
+        Self::Valued(ValuedPolicy::new(capacity, sketch, oracle, params))
+    }
+
+    /// A slot just became a `Real` node (fresh insert or ghost promotion). `seq_hash` is
+    /// only consumed by [`Valued`](Self::Valued) (frequency/oracle lookup keys).
+    pub(crate) fn on_node_inserted(&mut self, idx: u32, seq_hash: SequenceHash) {
         match self {
             Self::Fifo(_) => {} // FIFO assigns nothing at insert time
             Self::Tick(p) => p.on_node_inserted(idx),
+            Self::Valued(p) => p.on_node_inserted(idx, seq_hash),
         }
     }
 
@@ -66,6 +89,7 @@ impl LeafPolicy {
         match self {
             Self::Fifo(p) => p.on_leaf_added(idx),
             Self::Tick(p) => p.on_leaf_added(idx),
+            Self::Valued(p) => p.on_leaf_added(idx),
         }
     }
 
@@ -75,6 +99,7 @@ impl LeafPolicy {
         match self {
             Self::Fifo(p) => p.unlink(idx),
             Self::Tick(p) => p.on_leaf_demoted(idx),
+            Self::Valued(p) => p.on_leaf_demoted(idx),
         }
     }
 
@@ -84,14 +109,34 @@ impl LeafPolicy {
         match self {
             Self::Fifo(p) => p.unlink(idx),
             Self::Tick(p) => p.on_node_removed(idx),
+            Self::Valued(p) => p.on_node_removed(idx),
         }
     }
 
-    /// Slot index of the next block to evict, or `None` if no leaves.
-    pub(crate) fn next_victim(&self) -> Option<u32> {
+    /// Slot index of the next block to evict, or `None` if no leaves. `&mut self` because
+    /// [`Valued`](Self::Valued) advances its sampling RNG.
+    pub(crate) fn next_victim(&mut self) -> Option<u32> {
         match self {
             Self::Fifo(p) => p.next_victim(),
             Self::Tick(p) => p.next_victim(),
+            Self::Valued(p) => p.next_victim(),
+        }
+    }
+
+    /// Mark slot `idx` poisoned (evict-first). No-op for `Fifo`/`Tick`, which do not
+    /// support poisoning.
+    pub(crate) fn mark_poisoned(&mut self, idx: u32) {
+        if let Self::Valued(p) = self {
+            p.mark_poisoned(idx);
+        }
+    }
+
+    /// Peak fan-out for `seq_hash` as a parent, via `Valued`'s oracle; `None` otherwise.
+    /// The backend's poison walk stops at the first `≥ 2` ancestor.
+    pub(crate) fn max_fanout_of(&self, seq_hash: SequenceHash) -> Option<u32> {
+        match self {
+            Self::Valued(p) => p.max_fanout_of(seq_hash),
+            _ => None,
         }
     }
 
@@ -101,6 +146,16 @@ impl LeafPolicy {
         match self {
             Self::Fifo(p) => p.len(),
             Self::Tick(p) => p.queue.len(),
+            Self::Valued(p) => p.len(),
+        }
+    }
+
+    /// Whether slot `idx` is marked poisoned (`Valued` only). Test-only.
+    #[cfg(test)]
+    pub(crate) fn test_is_poisoned(&self, idx: u32) -> bool {
+        match self {
+            Self::Valued(p) => p.test_is_poisoned(idx),
+            _ => false,
         }
     }
 }

@@ -39,8 +39,8 @@ use tracing_mutex::parkinglot::Mutex;
 
 use crate::BlockId;
 use crate::blocks::{
-    BlockDuplicationPolicy, BlockMetadata, CompleteBlock, ImmutableBlockInner, MutableBlock,
-    SequenceHash,
+    BlockDuplicationPolicy, BlockMetadata, CompleteBlock, ImmutableBlock, ImmutableBlockInner,
+    MutableBlock, SequenceHash,
 };
 use crate::metrics::BlockPoolMetrics;
 use crate::registry::BlockRegistrationHandle;
@@ -92,6 +92,24 @@ pub(crate) trait InactiveIndex: Send + Sync {
     /// Remove a specific `block_id`/`seq_hash` pair if present.
     #[allow(dead_code)]
     fn take(&mut self, seq_hash: SequenceHash, block_id: BlockId) -> bool;
+
+    /// Mark the single-owner lineage suffix ending at `seq_hash` for evict-first
+    /// (compaction poison). Default is a no-op — only the lineage backend's valued leaf
+    /// policy acts on it; every other backend ignores it. Wired to a client compaction
+    /// hint through `BlockManager::poison_lineage` (EV-PR4).
+    fn poison(&mut self, seq_hash: SequenceHash) {
+        let _ = seq_hash;
+    }
+
+    /// Test-only: whether the resident node for `seq_hash` is marked poisoned.
+    /// Default `false` — only the lineage backend's valued policy tracks poison
+    /// marks. Mirrors [`Self::has`] so `BlockManager::test_is_poisoned` can
+    /// observe the compaction-poison wiring end-to-end (EV-PR4).
+    #[cfg(test)]
+    fn test_is_poisoned(&self, seq_hash: SequenceHash) -> bool {
+        let _ = seq_hash;
+        false
+    }
 
     /// Drain the entire index.
     fn allocate_all(&mut self) -> Vec<(SequenceHash, BlockId)> {
@@ -253,6 +271,68 @@ pub(crate) struct BlockStore<T: BlockMetadata> {
     release_primary_arrivals: std::sync::atomic::AtomicU64,
 }
 
+/// Options for [`BlockStore::release_blocks`].
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ReleaseOpts {
+    /// When `Some(v)`, overwrite every released block's per-slot
+    /// `reset_on_release` override with `v` inside the batch's single
+    /// critical section — for every entry, regardless of whether it ends
+    /// up released inline or deferred to its ordinary `Drop`. This
+    /// replaces a separate per-block `ImmutableBlock::set_evict_on_reset`
+    /// traversal (which would otherwise take the store mutex once per
+    /// block, before the drop pass). `None` leaves each slot's existing
+    /// override (from a prior `set_evict_on_reset` call, or the
+    /// store-wide default) untouched.
+    pub(crate) reset_on_release: Option<bool>,
+}
+
+/// Outcome counters for a [`BlockStore::release_blocks`] batch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ReleaseReport {
+    /// Primary slots routed `Primary → Reset` inline, under the batch lock.
+    pub(crate) primary_reset: usize,
+    /// Primary slots routed `Primary → Inactive` inline, under the batch lock.
+    pub(crate) primary_inactive: usize,
+    /// Duplicate slots routed `Duplicate → Reset` inline, under the batch lock.
+    pub(crate) duplicate_reset: usize,
+    /// Entries left to their normal per-block `Drop` — either because the
+    /// guard's `Inner` was still `Arc`-shared (a live duplicate's
+    /// primary-keepalive, or another clone) at the moment we tried to
+    /// take sole ownership via `Arc::try_unwrap`, or because the slot no
+    /// longer matched this `Inner`'s identity by the time we reached the
+    /// lock (defensive; see `release_blocks` docs).
+    pub(crate) deferred_to_drop: usize,
+}
+
+#[allow(dead_code)]
+impl ReleaseReport {
+    /// Total entries actually released inline, under the batch's single
+    /// lock acquisition (i.e. everything *not* deferred).
+    pub(crate) fn released(&self) -> usize {
+        self.primary_reset + self.primary_inactive + self.duplicate_reset
+    }
+}
+
+/// Result of matching a still-alive `Arc`'s identity against its slot,
+/// inside [`BlockStore::release_blocks`]'s single lock. Mirrors the
+/// `self_ptr` check in `release_primary` / `release_duplicate`, but
+/// captures the `(SequenceHash, BlockRegistrationHandle)` payload needed
+/// to complete the transition instead of just a bool.
+enum SlotIdentityMatch {
+    Primary(SequenceHash, BlockRegistrationHandle),
+    Duplicate(BlockRegistrationHandle),
+}
+
+/// Scratch entry for [`BlockStore::release_blocks`]'s single-pass
+/// algorithm. `arc` is `Some` exactly while this entry is still
+/// "unresolved" — not yet released inline and not yet swept into the
+/// deferred/external set. See [`BlockStore::release_entry_at`].
+struct ReleaseEntry<T: BlockMetadata> {
+    block_id: BlockId,
+    self_ptr: *const (),
+    arc: Option<Arc<ImmutableBlockInner<T>>>,
+}
+
 #[allow(dead_code)]
 impl<T: BlockMetadata + Sync> BlockStore<T> {
     pub(crate) fn new(
@@ -367,6 +447,25 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
 
     pub(crate) fn has_inactive(&self, seq_hash: SequenceHash) -> bool {
         self.inner.lock().inactive.has(seq_hash)
+    }
+
+    /// Mark the single-owner inactive lineage suffix ending at `seq_hash` for
+    /// evict-first (compaction poison). Membership-based: a no-op unless the
+    /// leaf is currently resident-inactive, and only the valued lineage backend
+    /// acts on the marks — every other backend ignores them (see
+    /// [`InactiveIndex::poison`]). The additive inverse of the
+    /// [`BlockManager::poison_lineage`](crate::manager::BlockManager::poison_lineage)
+    /// wrapper (EV-PR4); mirrors [`Self::has_inactive`].
+    pub(crate) fn poison_lineage(&self, seq_hash: SequenceHash) {
+        self.inner.lock().inactive.poison(seq_hash);
+    }
+
+    /// Test-only: whether the inactive backend has `seq_hash`'s resident node
+    /// marked poisoned. Mirrors [`Self::has_inactive`]; lets `BlockManager`
+    /// tests observe the compaction-poison wiring (EV-PR4).
+    #[cfg(test)]
+    pub(crate) fn test_is_poisoned(&self, seq_hash: SequenceHash) -> bool {
+        self.inner.lock().inactive.test_is_poisoned(seq_hash)
     }
 
     pub(crate) fn slot_block_size(&self, block_id: BlockId) -> usize {
@@ -718,6 +817,155 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         result
     }
 
+    /// Batched registration of completed blocks under **one** store-mutex
+    /// acquisition — the register-side analogue of
+    /// [`match_prefix_locked_batch`](Self::match_prefix_locked_batch)
+    /// (batched lookup) and [`allocate_atomic`](Self::allocate_atomic)
+    /// (batched commit). Mirrors [`register_completed_block`](Self::register_completed_block)
+    /// per item; added *alongside* it, not as a replacement — existing
+    /// single-block callers are unaffected.
+    ///
+    /// `blocks` and `handles` must be the same length and index-aligned:
+    /// `handles[i]` backs `blocks[i]`. `policy` applies uniformly to the
+    /// whole batch, matching `BlockManager`'s single store-wide
+    /// `duplication_policy`.
+    ///
+    /// Because every lookup-then-transition in the batch runs under the
+    /// same lock, this also closes the register-vs-register race *within*
+    /// the batch itself: if two entries share a sequence hash, the second
+    /// sees the first's `active_by_hash` update and is registered as a
+    /// duplicate (or rejected), exactly as if the two had been registered
+    /// one at a time.
+    pub(crate) fn register_blocks(
+        self: &Arc<Self>,
+        mut blocks: Vec<CompleteBlock<T>>,
+        handles: Vec<BlockRegistrationHandle>,
+        policy: BlockDuplicationPolicy,
+    ) -> Vec<Arc<ImmutableBlockInner<T>>> {
+        assert_eq!(
+            blocks.len(),
+            handles.len(),
+            "register_blocks: blocks/handles length mismatch"
+        );
+        if blocks.is_empty() {
+            return Vec::new();
+        }
+
+        // Validate every block/handle pair *before* mutating any guard
+        // state — matches the singular `register_block`'s
+        // (registration.rs) validate-before-mutate ordering. A real,
+        // always-on assertion (not `debug_assert!`): it must run in
+        // release builds too, and it must run before any guard is
+        // disarmed below, so a mismatch anywhere in the batch leaves
+        // every `CompleteBlock` untouched (still armed) to unwind and
+        // release itself normally on panic — no half-applied batch, no
+        // `Staged` slots stranded mid-registration.
+        for (block, handle) in blocks.iter().zip(handles.iter()) {
+            assert_eq!(
+                block.sequence_hash(),
+                handle.seq_hash(),
+                "register_blocks: attempted to register block {} with a different sequence hash than its handle",
+                block.block_id(),
+            );
+        }
+
+        // Disarm every guard up front so its slot stays `Staged` across
+        // the transition; `rearm[i]` re-arms the Reject-dedup entries so
+        // their guard drop still releases `Staged → Reset` once the lock
+        // is gone — mirrors the single-item disarm/rearm dance above.
+        for block in &mut blocks {
+            block.disarm();
+        }
+        let mut rearm = vec![false; blocks.len()];
+        let mut results = Vec::with_capacity(blocks.len());
+        let mut present_handles = Vec::with_capacity(blocks.len());
+
+        {
+            let mut inner = self.inner.lock();
+            for (i, (block, handle)) in blocks.iter().zip(handles.iter()).enumerate() {
+                let block_id = block.block_id();
+                let seq_hash = block.sequence_hash();
+
+                let existing = self.acquire_for_hash_locked(&mut inner, seq_hash, false);
+
+                let inner_arc = if let Some(existing_primary) = existing {
+                    assert_ne!(
+                        existing_primary.block_id(),
+                        block_id,
+                        "register_blocks: collision with same block_id {block_id}"
+                    );
+                    match policy {
+                        BlockDuplicationPolicy::Allow => {
+                            debug_assert!(matches!(
+                                inner.slots[block_id].state,
+                                SlotState::Staged { .. }
+                            ));
+                            let inner_arc = ImmutableBlockInner::new_duplicate(
+                                self.clone(),
+                                block_id,
+                                seq_hash,
+                                handle.clone(),
+                                existing_primary,
+                            );
+                            inner.slots[block_id].state = SlotState::Duplicate {
+                                seq_hash,
+                                handle: handle.clone(),
+                                inner: Arc::downgrade(&inner_arc),
+                            };
+                            self.metrics.inc_duplicate_blocks();
+                            present_handles.push(handle.clone());
+                            inner_arc
+                        }
+                        BlockDuplicationPolicy::Reject => {
+                            self.metrics.inc_registration_dedup();
+                            rearm[i] = true;
+                            existing_primary
+                        }
+                    }
+                } else {
+                    debug_assert!(matches!(
+                        inner.slots[block_id].state,
+                        SlotState::Staged { .. }
+                    ));
+                    let inner_arc = ImmutableBlockInner::new_primary(
+                        self.clone(),
+                        block_id,
+                        seq_hash,
+                        handle.clone(),
+                    );
+                    inner.slots[block_id].state = SlotState::Primary {
+                        seq_hash,
+                        handle: handle.clone(),
+                        inner: Arc::downgrade(&inner_arc),
+                    };
+                    inner.active_by_hash.insert(seq_hash, block_id);
+                    present_handles.push(handle.clone());
+                    inner_arc
+                };
+                results.push(inner_arc);
+            }
+        } // store lock released here
+
+        // mark_present takes the attachments lock; lock-order
+        // (attachments → store) is satisfied because the store lock has
+        // already been released.
+        for h in present_handles {
+            h.mark_present::<T>();
+        }
+
+        // Guard drops here, same semantics as the single-item path:
+        // armed=false on Allow/fresh (slot already transitioned),
+        // armed=true on Reject (releases Staged → Reset).
+        for (i, mut block) in blocks.into_iter().enumerate() {
+            if rearm[i] {
+                block.rearm();
+            }
+            drop(block);
+        }
+
+        results
+    }
+
     /// Internal helper: under the store lock, transition a Primary slot to
     /// Inactive without touching presence (the original Inner::drop's
     /// presence-side responsibilities are unchanged — it just no-ops the
@@ -959,6 +1207,337 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         handle.mark_absent::<T>();
     }
 
+    /// Batched release of a set of [`ImmutableBlock`] guards under **one**
+    /// store-mutex acquisition — the teardown-side analogue of
+    /// [`allocate_atomic`](Self::allocate_atomic): a request that today
+    /// drops N `ImmutableBlock`s one at a time (each independently taking
+    /// the store mutex via `ImmutableBlockInner::drop`) instead takes the
+    /// lock once for the whole batch.
+    ///
+    /// # Equivalence contract
+    ///
+    /// This must leave the store in a state indistinguishable from
+    /// dropping the same `blocks`, in the same order, one at a time via
+    /// the pre-existing per-block path — **including** the reset (free)
+    /// pool's FIFO order, which is observable: `allocate_reset_blocks`
+    /// pops the front, so a different push order hands out a different
+    /// block on the next allocation.
+    ///
+    /// The tricky case is a batch containing both a primary and its live
+    /// duplicate. One-at-a-time, dropping the duplicate's guard is what
+    /// (via ordinary `Drop` field-glue on `_primary_keepalive`) frees the
+    /// primary — so the primary's *actual* release happens at whichever
+    /// of {the primary's own guard, every co-batched duplicate targeting
+    /// it} is **last** in drop order, not at the primary's own position.
+    /// [`release_entry_at`](Self::release_entry_at) reproduces this
+    /// exactly by explicitly, synchronously replaying the keepalive
+    /// cascade at the right relative position instead of leaving it to
+    /// `Drop`'s arbitrary timing (which is what an earlier version of
+    /// this function did, and which a proptest caught reordering the
+    /// free list relative to one-at-a-time drops).
+    ///
+    /// # Algorithm
+    ///
+    /// Phase 0 (no lock): extract every guard's backing
+    /// `Arc<ImmutableBlockInner<T>>` (bypassing this guard's own `Drop`,
+    /// whose only effect — the `inflight_immutable` metric decrement —
+    /// `into_inner_for_batch_release` replicates), and capture each
+    /// one's identity pointer (`Arc::as_ptr`) while still alive. Index
+    /// every pointer by position (`target_position`) so a duplicate's
+    /// `_primary_keepalive` can be resolved back to a co-batched primary
+    /// entry, if any.
+    ///
+    /// Phase 1 (single lock): call
+    /// [`release_entry_at`](Self::release_entry_at) for every position,
+    /// in input order. See its docs for the identity-check +
+    /// try-unwrap-or-defer + cascade-replay logic.
+    ///
+    /// Anything left holding an `Arc` after Phase 1 (a slot that already
+    /// moved on before we reached the lock, or a guard that is genuinely
+    /// still `Arc`-shared — another clone, or an *external*, not
+    /// co-batched, duplicate/primary relationship) is swept into
+    /// `deferred` and counted in `report.deferred_to_drop`.
+    ///
+    /// Phase 2/3 (post-lock): drop `deferred` and the released-and-defused
+    /// `to_drop` values, then run `mark_absent` — preserving the
+    /// documented `attachments → inner` ordering by never holding both
+    /// locks at once. See `release_entry_at` for why some drops must
+    /// wait until here rather than happening inline.
+    pub(crate) fn release_blocks(
+        &self,
+        blocks: Vec<ImmutableBlock<T>>,
+        opts: ReleaseOpts,
+    ) -> ReleaseReport {
+        let mut report = ReleaseReport::default();
+        if blocks.is_empty() {
+            return report;
+        }
+
+        // Phase 0 (no lock): extract each guard's backing Arc and its
+        // identity pointer while the Arc is still alive.
+        let mut entries: Vec<ReleaseEntry<T>> = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            let block_id = block.block_id();
+            let arc = block.into_inner_for_batch_release();
+            let self_ptr = Arc::as_ptr(&arc) as *const ();
+            entries.push(ReleaseEntry {
+                block_id,
+                self_ptr,
+                arc: Some(arc),
+            });
+        }
+        let target_position: std::collections::HashMap<*const (), usize> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.self_ptr, i))
+            .collect();
+
+        // Phase 1 (single lock): process every entry, in input order.
+        let mut to_drop: Vec<ImmutableBlockInner<T>> = Vec::with_capacity(entries.len());
+        let mut deferred: Vec<Arc<ImmutableBlockInner<T>>> = Vec::new();
+        let mut pending_mark_absent: Vec<BlockRegistrationHandle> =
+            Vec::with_capacity(entries.len());
+        {
+            let mut inner = self.inner.lock();
+            for idx in 0..entries.len() {
+                self.release_entry_at(
+                    idx,
+                    &mut entries,
+                    &target_position,
+                    &mut inner,
+                    opts,
+                    &mut report,
+                    &mut to_drop,
+                    &mut deferred,
+                    &mut pending_mark_absent,
+                );
+            }
+
+            // Anything still unresolved is genuinely externally shared
+            // (or, defensively, a slot that had already moved on before
+            // we reached the lock) — left to its ordinary `Drop`.
+            for entry in &mut entries {
+                if let Some(arc) = entry.arc.take() {
+                    report.deferred_to_drop += 1;
+                    deferred.push(arc);
+                }
+            }
+        } // store lock released here
+
+        // Phase 2: drop everything deferred or released-and-defused, now
+        // that the lock is free. Safe even if a cascading Drop (e.g. an
+        // externally-shared duplicate's `_primary_keepalive` hitting
+        // zero once dropped here) needs the store lock itself — that is
+        // exactly why these particular drops were not performed inline;
+        // see `release_entry_at`.
+        drop(deferred);
+        drop(to_drop);
+
+        // Phase 3: attachments-lock work, strictly after the store lock —
+        // preserves the documented attachments → inner ordering by never
+        // letting the two overlap.
+        for handle in pending_mark_absent {
+            handle.mark_absent::<T>();
+        }
+
+        report
+    }
+
+    /// Resolve and, if possible, release a single [`ReleaseEntry`] in
+    /// [`release_blocks`](Self::release_blocks)'s batch, replaying the
+    /// exact per-block identity-check + `try_unwrap`-or-defer logic
+    /// (`release_primary`/`release_duplicate`), plus one addition: when
+    /// a released *duplicate*'s `_primary_keepalive` targets another
+    /// entry in the **same batch**, the keepalive is released
+    /// synchronously, right here, instead of being left for that
+    /// `Inner`'s ordinary field-drop glue to discover later (which is
+    /// what made an earlier version of this function reorder the reset
+    /// pool relative to one-at-a-time drops — see `release_blocks`'s
+    /// docs).
+    ///
+    /// A no-op if `entries[idx].arc` is already `None` (already resolved
+    /// — released, or merged into and resolved by a cascade from another
+    /// entry).
+    ///
+    /// # Why the cascade must be handled explicitly, not via `Drop`
+    ///
+    /// If the duplicate's `Arc::try_unwrap` succeeds, we hold the
+    /// duplicate's `Inner` by value. Its `_primary_keepalive` field, if
+    /// dropped as ordinary field-drop glue, may make the primary's
+    /// refcount hit zero and invoke the primary's **own**, non-defused
+    /// `Drop` — which calls `release_primary`, reacquiring
+    /// `self.inner`'s mutex. If that happened while this function still
+    /// held the lock (as it must, to place the release at the correct
+    /// relative position — see below), it would deadlock. So the
+    /// keepalive is taken out via `take_primary_keepalive` (a safe field
+    /// swap, not a drop) and handled explicitly:
+    ///
+    /// - If it points to a **co-batched** entry at position `j`:
+    ///   - `j < idx` (already reached by the outer loop, so its own
+    ///     `Arc` is either still held — untried or previously deferred
+    ///     — or, defensively, already resolved by something else):
+    ///     merge the two references (drop the redundant extraction —
+    ///     provably safe, since the entry's own stored `Arc`, if
+    ///     present, guarantees at least one reference survives that
+    ///     drop) and retry position `j` **right now**. A successful
+    ///     retry lands the release at position `idx` — matching
+    ///     one-at-a-time order, where the cascade fires at the *later*
+    ///     of the two positions.
+    ///   - `j > idx` (not yet reached by the outer loop, so its `Arc` is
+    ///     provably still untouched and therefore still holds a live
+    ///     reference): drop the redundant extraction (provably not the
+    ///     last reference) and do nothing further — the outer loop's
+    ///     future visit to `j` will see the reduced count and correctly
+    ///     release there, again matching one-at-a-time order.
+    /// - If it points to an entry **not** in this batch, or (defensively)
+    ///   to an already-`None` co-batched slot: we cannot prove this
+    ///   drop isn't the last reference, so it is **not** dropped here —
+    ///   it goes to `deferred` for the post-lock sweep, exactly like a
+    ///   genuinely `Arc`-shared entry.
+    #[allow(clippy::too_many_arguments)]
+    fn release_entry_at(
+        &self,
+        idx: usize,
+        entries: &mut [ReleaseEntry<T>],
+        target_position: &std::collections::HashMap<*const (), usize>,
+        inner: &mut BlockStoreInner<T>,
+        opts: ReleaseOpts,
+        report: &mut ReleaseReport,
+        to_drop: &mut Vec<ImmutableBlockInner<T>>,
+        deferred: &mut Vec<Arc<ImmutableBlockInner<T>>>,
+        pending_mark_absent: &mut Vec<BlockRegistrationHandle>,
+    ) {
+        let Some(arc) = entries[idx].arc.take() else {
+            return; // Already resolved.
+        };
+        let block_id = entries[idx].block_id;
+        let self_ptr = entries[idx].self_ptr;
+
+        // Applies to every entry we reach, matched or not — replaces a
+        // separate pre-drop `set_evict_on_reset` traversal.
+        if let Some(v) = opts.reset_on_release {
+            inner.reset_on_release[block_id] = v;
+        }
+
+        let matched = match &inner.slots[block_id].state {
+            SlotState::Primary {
+                seq_hash,
+                handle,
+                inner: weak,
+            } if weak.as_ptr() as *const () == self_ptr => {
+                Some(SlotIdentityMatch::Primary(*seq_hash, handle.clone()))
+            }
+            SlotState::Duplicate {
+                handle,
+                inner: weak,
+                ..
+            } if weak.as_ptr() as *const () == self_ptr => {
+                Some(SlotIdentityMatch::Duplicate(handle.clone()))
+            }
+            _ => None,
+        };
+
+        let Some(matched) = matched else {
+            entries[idx].arc = Some(arc); // Put back for the final sweep.
+            return;
+        };
+
+        let mut owned = match Arc::try_unwrap(arc) {
+            Ok(owned) => owned,
+            Err(arc) => {
+                entries[idx].arc = Some(arc); // Still shared — put back;
+                // may yet be resolved by a later cascade, else swept.
+                return;
+            }
+        };
+
+        match matched {
+            SlotIdentityMatch::Primary(seq_hash, handle) => {
+                if inner.reset_on_release[block_id] {
+                    self.reset_slot_locked(inner, block_id);
+                    // Only the primary owns the `active_by_hash` mapping.
+                    inner.active_by_hash.remove(&seq_hash);
+                    pending_mark_absent.push(handle);
+                    report.primary_reset += 1;
+                } else {
+                    inner.slots[block_id].state = SlotState::Inactive { seq_hash, handle };
+                    inner.inactive.insert(seq_hash, block_id);
+                    inner.active_by_hash.remove(&seq_hash);
+                    self.metrics.inc_inactive_pool_size();
+                    report.primary_inactive += 1;
+                }
+            }
+            SlotIdentityMatch::Duplicate(handle) => {
+                // Duplicates do NOT clear `active_by_hash` — that
+                // mapping belongs to the primary.
+                self.reset_slot_locked(inner, block_id);
+                pending_mark_absent.push(handle);
+                report.duplicate_reset += 1;
+
+                // Explicitly replay the keepalive cascade — see the
+                // design note above for why this can't be left to
+                // ordinary field-drop glue.
+                if let Some(primary_arc) = owned.take_primary_keepalive() {
+                    let target_ptr = Arc::as_ptr(&primary_arc) as *const ();
+                    match target_position.get(&target_ptr) {
+                        Some(&j) if j < idx => {
+                            if let Some(existing) = entries[j].arc.take() {
+                                // Two live references to the same Inner
+                                // (`existing` + `primary_arc`); `existing`
+                                // guarantees at least one survives, so
+                                // dropping the redundant one can't be the
+                                // last reference — safe under the lock.
+                                entries[j].arc = Some(existing);
+                                drop(primary_arc);
+                                self.release_entry_at(
+                                    j,
+                                    entries,
+                                    target_position,
+                                    inner,
+                                    opts,
+                                    report,
+                                    to_drop,
+                                    deferred,
+                                    pending_mark_absent,
+                                );
+                            } else {
+                                // Defensive: already resolved by
+                                // something else. Can't prove this
+                                // isn't the last reference — must not
+                                // drop while holding the lock.
+                                deferred.push(primary_arc);
+                            }
+                        }
+                        Some(&j) if j > idx => {
+                            // entries[j].arc is provably still untouched
+                            // (the outer loop hasn't reached it, and
+                            // nothing before `idx` could have — cascades
+                            // only ever target strictly earlier
+                            // positions), so it still holds a live
+                            // reference: dropping this redundant one
+                            // can't be the last.
+                            debug_assert!(entries[j].arc.is_some());
+                            drop(primary_arc);
+                        }
+                        _ => {
+                            // External to this batch (or, defensively,
+                            // `j == idx`, which cannot happen — a
+                            // duplicate never keeps itself alive).
+                            // Cannot prove this isn't the last
+                            // reference; must not risk dropping (and
+                            // possibly reacquiring the store lock) while
+                            // we still hold it.
+                            deferred.push(primary_arc);
+                        }
+                    }
+                }
+            }
+        }
+
+        owned.defuse();
+        to_drop.push(owned);
+    }
+
     /// Slot transition shared by `release_primary` (when
     /// `reset_on_release = true`) and `release_duplicate`:
     /// `*` → `SlotState::Reset`, push to the free list, bump the
@@ -970,6 +1549,86 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         inner.slots[block_id].state = SlotState::Reset;
         inner.free.push_back(block_id);
         self.metrics.inc_reset_pool_size();
+    }
+}
+
+/// Per-slot summary for [`BlockStore::debug_snapshot`] — everything
+/// [`SlotState`] carries except the `Weak`/`BlockRegistrationHandle`
+/// payloads, which aren't meaningfully comparable across two independent
+/// stores.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SlotKind {
+    Reset,
+    Mutable,
+    Staged(SequenceHash),
+    Primary(SequenceHash),
+    Duplicate(SequenceHash),
+    Inactive(SequenceHash),
+}
+
+/// Full test-only snapshot of a [`BlockStore`]'s bookkeeping, for
+/// asserting two independently-operated stores end up byte-for-byte
+/// equivalent (see the `release_blocks` state-equivalence proptest).
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DebugStoreSnapshot {
+    /// Every slot's kind, in `block_id` order.
+    pub(crate) slots: Vec<SlotKind>,
+    /// The reset (free) pool, in exact FIFO order. Order-sensitive on
+    /// purpose: `allocate_reset_blocks`/`allocate_atomic` pop the front,
+    /// so a different push order hands a different physical block to
+    /// the next allocation — that's observable, not just an internal
+    /// bookkeeping detail. `release_blocks` must reproduce the exact
+    /// push order that dropping the same guards one at a time would
+    /// produce, including when a batch contains a primary and its live
+    /// duplicate (see `release_blocks`'s and `release_entry_at`'s design
+    /// notes for how the keepalive cascade is replayed at the correct
+    /// relative position instead of being deferred to `Drop`'s arbitrary
+    /// timing).
+    pub(crate) free: Vec<BlockId>,
+    /// The full `active_by_hash` map (primary `block_id` per registered
+    /// hash). `HashMap` equality is set-like (order-independent), which
+    /// is the right comparison for a map.
+    pub(crate) active_by_hash: std::collections::HashMap<SequenceHash, BlockId>,
+    /// Per-slot "reset on last drop" overrides, in `block_id` order.
+    pub(crate) reset_on_release: Vec<bool>,
+}
+
+#[cfg(test)]
+impl<T: BlockMetadata + Sync> BlockStore<T> {
+    /// Test-only deep snapshot of every piece of bookkeeping the unified
+    /// mutex protects. Used to assert that `release_blocks` (batched) and
+    /// dropping the same guards one at a time (per-block) leave the store
+    /// in an indistinguishable state.
+    pub(crate) fn debug_snapshot(&self) -> DebugStoreSnapshot {
+        let inner = self.inner.lock();
+        let slots = inner
+            .slots
+            .iter()
+            .map(|slot| match &slot.state {
+                SlotState::Reset => SlotKind::Reset,
+                SlotState::Mutable => SlotKind::Mutable,
+                SlotState::Staged { seq_hash } => SlotKind::Staged(*seq_hash),
+                SlotState::Primary { seq_hash, .. } => SlotKind::Primary(*seq_hash),
+                SlotState::Duplicate { seq_hash, .. } => SlotKind::Duplicate(*seq_hash),
+                SlotState::Inactive { seq_hash, .. } => SlotKind::Inactive(*seq_hash),
+            })
+            .collect();
+        // Exact FIFO order — see the `free` field docs.
+        let free: Vec<BlockId> = inner.free.iter().copied().collect();
+        let active_by_hash: std::collections::HashMap<SequenceHash, BlockId> = inner
+            .active_by_hash
+            .iter()
+            .map(|(&h, &id)| (h, id))
+            .collect();
+        let reset_on_release = inner.reset_on_release.clone();
+        DebugStoreSnapshot {
+            slots,
+            free,
+            active_by_hash,
+            reset_on_release,
+        }
     }
 }
 

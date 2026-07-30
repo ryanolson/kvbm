@@ -76,6 +76,7 @@ kvbm-consolidator = { workspace = true }
 tmq = { workspace = true }
 portpicker = "0.1"
 proptest = "1.5"
+tempfile = { workspace = true }
 
 [features]
 default = ["s3", "testing"]

@@ -29,6 +29,14 @@ use kvbm_physical::manager::{
     SerializedLayout, WorkerDataPlacement,
 };
 
+/// Canonical physical transfer placement for one configured parallelism mode.
+pub fn worker_data_placement(mode: ParallelismMode) -> WorkerDataPlacement {
+    match mode {
+        ParallelismMode::TensorParallel => WorkerDataPlacement::TensorSharded,
+        ParallelismMode::ReplicatedData => WorkerDataPlacement::ReplicatedG1StripedLower,
+    }
+}
+
 /// Per-leader parallelism template — the knobs the leader applies when
 /// stamping per-worker descriptors. PP is reserved (must be 1 for now).
 #[derive(Debug, Clone)]
@@ -136,10 +144,7 @@ impl ParallelismTemplate {
     }
 
     pub(crate) fn worker_data_placement(&self) -> WorkerDataPlacement {
-        match self.parallelism_mode {
-            ParallelismMode::TensorParallel => WorkerDataPlacement::TensorSharded,
-            ParallelismMode::ReplicatedData => WorkerDataPlacement::ReplicatedG1StripedLower,
-        }
+        worker_data_placement(self.parallelism_mode)
     }
 
     /// Build a [`CanonicalBlockShape`](kvbm_common::CanonicalBlockShape)

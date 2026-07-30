@@ -7,6 +7,7 @@
 //! and single-worker scenarios where no actual collective communication is needed.
 
 use std::ops::Range;
+use std::sync::OnceLock;
 
 use anyhow::Result;
 use velo::EventManager;
@@ -50,6 +51,7 @@ pub struct StubCollectiveOps {
     events: EventManager,
     rank: usize,
     world_size: usize,
+    failure: OnceLock<String>,
 }
 
 impl StubCollectiveOps {
@@ -64,6 +66,7 @@ impl StubCollectiveOps {
             events,
             rank,
             world_size,
+            failure: OnceLock::new(),
         }
     }
 
@@ -74,6 +77,11 @@ impl StubCollectiveOps {
 }
 
 impl CollectiveOps for StubCollectiveOps {
+    fn abort(&self, reason: &str) -> Result<()> {
+        let _ = self.failure.set(reason.to_owned());
+        Ok(())
+    }
+
     fn broadcast(
         &self,
         root_rank: usize,
@@ -83,6 +91,9 @@ impl CollectiveOps for StubCollectiveOps {
         dst_block_ids: &[BlockId],
         layer_range: Option<Range<usize>>,
     ) -> Result<TransferCompleteNotification> {
+        if let Some(reason) = self.failure.get() {
+            anyhow::bail!("collective communicator is aborted: {reason}");
+        }
         anyhow::ensure!(
             root_rank < self.world_size,
             "broadcast root {root_rank} is outside collective world size {}",
@@ -135,5 +146,29 @@ impl CollectiveOps for StubCollectiveOps {
 
     fn world_size(&self) -> usize {
         self.world_size
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn abort_permanently_rejects_later_collectives() {
+        let collective = StubCollectiveOps::single_worker(EventManager::local());
+        collective.abort("injected rank failure").unwrap();
+
+        let error = collective
+            .broadcast(
+                0,
+                LogicalLayoutHandle::G2,
+                LogicalLayoutHandle::G1,
+                &[0],
+                &[0],
+                None,
+            )
+            .err()
+            .expect("an aborted collective must fail closed");
+        assert!(error.to_string().contains("injected rank failure"));
     }
 }

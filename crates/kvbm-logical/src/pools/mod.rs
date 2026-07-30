@@ -21,7 +21,7 @@ pub mod tests;
 mod block_proptest;
 
 pub(crate) use inactive::backends;
-pub(crate) use store::{BlockStore, InactiveIndex};
+pub(crate) use store::{BlockStore, InactiveIndex, ReleaseOpts};
 
 pub(crate) use crate::SequenceHash;
 use crate::blocks::BlockId;

@@ -3,7 +3,6 @@
 
 //! Per-resource selection of tensor-sharded or replicated transfer behavior.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, ensure};
@@ -17,8 +16,8 @@ use crate::collectives::CollectiveOps;
 use crate::leader::dispatch::WorkerPullPlan;
 use crate::object::ObjectBlockOps;
 use crate::worker::{
-    BlockId, ConnectRemoteResponse, ImportMetadataResponse, InstanceId, RemoteDescriptor,
-    SequenceHash, SerializedLayoutResponse, Worker, WorkerTransfers,
+    BlockId, ConnectRemoteResponse, ImportMetadataResponse, InstanceId, LocalTransferPlacements,
+    RemoteDescriptor, SequenceHash, SerializedLayoutResponse, Worker, WorkerTransfers,
 };
 
 use super::{PhysicalWorker, ReplicatedDataWorker};
@@ -27,7 +26,7 @@ use super::{PhysicalWorker, ReplicatedDataWorker};
 pub struct ResourceDispatchWorker {
     inner: Arc<PhysicalWorker>,
     replicated: Option<ReplicatedDataWorker>,
-    placements: ResourceTransferPlacements,
+    placements: LocalTransferPlacements,
 }
 
 impl ResourceDispatchWorker {
@@ -45,7 +44,7 @@ impl ResourceDispatchWorker {
             .resource_handles()
             .map(|handles| handles.primary())
             .unwrap_or_default();
-        let placements = ResourceTransferPlacements::new(primary, placements)?;
+        let placements = LocalTransferPlacements::new(primary, placements)?;
         if let Some(handles) = worker.resource_handles() {
             let physical_resources = handles
                 .iter()
@@ -95,6 +94,17 @@ impl ResourceDispatchWorker {
 }
 
 impl WorkerTransfers for ResourceDispatchWorker {
+    fn local_onboard_requires_serialization(&self, resource: Option<LogicalResourceId>) -> bool {
+        self.placements.onboard_requires_serialization(resource)
+    }
+
+    fn abort_local_collectives(&self, reason: String) -> Result<TransferCompleteNotification> {
+        match &self.replicated {
+            Some(replicated) => replicated.abort_local_collectives(reason),
+            None => Ok(TransferCompleteNotification::completed()),
+        }
+    }
+
     fn execute_local_transfer(
         &self,
         src: LogicalLayoutHandle,
@@ -329,51 +339,6 @@ impl ObjectBlockOps for ResourceDispatchWorker {
     }
 }
 
-struct ResourceTransferPlacements {
-    primary: LogicalResourceId,
-    placements: BTreeMap<LogicalResourceId, WorkerDataPlacement>,
-}
-
-impl ResourceTransferPlacements {
-    fn new(
-        primary: LogicalResourceId,
-        placements: Vec<(LogicalResourceId, WorkerDataPlacement)>,
-    ) -> Result<Self> {
-        let expected_len = placements.len();
-        let placements = placements.into_iter().collect::<BTreeMap<_, _>>();
-        ensure!(
-            placements.len() == expected_len,
-            "duplicate resource transfer placement"
-        );
-        ensure!(
-            placements.contains_key(&primary),
-            "primary resource {primary:?} has no transfer placement"
-        );
-        Ok(Self {
-            primary,
-            placements,
-        })
-    }
-
-    fn primary(&self) -> LogicalResourceId {
-        self.primary
-    }
-
-    fn get(&self, resource: LogicalResourceId) -> Option<WorkerDataPlacement> {
-        self.placements.get(&resource).copied()
-    }
-
-    fn resources(&self) -> Vec<LogicalResourceId> {
-        self.placements.keys().copied().collect()
-    }
-
-    fn has_replicated(&self) -> bool {
-        self.placements
-            .values()
-            .any(|placement| *placement == WorkerDataPlacement::ReplicatedG1StripedLower)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -384,7 +349,7 @@ mod tests {
     use kvbm_physical::testing::{create_fc_layout, create_test_agent, create_transfer_manager};
     use kvbm_physical::transfer::{FillPattern, fill_blocks};
 
-    use super::{PhysicalWorker, ResourceDispatchWorker, ResourceTransferPlacements, Worker};
+    use super::{LocalTransferPlacements, PhysicalWorker, ResourceDispatchWorker, Worker};
 
     #[tokio::test]
     async fn resource_dispatch_forwards_host_payload_digests_to_physical_worker() {
@@ -405,7 +370,7 @@ mod tests {
         let worker = ResourceDispatchWorker {
             inner: Arc::clone(&inner),
             replicated: None,
-            placements: ResourceTransferPlacements::new(
+            placements: LocalTransferPlacements::new(
                 resource,
                 vec![(resource, WorkerDataPlacement::TensorSharded)],
             )
@@ -428,7 +393,7 @@ mod tests {
     fn placement_map_routes_each_resource_and_rejects_invalid_sets() {
         let primary = LogicalResourceId(2);
         let mla = LogicalResourceId(7);
-        let placements = ResourceTransferPlacements::new(
+        let placements = LocalTransferPlacements::new(
             primary,
             vec![
                 (primary, WorkerDataPlacement::TensorSharded),
@@ -446,8 +411,12 @@ mod tests {
             placements.get(mla),
             Some(WorkerDataPlacement::ReplicatedG1StripedLower)
         );
+        assert!(!placements.onboard_requires_serialization(None));
+        assert!(!placements.onboard_requires_serialization(Some(primary)));
+        assert!(placements.onboard_requires_serialization(Some(mla)));
+        assert!(placements.onboard_requires_serialization(Some(LogicalResourceId(99))));
         assert!(
-            ResourceTransferPlacements::new(
+            LocalTransferPlacements::new(
                 primary,
                 vec![
                     (primary, WorkerDataPlacement::TensorSharded),
@@ -457,7 +426,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            ResourceTransferPlacements::new(
+            LocalTransferPlacements::new(
                 primary,
                 vec![(mla, WorkerDataPlacement::ReplicatedG1StripedLower)],
             )

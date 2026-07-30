@@ -176,8 +176,16 @@ impl crate::collectives::LayoutResolver for PhysicalWorker {
 
 #[cfg(feature = "collectives")]
 impl crate::collectives::CudaEventRegistrar for PhysicalWorker {
-    fn register_cuda_event(&self, event: CudaEvent) -> TransferCompleteNotification {
-        self.manager.register_cuda_event(event)
+    fn reserve_cuda_event(&self) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        self.manager.reserve_cuda_event()
+    }
+
+    fn register_cuda_event(
+        &self,
+        event: CudaEvent,
+        admission: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<TransferCompleteNotification> {
+        self.manager.register_cuda_event(event, admission)
     }
 }
 
@@ -581,6 +589,10 @@ impl PhysicalWorker {
 }
 
 impl WorkerTransfers for PhysicalWorker {
+    fn local_onboard_requires_serialization(&self, _resource: Option<LogicalResourceId>) -> bool {
+        false
+    }
+
     fn execute_local_transfer(
         &self,
         src: LogicalLayoutHandle,

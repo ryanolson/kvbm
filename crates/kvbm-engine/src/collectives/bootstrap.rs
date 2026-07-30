@@ -13,7 +13,7 @@
 //!
 //! 1. **Bootstrap (this module)**: For tests and standalone Rust applications.
 //!    Rank 0 generates a unique ID, distributes it to other ranks, and all
-//!    ranks collectively call `ncclCommInitRank`.
+//!    ranks collectively call nonblocking `ncclCommInitRankConfig`.
 //!
 //! 2. **Borrowed handles**: For production use with PyTorch, vLLM, or TensorRT-LLM.
 //!    The external runtime creates the communicator, and Rust code borrows it
@@ -44,16 +44,21 @@
 
 use std::ffi::c_char;
 use std::mem::MaybeUninit;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 /// Platform-neutral byte type for NCCL's `ncclUniqueId::internal` field.
 /// `c_char` is `i8` on x86_64 and `u8` on aarch64.
 type NcclByte = c_char;
 
 use super::nccl_ffi::{
-    NCCL_SUCCESS, NcclComm, NcclResult, NcclUniqueId, comm_init_rank, error_string, get_unique_id,
+    NCCL_IN_PROGRESS, NCCL_SUCCESS, NcclComm, NcclConfig, NcclResult, NcclUniqueId, comm_abort,
+    comm_get_async_error, comm_init_rank_config, error_string, get_unique_id, get_version,
 };
 use anyhow::{Context, Result};
 use cudarc::driver::sys::CUstream;
+
+pub(crate) const NCCL_INIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Bootstrap for creating NCCL communicators from scratch.
 ///
@@ -131,7 +136,7 @@ impl NcclBootstrap {
         let mut bytes = Vec::with_capacity(8 + 128);
         bytes.extend_from_slice(&(self.world_size as u64).to_le_bytes());
         for &byte in &self.nccl_id.internal {
-            bytes.push(byte);
+            bytes.push(byte as u8);
         }
         bytes
     }
@@ -191,8 +196,24 @@ impl NcclBootstrap {
     /// Returns an error if:
     /// - `rank` is >= `world_size`
     /// - NCCL initialization fails (e.g., network issues, GPU errors)
-    /// - Not all ranks call this method (will hang)
+    /// - Not all ranks call this method before the initialization timeout
     pub fn init_communicator(&self, rank: usize, _stream: CUstream) -> Result<NcclComm> {
+        let cancelled = AtomicBool::new(false);
+        self.init_communicator_with_cancel(
+            rank,
+            _stream,
+            &cancelled,
+            Instant::now() + NCCL_INIT_TIMEOUT,
+        )
+    }
+
+    pub(crate) fn init_communicator_with_cancel(
+        &self,
+        rank: usize,
+        _stream: CUstream,
+        cancelled: &AtomicBool,
+        deadline: Instant,
+    ) -> Result<NcclComm> {
         if rank >= self.world_size {
             anyhow::bail!(
                 "Rank {} is invalid for world_size {}",
@@ -205,21 +226,46 @@ impl NcclBootstrap {
             "world_size {} exceeds i32::MAX",
             self.world_size
         );
+        anyhow::ensure!(
+            !cancelled.load(Ordering::Acquire),
+            "NCCL communicator initialization was cancelled before rank {rank} started"
+        );
 
         let mut comm = MaybeUninit::<NcclComm>::uninit();
 
-        // SAFETY: ncclCommInitRank is a collective call that initializes the communicator.
-        // All ranks must call this with the same nccl_id for it to complete.
-        let result = comm_init_rank(
+        let mut version = 0;
+        check_nccl_result(get_version(&mut version)?).context("Failed to query NCCL version")?;
+        let mut config = NcclConfig::nonblocking(version)?;
+
+        // SAFETY: ncclCommInitRankConfig initializes the communicator. All
+        // ranks use the same ID and a nonblocking config so initialization can
+        // be polled and safely aborted by higher-level failure handling.
+        let result = comm_init_rank_config(
             comm.as_mut_ptr(),
             self.world_size as i32,
             self.nccl_id,
             rank as i32,
-        )?;
-        check_nccl_result(result).context("Failed to initialize NCCL communicator")?;
+            &mut config,
+        );
+        match result.and_then(|result| {
+            check_nccl_submission(result)
+                .context("Failed to start NCCL communicator initialization")
+                .map(|()| result)
+        }) {
+            Ok(result) => result,
+            Err(error) => {
+                cancelled.store(true, Ordering::Release);
+                return Err(error);
+            }
+        };
 
-        // SAFETY: ncclCommInitRank has initialized the communicator
+        // SAFETY: NCCL populates the handle on both success and in-progress.
         let comm = unsafe { comm.assume_init() };
+        if let Err(error) = wait_for_nonblocking_init(comm, cancelled, deadline) {
+            cancelled.store(true, Ordering::Release);
+            let _ = comm_abort(comm);
+            return Err(error).context("Failed to initialize NCCL communicator");
+        }
 
         tracing::info!(
             rank,
@@ -240,6 +286,39 @@ pub(crate) fn check_nccl_result(result: NcclResult) -> Result<()> {
             "NCCL operation failed: {} (code {result})",
             error_string(result)
         )
+    }
+}
+
+pub(crate) fn check_nccl_submission(result: NcclResult) -> Result<()> {
+    if result == NCCL_SUCCESS || result == NCCL_IN_PROGRESS {
+        Ok(())
+    } else {
+        check_nccl_result(result)
+    }
+}
+
+fn wait_for_nonblocking_init(
+    comm: NcclComm,
+    cancelled: &AtomicBool,
+    deadline: Instant,
+) -> Result<()> {
+    loop {
+        anyhow::ensure!(
+            !cancelled.load(Ordering::Acquire),
+            "NCCL communicator initialization cancelled after a peer rank failed"
+        );
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "NCCL communicator initialization timed out"
+        );
+        let mut state = NCCL_IN_PROGRESS;
+        check_nccl_result(comm_get_async_error(comm, &mut state)?)
+            .context("ncclCommGetAsyncError failed during initialization")?;
+        match state {
+            NCCL_SUCCESS => return Ok(()),
+            NCCL_IN_PROGRESS => std::thread::yield_now(),
+            error => return check_nccl_result(error),
+        }
     }
 }
 

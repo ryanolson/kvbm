@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, mpsc};
 use tokio::time::interval;
 use tracing::{error, warn};
 use uuid::Uuid;
@@ -97,6 +97,8 @@ pub struct RegisterPollingNotification<C: CompletionChecker> {
     /// Worker-side timing for the `worker_xfer_complete` event, or `None` for
     /// transfers we don't instrument (CUDA events, staged legs).
     pub telemetry: Option<XferTelemetry>,
+    /// Outstanding-completion admission, held through terminal polling.
+    pub admission: OwnedSemaphorePermit,
 }
 
 /// Tracking struct for outstanding polling-based transfers.
@@ -106,6 +108,7 @@ struct OutstandingPollingTransfer<C: CompletionChecker> {
     arrived_at: Instant,
     last_warned_at: Option<Instant>,
     telemetry: Option<XferTelemetry>,
+    _admission: OwnedSemaphorePermit,
 }
 
 /// Helper function to check if a transfer should be warned about and log the warning.
@@ -148,12 +151,18 @@ pub async fn process_polling_notifications<C: CompletionChecker>(
             notification = rx.recv() => {
                 match notification {
                     Some(notif) => {
+                        tracing::debug!(
+                            uuid = %notif.uuid,
+                            checker = std::any::type_name::<C>(),
+                            "registered KVBM polling notification"
+                        );
                         outstanding.insert(notif.uuid, OutstandingPollingTransfer {
                             checker: notif.checker,
                             event_handle: notif.event_handle,
                             arrived_at: Instant::now(),
                             last_warned_at: None,
                             telemetry: notif.telemetry,
+                            _admission: notif.admission,
                         });
                     }
                     None => {
@@ -196,6 +205,12 @@ pub async fn process_polling_notifications<C: CompletionChecker>(
                 // Remove completed transfers and signal completion
                 for (uuid, result) in completed {
                     if let Some(transfer) = outstanding.remove(&uuid) {
+                        tracing::debug!(
+                            uuid = %uuid,
+                            checker = std::any::type_name::<C>(),
+                            success = result.is_ok(),
+                            "completed KVBM polling notification"
+                        );
                         // Per-worker RDMA telemetry: emit on the transition to
                         // complete (this site fires exactly once per transfer).
                         if let Some(tel) = &transfer.telemetry {
@@ -258,5 +273,131 @@ pub async fn process_polling_notifications<C: CompletionChecker>(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use anyhow::Result;
+    use uuid::Uuid;
+    use velo::EventManager;
+
+    use super::{CompletionChecker, RegisterPollingNotification, process_polling_notifications};
+
+    struct ImmediatelyComplete;
+
+    impl CompletionChecker for ImmediatelyComplete {
+        fn is_complete(&self) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    struct ControlledCompletion {
+        polls: Arc<AtomicUsize>,
+        complete: Arc<AtomicBool>,
+    }
+
+    impl CompletionChecker for ControlledCompletion {
+        fn is_complete(&self) -> Result<bool> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.complete.load(Ordering::SeqCst))
+        }
+    }
+
+    #[tokio::test]
+    async fn polling_registration_queue_is_lossless_under_burst() -> Result<()> {
+        const REGISTRATIONS: usize = 256;
+
+        let system = Arc::new(EventManager::local());
+        let (queue, rx) = crate::transfer::context::PollingRegistrationQueue::new(REGISTRATIONS);
+        let mut awaiters = Vec::with_capacity(REGISTRATIONS);
+
+        // Enqueue the whole burst before the receiver starts. This exceeded
+        // the old capacity of 64 and reproduced the silently lost completion
+        // registrations seen when models expose many fixed KV resources.
+        for _ in 0..REGISTRATIONS {
+            let event = system.new_event()?;
+            let handle = event.into_handle();
+            awaiters.push(system.awaiter(handle)?);
+            let admission = queue.reserve()?;
+            queue.send(RegisterPollingNotification {
+                uuid: Uuid::new_v4(),
+                checker: ImmediatelyComplete,
+                event_handle: handle,
+                telemetry: None,
+                admission,
+            })?;
+        }
+        assert!(
+            queue.reserve().is_err(),
+            "outstanding completion registration must be bounded"
+        );
+
+        let worker = tokio::spawn(process_polling_notifications(rx, Arc::clone(&system)));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            for awaiter in awaiters {
+                awaiter.await?;
+            }
+            Result::<()>::Ok(())
+        })
+        .await??;
+        let _released_slot = queue.reserve()?;
+        drop(queue);
+        worker.await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admission_remains_held_while_completion_is_outstanding() -> Result<()> {
+        let system = Arc::new(EventManager::local());
+        let (queue, rx) = crate::transfer::context::PollingRegistrationQueue::new(1);
+        let event = system.new_event()?;
+        let handle = event.into_handle();
+        let awaiter = system.awaiter(handle)?;
+        let polls = Arc::new(AtomicUsize::new(0));
+        let complete = Arc::new(AtomicBool::new(false));
+        let admission = queue.reserve()?;
+        queue.send(RegisterPollingNotification {
+            uuid: Uuid::new_v4(),
+            checker: ControlledCompletion {
+                polls: Arc::clone(&polls),
+                complete: Arc::clone(&complete),
+            },
+            event_handle: handle,
+            telemetry: None,
+            admission,
+        })?;
+
+        let worker = tokio::spawn(process_polling_notifications(rx, Arc::clone(&system)));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while polls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert!(
+            queue.reserve().is_err(),
+            "draining the channel must not release outstanding admission"
+        );
+
+        complete.store(true, Ordering::SeqCst);
+        awaiter.await?;
+        let released = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(admission) = queue.reserve() {
+                    break admission;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        drop(released);
+        drop(queue);
+        worker.await?;
+        Ok(())
     }
 }

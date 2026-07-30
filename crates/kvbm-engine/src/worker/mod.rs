@@ -18,13 +18,13 @@ pub use physical::PhysicalWorker as DirectWorker;
 
 use anyhow::Result;
 use futures::future::BoxFuture;
-use std::{pin::Pin, sync::Arc};
+use std::{collections::BTreeMap, pin::Pin, sync::Arc};
 
 use crate::object::ObjectBlockOps;
 pub use crate::{BlockId, InstanceId, SequenceHash};
 pub use kvbm_common::{LogicalLayoutHandle, LogicalResourceId};
 pub use kvbm_physical::{
-    manager::{LayoutHandle, SerializedLayout},
+    manager::{LayoutHandle, RdmaLayoutDescriptors, SerializedLayout, WorkerDataPlacement},
     transfer::{PayloadDigest, TransferCompleteNotification},
 };
 
@@ -36,9 +36,109 @@ pub type SerializedResponseAwaiter = Pin<Box<dyn Future<Output = Result<Serializ
 pub type ImportMetadataResponseAwaiter =
     Pin<Box<dyn Future<Output = Result<Vec<LayoutHandle>>> + Send>>;
 
+/// Authoritative rank-local routing for local transfers, keyed by KV resource.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LocalTransferPlacements {
+    primary: LogicalResourceId,
+    resources: BTreeMap<LogicalResourceId, WorkerDataPlacement>,
+}
+
+impl LocalTransferPlacements {
+    pub(crate) fn new(
+        primary: LogicalResourceId,
+        placements: Vec<(LogicalResourceId, WorkerDataPlacement)>,
+    ) -> Result<Self> {
+        let expected_len = placements.len();
+        let resources = placements.into_iter().collect::<BTreeMap<_, _>>();
+        anyhow::ensure!(
+            resources.len() == expected_len,
+            "duplicate resource transfer placement"
+        );
+        anyhow::ensure!(
+            resources.contains_key(&primary),
+            "primary resource {primary:?} has no transfer placement"
+        );
+        Ok(Self { primary, resources })
+    }
+
+    pub(crate) fn from_metadata(metadata: &RdmaLayoutDescriptors) -> Result<Option<Self>> {
+        if let Some(resources) = metadata.resource_parallelism.as_ref() {
+            return Self::new(
+                resources.primary(),
+                resources
+                    .iter()
+                    .map(|entry| (entry.resource, entry.placement))
+                    .collect(),
+            )
+            .map(Some);
+        }
+        metadata
+            .worker_data_placement
+            .map(|placement| {
+                let primary = metadata
+                    .resource_layouts
+                    .as_ref()
+                    .map(|resources| resources.primary())
+                    .unwrap_or_default();
+                Self::new(primary, vec![(primary, placement)])
+            })
+            .transpose()
+    }
+
+    pub(crate) fn primary(&self) -> LogicalResourceId {
+        self.primary
+    }
+
+    pub(crate) fn get(&self, resource: LogicalResourceId) -> Option<WorkerDataPlacement> {
+        self.resources.get(&resource).copied()
+    }
+
+    pub(crate) fn resources(&self) -> Vec<LogicalResourceId> {
+        self.resources.keys().copied().collect()
+    }
+
+    pub(crate) fn has_replicated(&self) -> bool {
+        self.resources
+            .values()
+            .any(|placement| *placement == WorkerDataPlacement::ReplicatedG1StripedLower)
+    }
+
+    pub(crate) fn onboard_requires_serialization(
+        &self,
+        resource: Option<LogicalResourceId>,
+    ) -> bool {
+        self.get(resource.unwrap_or(self.primary))
+            .is_none_or(|placement| placement == WorkerDataPlacement::ReplicatedG1StripedLower)
+    }
+}
+
 pub use protocol::*;
 
 pub trait WorkerTransfers: Send + Sync {
+    /// Whether a local G2 -> G1 dispatch must be serialized with other
+    /// onboards for this worker group.
+    ///
+    /// Replicated G1 placements enter collectives synchronously during
+    /// dispatch, so every rank must observe one logical onboard at a time and
+    /// in the same order. `resource == None` asks about the worker's selected
+    /// primary resource. Implementations that cannot prove their routing is
+    /// independent retain the conservative default.
+    fn local_onboard_requires_serialization(&self, resource: Option<LogicalResourceId>) -> bool {
+        let _ = resource;
+        true
+    }
+
+    /// Permanently abort rank-local collective state after one member of a
+    /// replicated transfer group fails.
+    ///
+    /// Workers without collectives complete this operation immediately. RPC
+    /// clients override it to poison their local route before forwarding the
+    /// abort to the worker process.
+    fn abort_local_collectives(&self, reason: String) -> Result<TransferCompleteNotification> {
+        let _ = reason;
+        Ok(TransferCompleteNotification::completed())
+    }
+
     /// Execute a local transfer between two logical layouts.
     ///
     /// # Arguments

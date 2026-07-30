@@ -35,6 +35,50 @@ use anyhow::{Context, Result, bail, ensure};
 
 use std::sync::Arc;
 
+type CollectiveJob = Box<dyn FnOnce() + Send + 'static>;
+
+/// Rank-local executor for synchronous collective dispatch.
+///
+/// Each co-located rank owns a dedicated OS thread, so collective entry never
+/// depends on Tokio's async-worker or blocking-pool limits. The channel also
+/// preserves dispatch order for this rank.
+#[derive(Clone)]
+struct CollectiveExecutor {
+    jobs: std::sync::mpsc::Sender<CollectiveJob>,
+}
+
+impl CollectiveExecutor {
+    fn new(rank: usize) -> Result<Self> {
+        let (jobs, receiver) = std::sync::mpsc::channel::<CollectiveJob>();
+        std::thread::Builder::new()
+            .name(format!("kvbm-collective-rank-{rank}"))
+            .spawn(move || {
+                while let Ok(job) = receiver.recv() {
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
+                        tracing::error!(rank, "KVBM collective dispatch job panicked");
+                    }
+                }
+            })
+            .context("failed to spawn rank-local collective executor")?;
+        Ok(Self { jobs })
+    }
+
+    async fn dispatch<Dispatch>(&self, dispatch: Dispatch) -> Result<TransferCompleteNotification>
+    where
+        Dispatch: FnOnce() -> Result<TransferCompleteNotification> + Send + 'static,
+    {
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        self.jobs
+            .send(Box::new(move || {
+                let _ = result_tx.send(dispatch());
+            }))
+            .map_err(|_| anyhow::anyhow!("rank-local collective executor stopped"))?;
+        result_rx
+            .await
+            .context("rank-local collective dispatch job terminated")?
+    }
+}
+
 /// Replicated data worker for MLA scenarios.
 ///
 /// G1 is replicated on every rank while G2 is striped across ranks. When loading
@@ -54,6 +98,7 @@ pub struct ReplicatedDataWorker {
     inner: Arc<PhysicalWorker>,
     runtime: Arc<KvbmRuntime>,
     collective: Arc<dyn CollectiveOps>,
+    collective_executor: CollectiveExecutor,
     planner: ReplicatedTransferPlanner,
     rank: usize,
 }
@@ -79,11 +124,13 @@ impl ReplicatedDataWorker {
             collective.rank()
         );
         let planner = ReplicatedTransferPlanner::new(collective.world_size())?;
+        let collective_executor = CollectiveExecutor::new(rank)?;
 
         Ok(Self {
             inner: worker,
             runtime,
             collective,
+            collective_executor,
             planner,
             rank,
         })
@@ -101,6 +148,15 @@ impl ReplicatedDataWorker {
 }
 
 impl WorkerTransfers for ReplicatedDataWorker {
+    fn local_onboard_requires_serialization(&self, _resource: Option<LogicalResourceId>) -> bool {
+        true
+    }
+
+    fn abort_local_collectives(&self, reason: String) -> Result<TransferCompleteNotification> {
+        self.collective.abort(&reason)?;
+        Ok(TransferCompleteNotification::completed())
+    }
+
     fn execute_local_transfer(
         &self,
         src: LogicalLayoutHandle,
@@ -176,6 +232,7 @@ impl WorkerTransfers for ReplicatedDataWorker {
                 let awaiter = event_system.awaiter(event.handle())?;
                 let inner = Arc::clone(&self.inner);
                 let collective = Arc::clone(&self.collective);
+                let collective_executor = self.collective_executor.clone();
                 let rank = self.rank();
                 let layer_range = options.layer_range.clone();
 
@@ -183,6 +240,7 @@ impl WorkerTransfers for ReplicatedDataWorker {
                     let result = execute_onboard_plans(
                         inner,
                         collective,
+                        collective_executor,
                         rank,
                         resource,
                         plans,
@@ -331,6 +389,7 @@ impl ObjectBlockOps for ReplicatedDataWorker {
 async fn execute_onboard_plans(
     inner: Arc<PhysicalWorker>,
     collective: Arc<dyn CollectiveOps>,
+    collective_executor: CollectiveExecutor,
     rank: usize,
     resource: LogicalResourceId,
     plans: Vec<planner::ReplicaOnboardPlan>,
@@ -340,14 +399,17 @@ async fn execute_onboard_plans(
     drain_all_replica_steps(plans, move |plan| {
         let inner = Arc::clone(&inner);
         let collective = Arc::clone(&collective);
+        let collective_executor = collective_executor.clone();
         let options = options.clone();
         let layer_range = layer_range.clone();
         async move {
             let g1_block_ids: Arc<[BlockId]> = Arc::from(plan.g1_block_ids());
+            let broadcast_block_ids = Arc::clone(&g1_block_ids);
             let root_rank = plan.root_rank();
             execute_owner_copy_then_broadcast(
+                collective_executor,
                 rank == root_rank,
-                || {
+                move || {
                     inner.execute_local_transfer_for_resource(
                         resource,
                         LogicalLayoutHandle::G2,
@@ -357,14 +419,14 @@ async fn execute_onboard_plans(
                         options,
                     )
                 },
-                || {
+                move || {
                     collective.broadcast_for_resource(
                         resource,
                         root_rank,
                         LogicalLayoutHandle::G1,
                         LogicalLayoutHandle::G1,
-                        g1_block_ids.as_ref(),
-                        g1_block_ids.as_ref(),
+                        broadcast_block_ids.as_ref(),
+                        broadcast_block_ids.as_ref(),
                         layer_range,
                     )
                 },
@@ -406,19 +468,21 @@ where
 /// retains its copy failure, drains the broadcast alongside its peers, and only
 /// then reports the combined terminal error.
 async fn execute_owner_copy_then_broadcast<OwnerCopy, Broadcast>(
+    collective_executor: CollectiveExecutor,
     is_root: bool,
     owner_copy: OwnerCopy,
     broadcast: Broadcast,
 ) -> Result<()>
 where
     OwnerCopy: FnOnce() -> Result<TransferCompleteNotification>,
-    Broadcast: FnOnce() -> Result<TransferCompleteNotification>,
+    Broadcast: FnOnce() -> Result<TransferCompleteNotification> + Send + 'static,
 {
     let mut errors = Vec::new();
     if is_root {
         drain_replica_phase("owner G2 to G1 copy", owner_copy(), &mut errors).await;
     }
-    drain_replica_phase("replicated G1 broadcast", broadcast(), &mut errors).await;
+    let broadcast = collective_executor.dispatch(broadcast).await;
+    drain_replica_phase("replicated G1 broadcast", broadcast, &mut errors).await;
 
     if errors.is_empty() {
         Ok(())
@@ -506,7 +570,7 @@ mod trait_tests {
 #[cfg(test)]
 mod drain_tests {
     use std::sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use std::time::Duration;
@@ -515,7 +579,8 @@ mod drain_tests {
     use velo::EventManager;
 
     use super::{
-        TransferCompleteNotification, drain_all_replica_steps, execute_owner_copy_then_broadcast,
+        CollectiveExecutor, TransferCompleteNotification, drain_all_replica_steps,
+        execute_owner_copy_then_broadcast,
     };
 
     #[tokio::test]
@@ -524,23 +589,38 @@ mod drain_tests {
         let broadcast_event = events.new_event()?;
         let broadcast_notification =
             TransferCompleteNotification::from_awaiter(events.awaiter(broadcast_event.handle())?);
-        let broadcast_entered = AtomicBool::new(false);
+        let broadcast_entered = Arc::new(AtomicBool::new(false));
+        let collective_executor = CollectiveExecutor::new(0)?;
 
         let mut completion = Box::pin(execute_owner_copy_then_broadcast(
+            collective_executor,
             true,
             || Err(anyhow!("injected owner copy dispatch failure")),
-            || {
-                broadcast_entered.store(true, Ordering::SeqCst);
-                Ok(broadcast_notification)
+            {
+                let broadcast_entered = Arc::clone(&broadcast_entered);
+                move || {
+                    broadcast_entered.store(true, Ordering::SeqCst);
+                    Ok(broadcast_notification)
+                }
             },
         ));
 
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut completion)
-                .await
-                .is_err(),
-            "root must remain in the collective until its broadcast notification settles"
-        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    result = &mut completion => {
+                        panic!("root completed before its collective drained: {result:?}");
+                    }
+                    () = tokio::task::yield_now() => {
+                        if broadcast_entered.load(Ordering::SeqCst) {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("rank-local executor did not enter the broadcast");
         assert!(
             broadcast_entered.load(Ordering::SeqCst),
             "a root copy dispatch failure must not skip the collective"
@@ -566,15 +646,19 @@ mod drain_tests {
             TransferCompleteNotification::from_awaiter(events.awaiter(second_event.handle())?);
         let delayed = Arc::new(Mutex::new(Some(second_notification)));
         let broadcasts = Arc::new(AtomicUsize::new(0));
+        let collective_executor = CollectiveExecutor::new(0)?;
 
         let completion = tokio::spawn(drain_all_replica_steps(0..2, {
             let delayed = Arc::clone(&delayed);
             let broadcasts = Arc::clone(&broadcasts);
+            let collective_executor = collective_executor.clone();
             move |step| {
                 let delayed = Arc::clone(&delayed);
                 let broadcasts = Arc::clone(&broadcasts);
+                let collective_executor = collective_executor.clone();
                 async move {
                     execute_owner_copy_then_broadcast(
+                        collective_executor,
                         true,
                         move || {
                             if step == 0 {
@@ -613,5 +697,56 @@ mod drain_tests {
             .expect_err("first plan failure must surface after every plan drains");
         assert!(failure.to_string().contains("first-plan owner copy failed"));
         Ok(())
+    }
+
+    #[test]
+    fn one_async_and_one_blocking_runtime_thread_allows_every_rank_to_enter_collective()
+    -> Result<()> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            const RANKS: usize = 4;
+            let rendezvous = Arc::new((Mutex::new(0usize), Condvar::new()));
+            let mut ranks = Vec::with_capacity(RANKS);
+
+            for rank in 0..RANKS {
+                let rendezvous = Arc::clone(&rendezvous);
+                let collective_executor = CollectiveExecutor::new(rank)?;
+                ranks.push(tokio::spawn(execute_owner_copy_then_broadcast(
+                    collective_executor,
+                    false,
+                    || Ok(TransferCompleteNotification::completed()),
+                    move || {
+                        let (arrivals, ready) = rendezvous.as_ref();
+                        let mut arrivals = arrivals.lock().unwrap();
+                        *arrivals += 1;
+                        if *arrivals == RANKS {
+                            ready.notify_all();
+                        } else {
+                            let (observed, timeout) = ready
+                                .wait_timeout_while(arrivals, Duration::from_secs(5), |count| {
+                                    *count != RANKS
+                                })
+                                .unwrap();
+                            arrivals = observed;
+                            if timeout.timed_out() && *arrivals != RANKS {
+                                return Err(anyhow!(
+                                    "peer ranks were starved before collective entry"
+                                ));
+                            }
+                        }
+                        Ok(TransferCompleteNotification::completed())
+                    },
+                )));
+            }
+
+            for rank in ranks {
+                rank.await??;
+            }
+            Result::<()>::Ok(())
+        })
     }
 }

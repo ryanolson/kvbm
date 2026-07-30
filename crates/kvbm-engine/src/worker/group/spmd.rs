@@ -3,6 +3,7 @@
 
 use super::*;
 
+mod replicated_onboard;
 mod resources;
 
 use crate::leader::dispatch::{PullRef, WirePullOptions, plan_pull};
@@ -16,9 +17,10 @@ use kvbm_common::LogicalResourceId;
 use kvbm_physical::manager::{ParallelismDescriptor, WorkerDataPlacement};
 // velo event types used via fully-qualified paths (::velo::Event, ::velo::EventManager)
 use futures::future::BoxFuture;
-
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+
+use replicated_onboard::{ReplicatedOnboardCoordinator, dispatch_collective_aborts};
 
 /// SPMD (Single Program, Multiple Data) parallel worker group.
 ///
@@ -38,6 +40,9 @@ pub struct SpmdParallelWorkers {
     workers: Vec<Arc<dyn Worker>>,
     events: Arc<::velo::EventManager>,
     runtime: tokio::runtime::Handle,
+
+    /// Owns sequencing and fatal recovery for replicated G2 -> G1 onboards.
+    replicated_onboard: ReplicatedOnboardCoordinator,
 
     /// Remote handle mappings: (InstanceId, REMOTE rank, LogicalLayoutHandle)
     /// -> remote LayoutHandle. Populated by `connect_remote` for later use
@@ -133,8 +138,9 @@ impl SpmdParallelWorkers {
     ) -> Self {
         Self {
             workers,
-            events,
-            runtime,
+            events: Arc::clone(&events),
+            runtime: runtime.clone(),
+            replicated_onboard: ReplicatedOnboardCoordinator::new(events, runtime),
             remote_handles: RwLock::new(HashMap::new()),
             remote_tp_sizes: RwLock::new(HashMap::new()),
             remote_descriptors: RwLock::new(HashMap::new()),
@@ -175,6 +181,75 @@ impl SpmdParallelWorkers {
         self.workers.len()
     }
 
+    fn onboard_requires_serialization(&self, resource: Option<LogicalResourceId>) -> bool {
+        self.workers.len() > 1
+            && self
+                .workers
+                .iter()
+                .any(|worker| worker.local_onboard_requires_serialization(resource))
+    }
+
+    fn execute_sequenced_onboard<Dispatch>(
+        &self,
+        dispatch: Dispatch,
+    ) -> Result<TransferCompleteNotification>
+    where
+        Dispatch: FnOnce() -> Vec<Result<TransferCompleteNotification>> + Send + 'static,
+    {
+        let workers = self.workers.clone();
+        let runtime = self.runtime.clone();
+        self.replicated_onboard.execute(dispatch, move |reason| {
+            dispatch_collective_aborts(
+                workers,
+                reason,
+                runtime,
+                Arc::new(|worker: Arc<dyn Worker>, reason| worker.abort_local_collectives(reason)),
+            );
+        })
+    }
+
+    fn execute_local_transfer_route(
+        &self,
+        resource: Option<LogicalResourceId>,
+        src: LogicalLayoutHandle,
+        dst: LogicalLayoutHandle,
+        src_block_ids: Arc<[BlockId]>,
+        dst_block_ids: Arc<[BlockId]>,
+        options: kvbm_physical::transfer::TransferOptions,
+    ) -> Result<TransferCompleteNotification> {
+        let workers = self.workers.clone();
+        let dispatch = move || {
+            workers
+                .iter()
+                .map(|worker| match resource {
+                    Some(resource) => worker.execute_local_transfer_for_resource(
+                        resource,
+                        src,
+                        dst,
+                        src_block_ids.clone(),
+                        dst_block_ids.clone(),
+                        options.clone(),
+                    ),
+                    None => worker.execute_local_transfer(
+                        src,
+                        dst,
+                        src_block_ids.clone(),
+                        dst_block_ids.clone(),
+                        options.clone(),
+                    ),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        if src == LogicalLayoutHandle::G2
+            && dst == LogicalLayoutHandle::G1
+            && self.onboard_requires_serialization(resource)
+        {
+            return self.execute_sequenced_onboard(dispatch);
+        }
+        TransferCompleteNotification::aggregate_results(dispatch(), &self.events, &self.runtime)
+    }
+
     /// Builder-style: install a local parallelism template so that
     /// `connect_remote` can run cross-leader compatibility gates and
     /// reject incompatible peer metadata up front.
@@ -205,6 +280,20 @@ impl SpmdParallelWorkers {
 }
 
 impl WorkerTransfers for SpmdParallelWorkers {
+    fn local_onboard_requires_serialization(&self, resource: Option<LogicalResourceId>) -> bool {
+        self.onboard_requires_serialization(resource)
+    }
+
+    fn abort_local_collectives(&self, reason: String) -> Result<TransferCompleteNotification> {
+        self.replicated_onboard.poison(reason.clone());
+        let notifications = self
+            .workers
+            .iter()
+            .map(|worker| worker.abort_local_collectives(reason.clone()))
+            .collect();
+        TransferCompleteNotification::aggregate_results(notifications, &self.events, &self.runtime)
+    }
+
     fn execute_local_transfer(
         &self,
         src: LogicalLayoutHandle,
@@ -213,21 +302,7 @@ impl WorkerTransfers for SpmdParallelWorkers {
         dst_block_ids: Arc<[BlockId]>,
         options: kvbm_physical::transfer::TransferOptions,
     ) -> Result<TransferCompleteNotification> {
-        let notifications = self
-            .workers
-            .iter()
-            .map(|worker| {
-                worker.execute_local_transfer(
-                    src,
-                    dst,
-                    src_block_ids.clone(),
-                    dst_block_ids.clone(),
-                    options.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-
-        TransferCompleteNotification::aggregate_results(notifications, &self.events, &self.runtime)
+        self.execute_local_transfer_route(None, src, dst, src_block_ids, dst_block_ids, options)
     }
 
     fn execute_local_transfer_for_resource(
@@ -239,22 +314,14 @@ impl WorkerTransfers for SpmdParallelWorkers {
         dst_block_ids: Arc<[BlockId]>,
         options: kvbm_physical::transfer::TransferOptions,
     ) -> Result<TransferCompleteNotification> {
-        let notifications = self
-            .workers
-            .iter()
-            .map(|worker| {
-                worker.execute_local_transfer_for_resource(
-                    resource,
-                    src,
-                    dst,
-                    src_block_ids.clone(),
-                    dst_block_ids.clone(),
-                    options.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-
-        TransferCompleteNotification::aggregate_results(notifications, &self.events, &self.runtime)
+        self.execute_local_transfer_route(
+            Some(resource),
+            src,
+            dst,
+            src_block_ids,
+            dst_block_ids,
+            options,
+        )
     }
 
     fn execute_remote_onboard(

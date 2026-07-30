@@ -48,6 +48,7 @@ pub use service::{VeloWorkerService, VeloWorkerServiceBuilder};
 /// `service.rs`, and use the const at the call site in `client.rs`.
 pub(crate) mod handler_names {
     pub const LOCAL_TRANSFER: &str = "kvbm.worker.local_transfer";
+    pub const ABORT_LOCAL_COLLECTIVES: &str = "kvbm.worker.abort_local_collectives";
     pub const REMOTE_ONBOARD: &str = "kvbm.worker.remote_onboard";
     pub const REMOTE_OFFLOAD: &str = "kvbm.worker.remote_offload";
     pub const IMPORT_METADATA: &str = "kvbm.worker.import_metadata";
@@ -152,6 +153,11 @@ struct LocalTransferMessage {
     src_block_ids: Vec<BlockId>,
     dst_block_ids: Vec<BlockId>,
     options: SerializableTransferOptions,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AbortLocalCollectivesMessage {
+    reason: String,
 }
 
 #[derive(Serialize, Deserialize)]

@@ -30,6 +30,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use kvbm_common::LogicalResourceId;
+use kvbm_config::ParallelismMode;
+use kvbm_engine::leader::parallelism::worker_data_placement;
 use kvbm_engine::leader::{ConsolidatorParams, InstanceLeader};
 use kvbm_engine::object::{ObjectLockManager, create_lock_manager, create_object_client};
 use kvbm_engine::offload::{
@@ -43,6 +46,7 @@ use kvbm_logical::blocks::{BlockDuplicationPolicy, BlockRegistry};
 use kvbm_logical::events::{EventsManager, KvbmCacheEventsPublisher};
 use kvbm_logical::manager::{BlockManager, FrequencyTrackingCapacity};
 use kvbm_physical::layout::LayoutConfig;
+use kvbm_physical::manager::WorkerDataPlacement;
 
 use crate::connector::leader::hub_handshake::{self, HubHandshake};
 use crate::connector::leader::hub_indexer;
@@ -55,6 +59,15 @@ mod resources;
 use resources::{
     ResourcePlan, build_collective_bootstrap, logical_tier_block_count, resolve_parallelism,
 };
+
+fn local_transfer_placements(
+    resource_parallelism: &BTreeMap<LogicalResourceId, ParallelismMode>,
+) -> Vec<(LogicalResourceId, WorkerDataPlacement)> {
+    resource_parallelism
+        .iter()
+        .map(|(&resource, &mode)| (resource, worker_data_placement(mode)))
+        .collect()
+}
 
 /// The leader-side engine stack produced by [`build_engine_stack`]. The caller
 /// (`Leader::initialize`) clones `instance_leader` for the CD wiring before
@@ -271,7 +284,10 @@ pub(super) async fn build_engine_stack(c: &Construction) -> Result<EngineStack> 
         collected_metadata.push(worker_layout.metadata.clone());
     }
 
-    // Store metadata + configure transfer-client layout handles.
+    // Store metadata + configure transfer-client routing and layout handles.
+    // `resource_parallelism` is the same authoritative plan sent to workers
+    // above, so the leader's SPMD layer cannot drift from worker-side routing.
+    let local_transfer_placements = local_transfer_placements(&resource_parallelism);
     {
         let mut workers = c.workers.lock();
         workers.metadata = collected_metadata.clone();
@@ -281,6 +297,14 @@ pub(super) async fn build_engine_stack(c: &Construction) -> Result<EngineStack> 
             .zip(collected_metadata.iter())
             .enumerate()
         {
+            client
+                .configure_local_transfer_placements(
+                    primary_resource,
+                    local_transfer_placements.clone(),
+                )
+                .with_context(|| {
+                    format!("Failed to configure transfer placements for worker {i}")
+                })?;
             client
                 .configure_layout_handles(metadata)
                 .with_context(|| format!("Failed to configure handles for worker {i}"))?;
@@ -740,4 +764,39 @@ pub(super) async fn build_engine_stack(c: &Construction) -> Result<EngineStack> 
         indexer_publisher,
         indexer_hub_client,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tensor_parallel_resources_configure_independent_local_transfers() {
+        let resource = LogicalResourceId(3);
+        let placements = local_transfer_placements(&BTreeMap::from([(
+            resource,
+            ParallelismMode::TensorParallel,
+        )]));
+        assert_eq!(
+            placements,
+            vec![(resource, WorkerDataPlacement::TensorSharded)]
+        );
+    }
+
+    #[test]
+    fn mixed_resources_preserve_each_worker_transfer_route() {
+        let attention = LogicalResourceId(2);
+        let latent = LogicalResourceId(7);
+        let placements = local_transfer_placements(&BTreeMap::from([
+            (attention, ParallelismMode::TensorParallel),
+            (latent, ParallelismMode::ReplicatedData),
+        ]));
+        assert_eq!(
+            placements,
+            vec![
+                (attention, WorkerDataPlacement::TensorSharded),
+                (latent, WorkerDataPlacement::ReplicatedG1StripedLower),
+            ]
+        );
+    }
 }

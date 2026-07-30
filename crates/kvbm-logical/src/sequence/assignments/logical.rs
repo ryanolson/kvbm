@@ -205,14 +205,23 @@ impl<T: BlockMetadata> LogicalBlockAssignments<T> {
     ) -> Result<usize, BlockError<MutableBlock<T>>> {
         let to_stage = sequence_blocks.len().min(self.store.unassigned_count());
 
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..to_stage {
-            let (block_id, mutable) = self.store.shift_unassigned().unwrap();
+        // Drain the whole prefix up front (O(len) once) instead of shifting
+        // one element at a time (O(to_stage * len) — see `BlockStore`'s
+        // "Batch Drain" doc comment).
+        let mut drained = self.store.drain_unassigned_prefix(to_stage).into_iter();
+
+        for (i, (block_id, mutable)) in drained.by_ref().enumerate() {
             match mutable.complete(&sequence_blocks[i]) {
                 Ok(complete) => {
                     self.store.insert_staged(block_id, complete);
                 }
                 Err(err) => {
+                    // Put the unprocessed tail of this batch (everything
+                    // after the failed block) back at the front of
+                    // unassigned, preserving FIFO order, so no guard is
+                    // dropped/leaked back into the reset pool.
+                    let tail: Vec<(BlockId, MutableBlock<T>)> = drained.collect();
+                    self.store.reinsert_unassigned_front(tail);
                     return Err(err);
                 }
             }
@@ -228,7 +237,10 @@ impl<T: BlockMetadata> LogicalBlockAssignments<T> {
     pub fn register(&mut self, manager: &BlockManager<T>) -> usize {
         let count = self.store.staged_count();
 
-        while let Some((block_id, complete)) = self.store.shift_staged() {
+        // Drain the whole batch up front (O(len) once) instead of shifting
+        // one element at a time (O(count * len) — see `BlockStore`'s "Batch
+        // Drain" doc comment).
+        for (block_id, complete) in self.store.drain_staged() {
             let immutable = manager.register_block(complete);
             self.store.insert_assigned(block_id, immutable);
         }
@@ -282,7 +294,7 @@ impl<T: BlockMetadata> std::fmt::Debug for LogicalBlockAssignments<T> {
 mod tests {
     use super::*;
     use crate::sequence::BlockSequence;
-    use crate::testing::{TestMeta, create_test_manager};
+    use crate::testing::{TestMeta, create_iota_token_block, create_test_manager};
 
     const BLOCK_SIZE: u32 = 4;
 
@@ -1074,5 +1086,213 @@ mod tests {
         let la = LogicalBlockAssignments::<TestMeta>::new();
         let debug_str = format!("{la:?}");
         assert!(debug_str.contains("LogicalBlockAssignments"));
+    }
+
+    // =========================================================================
+    // Batch drain (O(N²) prefill regression coverage)
+    //
+    // `stage()`/`register()` used to drive `BlockStore::shift_unassigned`/
+    // `shift_staged` in a per-element loop. Each `shift_remove_index(0)` is
+    // O(len) (it shifts every following element down), so an N-element loop
+    // was O(N²) — quadratic at 1M-token prefills. The fix batch-drains the
+    // whole prefix/collection in one O(len) pass via
+    // `drain_unassigned_prefix`/`drain_staged`.
+    // =========================================================================
+
+    #[test]
+    fn test_stage_register_order_preservation_large_batch() {
+        // Larger-N variant of `test_full_pipeline_extend_stage_register`:
+        // confirms the batch-drain rewrite preserves strict FIFO/staging
+        // order end to end, not just for small N.
+        let n = 500;
+        let manager = create_test_manager::<TestMeta>(n);
+        let blocks = manager.allocate_blocks(n).unwrap();
+        let ids: Vec<BlockId> = blocks.iter().map(|b| b.block_id()).collect();
+        let seq = create_sequence(n);
+
+        let mut la = LogicalBlockAssignments::new();
+        la.extend_blocks(blocks).unwrap();
+
+        let staged = la.stage(seq.blocks()).unwrap();
+        assert_eq!(staged, n);
+        for (i, expected_id) in ids.iter().enumerate() {
+            let (id, _) = la.get_staged(i).unwrap();
+            assert_eq!(id, expected_id, "staged order mismatch at index {i}");
+        }
+
+        let registered = la.register(&manager);
+        assert_eq!(registered, n);
+        for (i, expected_id) in ids.iter().enumerate() {
+            let (id, _) = la.get_assigned(i).unwrap();
+            assert_eq!(id, expected_id, "assigned order mismatch at index {i}");
+        }
+    }
+
+    #[test]
+    fn test_stage_mid_batch_failure_no_leak_and_tail_restored() {
+        // Load-bearing regression test for the batch-drain rewrite's error
+        // path. Forces `MutableBlock::complete()` to fail at index 2 of a
+        // 5-block `stage()` call (to_stage=5 > i+1=3), by handing it a
+        // `TokenBlock` with the wrong block_size at that position.
+        //
+        // A naive full `drain(..)` that returns early on error would drop
+        // the unprocessed tail (indices 3, 4) — silently returning those
+        // guards' MutableBlocks to the reset pool and losing the request's
+        // blocks. The fix must instead reinsert that tail at the front of
+        // `unassigned`, preserving FIFO order, with zero blocks lost.
+        let manager = create_test_manager::<TestMeta>(10);
+        let blocks = manager.allocate_blocks(5).unwrap();
+        let ids: Vec<BlockId> = blocks.iter().map(|b| b.block_id()).collect();
+
+        let seq = create_sequence(5); // 5 good TokenBlocks, block_size=4
+        let mut mixed: Vec<TokenBlock> = seq.blocks().to_vec();
+        // Corrupt index 2: block_size=8 != manager's block_size=4.
+        mixed[2] = create_iota_token_block(9_000, 8);
+
+        let mut la = LogicalBlockAssignments::new();
+        la.extend_blocks(blocks).unwrap();
+
+        let result = la.stage(&mixed);
+        assert!(result.is_err());
+
+        // (a) blocks 0..2 are in staged, in FIFO order.
+        assert_eq!(la.staged_count(), 2);
+        let (staged0, _) = la.get_staged(0).unwrap();
+        let (staged1, _) = la.get_staged(1).unwrap();
+        assert_eq!(*staged0, ids[0]);
+        assert_eq!(*staged1, ids[1]);
+
+        // (b) the failed block (index 2) is returned in the Err.
+        let recovered_failed_id = match result.unwrap_err() {
+            BlockError::BlockSizeMismatch {
+                expected,
+                actual,
+                block,
+            } => {
+                assert_eq!(expected, 4);
+                assert_eq!(actual, 8);
+                let id = block.block_id();
+                drop(block); // RAII: returns to the reset pool.
+                id
+            }
+        };
+        assert_eq!(recovered_failed_id, ids[2]);
+
+        // (c) the unprocessed tail (indices 3, 4) is back in unassigned,
+        // in FIFO order, at the front.
+        assert_eq!(la.unassigned_count(), 2);
+        let (unassigned0, _) = la.get_unassigned(0).unwrap();
+        let (unassigned1, _) = la.get_unassigned(1).unwrap();
+        assert_eq!(*unassigned0, ids[3]);
+        assert_eq!(*unassigned1, ids[4]);
+
+        // (d) no block was leaked or dropped: staged (2) + unassigned (2) +
+        // the one recovered/dropped failed block (1) = all 5 original
+        // blocks accounted for.
+        assert_eq!(la.staged_count() + la.unassigned_count() + 1, 5);
+        assert!(la.contains(&ids[3]));
+        assert!(la.contains(&ids[4]));
+    }
+
+    #[test]
+    fn test_stage_mid_batch_failure_reinserts_tail_at_front_not_back() {
+        // Discriminates `reinsert_unassigned_front`'s "front" contract from
+        // an append-to-back mutation. The previous test
+        // (`test_stage_mid_batch_failure_no_leak_and_tail_restored`) used
+        // to_stage == unassigned_count, so the drained prefix covered *all*
+        // of unassigned and the reinsert left no pre-existing remainder to
+        // get the order wrong against — front vs. back would have looked
+        // identical. Here to_stage=4 < unassigned_count=6, so ids[4..6]
+        // remain in `unassigned` untouched, giving the drained-but-
+        // unprocessed tail (ids[2..4]) something to be reinserted ahead of.
+        let manager = create_test_manager::<TestMeta>(10);
+        let blocks = manager.allocate_blocks(6).unwrap();
+        let ids: Vec<BlockId> = blocks.iter().map(|b| b.block_id()).collect();
+
+        let seq = create_sequence(4); // 4 good TokenBlocks, block_size=4
+        let mut mixed: Vec<TokenBlock> = seq.blocks().to_vec();
+        // Corrupt index 1: block_size=8 != manager's block_size=4.
+        mixed[1] = create_iota_token_block(9_100, 8);
+
+        let mut la = LogicalBlockAssignments::new();
+        la.extend_blocks(blocks).unwrap();
+
+        let result = la.stage(&mixed);
+        assert!(result.is_err());
+
+        // Only block 0 staged before the failure at index 1.
+        assert_eq!(la.staged_count(), 1);
+        let (staged0, _) = la.get_staged(0).unwrap();
+        assert_eq!(*staged0, ids[0]);
+
+        // The failed block (index 1) is returned in the Err.
+        let failed_id = match result.unwrap_err() {
+            BlockError::BlockSizeMismatch { block, .. } => {
+                let id = block.block_id();
+                drop(block); // RAII: returns to the reset pool.
+                id
+            }
+        };
+        assert_eq!(failed_id, ids[1]);
+
+        // unassigned must be exactly [ids[2], ids[3], ids[4], ids[5]]: the
+        // drained-but-unprocessed tail (2, 3) reinserted at the FRONT,
+        // ahead of the untouched remainder (4, 5). An append-to-back
+        // mutation would instead yield [4, 5, 2, 3].
+        assert_eq!(la.unassigned_count(), 4);
+        let expected_order = [ids[2], ids[3], ids[4], ids[5]];
+        for (i, expected_id) in expected_order.iter().enumerate() {
+            let (id, _) = la.get_unassigned(i).unwrap();
+            assert_eq!(id, expected_id, "unassigned order mismatch at index {i}");
+        }
+
+        // No block leaked: staged (1) + unassigned (4) + the one
+        // recovered/dropped failed block (1) = all 6 original blocks.
+        assert_eq!(la.staged_count() + la.unassigned_count() + 1, 6);
+    }
+
+    #[test]
+    fn test_stage_register_linear_time_guard() {
+        // Kill-mutation target: reverting `drain_unassigned_prefix`/
+        // `drain_staged` back to a per-element `shift_remove_index(0)` loop
+        // makes this fail. `shift_remove_index(0)` is O(len), so an
+        // N-element drain loop is O(N²); quadratic scaling would show ~16x
+        // wall time for a 4x input, versus ~4x for linear scaling. We assert
+        // well under quadratic (< 8x) to leave headroom for measurement
+        // noise while still catching a regression to O(N²).
+        use std::time::Instant;
+
+        fn run(n: usize) -> std::time::Duration {
+            let manager = create_test_manager::<TestMeta>(n);
+            let blocks = manager.allocate_blocks(n).unwrap();
+            let seq = create_sequence(n);
+
+            let mut la = LogicalBlockAssignments::new();
+            la.extend_blocks(blocks).unwrap();
+
+            let start = Instant::now();
+            la.stage(seq.blocks()).unwrap();
+            la.register(&manager);
+            start.elapsed()
+        }
+
+        let n = 2000;
+
+        // Warm-up run: absorbs first-touch allocator/cache noise so it
+        // doesn't skew the timed comparison below.
+        run(n);
+
+        let small = run(n);
+        let large = run(4 * n);
+
+        let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-9);
+        assert!(
+            ratio < 8.0,
+            "stage+register time ratio for a 4x input was {ratio:.2}x \
+             (n={n}: {small:?}, 4n={0}: {large:?}); expected well under \
+             quadratic scaling (~16x) — this guards against reintroducing \
+             the shift_remove_index(0) O(N²) drain loop",
+            4 * n
+        );
     }
 }

@@ -4,11 +4,12 @@
 use kvbm_physical::manager::SerializedLayout;
 
 use super::{
-    Arc, ConnectRemoteMessage, DirectWorker, ExecuteRemoteOnboardForInstanceMessage,
-    ExecuteRemoteOnboardForInstanceRankMessage, HostPayloadDigestsMessage, LocalTransferMessage,
-    ObjectGetBlocksMessage, ObjectHasBlocksMessage, ObjectHasBlocksResponse,
-    ObjectPutBlocksMessage, ObjectPutGetBlocksResponse, RemoteOffloadMessage, RemoteOnboardMessage,
-    RemotePullPlanMessage, Result, TransferOptions, Worker, WorkerTransfers, handler_names,
+    AbortLocalCollectivesMessage, Arc, ConnectRemoteMessage, DirectWorker,
+    ExecuteRemoteOnboardForInstanceMessage, ExecuteRemoteOnboardForInstanceRankMessage,
+    HostPayloadDigestsMessage, LocalTransferMessage, ObjectGetBlocksMessage,
+    ObjectHasBlocksMessage, ObjectHasBlocksResponse, ObjectPutBlocksMessage,
+    ObjectPutGetBlocksResponse, RemoteOffloadMessage, RemoteOnboardMessage, RemotePullPlanMessage,
+    Result, TransferOptions, Worker, WorkerTransfers, handler_names,
 };
 use crate::object::ObjectBlockOps;
 
@@ -80,6 +81,7 @@ impl VeloWorkerService {
     /// Register all worker handlers with Velo
     fn register_handlers(&self) -> Result<()> {
         self.register_local_transfer_handler()?;
+        self.register_abort_local_collectives_handler()?;
         self.register_remote_onboard_handler()?;
         self.register_remote_offload_handler()?;
         self.register_import_metadata_handler()?;
@@ -93,6 +95,23 @@ impl VeloWorkerService {
         self.register_object_has_blocks_handler()?;
         self.register_object_put_blocks_handler()?;
         self.register_object_get_blocks_handler()?;
+        Ok(())
+    }
+
+    fn register_abort_local_collectives_handler(&self) -> Result<()> {
+        let transfers = self.transfers();
+        let handler =
+            Handler::unary_handler_async(handler_names::ABORT_LOCAL_COLLECTIVES, move |ctx| {
+                let transfers = Arc::clone(&transfers);
+                async move {
+                    let message: AbortLocalCollectivesMessage =
+                        serde_json::from_slice(&ctx.payload)?;
+                    transfers.abort_local_collectives(message.reason)?.await?;
+                    Ok(Some(Bytes::new()))
+                }
+            })
+            .build();
+        self.messenger.register_handler(handler)?;
         Ok(())
     }
 

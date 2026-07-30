@@ -18,6 +18,10 @@ struct RecordingCollective {
 }
 
 impl CollectiveOps for RecordingCollective {
+    fn abort(&self, _reason: &str) -> Result<()> {
+        Ok(())
+    }
+
     fn broadcast(
         &self,
         root_rank: usize,

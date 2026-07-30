@@ -11,6 +11,7 @@
 //! - Block manager orchestration
 
 pub mod blocks;
+pub mod branch_tracker;
 pub mod events;
 pub mod integrations;
 pub mod manager;
@@ -35,6 +36,7 @@ pub use blocks::{
     BlockError, BlockMetadata, CompleteBlock, ImmutableBlock, LifecyclePin, LifecyclePinRef,
     MutableBlock, WeakBlock,
 };
+pub use branch_tracker::{BranchOracle, BranchPointRecord, BranchPointTracker, NoOpBranchOracle};
 pub use integrations::{
     ApplyError, DecodeOutcome, NoopDelegate, RequestSequence, SchedulableSequence,
     SchedulableSequenceBuilder, ScheduleError, SequenceDelegate, SequenceEvent, SequenceState,

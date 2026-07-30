@@ -2451,6 +2451,7 @@ dependencies = [
  "async-stream",
  "bincode 2.0.1",
  "bytes",
+ "dashmap",
  "derive_builder",
  "dynamo-tokens",
  "futures",

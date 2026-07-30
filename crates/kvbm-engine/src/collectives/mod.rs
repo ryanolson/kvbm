@@ -77,6 +77,15 @@ use kvbm_physical::transfer::TransferCompleteNotification;
 /// NCCL operations are inherently thread-safe when used correctly (one stream
 /// per communicator per thread).
 pub trait CollectiveOps: Send + Sync {
+    /// Permanently abort this communicator after a rank-group failure.
+    ///
+    /// Owned implementations must unblock in-flight collectives. An
+    /// implementation that cannot safely abort an externally owned transport
+    /// must still poison its local view, preserve external ownership, and
+    /// return an error. The communicator remains poisoned afterward and
+    /// rejects every later operation.
+    fn abort(&self, reason: &str) -> Result<()>;
+
     /// Broadcast blocks from the selected root to all other ranks.
     ///
     /// This operation transfers the specified blocks from the source layout on

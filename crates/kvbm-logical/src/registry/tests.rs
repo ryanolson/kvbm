@@ -579,6 +579,7 @@ fn drop_does_not_remove_entry_when_replaced_by_newer_registration() {
     let inner_b = Arc::new(BlockRegistrationHandleInner::new(
         seq_hash,
         Arc::downgrade(&registry.prt),
+        None,
     ));
     {
         let map = registry.prt.prefix(&seq_hash);

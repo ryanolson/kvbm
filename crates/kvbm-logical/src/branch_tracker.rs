@@ -1,342 +1,282 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Real-time branch-point tracking for the block registration path.
+//! Bounded branch-point tracking, attachable to the block registry as an oracle.
 //!
-//! A **branch point** is a positional node with more than one distinct child — the point
-//! where multiple token sequences diverge from a shared prefix.
+//! A **branch point** is a positional node with more than one distinct live child --
+//! the point where multiple token sequences currently diverge from a shared prefix.
 //!
-//! [`BranchPointTracker`] maintains:
-//! - Exact online parent-child accounting for all registered blocks
-//! - A bounded historical cache of high-fanout / frequently-reused branch nodes
+//! [`BranchOracle`] is the attach point: [`BlockRegistry`](crate::registry::BlockRegistry)
+//! holds an `Option<Arc<dyn BranchOracle>>`, exactly like its `frequency_tracker`. Unset,
+//! behavior is a no-op ([`NoOpBranchOracle`]) -- fail closed, byte-identical to today.
+//! Attached, [`BranchPointTracker`] observes every block registration/removal that flows
+//! through the registry and answers `max_fanout` queries.
 //!
-//! Updates happen incrementally inside [`BlockRegistry::register_sequence_hash`] with
-//! ~3 hash operations per registration. The tracker is wrapped in
-//! `Arc<parking_lot::Mutex<_>>`, matching the [`TinyLFUTracker`](crate::tinylfu) pattern.
+//! # Bounded state
+//!
+//! State is bounded by the number of *currently resident* lineages, never by the number
+//! of blocks ever registered:
+//! - `parents`: one entry per resident non-root block (child hash -> parent key).
+//! - `records`: one entry per resident block that currently has, or has ever had while
+//!   still resident, at least one live child.
+//!
+//! `on_block_removed(hash)` drops exactly `hash`'s own entries from both maps:
+//! - Its `parents[hash]` entry (its own bookkeeping as *someone else's child*), which
+//!   also decrements that parent's `current_fanout` -- but **never** lowers the parent's
+//!   `max_fanout`, which is a monotone high-water mark.
+//! - Its own `records` entry (its bookkeeping as *a parent in its own right*), if any.
+//!   A branch point that loses its last live child "re-leafs" (`current_fanout` -> 0)
+//!   but its record and `max_fanout` persist -- the record is only forgotten when the
+//!   branch-point block itself is removed.
+//!
+//! This keeps both maps at O(resident lineages) regardless of how much churn (register /
+//! evict / re-register) has flowed through the tracker.
+//!
+//! # Positional keying rule
+//!
+//! Every map here that is indexed by a [`SequenceHash`] (`PositionalLineageHash`) keys on
+//! the **combination `(position, hash-or-fragment)`**, never a bare hash -- matching the
+//! registry's own [`PositionalRadixTree`](crate::registry) `(position, hash)` layout and
+//! the inactive-pool lineage backend's `(position, fragment)` index.
+//!
+//! *Why:* a PLH packs `(mode, position, 64-bit current hash, parent-hash fragment)` into
+//! 128 bits, and as `position` grows more bits are spent encoding it, so the stored
+//! **parent-hash fragment is truncated** -- 54 bits below position 2^8, 46 below 2^16, and
+//! only 38 bits at position >= 2^16 (~>= 1M tokens at typical block sizes). Concretely:
+//! - [`Inner::records`] is keyed by `(parent_position, parent_fragment)`; the fragment is
+//!   position-masked, hence never used alone.
+//! - [`Inner::parents`] is keyed by `(child_position, child_hash)`.
+//!
+//! Two *distinct* parents that share a position and whose low fragment bits coincide
+//! collide in `records` and merge. This is a **known, bounded limitation** that only bites
+//! at the >= ~1M-token / 38-bit-fragment regime; it is the accepted pattern under the
+//! current PLH bit budget and will be fully resolved when `PositionalLineageHash` widens
+//! to 160--192 bits, letting the `SequenceHash` retain all 64 content bits. The
+//! `(position, hash)` keying is deliberate, not a defect to be worked around by trying to
+//! recover a full parent hash the child no longer carries.
+//!
+//! # Parent-before-child registration invariant
+//!
+//! In the block-registration flow blocks register in **prefix order** -- a parent block
+//! registers before any of its children. So every inferred parent record `records[K_P]`
+//! corresponds to a parent block `P` that has itself registered and will later fire
+//! `on_block_removed(P)`, whose `self_as_parent_key(P) == K_P` drops the record. That is
+//! what bounds `records` to O(resident lineages).
+//!
+//! A **pure orphan** child -- registered while its parent block `P` is *never* registered
+//! -- is reachable through the raw [`BranchOracle`] API but does **not** occur in the
+//! registration flow. Such a child still creates `records[K_P]`, and because `P` never
+//! registers, `P` never fires the `on_block_removed(P)` that would reclaim it; the record
+//! is pinned until then. Callers driving the oracle outside the prefix-ordered
+//! registration path must preserve the parent-before-child discipline to keep the bound.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+
+use parking_lot::Mutex;
 
 use crate::SequenceHash;
 
-// ---------------------------------------------------------------------------
-// ParentNode — lightweight per-node child set
-// ---------------------------------------------------------------------------
-
-/// Tracks the set of distinct child fragments for a single positional node.
-struct ParentNode {
-    /// Child fragments at `position + 1`.
-    children: HashSet<u64>,
-}
-
-// ---------------------------------------------------------------------------
-// BranchPointRecord — public metadata for a branch node
-// ---------------------------------------------------------------------------
-
-/// Metadata record for a branch point (a node with fanout > 1).
+/// Identifies a node in its role as a *parent*.
 ///
-/// Stored in the bounded historical cache and returned by query methods.
-#[derive(Debug, Clone)]
+/// Computed two symmetric ways that are guaranteed to agree (see
+/// `PositionalLineageHash::parent_fragment_for_child_position`):
+/// - From a child's own hash: `(child.position() - 1, child.parent_hash_fragment())`.
+/// - From the parent's own hash: `(parent.position(), parent.parent_fragment_for_child_position(parent.position() + 1))`.
+///
+/// Fragment-truncated, so not globally unique in isolation -- always paired with
+/// position, matching the radix tree's own backward-matching convention elsewhere in
+/// this crate.
+type ParentKey = (u64, u64);
+
+/// Identifies a node in its role as a *child*, per the positional keying rule
+/// (see the module docs): `(position, full child SequenceHash)`. Mirrors the
+/// registry's [`PositionalRadixTree`](crate::registry) `(position, hash)`
+/// layout. The child's own current-hash bits are not position-masked, but the
+/// leading `position` element keeps this key consistent with `records`'
+/// `(position, fragment)` key and with every other PLH-keyed index in the crate.
+type ChildKey = (u64, SequenceHash);
+
+/// Metadata for a node that currently has, or has ever had while resident, at least one
+/// live child.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BranchPointRecord {
-    /// Block position in the sequence.
+    /// Block position of the parent node in the sequence.
     pub position: u64,
-    /// Hash fragment identifying this node at its position.
+    /// Hash fragment identifying the parent node at its position.
     pub fragment: u64,
-    /// Current number of distinct children.
-    pub current_fanout: u16,
-    /// Peak fanout ever observed for this node.
-    pub max_fanout: u16,
-    /// Number of times a new child was added (measures branch-point activity).
+    /// Current number of distinct live children.
+    pub current_fanout: u32,
+    /// Peak fanout ever observed for this node while it has been resident. Monotone --
+    /// never lowered by child removal, only forgotten when the node itself is removed.
+    pub max_fanout: u32,
+    /// Number of times a new child was registered under this node (measures
+    /// branch-point activity; not decremented on removal).
     pub observation_count: u32,
-    /// Tick when this record was last updated.
-    pub last_updated_tick: u64,
 }
 
-// ---------------------------------------------------------------------------
-// BoundedBranchCache — fixed-capacity history of branch points
-// ---------------------------------------------------------------------------
+/// Returns the key identifying `hash`'s parent, or `None` if `hash` is a root
+/// (position 0, no parent).
+fn parent_key_of(hash: SequenceHash) -> Option<ParentKey> {
+    let position = hash.position();
+    if position == 0 {
+        return None;
+    }
+    Some((position - 1, hash.parent_hash_fragment()))
+}
 
-/// Fixed-capacity cache of [`BranchPointRecord`]s.
+/// Returns the positional key identifying `hash` in its role as a *child*:
+/// `(position, hash)`, per the module's positional-keying rule.
+fn child_key_of(hash: SequenceHash) -> ChildKey {
+    (hash.position(), hash)
+}
+
+/// Returns the key that `hash`'s own children would compute as their `parent_key_of`.
+fn self_as_parent_key(hash: SequenceHash) -> ParentKey {
+    let position = hash.position();
+    (
+        position,
+        hash.parent_fragment_for_child_position(position + 1),
+    )
+}
+
+/// Attach point for branch-point observation on the block registration path.
 ///
-/// Eviction uses a frequency/recency hybrid score:
-/// `observation_count / (current_tick - last_updated_tick + 1)`.
-struct BoundedBranchCache {
-    entries: HashMap<(u64, u64), BranchPointRecord>,
-    capacity: usize,
-}
-
-impl BoundedBranchCache {
-    fn new(capacity: usize) -> Self {
-        Self {
-            entries: HashMap::new(),
-            capacity,
-        }
-    }
-
-    /// Score a record: higher is more valuable (frequently updated + recent).
-    fn score(record: &BranchPointRecord, current_tick: u64) -> f64 {
-        let age = current_tick.saturating_sub(record.last_updated_tick) + 1;
-        record.observation_count as f64 / age as f64
-    }
-
-    /// Insert a new branch point (first time crossing fanout > 1).
-    fn insert_new(
-        &mut self,
-        position: u64,
-        fragment: u64,
-        fanout: u16,
-        tick: u64,
-    ) {
-        let key = (position, fragment);
-
-        // Already tracked — just update
-        if let Some(record) = self.entries.get_mut(&key) {
-            record.current_fanout = fanout;
-            record.max_fanout = record.max_fanout.max(fanout);
-            record.observation_count = record.observation_count.saturating_add(1);
-            record.last_updated_tick = tick;
-            return;
-        }
-
-        // Evict if at capacity
-        if self.entries.len() >= self.capacity && self.capacity > 0 {
-            self.evict_lowest(tick);
-        }
-
-        if self.capacity > 0 {
-            self.entries.insert(
-                key,
-                BranchPointRecord {
-                    position,
-                    fragment,
-                    current_fanout: fanout,
-                    max_fanout: fanout,
-                    observation_count: 1,
-                    last_updated_tick: tick,
-                },
-            );
-        }
-    }
-
-    /// Update an existing branch point record (fanout increased beyond 2).
-    fn update(
-        &mut self,
-        position: u64,
-        fragment: u64,
-        fanout: u16,
-        tick: u64,
-    ) {
-        if let Some(record) = self.entries.get_mut(&(position, fragment)) {
-            record.current_fanout = fanout;
-            record.max_fanout = record.max_fanout.max(fanout);
-            record.observation_count = record.observation_count.saturating_add(1);
-            record.last_updated_tick = tick;
-        } else {
-            // Not in cache (may have been evicted). Re-insert.
-            self.insert_new(position, fragment, fanout, tick);
-        }
-    }
-
-    fn get(&self, position: u64, fragment: u64) -> Option<&BranchPointRecord> {
-        self.entries.get(&(position, fragment))
-    }
-
-    /// Return top entries by score, descending.
-    fn top_by_score(&self, limit: usize, current_tick: u64) -> Vec<BranchPointRecord> {
-        let mut scored: Vec<_> = self
-            .entries
-            .values()
-            .map(|r| (Self::score(r, current_tick), r))
-            .collect();
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        scored
-            .into_iter()
-            .take(limit)
-            .map(|(_, r)| r.clone())
-            .collect()
-    }
-
-    /// Evict the entry with the lowest score.
-    fn evict_lowest(&mut self, current_tick: u64) {
-        if self.entries.is_empty() {
-            return;
-        }
-        let victim = self
-            .entries
-            .iter()
-            .map(|(&key, record)| (key, Self::score(record, current_tick)))
-            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(key, _)| key);
-
-        if let Some(key) = victim {
-            self.entries.remove(&key);
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.entries.len()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// BranchPointTracker — public API
-// ---------------------------------------------------------------------------
-
-/// Tracks parent-child relationships for all registered blocks and maintains
-/// a bounded historical cache of branch points (nodes with fanout > 1).
+/// Implementors must tolerate idempotent re-registration (must not double-count a hash
+/// that is already live) and idempotent/out-of-order removal (removing an unknown hash
+/// is a no-op). [`NoOpBranchOracle`] is the fail-closed default when nothing is
+/// attached, matching the registry's `frequency_tracker` pattern.
 ///
-/// Designed to sit inside [`BlockRegistry`](crate::registry::BlockRegistry) behind
-/// `Arc<parking_lot::Mutex<BranchPointTracker>>`.
+/// **Non-reentrancy:** a callback must not re-enter the [`BlockRegistry`](crate::registry)
+/// it is attached to (no `register_sequence_hash` / `match_sequence_hash` / `is_registered`
+/// / `remove_batch` on the same registry). The singular removal path fires
+/// `on_block_removed` while holding the entry's position-radix guard, so re-entry
+/// deadlocks. [`BranchPointTracker`] honors this — it only touches its own internal mutex.
+pub trait BranchOracle: Send + Sync {
+    /// Called when a block is newly registered in the registry.
+    fn on_block_registered(&self, hash: SequenceHash);
+
+    /// Called when a block's registration is fully dropped from the registry.
+    fn on_block_removed(&self, hash: SequenceHash);
+
+    /// Peak fanout ever observed for the node identified by `hash`, treating `hash` as
+    /// a *parent* (not a child). Returns `None` if `hash` has never had a live child
+    /// while resident -- callers that fail open to "shared" on `None` get that behavior
+    /// automatically.
+    fn max_fanout(&self, hash: SequenceHash) -> Option<u32>;
+}
+
+/// Fail-closed default: observes nothing, always reports `None`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoOpBranchOracle;
+
+impl BranchOracle for NoOpBranchOracle {
+    fn on_block_registered(&self, _hash: SequenceHash) {}
+    fn on_block_removed(&self, _hash: SequenceHash) {}
+    fn max_fanout(&self, _hash: SequenceHash) -> Option<u32> {
+        None
+    }
+}
+
+#[derive(Default)]
+struct Inner {
+    /// child key `(position, child hash)` -> its parent's key. One entry per resident
+    /// non-root block. Keyed positionally per the module's `(position, hash)` rule.
+    parents: HashMap<ChildKey, ParentKey>,
+    /// parent key `(position, fragment)` -> branch-point record. One entry per resident
+    /// block that currently has, or has ever had while resident, a live child.
+    records: HashMap<ParentKey, BranchPointRecord>,
+}
+
+/// Tracks live parent/child fanout for the block registration path.
+///
+/// Wrapped around an internal `parking_lot::Mutex` so [`BranchOracle`]'s methods can
+/// take `&self`, matching the [`TinyLFUTracker`](crate::tinylfu::TinyLFUTracker) pattern
+/// used elsewhere in this crate.
+#[derive(Default)]
 pub struct BranchPointTracker {
-    /// Parent node tracking. Outer key: position, inner key: fragment at that position.
-    /// Only nodes that have had at least one child registered appear here.
-    parents: HashMap<u64, HashMap<u64, ParentNode>>,
-
-    /// Bounded cache of historical branch-point records.
-    history: BoundedBranchCache,
-
-    /// Monotonic tick for recency ordering.
-    tick: u64,
+    inner: Mutex<Inner>,
 }
 
 impl BranchPointTracker {
-    /// Creates a new tracker with the given history cache capacity.
-    pub fn new(history_capacity: usize) -> Self {
-        Self {
-            parents: HashMap::new(),
-            history: BoundedBranchCache::new(history_capacity),
-            tick: 0,
-        }
+    /// Creates a new, empty tracker.
+    pub fn new() -> Self {
+        Self::default()
     }
+}
 
-    /// Called when a new block is registered. Extracts the parent-child
-    /// relationship from `seq_hash` and updates tracking state.
-    ///
-    /// Cost: O(1) amortized — one `HashMap` lookup + one `HashSet` insert.
-    pub fn on_block_registered(&mut self, seq_hash: SequenceHash) {
-        let position = seq_hash.position();
+impl BranchOracle for BranchPointTracker {
+    fn on_block_registered(&self, hash: SequenceHash) {
+        let Some(key) = parent_key_of(hash) else {
+            return; // Root blocks have no parent -- nothing to record.
+        };
 
-        // Root blocks (position 0) have no parent.
-        if position == 0 {
+        let child_key = child_key_of(hash);
+        let mut inner = self.inner.lock();
+
+        // Idempotent: an already-live child must not be double-counted.
+        if inner.parents.contains_key(&child_key) {
             return;
         }
+        inner.parents.insert(child_key, key);
 
-        let parent_position = position - 1;
-        let parent_fragment = seq_hash.parent_hash_fragment();
-        let current_fragment = seq_hash.current_hash_fragment();
+        let record = inner.records.entry(key).or_insert(BranchPointRecord {
+            position: key.0,
+            fragment: key.1,
+            current_fanout: 0,
+            max_fanout: 0,
+            observation_count: 0,
+        });
+        record.current_fanout += 1;
+        record.max_fanout = record.max_fanout.max(record.current_fanout);
+        record.observation_count = record.observation_count.saturating_add(1);
+    }
 
-        let parent_level = self.parents.entry(parent_position).or_default();
-        let parent_node = parent_level
-            .entry(parent_fragment)
-            .or_insert_with(|| ParentNode {
-                children: HashSet::new(),
-            });
+    fn on_block_removed(&self, hash: SequenceHash) {
+        let mut inner = self.inner.lock();
 
-        let is_new_child = parent_node.children.insert(current_fragment);
-
-        if is_new_child {
-            let fanout = parent_node.children.len();
-
-            if fanout == 2 {
-                // Crossed from 1 → 2 children: new branch point.
-                self.history
-                    .insert_new(parent_position, parent_fragment, fanout as u16, self.tick);
-            } else if fanout > 2 {
-                // Existing branch point gained another child.
-                self.history
-                    .update(parent_position, parent_fragment, fanout as u16, self.tick);
-            }
+        // (1) Drop this block's own entry as a *child*: decrement its parent's live
+        // fanout. `max_fanout` is a monotone high-water mark -- never lowered here.
+        if let Some(key) = inner.parents.remove(&child_key_of(hash))
+            && let Some(record) = inner.records.get_mut(&key)
+        {
+            record.current_fanout = record.current_fanout.saturating_sub(1);
         }
 
-        self.tick += 1;
+        // (2) Drop this block's own entry as a *parent* (a branch-point record), if it
+        // has one. The record -- and its max_fanout high-water mark -- persists through
+        // re-leafing (fanout dropping to zero via child removal above) and is only
+        // forgotten here, when the block itself is removed.
+        let own_key = self_as_parent_key(hash);
+        inner.records.remove(&own_key);
     }
 
-    // -- Point queries -------------------------------------------------------
+    fn max_fanout(&self, hash: SequenceHash) -> Option<u32> {
+        let key = self_as_parent_key(hash);
+        self.inner.lock().records.get(&key).map(|r| r.max_fanout)
+    }
+}
 
-    /// Returns `true` if the node at `(position, fragment)` currently has more
-    /// than one child.
-    pub fn is_branch_point(&self, position: u64, fragment: u64) -> bool {
-        self.parents
-            .get(&position)
-            .and_then(|level| level.get(&fragment))
-            .is_some_and(|node| node.children.len() > 1)
+#[cfg(test)]
+impl BranchPointTracker {
+    /// Test-only: current live fanout for `hash` treated as a parent.
+    pub(crate) fn current_fanout(&self, hash: SequenceHash) -> Option<u32> {
+        let key = self_as_parent_key(hash);
+        self.inner
+            .lock()
+            .records
+            .get(&key)
+            .map(|r| r.current_fanout)
     }
 
-    /// Returns the current fanout of a node, or `None` if untracked.
-    pub fn current_fanout(&self, position: u64, fragment: u64) -> Option<usize> {
-        self.parents
-            .get(&position)
-            .and_then(|level| level.get(&fragment))
-            .map(|node| node.children.len())
+    /// Test-only: number of resident branch-point records (the bound this design
+    /// targets: O(resident lineages), not O(all-ever-registered)).
+    pub(crate) fn record_len(&self) -> usize {
+        self.inner.lock().records.len()
     }
 
-    // -- Enumeration ---------------------------------------------------------
-
-    /// Returns all current branch points as `(position, fragment, fanout)` triples.
-    pub fn current_branch_points(&self) -> Vec<(u64, u64, usize)> {
-        let mut result = Vec::new();
-        for (&position, level) in &self.parents {
-            for (&fragment, node) in level {
-                if node.children.len() > 1 {
-                    result.push((position, fragment, node.children.len()));
-                }
-            }
-        }
-        result
-    }
-
-    /// Returns top-scoring historical branch points, descending by score.
-    pub fn hot_branch_points(&self, limit: usize) -> Vec<BranchPointRecord> {
-        self.history.top_by_score(limit, self.tick)
-    }
-
-    /// Returns branch points along a prefix path.
-    ///
-    /// The slice should contain the `SequenceHash` for each block position,
-    /// ordered by position (index 0 = position 0, etc.). For each position
-    /// that is a branch point, a [`BranchPointRecord`] is returned — from the
-    /// history cache if available, otherwise synthesized from live state.
-    pub fn branch_points_on_prefix(&self, prefix: &[SequenceHash]) -> Vec<BranchPointRecord> {
-        let mut result = Vec::new();
-        for seq_hash in prefix {
-            let pos = seq_hash.position();
-            let frag = seq_hash.current_hash_fragment();
-
-            if let Some(record) = self.history.get(pos, frag) {
-                result.push(record.clone());
-            } else if self.is_branch_point(pos, frag) {
-                let fanout = self.parents[&pos][&frag].children.len() as u16;
-                result.push(BranchPointRecord {
-                    position: pos,
-                    fragment: frag,
-                    current_fanout: fanout,
-                    max_fanout: fanout,
-                    observation_count: 0,
-                    last_updated_tick: self.tick,
-                });
-            }
-        }
-        result
-    }
-
-    // -- Aggregate stats -----------------------------------------------------
-
-    /// Returns the number of current branch points (fanout > 1).
-    pub fn branch_point_count(&self) -> usize {
-        self.parents
-            .values()
-            .flat_map(|level| level.values())
-            .filter(|node| node.children.len() > 1)
-            .count()
-    }
-
-    /// Returns the total number of tracked parent nodes (fanout >= 1).
-    pub fn tracked_parent_count(&self) -> usize {
-        self.parents.values().map(|level| level.len()).sum()
-    }
-
-    /// Returns the number of entries in the history cache.
-    pub fn history_len(&self) -> usize {
-        self.history.len()
+    /// Test-only: number of resident child->parent entries (the other bounded map).
+    pub(crate) fn parents_len(&self) -> usize {
+        self.inner.lock().parents.len()
     }
 }
 
@@ -347,19 +287,12 @@ impl BranchPointTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{BlockSequenceBuilder, TestMeta};
+    use crate::registry::BlockRegistry;
+    use crate::testing::BlockSequenceBuilder;
+    use std::sync::Arc;
 
-    // -----------------------------------------------------------------------
-    // Helpers
-    // -----------------------------------------------------------------------
-
-    /// Build a chain of registered blocks from a token sequence.
-    /// Returns `(blocks, seq_hashes)` — blocks are consumed by the caller.
-    fn build_chain(
-        tokens: Vec<u32>,
-        block_size: usize,
-    ) -> Vec<SequenceHash> {
-        BlockSequenceBuilder::<TestMeta>::from_tokens(tokens)
+    fn build_chain(tokens: Vec<u32>, block_size: usize) -> Vec<SequenceHash> {
+        BlockSequenceBuilder::from_tokens(tokens)
             .with_block_size(block_size)
             .build()
             .into_iter()
@@ -367,314 +300,344 @@ mod tests {
             .collect()
     }
 
-    /// Register all hashes from a chain into the tracker.
-    fn register_all(tracker: &mut BranchPointTracker, hashes: &[SequenceHash]) {
+    fn register_all(oracle: &dyn BranchOracle, hashes: &[SequenceHash]) {
         for &hash in hashes {
-            tracker.on_block_registered(hash);
+            oracle.on_block_registered(hash);
+        }
+    }
+
+    /// Test helper: records every hash it observes, so we can assert the registry
+    /// invokes the oracle with exactly the expected set (and no more).
+    #[derive(Default)]
+    struct RecordingOracle {
+        registered: Mutex<Vec<SequenceHash>>,
+        removed: Mutex<Vec<SequenceHash>>,
+    }
+
+    impl BranchOracle for RecordingOracle {
+        fn on_block_registered(&self, hash: SequenceHash) {
+            self.registered.lock().push(hash);
+        }
+        fn on_block_removed(&self, hash: SequenceHash) {
+            self.removed.lock().push(hash);
+        }
+        fn max_fanout(&self, _hash: SequenceHash) -> Option<u32> {
+            None
         }
     }
 
     // -----------------------------------------------------------------------
-    // 1. No branching
+    // (a) No oracle attached => registry behavior is byte-identical to today
+    //     (fail-closed no-op), and an attached NoOpBranchOracle behaves the same.
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_linear_chain_no_branch_points() {
-        let mut tracker = BranchPointTracker::new(1024);
-        let hashes = build_chain((0..5).collect(), 1);
-        register_all(&mut tracker, &hashes);
-
-        assert_eq!(tracker.branch_point_count(), 0);
-        for hash in &hashes {
-            assert!(!tracker.is_branch_point(hash.position(), hash.current_hash_fragment()));
-        }
+    fn test_no_oracle_is_fail_closed_noop() {
+        let registry = BlockRegistry::new();
+        let chain = build_chain(vec![10, 20, 30], 1);
+        // Hold the handles alive: BlockRegistry entries are Weak-ref-backed and are
+        // removed as soon as the last strong handle drops.
+        let handles: Vec<_> = chain
+            .iter()
+            .map(|&hash| {
+                let handle = registry.register_sequence_hash(hash);
+                assert_eq!(handle.seq_hash(), hash);
+                handle
+            })
+            .collect();
+        assert_eq!(registry.registered_count(), 3);
+        drop(handles);
     }
 
-    // -----------------------------------------------------------------------
-    // 2. Simple fork
-    // -----------------------------------------------------------------------
-
     #[test]
-    fn test_simple_fork_detected() {
-        let mut tracker = BranchPointTracker::new(1024);
-
-        // Chain A: tokens [0, 1, 2]  → positions 0, 1, 2
-        // Chain B: tokens [0, 1, 99] → positions 0, 1, 2 (diverges at block 2)
-        //
-        // The block at position 1 in chain A has the same lineage hash as
-        // position 1 in chain B (shared prefix [0, 1]). The blocks at
-        // position 2 differ. So position 1 should become a branch point.
-        let chain_a = build_chain(vec![0, 1, 2], 1);
-        let chain_b = build_chain(vec![0, 1, 99], 1);
-
-        register_all(&mut tracker, &chain_a);
-        register_all(&mut tracker, &chain_b);
-
-        // Position 1 should be a branch point (two distinct children at pos 2)
-        let bp = tracker.current_branch_points();
-        assert_eq!(bp.len(), 1, "Expected exactly one branch point, got: {:?}", bp);
-        assert_eq!(bp[0].0, 1, "Branch point should be at position 1");
-        assert_eq!(bp[0].2, 2, "Fanout should be 2");
-
-        assert_eq!(tracker.branch_point_count(), 1);
-    }
-
-    // -----------------------------------------------------------------------
-    // 3. Multiple forks at different positions
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_multiple_forks() {
-        let mut tracker = BranchPointTracker::new(1024);
-
-        // Shared prefix: [10, 20, 30, 40]
-        // Fork 1 at position 1: chain [10, 20, 30, 40] vs [10, 20, 30, 41]
-        //   → position 2 (block [30]) is branch point (children [40] and [41])
-        // But we also want a fork at position 0:
-        //   chain [10, 77, ...] diverges from [10, 20, ...]
-        //   → position 0 (block [10]) is branch point
-
-        let chain_a = build_chain(vec![10, 20, 30, 40], 1);
-        let chain_b = build_chain(vec![10, 20, 30, 41], 1);
-        let chain_c = build_chain(vec![10, 77], 1);
-
-        register_all(&mut tracker, &chain_a);
-        register_all(&mut tracker, &chain_b);
-        register_all(&mut tracker, &chain_c);
-
-        // We should have at least 2 branch points
-        let bp_count = tracker.branch_point_count();
-        assert!(
-            bp_count >= 2,
-            "Expected at least 2 branch points, got {}",
-            bp_count
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // 4. High fanout
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_high_fanout() {
-        let mut tracker = BranchPointTracker::new(1024);
-
-        // Shared root [42], then 10 distinct children
-        for child_token in 100..110u32 {
-            let chain = build_chain(vec![42, child_token], 1);
-            register_all(&mut tracker, &chain);
-        }
-
-        assert_eq!(tracker.branch_point_count(), 1);
-
-        // Find the branch point
-        let bps = tracker.current_branch_points();
-        assert_eq!(bps.len(), 1);
-        assert_eq!(bps[0].2, 10, "Fanout should be 10");
-
-        // History should track max_fanout
-        let hot = tracker.hot_branch_points(1);
-        assert_eq!(hot.len(), 1);
-        assert_eq!(hot[0].max_fanout, 10);
-        assert_eq!(hot[0].current_fanout, 10);
-    }
-
-    // -----------------------------------------------------------------------
-    // 5. Cache capacity and eviction
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_cache_capacity_eviction() {
-        let mut tracker = BranchPointTracker::new(2); // Only 2 slots
-
-        // Create 3 independent branch points using different root tokens
-        // BP1: root [1000], children [1001] and [1002]
-        register_all(&mut tracker, &build_chain(vec![1000, 1001], 1));
-        register_all(&mut tracker, &build_chain(vec![1000, 1002], 1));
-
-        // BP2: root [2000], children [2001] and [2002]
-        register_all(&mut tracker, &build_chain(vec![2000, 2001], 1));
-        register_all(&mut tracker, &build_chain(vec![2000, 2002], 1));
-
-        // BP3: root [3000], children [3001] and [3002]
-        register_all(&mut tracker, &build_chain(vec![3000, 3001], 1));
-        register_all(&mut tracker, &build_chain(vec![3000, 3002], 1));
-
-        // All 3 are live branch points
-        assert_eq!(tracker.branch_point_count(), 3);
-        // But the history cache can only hold 2
-        assert_eq!(tracker.history_len(), 2);
-    }
-
-    // -----------------------------------------------------------------------
-    // 6. Cache scoring: frequent branch point survives eviction
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_cache_scoring_frequency_wins() {
-        let mut tracker = BranchPointTracker::new(2);
-
-        // BP1 (high frequency): root [500], keep adding children
-        register_all(&mut tracker, &build_chain(vec![500, 501], 1));
-        register_all(&mut tracker, &build_chain(vec![500, 502], 1)); // becomes branch point
-        register_all(&mut tracker, &build_chain(vec![500, 503], 1)); // obs_count increases
-        register_all(&mut tracker, &build_chain(vec![500, 504], 1));
-        register_all(&mut tracker, &build_chain(vec![500, 505], 1));
-
-        // BP2 (low frequency): root [600], only 2 children
-        register_all(&mut tracker, &build_chain(vec![600, 601], 1));
-        register_all(&mut tracker, &build_chain(vec![600, 602], 1));
-
-        // BP3 (low frequency): root [700], only 2 children
-        register_all(&mut tracker, &build_chain(vec![700, 701], 1));
-        register_all(&mut tracker, &build_chain(vec![700, 702], 1));
-
-        // BP1 should survive because it has the highest observation_count
-        let hot = tracker.hot_branch_points(1);
-        assert_eq!(hot.len(), 1);
-        // The top entry should have observation_count >= 4 (initial + 3 more children)
-        assert!(
-            hot[0].observation_count >= 4,
-            "Top entry should be the high-frequency one, obs_count={}",
-            hot[0].observation_count
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // 7. Prefix query
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_branch_points_on_prefix() {
-        let mut tracker = BranchPointTracker::new(1024);
-
-        // Chain: [10, 20, 30, 40, 50]
-        let main_chain = build_chain(vec![10, 20, 30, 40, 50], 1);
-        register_all(&mut tracker, &main_chain);
-
-        // Fork at position 1 (block [20]): another child [99] from [10]
-        register_all(&mut tracker, &build_chain(vec![10, 99], 1));
-
-        // Fork at position 3 (block [40]): another child [88] from [30]
-        register_all(&mut tracker, &build_chain(vec![10, 20, 30, 88], 1));
-
-        let bp_on_path = tracker.branch_points_on_prefix(&main_chain);
-        let positions: Vec<u64> = bp_on_path.iter().map(|r| r.position).collect();
-
-        // Position 0 has 2 children ([20] and [99]) → branch point
-        assert!(positions.contains(&0), "Expected branch point at position 0, got {:?}", positions);
-        // Position 2 has 2 children ([40] and [88]) → branch point
-        assert!(positions.contains(&2), "Expected branch point at position 2, got {:?}", positions);
-    }
-
-    // -----------------------------------------------------------------------
-    // 8. Registry integration
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_registry_integration() {
-        use crate::registry::BlockRegistry;
-        use std::sync::Arc;
-
-        let tracker = Arc::new(parking_lot::Mutex::new(BranchPointTracker::new(1024)));
+    fn test_explicit_noop_oracle_matches_unset() {
         let registry = BlockRegistry::builder()
-            .branch_tracker(tracker.clone())
+            .branch_oracle(Arc::new(NoOpBranchOracle))
+            .build();
+        let chain = build_chain(vec![10, 20, 30], 1);
+        let handles: Vec<_> = chain
+            .iter()
+            .map(|&hash| {
+                let handle = registry.register_sequence_hash(hash);
+                assert_eq!(handle.seq_hash(), hash);
+                handle
+            })
+            .collect();
+        assert_eq!(registry.registered_count(), 3);
+        // The NoOp oracle never records a fanout for anything.
+        assert_eq!(NoOpBranchOracle.max_fanout(chain[0]), None);
+        drop(handles);
+    }
+
+    // -----------------------------------------------------------------------
+    // (b) Attached oracle receives exactly the registered hashes; fanout
+    //     transitions 1 -> 2 -> K as K children register under one parent.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_oracle_receives_exactly_registered_hashes() {
+        let oracle = Arc::new(RecordingOracle::default());
+        let registry = BlockRegistry::builder()
+            .branch_oracle(oracle.clone() as Arc<dyn BranchOracle>)
             .build();
 
-        // Register blocks through the registry's normal path.
-        // Chain A: [10, 20, 30]
         let chain_a = build_chain(vec![10, 20, 30], 1);
+        // Hold the handles alive: BlockRegistry entries are Weak-ref-backed and are
+        // removed as soon as the last strong handle drops, which would make a
+        // "re-registration" actually be a fresh registration.
+        let handles: Vec<_> = chain_a
+            .iter()
+            .map(|&hash| registry.register_sequence_hash(hash))
+            .collect();
+        assert_eq!(*oracle.registered.lock(), chain_a);
+
+        // Re-registering the same hashes (while still live) must NOT call the oracle
+        // again: the registry only notifies on genuinely new registrations (see
+        // register_sequence_hash's early-return on `weak.upgrade()`).
         for &hash in &chain_a {
             registry.register_sequence_hash(hash);
         }
+        assert_eq!(
+            *oracle.registered.lock(),
+            chain_a,
+            "re-registration must not re-notify the oracle"
+        );
+        drop(handles);
+    }
 
-        // Chain B: [10, 20, 99] — diverges at position 2
-        let chain_b = build_chain(vec![10, 20, 99], 1);
-        for &hash in &chain_b {
-            registry.register_sequence_hash(hash);
+    #[test]
+    fn test_fanout_transitions_1_to_2_to_k() {
+        let tracker = BranchPointTracker::new();
+
+        // Root token 42, then children registered one at a time: fanout should climb
+        // 1, 2, ..., K as each new child is observed.
+        let root = build_chain(vec![42], 1)[0];
+        let k = 5u32;
+        for (i, child_token) in (100..100 + k).enumerate() {
+            let chain = build_chain(vec![42, child_token], 1);
+            register_all(&tracker, &chain);
+            let expected_fanout = (i as u32) + 1;
+            assert_eq!(tracker.current_fanout(root), Some(expected_fanout));
+            assert_eq!(tracker.max_fanout(root), Some(expected_fanout));
         }
-
-        let bt = tracker.lock();
-        assert_eq!(bt.branch_point_count(), 1);
-        let bps = bt.current_branch_points();
-        assert_eq!(bps[0].0, 1, "Branch point should be at position 1");
-        assert_eq!(bps[0].2, 2, "Fanout should be 2");
+        assert_eq!(tracker.current_fanout(root), Some(k));
     }
 
     // -----------------------------------------------------------------------
-    // 9. Re-registration idempotency
+    // (c) Absent-record max_fanout query returns None.
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_reregistration_idempotent() {
-        use crate::registry::BlockRegistry;
-        use std::sync::Arc;
+    fn test_absent_record_max_fanout_is_none() {
+        let tracker = BranchPointTracker::new();
+        let never_registered = build_chain(vec![999], 1)[0];
+        assert_eq!(tracker.max_fanout(never_registered), None);
 
-        let tracker = Arc::new(parking_lot::Mutex::new(BranchPointTracker::new(1024)));
+        // A registered root with zero children also has no record yet.
+        let root = build_chain(vec![7], 1)[0];
+        tracker.on_block_registered(root);
+        assert_eq!(tracker.max_fanout(root), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // (d) BOUNDED-GROWTH GUARD (kill-mutation): register N distinct lineages,
+    //     remove them all, internal map sizes return to baseline -- not O(N).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_bounded_growth_returns_to_baseline_after_removal() {
+        let tracker = BranchPointTracker::new();
+
+        let n = 200;
+        let mut all_hashes = Vec::new();
+        for i in 0..n {
+            let root_token = 10_000 + i;
+            let chain = build_chain(vec![root_token as u32, (root_token + 1) as u32], 1);
+            register_all(&tracker, &chain);
+            all_hashes.extend(chain);
+        }
+
+        assert_eq!(tracker.parents_len(), n as usize);
+        assert!(tracker.record_len() >= 1);
+
+        // Remove every block from every lineage (children first, then roots -- typical
+        // eviction order, though the contract holds regardless of order).
+        for &hash in &all_hashes {
+            tracker.on_block_removed(hash);
+        }
+
+        assert_eq!(
+            tracker.parents_len(),
+            0,
+            "parents map must return to baseline after full removal, not stay O(N)"
+        );
+        assert_eq!(
+            tracker.record_len(),
+            0,
+            "records map must return to baseline after full removal, not stay O(N)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // (e) HIGH-WATER PRESERVATION ACROSS RE-LEAF (kill-mutation): max_fanout is a
+    //     monotone high-water mark that survives a branch point losing all its
+    //     live children, and is only forgotten when the branch-point block itself
+    //     is removed.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_high_water_mark_survives_re_leaf() {
+        let tracker = BranchPointTracker::new();
+
+        let root = build_chain(vec![77], 1)[0];
+        tracker.on_block_registered(root);
+
+        let k = 4u32;
+        let mut children = Vec::new();
+        for child_token in 200..200 + k {
+            let chain = build_chain(vec![77, child_token], 1);
+            register_all(&tracker, &chain);
+            children.push(chain[1]);
+        }
+        assert_eq!(tracker.max_fanout(root), Some(k));
+        assert_eq!(tracker.current_fanout(root), Some(k));
+
+        // Remove all but the last child.
+        for &child in &children[..children.len() - 1] {
+            tracker.on_block_removed(child);
+        }
+        assert_eq!(
+            tracker.max_fanout(root),
+            Some(k),
+            "max_fanout must not drop while children are being removed"
+        );
+        assert_eq!(tracker.current_fanout(root), Some(1));
+
+        // Remove the LAST child: re-leaf. max_fanout must STILL be K.
+        tracker.on_block_removed(*children.last().unwrap());
+        assert_eq!(
+            tracker.max_fanout(root),
+            Some(k),
+            "max_fanout must persist through re-leaf (current_fanout -> 0)"
+        );
+        assert_eq!(tracker.current_fanout(root), Some(0));
+
+        // A brand-new child under the same root: current_fanout resets to 1, max_fanout
+        // stays at its high-water mark (>= k, here exactly k).
+        let new_child_chain = build_chain(vec![77, 999], 1);
+        register_all(&tracker, &new_child_chain);
+        assert_eq!(tracker.current_fanout(root), Some(1));
+        assert!(tracker.max_fanout(root).unwrap() >= k);
+
+        // Removing the branch-point BLOCK ITSELF (root) drops its record entirely.
+        tracker.on_block_removed(root);
+        assert_eq!(tracker.max_fanout(root), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional: root blocks never register a parent-side record for
+    // themselves as a child (position 0 has no parent).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_root_blocks_have_no_parent_entry() {
+        let tracker = BranchPointTracker::new();
+        let root = build_chain(vec![55], 1)[0];
+        tracker.on_block_registered(root);
+        assert_eq!(tracker.parents_len(), 0, "root has no parent to record");
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional: registry removal path invokes on_block_removed when the last
+    // strong reference to a registration handle is dropped.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_registry_drop_invokes_on_block_removed() {
+        let oracle = Arc::new(RecordingOracle::default());
         let registry = BlockRegistry::builder()
-            .branch_tracker(tracker.clone())
+            .branch_oracle(oracle.clone() as Arc<dyn BranchOracle>)
             .build();
 
-        let chain = build_chain(vec![10, 20], 1);
-        for &hash in &chain {
-            registry.register_sequence_hash(hash);
+        let chain = build_chain(vec![1, 2], 1);
+        {
+            let handle = registry.register_sequence_hash(chain[1]);
+            assert_eq!(*oracle.registered.lock(), vec![chain[1]]);
+            drop(handle);
         }
-
-        let parents_before = tracker.lock().tracked_parent_count();
-
-        // Re-register the same hashes — should be a no-op for the tracker
-        // because register_sequence_hash returns the existing handle.
-        for &hash in &chain {
-            registry.register_sequence_hash(hash);
-        }
-
-        let parents_after = tracker.lock().tracked_parent_count();
-        assert_eq!(parents_before, parents_after, "Re-registration should not add parents");
+        assert_eq!(*oracle.removed.lock(), vec![chain[1]]);
     }
 
     // -----------------------------------------------------------------------
-    // 10. Root blocks — no branch points
+    // (f) TRANSFER PAIRING (kill-mutation): `transfer_registration` creates a
+    //     fresh canonical handle WITHOUT firing `on_block_registered`. Its
+    //     Drop must therefore NOT fire `on_block_removed` -- an unpaired
+    //     removal underflows fanout / phantom-deletes a live record. The
+    //     callbacks must be paired 1:1.
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_root_blocks_no_branch_points() {
-        let mut tracker = BranchPointTracker::new(1024);
+    fn test_transfer_registration_does_not_fire_unpaired_removal() {
+        let oracle = Arc::new(RecordingOracle::default());
+        let registry = BlockRegistry::builder()
+            .branch_oracle(oracle.clone() as Arc<dyn BranchOracle>)
+            .build();
 
-        // Multiple independent root blocks (position 0)
-        for token in [100, 200, 300, 400, 500] {
-            let chain = build_chain(vec![token], 1);
-            register_all(&mut tracker, &chain);
+        let chain = build_chain(vec![1, 2], 1);
+        {
+            // Fresh registration via transfer: no `on_block_registered`.
+            let handle = registry.transfer_registration(chain[1]);
+            assert!(
+                oracle.registered.lock().is_empty(),
+                "transfer_registration must not fire on_block_registered"
+            );
+            drop(handle);
         }
-
-        // Root blocks have no parent, so no branch points
-        assert_eq!(tracker.branch_point_count(), 0);
-        assert_eq!(tracker.tracked_parent_count(), 0);
+        // ... and, because it never registered, its Drop must not remove either.
+        assert!(
+            oracle.removed.lock().is_empty(),
+            "transfer-created handle fired an unpaired on_block_removed"
+        );
     }
 
-    // -----------------------------------------------------------------------
-    // Additional: current_fanout
-    // -----------------------------------------------------------------------
-
     #[test]
-    fn test_current_fanout() {
-        let mut tracker = BranchPointTracker::new(1024);
+    fn test_transfer_then_drop_does_not_phantom_delete_record() {
+        // A live branch-point record can exist for a *non-resident* parent: it
+        // is created by the first CHILD registering under it. Registering only
+        // the child `b` of `a` creates `records[K_a]` (max_fanout = 1), and
+        // `max_fanout(a)` reads it back via the parent<->child fragment symmetry
+        // -- even though `a` itself is not resident.
+        let tracker = Arc::new(BranchPointTracker::new());
+        let registry = BlockRegistry::builder()
+            .branch_oracle(tracker.clone() as Arc<dyn BranchOracle>)
+            .build();
 
-        let chain_a = build_chain(vec![42, 100], 1);
-        register_all(&mut tracker, &chain_a);
+        let chain = build_chain(vec![7, 8], 1);
+        let parent = chain[0];
+        let _child = registry.register_sequence_hash(chain[1]);
+        assert_eq!(
+            tracker.max_fanout(parent),
+            Some(1),
+            "child registration must create the parent's branch-point record"
+        );
 
-        let root_hash = chain_a[0];
-        let pos = root_hash.position();
-        let frag = root_hash.current_hash_fragment();
-
-        assert_eq!(tracker.current_fanout(pos, frag), Some(1));
-
-        register_all(&mut tracker, &build_chain(vec![42, 200], 1));
-        assert_eq!(tracker.current_fanout(pos, frag), Some(2));
-
-        register_all(&mut tracker, &build_chain(vec![42, 300], 1));
-        assert_eq!(tracker.current_fanout(pos, frag), Some(3));
-
-        // Untracked position
-        assert_eq!(tracker.current_fanout(999, 0), None);
+        // Transfer-register the (non-resident) PARENT block. Under the bug its
+        // Drop fires an unpaired `on_block_removed(parent)` whose
+        // `self_as_parent_key(parent)` collides with `K_a`, phantom-deleting the
+        // live record. Paired correctly, the record survives untouched.
+        {
+            let handle = registry.transfer_registration(parent);
+            assert_eq!(
+                tracker.max_fanout(parent),
+                Some(1),
+                "transfer must not observe a registration"
+            );
+            drop(handle);
+        }
+        assert_eq!(
+            tracker.max_fanout(parent),
+            Some(1),
+            "transfer+drop phantom-deleted a live branch-point record (unpaired removal)"
+        );
     }
 }

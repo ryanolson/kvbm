@@ -28,14 +28,14 @@ use kvbm_common::LogicalResourceId;
 use kvbm_engine::WorkerEngine;
 #[cfg(feature = "nccl")]
 use kvbm_engine::collectives::{NcclBootstrap, NcclCollectives};
+#[cfg(feature = "nccl")]
+use kvbm_engine::leader::parallelism::worker_data_placement;
 use kvbm_engine::worker::{
     CollectiveBootstrap, LeaderLayoutConfig, VeloWorkerService, WorkerCacheConfig,
     WorkerLayoutResponse, WorkerTransfers,
 };
 #[cfg(feature = "nccl")]
 use kvbm_engine::worker::{ReplicatedDataWorker, ResourceDispatchWorker};
-#[cfg(feature = "nccl")]
-use kvbm_physical::manager::WorkerDataPlacement;
 use kvbm_protocols::connector::EngineWorkerSink;
 
 use crate::KvbmRuntime;
@@ -348,17 +348,7 @@ fn build_resource_transfers(
         )?);
         let placements = modes
             .into_iter()
-            .map(|(resource, mode)| {
-                let placement = match mode {
-                    kvbm_config::ParallelismMode::ReplicatedData => {
-                        WorkerDataPlacement::ReplicatedG1StripedLower
-                    }
-                    kvbm_config::ParallelismMode::TensorParallel => {
-                        WorkerDataPlacement::TensorSharded
-                    }
-                };
-                (resource, placement)
-            })
+            .map(|(resource, mode)| (resource, worker_data_placement(mode)))
             .collect();
         let transfers =
             ResourceDispatchWorker::new(worker, Arc::clone(runtime), Some(collective), placements)?;

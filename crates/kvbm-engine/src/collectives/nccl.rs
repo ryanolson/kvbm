@@ -47,11 +47,14 @@
 //!
 //! # Thread Safety
 //!
-//! NCCL operations are thread-safe when each thread uses its own stream. This
-//! implementation uses a dedicated NCCL stream per `NcclCollectives` instance.
+//! NCCL permits only one host thread at a time to call a communicator. KVBM
+//! serializes complete group submissions, async polling, and owned-handle abort
+//! through one lifecycle. KVBM-created communicators are nonblocking.
 
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use anyhow::{Context, Result, ensure};
 use cudarc::driver::sys::CUstream;
@@ -64,8 +67,19 @@ use kvbm_physical::layout::PhysicalLayout;
 use kvbm_physical::transfer::TransferCompleteNotification;
 
 use super::CollectiveOps;
-use super::bootstrap::{NcclBootstrap, check_nccl_result};
-use super::nccl_ffi::{NCCL_INT8, NcclComm, bcast, comm_destroy, group_end, group_start};
+use super::bootstrap::{
+    NCCL_INIT_TIMEOUT, NcclBootstrap, check_nccl_result, check_nccl_submission,
+};
+use super::nccl_ffi::{
+    NCCL_IN_PROGRESS, NCCL_INT8, NCCL_SUCCESS, NcclComm, bcast, comm_abort, comm_destroy,
+    comm_get_async_error, group_end, group_start,
+};
+
+mod initialization;
+mod lifecycle;
+
+use initialization::initialize_rank_group;
+use lifecycle::{CommunicatorLifecycle, GroupSubmission};
 
 /// Trait for resolving logical layout handles to physical layouts.
 ///
@@ -104,6 +118,9 @@ pub trait LayoutResolver: Send + Sync {
 /// The primary implementation wraps `TransferContext::register_cuda_event`,
 /// which uses a shared background task for polling multiple events.
 pub trait CudaEventRegistrar: Send + Sync {
+    /// Reserve bounded completion admission before launching CUDA work.
+    fn reserve_cuda_event(&self) -> Result<tokio::sync::OwnedSemaphorePermit>;
+
     /// Register a CUDA event for completion notification.
     ///
     /// The returned notification will complete when the CUDA event has been
@@ -114,7 +131,11 @@ pub trait CudaEventRegistrar: Send + Sync {
     ///
     /// # Returns
     /// A notification that completes when the event is signaled.
-    fn register_cuda_event(&self, event: CudaEvent) -> TransferCompleteNotification;
+    fn register_cuda_event(
+        &self,
+        event: CudaEvent,
+        admission: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<TransferCompleteNotification>;
 }
 
 /// Ownership mode for the NCCL communicator.
@@ -179,8 +200,9 @@ pub struct NcclCollectives {
     /// CUDA stream for NCCL operations (owned or borrowed)
     nccl_stream: NcclStream,
 
-    /// CUDA context for stream/event management (only used for owned mode)
-    #[allow(dead_code)]
+    /// CUDA context for stream/event management. KVBM can execute several
+    /// co-located ranks on a shared Tokio runtime, so the current context on a
+    /// worker thread is not stable between calls.
     cuda_context: Arc<CudaContext>,
 
     /// Event system for completion notifications (used for borrowed stream fallback)
@@ -191,6 +213,16 @@ pub struct NcclCollectives {
 
     /// Layout resolver for mapping logical handles to physical layouts
     layout_resolver: Arc<dyn LayoutResolver>,
+
+    /// Atomic admission, abort, and terminal-result state for the native
+    /// communicator handle.
+    lifecycle: CommunicatorLifecycle,
+
+    /// Immediate local poison, independent of native-call admission. This is
+    /// especially important for borrowed communicators: KVBM cannot abort an
+    /// externally owned handle, and a blocking owner operation may never
+    /// release the lifecycle mutex.
+    fatal_reason: OnceLock<String>,
 }
 
 impl NcclCollectives {
@@ -242,6 +274,8 @@ impl NcclCollectives {
             event_system,
             event_registrar,
             layout_resolver,
+            lifecycle: CommunicatorLifecycle::new(),
+            fatal_reason: OnceLock::new(),
         })
     }
 
@@ -254,26 +288,54 @@ impl NcclCollectives {
         worker: Arc<crate::worker::PhysicalWorker>,
         runtime: &crate::KvbmRuntime,
     ) -> Result<Self> {
+        let cancelled = AtomicBool::new(false);
+        Self::from_worker_bootstrap_with_cancel(
+            bootstrap,
+            worker,
+            runtime,
+            &cancelled,
+            Instant::now() + NCCL_INIT_TIMEOUT,
+        )
+    }
+
+    fn from_worker_bootstrap_with_cancel(
+        bootstrap: &NcclBootstrap,
+        worker: Arc<crate::worker::PhysicalWorker>,
+        runtime: &crate::KvbmRuntime,
+        cancelled: &AtomicBool,
+        deadline: Instant,
+    ) -> Result<Self> {
         let rank = worker
             .rank()
             .context("NCCL collective worker requires a rank")?;
         let cuda_context = worker.transfer_manager().cuda_context().clone();
         let event_registrar: Arc<dyn CudaEventRegistrar> = worker.clone();
         let layout_resolver: Arc<dyn LayoutResolver> = worker;
+        let nccl_stream = cuda_context
+            .new_stream()
+            .context("Failed to create NCCL stream")?;
+        let comm = bootstrap
+            .init_communicator_with_cancel(rank, nccl_stream.cu_stream(), cancelled, deadline)
+            .context("Failed to initialize NCCL communicator")?;
 
-        Self::from_bootstrap(
-            bootstrap,
+        Ok(Self {
+            comm,
+            ownership: CommOwnership::Owned,
             rank,
+            world_size: bootstrap.world_size(),
+            nccl_stream: NcclStream::Owned(nccl_stream),
             cuda_context,
-            runtime.event_system(),
+            event_system: runtime.event_system(),
             event_registrar,
             layout_resolver,
-        )
+            lifecycle: CommunicatorLifecycle::new(),
+            fatal_reason: OnceLock::new(),
+        })
     }
 
     /// Initialize one KVBM-owned communicator per in-process physical worker.
     ///
-    /// `ncclCommInitRank` is collective, so rank initialization runs
+    /// `ncclCommInitRankConfig` is collective, so rank initialization runs
     /// concurrently even when a host process owns every Rhino worker. Workers
     /// must be supplied in rank order with contiguous rank IDs.
     pub fn from_worker_group(
@@ -295,28 +357,22 @@ impl NcclCollectives {
             );
         }
 
-        std::thread::scope(|scope| {
-            let initializers = workers
-                .iter()
-                .map(|worker| {
-                    scope.spawn(move || {
-                        Self::from_worker_bootstrap(bootstrap, Arc::clone(worker), runtime)
-                    })
-                })
-                .collect::<Vec<_>>();
-
-            initializers
-                .into_iter()
-                .enumerate()
-                .map(|(rank, initializer)| {
-                    initializer
-                        .join()
-                        .map_err(|_| anyhow::anyhow!("NCCL rank {rank} initializer panicked"))?
-                        .with_context(|| format!("initialize KVBM NCCL rank {rank}"))
-                        .map(Arc::new)
-                })
-                .collect()
-        })
+        initialize_rank_group(
+            workers.len(),
+            NCCL_INIT_TIMEOUT,
+            |rank, cancelled, deadline| {
+                Self::from_worker_bootstrap_with_cancel(
+                    bootstrap,
+                    Arc::clone(&workers[rank]),
+                    runtime,
+                    cancelled,
+                    deadline,
+                )
+                .with_context(|| format!("initialize KVBM NCCL rank {rank}"))
+            },
+            |collective, reason| collective.abort(reason),
+        )
+        .map(|collectives| collectives.into_iter().map(Arc::new).collect())
     }
 
     // =========================================================================
@@ -328,6 +384,10 @@ impl NcclCollectives {
     /// This compatibility path is available when an external runtime owns the
     /// communicator. Connector workers prefer [`Self::from_worker_bootstrap`]
     /// so KVBM owns an isolated communicator and completion-safe stream.
+    /// Fatal group handling immediately poisons this wrapper but will not call
+    /// `ncclCommAbort` on the externally owned handle; its owner is responsible
+    /// for aborting or discarding the communicator. Borrowed communicators are
+    /// therefore not eligible for KVBM's replicated-collective recovery path.
     ///
     /// # Arguments
     /// * `comm_ptr` - Raw pointer to `ncclComm_t` handle (cast to usize)
@@ -344,6 +404,8 @@ impl NcclCollectives {
     /// - `stream_ptr` must be a valid `cudaStream_t` handle
     /// - The caller must ensure the handles outlive this struct
     /// - The communicator must not be destroyed while this struct exists
+    /// - The owner must serialize access and perform any required abort; KVBM
+    ///   only guarantees immediate local fail-closed behavior after an error
     ///
     /// # FFI Example (Python via PyO3)
     /// ```python
@@ -364,6 +426,7 @@ impl NcclCollectives {
     /// ```c
     /// // In C/C++
     /// ncclComm_t comm;
+    /// // The external owner chooses and manages the communicator configuration.
     /// ncclCommInitRank(&comm, world_size, id, rank);
     /// cudaStream_t stream;
     /// cudaStreamCreate(&stream);
@@ -392,6 +455,8 @@ impl NcclCollectives {
             event_system,
             event_registrar,
             layout_resolver,
+            lifecycle: CommunicatorLifecycle::new(),
+            fatal_reason: OnceLock::new(),
         }
     }
 
@@ -410,31 +475,69 @@ impl NcclCollectives {
 
         let stream = self.nccl_stream.raw();
 
-        // Start NCCL group - batches operations for efficiency
-        let result = group_start()?;
-        check_nccl_result(result).context("ncclGroupStart failed")?;
+        let submission = self.lifecycle.submit_group(|| {
+            let result = group_start()?;
+            check_nccl_submission(result).context("ncclGroupStart failed")?;
 
-        // Queue all broadcasts within the group
-        for (ptr, size) in regions {
-            // SAFETY: We're calling NCCL with valid pointers within a group operation.
-            // The stream cast is safe because both cudarc::driver::sys::CUstream and
-            // cudarc::nccl::sys::CUstream are the same underlying CUDA type (*mut CUstream_st).
-            let result = bcast(
-                *ptr as *mut std::ffi::c_void,
-                *size,
-                NCCL_INT8,
-                root,
-                self.comm,
-                stream.cast(),
-            )?;
-            check_nccl_result(result).context("ncclBcast failed")?;
+            // Once a group is open, every path below reaches `group_end`. NCCL
+            // keeps group state thread-local, so returning early would poison
+            // later collectives even when the communicator itself survives.
+            let mut deferred_error = None;
+            for (ptr, size) in regions {
+                // SAFETY: We're calling NCCL with valid pointers within a group operation.
+                // The stream cast is safe because both CUDA stream aliases are raw pointers
+                // to the same underlying CUDA stream type.
+                let result = bcast(
+                    *ptr as *mut std::ffi::c_void,
+                    *size,
+                    NCCL_INT8,
+                    root,
+                    self.comm,
+                    stream.cast(),
+                );
+                if let Err(error) = result
+                    .and_then(|result| check_nccl_submission(result).map(|()| result))
+                    .context("ncclBcast failed")
+                {
+                    deferred_error = Some(error);
+                    break;
+                }
+            }
+
+            let completion = group_end()
+                .and_then(|result| check_nccl_submission(result).map(|()| result))
+                .context("ncclGroupEnd failed")?;
+            Ok(GroupSubmission {
+                completion,
+                deferred_error,
+            })
+        })?;
+
+        if submission.completion == NCCL_IN_PROGRESS {
+            self.wait_for_async_submission()?;
         }
 
-        // End group - submits all queued ops to GPU
-        let result = group_end()?;
-        check_nccl_result(result).context("ncclGroupEnd failed")?;
+        if let Some(error) = submission.deferred_error {
+            return Err(error);
+        }
 
         Ok(())
+    }
+
+    fn wait_for_async_submission(&self) -> Result<()> {
+        loop {
+            let mut state = NCCL_IN_PROGRESS;
+            let state = self.lifecycle.poll_submission(|| {
+                let result = comm_get_async_error(self.comm, &mut state)?;
+                check_nccl_result(result).context("ncclCommGetAsyncError failed")?;
+                Ok(state)
+            })?;
+            match state {
+                NCCL_SUCCESS => return Ok(()),
+                NCCL_IN_PROGRESS => std::thread::yield_now(),
+                error => return check_nccl_result(error).context("NCCL async operation failed"),
+            }
+        }
     }
 
     /// Collect memory regions for a set of blocks and layers.
@@ -473,7 +576,10 @@ impl NcclCollectives {
     }
 
     /// Create a completion notification by recording an event on the NCCL stream.
-    fn create_completion_notification(&self) -> Result<TransferCompleteNotification> {
+    fn create_completion_notification(
+        &self,
+        admission: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Result<TransferCompleteNotification> {
         // For owned streams, we can record an event and use the efficient registrar
         if let Some(stream) = self.nccl_stream.as_owned() {
             let cuda_event = stream
@@ -481,7 +587,10 @@ impl NcclCollectives {
                 .context("Failed to record CUDA event")?;
 
             // Use the event registrar for efficient background polling
-            Ok(self.event_registrar.register_cuda_event(cuda_event))
+            self.event_registrar.register_cuda_event(
+                cuda_event,
+                admission.expect("owned NCCL streams reserve CUDA completion admission"),
+            )
         } else {
             // For borrowed streams, we can't easily record events since we don't
             // have ownership. Return an immediate completion notification.
@@ -511,6 +620,15 @@ impl NcclCollectives {
         dst_block_ids: &[BlockId],
         layer_range: Option<Range<usize>>,
     ) -> Result<TransferCompleteNotification> {
+        self.ensure_not_poisoned()?;
+        self.lifecycle.ensure_active()?;
+        // A Tokio worker may previously have run transfer work for another
+        // co-located rank. NCCL and CUDA event recording both use thread-local
+        // current-context state, so bind this collective's device before
+        // touching its communicator, stream, or pointers.
+        self.cuda_context
+            .bind_to_thread()
+            .context("failed to bind NCCL rank CUDA context")?;
         let layout = if self.rank == root_rank {
             src_layout
         } else {
@@ -533,12 +651,41 @@ impl NcclCollectives {
         );
 
         let root = i32::try_from(root_rank).context("NCCL broadcast root does not fit in i32")?;
+        let completion_admission = self
+            .nccl_stream
+            .as_owned()
+            .map(|_| self.event_registrar.reserve_cuda_event())
+            .transpose()?;
         self.broadcast_regions(&regions, root)?;
-        self.create_completion_notification()
+        self.create_completion_notification(completion_admission)
+    }
+
+    fn ensure_not_poisoned(&self) -> Result<()> {
+        match self.fatal_reason.get() {
+            Some(reason) => anyhow::bail!("NCCL communicator is aborted: {reason}"),
+            None => Ok(()),
+        }
     }
 }
 
 impl CollectiveOps for NcclCollectives {
+    fn abort(&self, reason: &str) -> Result<()> {
+        let _ = self.fatal_reason.set(reason.to_owned());
+        match self.ownership {
+            CommOwnership::Owned => self.lifecycle.abort_with(reason, || {
+                self.cuda_context
+                    .bind_to_thread()
+                    .context("failed to bind NCCL rank CUDA context for abort")?;
+                comm_abort(self.comm)
+                    .and_then(check_nccl_result)
+                    .context("ncclCommAbort failed")
+            }),
+            CommOwnership::Borrowed => anyhow::bail!(
+                "cannot abort externally owned borrowed NCCL communicator; its owner must abort or discard it"
+            ),
+        }
+    }
+
     fn broadcast(
         &self,
         root_rank: usize,
@@ -609,7 +756,7 @@ impl CollectiveOps for NcclCollectives {
 
 impl Drop for NcclCollectives {
     fn drop(&mut self) {
-        if self.ownership == CommOwnership::Owned {
+        if self.ownership == CommOwnership::Owned && !self.lifecycle.communicator_released() {
             // SAFETY: We own this communicator and it's valid
             match comm_destroy(self.comm).and_then(check_nccl_result) {
                 Ok(()) => {}
@@ -622,13 +769,12 @@ impl Drop for NcclCollectives {
 }
 
 // SAFETY: NcclCollectives can be sent between threads.
-// The NCCL communicator itself is thread-safe when operations use
-// the same stream (which we guarantee by having a dedicated stream).
+// Every native operation on the communicator is serialized by `lifecycle`.
 unsafe impl Send for NcclCollectives {}
 
 // SAFETY: NcclCollectives can be shared between threads.
-// All mutable state is behind Arc or atomic operations, and NCCL
-// operations are thread-safe when using the same stream.
+// `lifecycle` guarantees NCCL's one-thread-at-a-time rule for KVBM calls.
+// Borrowed-handle owners retain the documented external serialization duty.
 unsafe impl Sync for NcclCollectives {}
 
 #[cfg(all(test, feature = "testing-nccl"))]

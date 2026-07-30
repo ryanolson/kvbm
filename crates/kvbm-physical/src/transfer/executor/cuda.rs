@@ -138,6 +138,10 @@ pub fn execute_cuda_transfer(
         "Transfer prepared"
     );
 
+    let completion_admission = (!caller_manages_sync)
+        .then(|| ctx.reserve_cuda_event())
+        .transpose()?;
+
     match strategy {
         TransferStrategy::CudaAsyncH2D
         | TransferStrategy::CudaAsyncD2H
@@ -209,7 +213,10 @@ pub fn execute_cuda_transfer(
             | TransferStrategy::CudaAsyncD2D
     ) {
         let event = stream.record_event(None)?;
-        Ok(ctx.register_cuda_event(event))
+        Ok(ctx.register_cuda_event(
+            event,
+            completion_admission.expect("async CUDA transfer reserved completion admission"),
+        ))
     } else {
         // Blocking transfers are already synchronized
         Ok(TransferCompleteNotification::completed())

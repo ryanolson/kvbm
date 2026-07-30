@@ -135,6 +135,55 @@ impl<U, S, A> BlockStore<U, S, A> {
         self.unassigned.pop()
     }
 
+    // -- Batch Drain ------------------------------------------------------------
+    //
+    // These exist to avoid the O(N²) cost of driving `shift_staged`/
+    // `shift_unassigned` in a per-element loop: each `shift_remove_index(0)`
+    // is itself O(len) because it shifts every following element down, so an
+    // N-element loop is O(N²). Draining a contiguous prefix in one call is
+    // O(len) total.
+
+    /// Drains all staged entries in staging (FIFO) order, returning them as a
+    /// `Vec`. O(N) total, versus O(N²) for an N-element loop of
+    /// [`shift_staged`](Self::shift_staged).
+    ///
+    /// Returns an owned `Vec` (not the `Drain` iterator) so callers can
+    /// re-borrow `self` (e.g. to call `insert_assigned`) while iterating the
+    /// result.
+    pub fn drain_staged(&mut self) -> Vec<(BlockId, S)> {
+        self.staged.drain(..).collect()
+    }
+
+    /// Drains the first `min(n, unassigned.len())` entries from unassigned in
+    /// FIFO order, returning them as a `Vec`. O(len) total (a single prefix
+    /// shift), versus O(n · len) for an n-element loop of
+    /// [`shift_unassigned`](Self::shift_unassigned).
+    pub fn drain_unassigned_prefix(&mut self, n: usize) -> Vec<(BlockId, U)> {
+        let n = n.min(self.unassigned.len());
+        self.unassigned.drain(..n).collect()
+    }
+
+    /// Reinserts a batch of previously-drained unassigned entries at the
+    /// front of the unassigned queue, preserving their relative (FIFO) order
+    /// ahead of whatever remains.
+    ///
+    /// This is the recovery half of [`drain_unassigned_prefix`](Self::drain_unassigned_prefix):
+    /// when a caller drains a prefix, processes entries one at a time, and
+    /// hits an error partway through, the unprocessed tail of the drained
+    /// batch must go back to the front of unassigned (not be lost, and not be
+    /// appended to the back — that would violate FIFO order for anything
+    /// still queued behind it).
+    pub fn reinsert_unassigned_front(&mut self, front: Vec<(BlockId, U)>) {
+        if front.is_empty() {
+            return;
+        }
+        let remainder: IndexMap<BlockId, U> = std::mem::take(&mut self.unassigned);
+        let mut rebuilt = IndexMap::with_capacity(front.len() + remainder.len());
+        rebuilt.extend(front);
+        rebuilt.extend(remainder);
+        self.unassigned = rebuilt;
+    }
+
     // -- Insert ---------------------------------------------------------------
 
     /// Inserts into the assigned collection.

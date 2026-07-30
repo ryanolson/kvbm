@@ -210,6 +210,9 @@ pub(crate) fn execute_planner_cuda_transfer(
             }
         }
     };
+    let completion_admission = (!caller_manages_sync)
+        .then(|| ctx.reserve_cuda_event())
+        .transpose()?;
 
     // PR-7.6: capture telemetry fields from the outcome before dispatch
     // so we can compute bytes/descriptors once without a second projection.
@@ -294,7 +297,10 @@ pub(crate) fn execute_planner_cuda_transfer(
         return Ok(TransferCompleteNotification::completed());
     }
     let event = stream.record_event(None)?;
-    Ok(ctx.register_cuda_event(event))
+    Ok(ctx.register_cuda_event(
+        event,
+        completion_admission.expect("planner CUDA transfer reserved completion admission"),
+    ))
 }
 
 /// Dispatch a NIXL transfer through the stride-aware planner.
@@ -496,6 +502,7 @@ pub(crate) fn execute_planner_nixl_transfer(
     // post_xfer_req; COMPLETION is measured from `tel_submitted_at` by the
     // status poller. For an async RDMA read the post returns still_pending=true
     // and completion is polled; a synchronous completion emits inline below.
+    let registration = ctx.reserve_nixl_status()?;
     let xfer_req = nixl_agent.create_xfer_req(xfer_op, &src_dl, &dst_dl, remote_agent, None)?;
     let tel_ctrl_us = t_ctrl0.elapsed().as_micros() as u64;
     let t_post0 = std::time::Instant::now();
@@ -545,7 +552,7 @@ pub(crate) fn execute_planner_nixl_transfer(
     };
 
     if still_pending {
-        Ok(ctx.register_nixl_status(xfer_req, Some(telemetry)))
+        Ok(ctx.register_nixl_status(xfer_req, Some(telemetry), registration))
     } else {
         // Synchronous completion never enters the poller — emit inline.
         telemetry.emit_complete(true);
@@ -1486,15 +1493,11 @@ pub(crate) fn dispatch_transform_kernel(
 /// caller for graceful handling.
 struct OwnedStagedContext {
     event_system: Arc<velo::EventManager>,
-    tx_cuda_event: tokio::sync::mpsc::Sender<
-        crate::transfer::notifications::RegisterPollingNotification<
-            crate::transfer::notifications::CudaEventChecker,
-        >,
+    tx_cuda_event: crate::transfer::context::PollingRegistrationQueue<
+        crate::transfer::notifications::CudaEventChecker,
     >,
-    tx_nixl_status: tokio::sync::mpsc::Sender<
-        crate::transfer::notifications::RegisterPollingNotification<
-            crate::transfer::notifications::NixlStatusChecker,
-        >,
+    tx_nixl_status: crate::transfer::context::PollingRegistrationQueue<
+        crate::transfer::notifications::NixlStatusChecker,
     >,
     raw_agent: kvbm_memory::nixl::Agent,
     nixl_agent: super::super::NixlAgent,
@@ -1526,6 +1529,7 @@ impl OwnedStagedContext {
     fn register_cuda_event(
         &self,
         cuda_event: cudarc::driver::CudaEvent,
+        admission: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<TransferCompleteNotification> {
         let new_event = self.event_system.new_event()?;
         let handle = new_event.into_handle();
@@ -1535,9 +1539,10 @@ impl OwnedStagedContext {
             checker: crate::transfer::notifications::CudaEventChecker::new(cuda_event),
             event_handle: handle,
             telemetry: None,
+            admission,
         };
         self.tx_cuda_event
-            .try_send(notification)
+            .send(notification)
             .map_err(|e| anyhow!("staged: failed to enqueue CUDA event notification: {e}"))?;
         Ok(TransferCompleteNotification::from_awaiter(awaiter))
     }
@@ -1546,6 +1551,7 @@ impl OwnedStagedContext {
     fn register_nixl_status(
         &self,
         xfer_req: kvbm_memory::nixl::XferRequest,
+        admission: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<TransferCompleteNotification> {
         let new_event = self.event_system.new_event()?;
         let handle = new_event.into_handle();
@@ -1560,9 +1566,10 @@ impl OwnedStagedContext {
             // Staged NIXL legs (operational↔universal transform) are not part of
             // the uniform remote-search pull path we instrument.
             telemetry: None,
+            admission,
         };
         self.tx_nixl_status
-            .try_send(notification)
+            .send(notification)
             .map_err(|e| anyhow!("staged: failed to enqueue NIXL status notification: {e}"))?;
         Ok(TransferCompleteNotification::from_awaiter(awaiter))
     }
@@ -1646,6 +1653,7 @@ impl OwnedStagedContext {
             XferOp::Write => dst_metadata.agent_name(),
             XferOp::Read => src_metadata.agent_name(),
         };
+        let registration = self.tx_nixl_status.reserve()?;
         let xfer_req =
             self.nixl_agent
                 .create_xfer_req(xfer_op, &src_dl, &dst_dl, remote_agent, None)?;
@@ -1653,7 +1661,7 @@ impl OwnedStagedContext {
         if !still_pending {
             return Ok(TransferCompleteNotification::completed());
         }
-        self.register_nixl_status(xfer_req)
+        self.register_nixl_status(xfer_req, registration)
     }
 }
 
@@ -1827,6 +1835,7 @@ fn dispatch_staged_nixl_transform(
                 src,
                 bounce_layout,
             )?);
+            let completion_admission = staged.tx_cuda_event.reserve()?;
             dispatch_transform_kernel(
                 &invocation,
                 src,
@@ -1837,7 +1846,7 @@ fn dispatch_staged_nixl_transform(
                 &stage1_prepared,
             )?;
             let cuda_event = staged.stream.record_event(None)?;
-            staged.register_cuda_event(cuda_event)?
+            staged.register_cuda_event(cuda_event, completion_admission)?
         }
     };
 
@@ -1870,6 +1879,7 @@ fn dispatch_staged_nixl_transform(
                             &bounce_owned,
                             &dst_owned,
                         )?);
+                    let completion_admission = staged.tx_cuda_event.reserve()?;
                     dispatch_transform_kernel(
                         &invocation_owned,
                         &bounce_owned,
@@ -1880,7 +1890,7 @@ fn dispatch_staged_nixl_transform(
                         &stage2_prepared,
                     )?;
                     let cuda_event = staged.stream.record_event(None)?;
-                    staged.register_cuda_event(cuda_event)
+                    staged.register_cuda_event(cuda_event, completion_admission)
                 })();
                 match prep {
                     Ok(notif) => notif.await,

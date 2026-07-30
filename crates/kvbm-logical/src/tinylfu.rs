@@ -238,6 +238,16 @@ impl<K: SketchKey> TinyLFUSketch<K> {
 pub trait FrequencyTracker<K: SketchKey>: Send + Sync {
     fn touch(&self, key: K);
     fn count(&self, key: K) -> u32;
+
+    /// Batched touch. Default implementation loops [`touch`](Self::touch)
+    /// once per key; backends that hold an internal lock (e.g.
+    /// [`TinyLFUTracker`]) should override this to acquire it once for
+    /// the whole batch instead of once per key.
+    fn touch_batch(&self, keys: &[K]) {
+        for &key in keys {
+            self.touch(key);
+        }
+    }
 }
 
 pub struct TinyLFUTracker<K: SketchKey> {
@@ -259,6 +269,18 @@ impl<K: SketchKey> FrequencyTracker<K> for TinyLFUTracker<K> {
 
     fn count(&self, key: K) -> u32 {
         self.sketch.lock().estimate(key)
+    }
+
+    /// Takes the sketch mutex once for the whole batch instead of once
+    /// per key.
+    fn touch_batch(&self, keys: &[K]) {
+        if keys.is_empty() {
+            return;
+        }
+        let mut sketch = self.sketch.lock();
+        for &key in keys {
+            sketch.increment(key);
+        }
     }
 }
 

@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::object::ObjectBlockOps;
+use crate::worker::LocalTransferPlacements;
 use futures::future::BoxFuture;
 use parking_lot::RwLock;
 use std::collections::HashSet;
@@ -15,11 +16,33 @@ pub struct VeloWorkerClient {
     g1_handle: Arc<OnceLock<LayoutHandle>>,
     g2_handle: Arc<OnceLock<LayoutHandle>>,
     g3_handle: Arc<OnceLock<LayoutHandle>>,
+    /// The remote physical worker's authoritative local-transfer routing,
+    /// configured from the leader's initialization plan and checked against
+    /// stamped worker metadata when available.
+    local_transfer_placements: Arc<OnceLock<LocalTransferPlacements>>,
+    /// Fatal replicated-transfer failure observed by this client. Setting it
+    /// rejects later G2 -> G1 requests even if the abort RPC cannot reach the
+    /// worker process.
+    collective_failure: Arc<OnceLock<String>>,
     /// Track which remote instances we've connected to for has_remote_metadata()
     connected_instances: Arc<RwLock<HashSet<InstanceId>>>,
 }
 
 impl VeloWorkerClient {
+    fn install_local_transfer_placements(
+        &self,
+        placements: LocalTransferPlacements,
+        source: &str,
+    ) -> Result<()> {
+        if let Err(placements) = self.local_transfer_placements.set(placements) {
+            anyhow::ensure!(
+                self.local_transfer_placements.get() == Some(&placements),
+                "{source} transfer placements disagree with the configured worker routing"
+            );
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn dispatch_local_transfer(
         &self,
@@ -30,6 +53,13 @@ impl VeloWorkerClient {
         dst_block_ids: Arc<[BlockId]>,
         options: TransferOptions,
     ) -> Result<TransferCompleteNotification> {
+        if src == LogicalLayoutHandle::G2
+            && dst == LogicalLayoutHandle::G1
+            && self.local_onboard_requires_serialization(resource)
+            && let Some(reason) = self.collective_failure.get()
+        {
+            anyhow::bail!("local collective transfer group is aborted: {reason}");
+        }
         // Create a single local event for this operation
         let event = self.messenger.events().new_event()?;
         let awaiter = self.messenger.events().awaiter(event.handle())?;
@@ -83,6 +113,41 @@ impl VeloWorkerClient {
 }
 
 impl WorkerTransfers for VeloWorkerClient {
+    fn local_onboard_requires_serialization(&self, resource: Option<LogicalResourceId>) -> bool {
+        self.local_transfer_placements
+            .get()
+            .is_none_or(|placements| placements.onboard_requires_serialization(resource))
+    }
+
+    fn abort_local_collectives(&self, reason: String) -> Result<TransferCompleteNotification> {
+        let _ = self.collective_failure.set(reason.clone());
+        let event = self.messenger.events().new_event()?;
+        let awaiter = self.messenger.events().awaiter(event.handle())?;
+        let bytes = Bytes::from(serde_json::to_vec(&AbortLocalCollectivesMessage {
+            reason,
+        })?);
+        let velo = Arc::clone(&self.messenger);
+        let remote = self.remote;
+
+        self.messenger.tracker().spawn_on(
+            async move {
+                let result = velo
+                    .unary(handler_names::ABORT_LOCAL_COLLECTIVES)?
+                    .raw_payload(bytes)
+                    .instance(remote)
+                    .send()
+                    .await;
+                match result {
+                    Ok(_) => event.trigger(),
+                    Err(error) => event.poison(error.to_string()),
+                }
+            },
+            self.messenger.runtime(),
+        );
+
+        Ok(TransferCompleteNotification::from_awaiter(awaiter))
+    }
+
     fn execute_local_transfer(
         &self,
         src: LogicalLayoutHandle,
@@ -481,6 +546,8 @@ impl VeloWorkerClient {
             g1_handle: Arc::new(OnceLock::new()),
             g2_handle: Arc::new(OnceLock::new()),
             g3_handle: Arc::new(OnceLock::new()),
+            local_transfer_placements: Arc::new(OnceLock::new()),
+            collective_failure: Arc::new(OnceLock::new()),
             connected_instances: Arc::new(RwLock::new(HashSet::new())),
         }
     }
@@ -500,6 +567,9 @@ impl VeloWorkerClient {
     /// ```
     pub fn configure_layout_handles(&self, metadata: &SerializedLayout) -> Result<()> {
         let unpacked = metadata.unpack()?;
+        if let Some(placements) = LocalTransferPlacements::from_metadata(&unpacked)? {
+            self.install_local_transfer_placements(placements, "serialized worker metadata")?;
+        }
         for desc in &unpacked.layouts {
             match desc.logical_type {
                 LogicalLayoutHandle::G1 => {
@@ -515,6 +585,18 @@ impl VeloWorkerClient {
             }
         }
         Ok(())
+    }
+
+    /// Configure the worker's actual local-transfer routing selected during
+    /// initialization. The leader uses this policy to serialize only routes
+    /// that enter rank-wide collectives.
+    pub fn configure_local_transfer_placements(
+        &self,
+        primary: LogicalResourceId,
+        placements: Vec<(LogicalResourceId, WorkerDataPlacement)>,
+    ) -> Result<()> {
+        let placements = LocalTransferPlacements::new(primary, placements)?;
+        self.install_local_transfer_placements(placements, "leader initialization")
     }
 
     /// Get the layout configuration from the remote worker.
@@ -684,5 +766,206 @@ impl ObjectBlockOps for VeloWorkerClient {
                 None => keys.into_iter().map(Err).collect(),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+    use kvbm_physical::manager::{
+        ParallelismDescriptor, ResourceLayoutDescriptor, ResourceLayouts,
+        ResourceParallelismDescriptor, ResourceParallelismDescriptors, WorkerAddress,
+    };
+
+    use super::*;
+    use crate::testing::create_messenger_tcp;
+
+    #[tokio::test]
+    async fn tensor_sharded_velo_worker_does_not_serialize_local_onboards() -> Result<()> {
+        let client = VeloWorkerClient::new(create_messenger_tcp().await?, InstanceId::new_v4());
+        let resource = LogicalResourceId(3);
+        client.configure_local_transfer_placements(
+            resource,
+            vec![(resource, WorkerDataPlacement::TensorSharded)],
+        )?;
+
+        assert!(!client.local_onboard_requires_serialization(None));
+        assert!(!client.local_onboard_requires_serialization(Some(resource)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mixed_velo_worker_serializes_only_replicated_resource_onboards() -> Result<()> {
+        let client = VeloWorkerClient::new(create_messenger_tcp().await?, InstanceId::new_v4());
+        let attention = LogicalResourceId(2);
+        let latent = LogicalResourceId(7);
+        client.configure_local_transfer_placements(
+            attention,
+            vec![
+                (attention, WorkerDataPlacement::TensorSharded),
+                (latent, WorkerDataPlacement::ReplicatedG1StripedLower),
+            ],
+        )?;
+
+        assert!(!client.local_onboard_requires_serialization(None));
+        assert!(!client.local_onboard_requires_serialization(Some(attention)));
+        assert!(client.local_onboard_requires_serialization(Some(latent)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_metadata_preserves_nonzero_primary_transfer_placement() -> Result<()> {
+        let client = VeloWorkerClient::new(create_messenger_tcp().await?, InstanceId::new_v4());
+        let primary = LogicalResourceId(11);
+        let resource_layouts = ResourceLayouts::new(
+            primary,
+            vec![ResourceLayoutDescriptor::new(primary, Vec::new())],
+        )?;
+        let metadata = SerializedLayout::pack_with_resources(
+            WorkerAddress::new(11, "legacy-placement".to_string()),
+            Vec::new(),
+            Vec::new(),
+            Some(ParallelismDescriptor::single_worker(1)),
+            Some(WorkerDataPlacement::TensorSharded),
+            Some(resource_layouts),
+        )?;
+
+        client.configure_layout_handles(&metadata)?;
+
+        assert!(!client.local_onboard_requires_serialization(None));
+        assert!(!client.local_onboard_requires_serialization(Some(primary)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mixed_resource_metadata_configures_each_transfer_placement() -> Result<()> {
+        let client = VeloWorkerClient::new(create_messenger_tcp().await?, InstanceId::new_v4());
+        let attention = LogicalResourceId(2);
+        let latent = LogicalResourceId(7);
+        let descriptor = ParallelismDescriptor::single_worker(1);
+        let resources = ResourceParallelismDescriptors::new(
+            attention,
+            vec![
+                ResourceParallelismDescriptor::new(
+                    attention,
+                    descriptor.clone(),
+                    WorkerDataPlacement::TensorSharded,
+                ),
+                ResourceParallelismDescriptor::new(
+                    latent,
+                    descriptor.clone(),
+                    WorkerDataPlacement::ReplicatedG1StripedLower,
+                ),
+            ],
+        )?;
+        let metadata = SerializedLayout::pack_with_resource_parallelism(
+            WorkerAddress::new(12, "mixed-placement".to_string()),
+            Vec::new(),
+            Vec::new(),
+            Some(descriptor),
+            Some(WorkerDataPlacement::TensorSharded),
+            None,
+            Some(resources),
+        )?;
+
+        client.configure_layout_handles(&metadata)?;
+
+        assert!(!client.local_onboard_requires_serialization(Some(attention)));
+        assert!(client.local_onboard_requires_serialization(Some(latent)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stamped_metadata_must_match_explicit_initialization_placement() -> Result<()> {
+        let client = VeloWorkerClient::new(create_messenger_tcp().await?, InstanceId::new_v4());
+        let resource = LogicalResourceId::default();
+        client.configure_local_transfer_placements(
+            resource,
+            vec![(resource, WorkerDataPlacement::TensorSharded)],
+        )?;
+        let metadata = SerializedLayout::pack_with_resources(
+            WorkerAddress::new(13, "conflicting-placement".to_string()),
+            Vec::new(),
+            Vec::new(),
+            Some(ParallelismDescriptor::single_worker(1)),
+            Some(WorkerDataPlacement::ReplicatedG1StripedLower),
+            None,
+        )?;
+
+        let error = client
+            .configure_layout_handles(&metadata)
+            .expect_err("conflicting placement metadata must fail closed");
+        assert!(error.to_string().contains("disagree"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fatal_collective_failure_rejects_later_onboards_before_rpc_dispatch() -> Result<()> {
+        let client = VeloWorkerClient::new(create_messenger_tcp().await?, InstanceId::new_v4());
+        client
+            .collective_failure
+            .set("injected rank-group failure".to_string())
+            .unwrap();
+
+        let error = client
+            .execute_local_transfer(
+                LogicalLayoutHandle::G2,
+                LogicalLayoutHandle::G1,
+                Arc::from([0]),
+                Arc::from([0]),
+                TransferOptions::default(),
+            )
+            .err()
+            .expect("a poisoned client must fail before contacting its worker");
+        assert!(error.to_string().contains("injected rank-group failure"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fatal_collective_failure_preserves_independent_tensor_resource() -> Result<()> {
+        let client = VeloWorkerClient::new(create_messenger_tcp().await?, InstanceId::new_v4());
+        let attention = LogicalResourceId(2);
+        let latent = LogicalResourceId(7);
+        client.configure_local_transfer_placements(
+            attention,
+            vec![
+                (attention, WorkerDataPlacement::TensorSharded),
+                (latent, WorkerDataPlacement::ReplicatedG1StripedLower),
+            ],
+        )?;
+        client
+            .collective_failure
+            .set("injected replicated-resource failure".to_string())
+            .unwrap();
+
+        let tensor_route = client.execute_local_transfer_for_resource(
+            attention,
+            LogicalLayoutHandle::G2,
+            LogicalLayoutHandle::G1,
+            Arc::from([0]),
+            Arc::from([0]),
+            TransferOptions::default(),
+        );
+        assert!(
+            tensor_route.is_ok(),
+            "an independent tensor-sharded route must remain dispatchable"
+        );
+        let replicated_error = client
+            .execute_local_transfer_for_resource(
+                latent,
+                LogicalLayoutHandle::G2,
+                LogicalLayoutHandle::G1,
+                Arc::from([0]),
+                Arc::from([0]),
+                TransferOptions::default(),
+            )
+            .err()
+            .expect("the replicated route must fail closed");
+        assert!(
+            replicated_error
+                .to_string()
+                .contains("injected replicated-resource failure")
+        );
+        Ok(())
     }
 }

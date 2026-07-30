@@ -638,11 +638,18 @@ impl TransferManager {
 
     /// Register a CUDA event with the manager's shared completion poller.
     #[doc(hidden)]
+    pub fn reserve_cuda_event(&self) -> anyhow::Result<tokio::sync::OwnedSemaphorePermit> {
+        self.context.reserve_cuda_event()
+    }
+
+    /// Register a CUDA event using admission acquired before launching work.
+    #[doc(hidden)]
     pub fn register_cuda_event(
         &self,
         event: cudarc::driver::CudaEvent,
-    ) -> TransferCompleteNotification {
-        self.context.register_cuda_event(event)
+        admission: tokio::sync::OwnedSemaphorePermit,
+    ) -> anyhow::Result<TransferCompleteNotification> {
+        Ok(self.context.register_cuda_event(event, admission))
     }
 
     /// Get the CUDA memory pool (for testing only).

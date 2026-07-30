@@ -47,6 +47,20 @@ pub(crate) struct ImmutableBlockInner<T: BlockMetadata> {
     /// the primary cannot transition to `Inactive` (and thus be evicted)
     /// while any duplicate is alive.
     _primary_keepalive: Option<Arc<ImmutableBlockInner<T>>>,
+    /// Set by `BlockStore::release_blocks` immediately after it takes sole
+    /// ownership of this `Inner` (via `Arc::try_unwrap`) and performs its
+    /// pool-state release inline, under the batch's single lock. `Drop`
+    /// checks this to skip the now-redundant `release_primary` /
+    /// `release_duplicate` call — the batch already ran that exact
+    /// transition. Ordinary field-drop glue (`_primary_keepalive`,
+    /// `handle`, `store`) still runs afterward; only the custom
+    /// pool-release side effect is suppressed.
+    ///
+    /// Plain `bool`, not atomic: it is only ever set while this value is
+    /// held by unique, non-`Arc` ownership (immediately after
+    /// `Arc::try_unwrap` succeeds and just before the value is dropped),
+    /// so no cross-thread synchronization is required.
+    defused: bool,
 }
 
 impl<T: BlockMetadata + Sync> ImmutableBlockInner<T> {
@@ -63,6 +77,7 @@ impl<T: BlockMetadata + Sync> ImmutableBlockInner<T> {
             handle,
             is_primary: true,
             _primary_keepalive: None,
+            defused: false,
         })
     }
 
@@ -80,6 +95,7 @@ impl<T: BlockMetadata + Sync> ImmutableBlockInner<T> {
             handle,
             is_primary: false,
             _primary_keepalive: Some(primary),
+            defused: false,
         })
     }
 
@@ -95,6 +111,34 @@ impl<T: BlockMetadata + Sync> ImmutableBlockInner<T> {
     /// `LifecyclePin` trait.
     pub(crate) fn sequence_hash(&self) -> SequenceHash {
         self.seq_hash
+    }
+
+    /// Mark this `Inner` as already released by
+    /// [`BlockStore::release_blocks`](crate::pools::BlockStore::release_blocks),
+    /// so `Drop` skips the pool-release side effect (see the `defused`
+    /// field docs). Requires unique ownership (`&mut self` via an owned,
+    /// non-`Arc` value) — callers obtain that through `Arc::try_unwrap`.
+    pub(crate) fn defuse(&mut self) {
+        self.defused = true;
+    }
+
+    /// Take the `_primary_keepalive` reference out of a duplicate
+    /// `Inner`, leaving `None` behind. `Option::take` only swaps the
+    /// field in place via `&mut self` — it does not move the enclosing
+    /// struct, so this is legal even though `ImmutableBlockInner`
+    /// implements `Drop`.
+    ///
+    /// Used by `BlockStore::release_blocks` to explicitly, synchronously
+    /// release a duplicate's keepalive on its primary *inline*, under
+    /// the batch's single lock — reproducing the exact cascade that
+    /// `Drop`'s ordinary field-drop glue would perform later, but at the
+    /// correct position in FIFO/observation order instead of deferred to
+    /// whenever this value's `Drop` happens to run. Callers must ensure
+    /// the returned `Arc`, if `Some`, is not itself dropped while the
+    /// store lock is held unless the drop is provably not the last
+    /// reference (see `release_blocks`'s design note).
+    pub(crate) fn take_primary_keepalive(&mut self) -> Option<Arc<ImmutableBlockInner<T>>> {
+        self._primary_keepalive.take()
     }
 }
 
@@ -115,6 +159,16 @@ impl<T: BlockMetadata + Sync> LifecyclePin for ImmutableBlockInner<T> {
 
 impl<T: BlockMetadata> Drop for ImmutableBlockInner<T> {
     fn drop(&mut self) {
+        // A batched `BlockStore::release_blocks` call already performed
+        // this Inner's pool-state release inline, under its single lock
+        // acquisition, after taking sole ownership via `Arc::try_unwrap`.
+        // Re-running release_primary/release_duplicate here would be
+        // redundant (the slot has already moved on). Field-drop glue for
+        // `_primary_keepalive` / `handle` / `store` below still runs
+        // normally — only this custom side effect is skipped.
+        if self.defused {
+            return;
+        }
         // self_ptr identifies *this* Inner so the store can verify slot
         // identity before transitioning. If a concurrent
         // `acquire_for_hash` already eagerly completed the transition,
@@ -207,6 +261,26 @@ impl<T: BlockMetadata + Sync> ImmutableBlock<T> {
         self.inner
             .store
             .store_reset_on_release(self.inner.block_id, value);
+    }
+
+    /// Consume the guard for a batched release
+    /// ([`BlockStore::release_blocks`](crate::pools::BlockStore::release_blocks)),
+    /// handing back the backing `Arc<ImmutableBlockInner<T>>` so the store
+    /// can decide, under its own lock, whether to release it inline
+    /// (sole ownership) or defer to this `Inner`'s ordinary `Drop`
+    /// (still shared).
+    ///
+    /// Clones the backing `Arc` and lets `self` drop normally. `Drop for
+    /// ImmutableBlock` only decrements the `inflight_immutable` metric, and
+    /// dropping `self.inner` releases exactly one strong ref — so the
+    /// returned clone carries the same effective ownership `self` held, and
+    /// the store's `Arc::try_unwrap` sees sole ownership iff the block was
+    /// truly sole-owned. This is the safe equivalent of moving the field out
+    /// of a `Drop` type (via `ManuallyDrop`/`ptr::read`); it trades one
+    /// atomic refcount inc/dec — negligible, and off the serving hot path
+    /// (teardown only) — for keeping `kvbm-logical` free of `unsafe`.
+    pub(crate) fn into_inner_for_batch_release(self) -> Arc<ImmutableBlockInner<T>> {
+        Arc::clone(&self.inner)
     }
 
     /// Type-erased lifecycle pin for cross-policy use.

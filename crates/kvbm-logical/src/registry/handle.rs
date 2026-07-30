@@ -7,9 +7,13 @@ use super::attachments::{AttachmentError, AttachmentStore, TypedAttachments};
 use super::{BlockRegistry, PositionalRadixTree};
 
 use crate::blocks::{BlockMetadata, SequenceHash};
+use crate::branch_tracker::BranchOracle;
+
+use dashmap::DashMap;
 
 use std::any::{Any, TypeId};
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
 // Under `#[cfg(test)]`, swap in `tracing-mutex`'s parking_lot wrapper
@@ -40,6 +44,18 @@ pub(crate) struct BlockRegistrationHandleInner {
     touch_callbacks: Mutex<Vec<TouchCallback>>,
     /// Weak reference to the registry - allows us to remove the block from the registry on drop
     registry: Weak<PositionalRadixTree<Weak<BlockRegistrationHandleInner>>>,
+    /// Branch oracle to notify on removal (mirrors the registry's own field at the time
+    /// this handle was created). `None` when branch tracking isn't attached -- fail-closed.
+    /// A transfer-created inner is deliberately `None` (it never fired
+    /// `on_block_registered`); [`BlockRegistry::remove_batch`](super::BlockRegistry::remove_batch)
+    /// reads this to skip firing an unpaired removal for such handles.
+    pub(super) branch_oracle: Option<Arc<dyn BranchOracle>>,
+    /// Set by [`BlockRegistry::remove_batch`](super::BlockRegistry::remove_batch) once it
+    /// has already deregistered this entry (and fired the oracle) under a single
+    /// per-position lock. `Drop` checks this FIRST and returns before touching the
+    /// registry, so the batched path collapses N per-position locks to P and the oracle
+    /// never double-fires.
+    removed_via_batch: AtomicBool,
 }
 
 impl std::fmt::Debug for BlockRegistrationHandleInner {
@@ -59,48 +75,94 @@ impl BlockRegistrationHandleInner {
     pub(super) fn new(
         seq_hash: SequenceHash,
         registry: Weak<PositionalRadixTree<Weak<BlockRegistrationHandleInner>>>,
+        branch_oracle: Option<Arc<dyn BranchOracle>>,
     ) -> Self {
         Self {
             seq_hash,
             attachments: Mutex::new(AttachmentStore::new()),
             touch_callbacks: Mutex::new(Vec::new()),
             registry,
+            branch_oracle,
+            removed_via_batch: AtomicBool::new(false),
         }
     }
+
+    /// Marks this registration as already removed by the batched path so the subsequent
+    /// [`Drop`] is a no-op. Called under the entry's position guard, immediately before
+    /// [`BlockRegistry::remove_batch`](super::BlockRegistry::remove_batch) releases the
+    /// last strong reference.
+    pub(super) fn mark_removed_via_batch(&self) {
+        self.removed_via_batch.store(true, Ordering::Release);
+    }
+}
+
+/// Identity-checked removal of a single registry entry, performed under an already-held
+/// position guard (`map`). This is the ONE shared *removal decision* for both the singular
+/// [`Drop`] path and [`BlockRegistry::remove_batch`](super::BlockRegistry::remove_batch),
+/// so an entry is deregistered on identical terms either way.
+///
+/// It does **not** fire [`BranchOracle::on_block_removed`] — each caller owns notification,
+/// because they must fire it against *different* oracles and at *different* times:
+/// - `Drop` fires the **handle's own** `branch_oracle` inline (under this guard). A
+///   transfer-created inner carries `branch_oracle: None` (it never fired
+///   `on_block_registered`), so its drop correctly fires nothing — the pairing invariant.
+/// - `remove_batch` collects the removed hashes and fires the oracle **after** releasing
+///   the guard (a public `BranchOracle` impl must not re-enter the registry, but deferring
+///   the call keeps the batch path safe even if one does), skipping transfer-created
+///   handles the same way (see its body).
+///
+/// Compares the stored `Weak`'s pointer against `identity` (the dying inner):
+/// `Weak::<T>::as_ptr()` for sized `T` returns the same pointer as `&T as *const T`, and
+/// during `drop_in_place` the inner allocation is still live. Only removes when the entry
+/// still points to us; a mismatch means a newer registration replaced the slot between the
+/// strong-count drop and this body, and is left untouched (an unconditional remove would
+/// silently delete the newer registration's entry). Returns `true` iff removed.
+pub(super) fn remove_entry_if_identity(
+    map: &DashMap<SequenceHash, Weak<BlockRegistrationHandleInner>>,
+    seq_hash: SequenceHash,
+    identity: *const BlockRegistrationHandleInner,
+) -> bool {
+    let should_remove = match map.get(&seq_hash) {
+        Some(weak_ref) => std::ptr::eq(weak_ref.as_ptr(), identity),
+        None => {
+            debug_assert!(
+                false,
+                "registry entry vanished while a strong ref was alive: {seq_hash:?}"
+            );
+            false
+        }
+    };
+    if should_remove {
+        map.remove(&seq_hash);
+    }
+    should_remove
 }
 
 impl Drop for BlockRegistrationHandleInner {
     #[inline]
     fn drop(&mut self) {
+        // Batched removal already deregistered this entry (and fired the oracle) under one
+        // per-position lock; skip the singular per-position lock entirely. This early
+        // return is what lets `remove_batch` collapse N locks to P, and it keeps
+        // `on_block_removed` firing exactly once per removed hash.
+        if self.removed_via_batch.load(Ordering::Acquire) {
+            return;
+        }
         let Some(registry) = self.registry.upgrade() else {
             return;
         };
-        // The position-level write lock held by `prefix()` for the lifetime of
-        // `map` serializes us against concurrent `register_sequence_hash` and
-        // `transfer_registration` on this `seq_hash`. Without that lock, a
-        // concurrent registration could replace the entry's `Weak` between our
-        // strong-count-drop and this body running, and an unconditional remove
-        // would silently delete the newer registration's entry.
-        //
-        // Compare the stored `Weak`'s pointer to `self`: `Weak::<T>::as_ptr()`
-        // for sized `T` returns the same pointer as `&T as *const T`, and
-        // during `drop_in_place` the inner allocation is still live (the
-        // implicit weak from the strong refcount is released after `Drop`
-        // returns). Only remove if the entry still points to us.
+        // The position-level write lock held by `prefix()` for the lifetime of `map`
+        // serializes us against concurrent `register_sequence_hash` and
+        // `transfer_registration` on this `seq_hash`, so the stored `Weak` is stable across
+        // the identity check performed by `remove_entry_if_identity`.
         let map = registry.prefix(&self.seq_hash);
-        let should_remove = match map.get(&self.seq_hash) {
-            Some(weak_ref) => std::ptr::eq(weak_ref.as_ptr(), self as *const Self),
-            None => {
-                debug_assert!(
-                    false,
-                    "registry entry vanished while a strong ref was alive: {:?}",
-                    self.seq_hash
-                );
-                false
+        if remove_entry_if_identity(&map, self.seq_hash, self as *const Self) {
+            // Fire the *handle's own* oracle (a transfer-created inner has `None` here and
+            // so fires nothing — the pairing invariant). Held under `map`; `BranchOracle`
+            // impls must not re-enter the registry (documented on the trait).
+            if let Some(oracle) = &self.branch_oracle {
+                oracle.on_block_removed(self.seq_hash);
             }
-        };
-        if should_remove {
-            map.remove(&self.seq_hash);
         }
     }
 }

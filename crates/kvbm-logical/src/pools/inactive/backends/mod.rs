@@ -17,6 +17,7 @@ mod tests;
 
 pub(crate) use fifo::FifoReusePolicy;
 pub(crate) use hashmap_backend::HashMapBackend;
+pub use lineage::ScorerParams;
 pub(crate) use lineage::{LeafPolicy, LineageBackend};
 pub(crate) use lru_backend::LruBackend;
 pub(crate) use multi_lru_backend::MultiLruBackend;
