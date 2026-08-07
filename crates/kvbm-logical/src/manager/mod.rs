@@ -25,7 +25,10 @@ use parking_lot::RwLock;
 
 use crate::blocks::{BlockMetadata, CompleteBlock, ImmutableBlock, MutableBlock};
 use crate::metrics::BlockPoolMetrics;
-use crate::pools::{BlockDuplicationPolicy, BlockStore, ReleaseOpts, SequenceHash};
+use crate::pools::{
+    BlockDuplicationPolicy, BlockStore, InactiveCandidate, InactiveFeatures, ReleaseOpts,
+    SequenceHash,
+};
 use crate::registry::BlockRegistry;
 
 /// Manages the full block lifecycle over the unified [`BlockStore`].
@@ -287,6 +290,52 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
                     })
             })
             .collect()
+    }
+
+    /// Read-only snapshot of up to `max` inactive blocks in this pool's
+    /// eviction-policy order (worst-first: poisoned leaves, then lowest-value
+    /// or oldest). Non-destructive — it does not resurrect a block, touch its
+    /// frequency, reorder the policy, or re-seed its sampling RNG.
+    ///
+    /// Advisory only: entries are stale the instant the store lock drops, so a
+    /// consumer must re-acquire authority over any block it acts on through
+    /// the ordinary match / pin / hold path, and treat a candidate that went
+    /// active or was evicted in between as *skipped*, not as an error.
+    ///
+    /// Empty on backends that expose no eviction order (`HashMap`, `Lru`,
+    /// `MultiLru`); a consumer must degrade rather than depend on the signal.
+    /// Intended for an out-of-band pressure pass — never the allocation path.
+    pub fn inactive_candidates(&self, max: usize) -> Vec<InactiveCandidate> {
+        self.store.inactive_candidates(max)
+    }
+
+    /// Membership-based point advice, positionally aligned with `hashes`.
+    /// `None` = that hash is not currently resident-inactive in this pool
+    /// (it is active, absent, or the backend tracks no features). Resolved
+    /// under a single store-lock acquisition, with the same read-only
+    /// guarantees as [`inactive_candidates`](Self::inactive_candidates).
+    ///
+    /// Unlike a peek, this reaches *interior* lineage nodes too (reported with
+    /// `is_leaf: false`), so a consumer can ask about a block it already knows
+    /// about rather than only about eviction candidates.
+    pub fn inactive_advice(&self, hashes: &[SequenceHash]) -> Vec<Option<InactiveFeatures>> {
+        self.store.inactive_advice(hashes)
+    }
+
+    /// Number of blocks currently in the inactive (cached, evictable) pool.
+    /// Cheap: one store-lock acquisition. Named for the pool it reports, not
+    /// for this type's `*_blocks` getters — it is the pressure-pass companion
+    /// of [`reset_len`](Self::reset_len).
+    pub fn inactive_len(&self) -> usize {
+        self.store.inactive_len()
+    }
+
+    /// Number of blocks currently in the reset (free) pool. Cheap: one
+    /// store-lock acquisition. `reset_len + inactive_len` is the same quantity
+    /// as [`available_blocks`](Self::available_blocks), but that one reads both
+    /// under a *single* lock — prefer it when the sum is what matters.
+    pub fn reset_len(&self) -> usize {
+        self.store.reset_len()
     }
 
     /// Total number of blocks managed (constant after construction).

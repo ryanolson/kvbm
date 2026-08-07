@@ -48,6 +48,7 @@ use crate::registry::BlockRegistrationHandle;
 // Identity hashing for `SequenceHash`-keyed maps lives in `pools` — it is
 // shared by `active_by_hash` here and by the inactive-pool backends.
 use super::SeqHashMap;
+use super::advice::{InactiveCandidate, InactiveFeatures};
 
 /// Index trait for inactive-pool eviction backends. T-free: backends only
 /// need `(SequenceHash, BlockId)` pairs.
@@ -115,6 +116,38 @@ pub(crate) trait InactiveIndex: Send + Sync {
     fn allocate_all(&mut self) -> Vec<(SequenceHash, BlockId)> {
         let n = self.len();
         self.allocate(n)
+    }
+
+    /// Read-only ranked peek: up to `max` inactive blocks in this index's
+    /// eviction order, worst-first. Default: empty — a backend that exposes no
+    /// order simply advertises no candidates, and the consumer degrades to
+    /// its own registration-driven selection (R7a §4).
+    ///
+    /// # Determinism (load-bearing)
+    ///
+    /// Implementations MUST NOT mutate policy state — not the recency clock,
+    /// not the ordering structures, and **not any sampling RNG**. An RNG
+    /// advanced by a read-only peek would (a) perturb the *next real* victim
+    /// draw, an observer effect on eviction, and (b) make a replayed trace
+    /// non-reproducible from identical inputs. `&self` is the enforcement:
+    /// the only interior mutability reachable from here is the shared
+    /// frequency sketch / branch oracle, which must be *read* only (no
+    /// `touch`).
+    ///
+    /// Results are advisory and stale the moment the store lock drops; see
+    /// [`crate::pools::advice`].
+    fn peek_victims(&self, max: usize) -> Vec<(SequenceHash, BlockId, InactiveFeatures)> {
+        let _ = max;
+        Vec::new()
+    }
+
+    /// Read-only point advice for `seq_hash`. `None` means "not resident in
+    /// this index" — the block is active, absent, or the backend tracks no
+    /// features. Default: `None`. Same non-mutation contract as
+    /// [`Self::peek_victims`].
+    fn advice(&self, seq_hash: SequenceHash) -> Option<InactiveFeatures> {
+        let _ = seq_hash;
+        None
     }
 }
 
@@ -447,6 +480,35 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
 
     pub(crate) fn has_inactive(&self, seq_hash: SequenceHash) -> bool {
         self.inner.lock().inactive.has(seq_hash)
+    }
+
+    /// Bounded read-only snapshot of the inactive index in eviction order
+    /// (worst-first), up to `max` entries. Non-destructive: nothing is
+    /// resurrected, touched, reordered, or re-seeded — see
+    /// [`InactiveIndex::peek_victims`]. Empty on backends with no exposed
+    /// order. Backs
+    /// [`BlockManager::inactive_candidates`](crate::manager::BlockManager::inactive_candidates).
+    pub(crate) fn inactive_candidates(&self, max: usize) -> Vec<InactiveCandidate> {
+        self.inner
+            .lock()
+            .inactive
+            .peek_victims(max)
+            .into_iter()
+            .map(|(seq_hash, block_id, features)| InactiveCandidate {
+                seq_hash,
+                block_id,
+                features,
+            })
+            .collect()
+    }
+
+    /// Membership-based point advice for each hash in `hashes`, positionally.
+    /// `None` = not resident-inactive here. One store-lock acquisition for the
+    /// whole slice, so the batch is a coherent snapshot rather than N
+    /// independently-timed ones. Mirrors [`Self::has_inactive`].
+    pub(crate) fn inactive_advice(&self, hashes: &[SequenceHash]) -> Vec<Option<InactiveFeatures>> {
+        let inner = self.inner.lock();
+        hashes.iter().map(|&h| inner.inactive.advice(h)).collect()
     }
 
     /// Mark the single-owner inactive lineage suffix ending at `seq_hash` for

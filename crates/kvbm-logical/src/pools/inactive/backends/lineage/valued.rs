@@ -36,8 +36,11 @@
 //! validate and none can alias a recycled arena slot. A node poisoned while it is still
 //! interior joins when it later re-leafs (via [`on_leaf_added`](ValuedPolicy::on_leaf_added)).
 
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::sync::Arc;
 
+use super::eviction::LeafAdvice;
 use crate::blocks::SequenceHash;
 use crate::branch_tracker::BranchOracle;
 use crate::tinylfu::FrequencyTracker;
@@ -382,12 +385,138 @@ impl ValuedPolicy {
         self.oracle.as_ref().and_then(|o| o.max_fanout(seq_hash))
     }
 
+    // ---- read-only snapshot API (R7a §3.2 / §3.4) ----
+
+    /// Read-only per-node advice for slot `idx` (leaf *or* interior — every
+    /// `Real` node has a `LeafState`). Reads the sketch and oracle; never
+    /// touches either. All-absent for an untracked (ghost/free) slot.
+    pub(crate) fn advice_for(&self, idx: u32) -> LeafAdvice {
+        let Some(state) = self.slots.get(idx as usize).and_then(|s| s.as_ref()) else {
+            return LeafAdvice::default();
+        };
+        LeafAdvice {
+            poisoned: state.poisoned,
+            // Same recency baseline the scorer uses: pool-logical ticks, not time.
+            age_ticks: Some(self.now.saturating_sub(state.last_touch)),
+            freq_estimate: self
+                .sketch
+                .as_ref()
+                .map(|s| s.count(state.seq_hash.as_u128())),
+            max_fanout: self
+                .oracle
+                .as_ref()
+                .and_then(|o| o.max_fanout(state.seq_hash)),
+        }
+    }
+
+    /// Read-only victim peek: the poison set first (capped at `max`), then the
+    /// lowest-scoring leaves, up to `max` slots total.
+    ///
+    /// # Why this is not `next_victim`
+    ///
+    /// [`next_victim`](Self::next_victim) draws `k_sample` leaves through the
+    /// policy RNG. Reusing it here would advance that RNG, perturbing the next
+    /// *real* eviction and breaking trace replay (R7a §3.4). This is instead a
+    /// pure scan: `&self`, no RNG, no `now` stamp.
+    ///
+    /// # Bounds and the poison dedup rule
+    ///
+    /// The scan covers `min(leaf_dense.len(), MAX_PEEK_SCAN)` entries from the
+    /// head of `leaf_dense` and keeps a k-min heap, so the cost is
+    /// O(MAX_PEEK_SCAN + max·log max). Past that bound the peek may miss the
+    /// true global minimum — a *coverage* bound, not a correctness one: these
+    /// candidates feed an advisory consumer and the real eviction path is
+    /// untouched.
+    ///
+    /// A poisoned leaf lives in **both** dense vectors, so the scan phase skips
+    /// any slot whose `poison_idx` is `Some` — exact arena-slot identity, not a
+    /// hash comparison. Without that skip a poisoned leaf (which is also,
+    /// typically, a low scorer) would be listed twice in one peek. Skipped
+    /// entries still consume the scan budget; that only trims coverage.
+    pub(crate) fn peek_slots(&self, max: usize) -> Vec<u32> {
+        if max == 0 {
+            return Vec::new();
+        }
+        // Poisoned leaves first — they bypass scoring in `next_victim` too.
+        let mut out: Vec<u32> = self.poison_dense.iter().take(max).copied().collect();
+        let remaining = max - out.len();
+        if remaining == 0 {
+            return out;
+        }
+
+        let scan = self.leaf_dense.len().min(MAX_PEEK_SCAN);
+        // Max-heap of the `remaining` best-so-far: push, then drop the worst.
+        // Capacity is clamped to the scan bound: `max` is caller-supplied and
+        // "give me everything" (`usize::MAX`) must not turn into an overflowing
+        // or multi-gigabyte reservation — the heap can never exceed `scan`.
+        let mut heap: BinaryHeap<ScoredLeaf> = BinaryHeap::with_capacity(remaining.min(scan) + 1);
+        for &idx in &self.leaf_dense[..scan] {
+            if self
+                .slots
+                .get(idx as usize)
+                .and_then(|s| s.as_ref())
+                .is_some_and(|s| s.poison_idx.is_some())
+            {
+                continue; // already listed above (dedup by arena-slot identity)
+            }
+            heap.push(ScoredLeaf {
+                score: self.score_slot(idx),
+                idx,
+            });
+            if heap.len() > remaining {
+                heap.pop();
+            }
+        }
+        // Ascending score — the eviction order among the kept candidates.
+        out.extend(heap.into_sorted_vec().into_iter().map(|entry| entry.idx));
+        out
+    }
+
     /// Number of currently-evictable leaves. Test-only.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.leaf_dense.len()
     }
 }
+
+/// Coverage bound for the read-only [`ValuedPolicy::peek_slots`] scan: at most
+/// this many `leaf_dense` entries are scored per peek. Documented as a
+/// coverage bound, not a correctness bound — see `peek_slots`.
+const MAX_PEEK_SCAN: usize = 4096;
+
+/// Heap entry for the bounded k-min peek scan.
+///
+/// Ordered by score then slot index, both through total orders
+/// (`f64::total_cmp` orders every bit pattern, NaN included), so a peek is
+/// deterministic for a given policy state and the max-heap always pops the
+/// worst candidate kept so far. `PartialEq`/`PartialOrd` delegate to `cmp` to
+/// keep the four comparison traits mutually consistent.
+struct ScoredLeaf {
+    score: f64,
+    idx: u32,
+}
+
+impl Ord for ScoredLeaf {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.score
+            .total_cmp(&other.score)
+            .then(self.idx.cmp(&other.idx))
+    }
+}
+
+impl PartialOrd for ScoredLeaf {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for ScoredLeaf {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for ScoredLeaf {}
 
 #[cfg(test)]
 impl ValuedPolicy {

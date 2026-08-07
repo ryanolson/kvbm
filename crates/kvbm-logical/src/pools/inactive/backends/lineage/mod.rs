@@ -34,6 +34,8 @@
 //! variant is O(1) and allocation-free but appends a re-leafed node at the
 //! tail instead; it is opt-in via `with_lineage_backend_eviction`.
 
+#[cfg(test)]
+mod advice_tests;
 mod eviction;
 #[cfg(test)]
 mod trace_tests;
@@ -49,6 +51,7 @@ use dynamo_tokens::PositionalLineageHash;
 
 use crate::BlockId;
 use crate::blocks::SequenceHash;
+use crate::pools::advice::{InactiveFeatures, evict_rank_for};
 use crate::pools::store::InactiveIndex;
 
 // ---------------------------------------------------------------------------
@@ -489,6 +492,32 @@ impl LineageBackend {
         }
     }
 
+    /// `(seq_hash, block_id)` of the `Real` node at `idx`; `None` for a ghost or
+    /// freed slot.
+    fn real_payload(&self, idx: u32) -> Option<(SequenceHash, BlockId)> {
+        match self.slots.get(idx as usize)?.data {
+            SlotData::Real { seq_hash, block_id } => Some((seq_hash, block_id)),
+            _ => None,
+        }
+    }
+
+    /// Read-only feature snapshot for the `Real` node at `idx`: the leaf
+    /// policy's per-node advice plus the graph's own structural `is_leaf`, with
+    /// the caller-supplied peek-relative rank. Mutates nothing.
+    fn features_for(&self, idx: u32, evict_rank: Option<u8>) -> InactiveFeatures {
+        let advice = self.leaves.advice_for(idx);
+        InactiveFeatures {
+            poisoned: advice.poisoned,
+            // Structural truth from the graph, not from policy membership: an
+            // interior node is unevictable no matter what the policy thinks.
+            is_leaf: self.slots[idx as usize].is_leaf(),
+            age_ticks: advice.age_ticks,
+            freq_estimate: advice.freq_estimate,
+            max_fanout: advice.max_fanout,
+            evict_rank,
+        }
+    }
+
     /// A node is a (shared) branch point if it currently has ≥ 2 children, or — for a
     /// `Real` node — its monotone high-water `max_fanout` is ≥ 2 (a re-leafed branch point
     /// that may re-fork). A ghost has no hash, so only its current child count counts.
@@ -608,6 +637,54 @@ impl InactiveIndex for LineageBackend {
         match self.index.get(&(position, fragment)) {
             Some(&idx) => self.leaves.test_is_poisoned(idx),
             None => false,
+        }
+    }
+
+    /// Up to `max` inactive blocks in leaf-eviction order, worst-first, with
+    /// their features. Only leaves are ever returned — an interior node is
+    /// structurally unevictable — so a consumer must reach interior nodes
+    /// through [`Self::advice`] instead.
+    ///
+    /// `evict_rank` is the entry's position *within this returned slice*
+    /// scaled to `[0, 255]`; it says nothing about the rest of the pool.
+    /// Read-only: no clock stamp, no RNG draw, no reordering (R7a §3.4).
+    fn peek_victims(&self, max: usize) -> Vec<(SequenceHash, BlockId, InactiveFeatures)> {
+        let slots = self.leaves.peek_slots(max);
+        let len = slots.len();
+        slots
+            .into_iter()
+            .enumerate()
+            .filter_map(|(rank, idx)| {
+                let Some((seq_hash, block_id)) = self.real_payload(idx) else {
+                    // The policy only ever holds `Real` leaves the backend
+                    // announced; a ghost/free slot here is a bookkeeping bug.
+                    debug_assert!(false, "leaf policy peeked a non-Real slot {idx}");
+                    return None;
+                };
+                let features = self.features_for(idx, evict_rank_for(rank, len));
+                Some((seq_hash, block_id, features))
+            })
+            .collect()
+    }
+
+    /// Point advice for `seq_hash`, O(1) through the `(position, fragment)`
+    /// index. Membership is the same rule `poison_suffix` uses: the node must
+    /// be `Real` *and* its stored full hash must equal `seq_hash` (the index
+    /// key alone can collide across distinct PLHs). A ghost placeholder, a hash
+    /// mismatch, or an absent key all report `None`.
+    ///
+    /// Interior nodes are visible here (with `is_leaf: false`) even though they
+    /// never appear in [`Self::peek_victims`]. `evict_rank` is always `None` —
+    /// rank is only defined within one peek batch.
+    fn advice(&self, seq_hash: SequenceHash) -> Option<InactiveFeatures> {
+        let position = seq_hash.position();
+        let fragment = seq_hash.parent_fragment_for_child_position(position + 1);
+        let &idx = self.index.get(&(position, fragment))?;
+        match self.slots[idx as usize].data {
+            SlotData::Real {
+                seq_hash: stored, ..
+            } if stored == seq_hash => Some(self.features_for(idx, None)),
+            _ => None,
         }
     }
 }

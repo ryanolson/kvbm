@@ -4487,3 +4487,145 @@ mod poison_lineage_tests {
         );
     }
 }
+
+// ============================================================================
+// INACTIVE SNAPSHOT API (R7a): BlockManager::inactive_candidates /
+// inactive_advice / inactive_len / reset_len over the store's single lock.
+// ============================================================================
+mod inactive_snapshot_tests {
+    use super::*;
+    use crate::ImmutableBlock;
+    use crate::testing::{TEST_SALT, create_test_manager_with_backend};
+    use dynamo_tokens::TokenBlockSequence;
+
+    /// A `block_size = 1` manager on the **valued** lineage backend — the arm
+    /// that carries poison marks and a value order.
+    fn valued_manager(pages: usize) -> BlockManager<TestBlockData> {
+        create_test_manager_with_backend(pages, |builder| {
+            builder
+                .block_size(1)
+                .with_valued_lineage_backend(ScorerParams::default())
+        })
+    }
+
+    /// Block-boundary sequence hashes for `tokens` at block_size 1.
+    fn hashes(tokens: &[u32]) -> Vec<SequenceHash> {
+        TokenBlockSequence::from_slice(tokens, 1, Some(TEST_SALT))
+            .blocks()
+            .iter()
+            .map(|tb| tb.kvbm_sequence_hash())
+            .collect()
+    }
+
+    /// Register the whole `tokens` chain through the manager and return the live
+    /// `ImmutableBlock` handles (still active until the caller drops them).
+    fn register_chain(
+        manager: &BlockManager<TestBlockData>,
+        tokens: &[u32],
+    ) -> Vec<ImmutableBlock<TestBlockData>> {
+        let seq = TokenBlockSequence::from_slice(tokens, 1, Some(TEST_SALT));
+        seq.blocks()
+            .iter()
+            .map(|tb| {
+                let mutable = manager.allocate_blocks(1).expect("allocate one page");
+                let complete = mutable
+                    .into_iter()
+                    .next()
+                    .unwrap()
+                    .complete(tb)
+                    .expect("complete block");
+                manager
+                    .register_blocks(vec![complete])
+                    .into_iter()
+                    .next()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    /// End-to-end through the public manager surface: candidates come back in
+    /// eviction order with the poison bit set, advice distinguishes
+    /// resident-inactive from active and absent, and the occupancy getters
+    /// agree with `total_blocks`.
+    #[test]
+    fn candidates_and_advice_reach_the_valued_backend() {
+        let manager = valued_manager(8);
+        let a = hashes(&[0, 1, 2]); // a0 → a1 → a2, single-owner chain
+        let b = hashes(&[50, 51]); // independent chain, kept ACTIVE
+
+        let chain_a = register_chain(&manager, &[0, 1, 2]);
+        let held_b = register_chain(&manager, &[50, 51]);
+        drop(chain_a); // a0..a2 fall into the inactive pool; b0,b1 stay active
+
+        assert_eq!(manager.inactive_len(), 3, "chain A is resident-inactive");
+        assert_eq!(
+            manager.reset_len() + manager.inactive_len() + held_b.len(),
+            manager.total_blocks(),
+            "every page is accounted for across reset / inactive / active"
+        );
+
+        manager.poison_lineage(a[2]);
+
+        let candidates = manager.inactive_candidates(4);
+        assert_eq!(
+            candidates.len(),
+            1,
+            "only the leaf of the chain is an eviction candidate"
+        );
+        let leaf = candidates[0];
+        assert_eq!(leaf.seq_hash, a[2]);
+        assert!(
+            leaf.features.poisoned,
+            "the compaction hint reached the API"
+        );
+        assert!(leaf.features.is_leaf);
+        assert_eq!(leaf.features.evict_rank, Some(0), "rank 0 is next out");
+        assert!(
+            leaf.features.freq_estimate.is_some(),
+            "the test registry has a frequency tracker attached"
+        );
+
+        // Point advice: interior inactive → Some(is_leaf: false); active → None;
+        // never-registered → None. Positional, one lock for the batch.
+        let absent = hashes(&[77])[0];
+        let advice = manager.inactive_advice(&[a[1], b[1], absent]);
+        assert_eq!(advice.len(), 3, "one answer per requested hash");
+        let interior = advice[0].expect("an inactive interior node is visible");
+        assert!(!interior.is_leaf);
+        assert!(interior.poisoned, "the suffix walk poisoned it");
+        assert!(
+            advice[1].is_none(),
+            "an ACTIVE block is not resident-inactive"
+        );
+        assert!(advice[2].is_none(), "an absent hash has no advice");
+
+        // Non-destructive: nothing was evicted or resurrected by the reads.
+        assert_eq!(manager.inactive_len(), 3);
+        drop(held_b);
+    }
+
+    /// A non-lineage backend degrades to no signal at all — empty candidates and
+    /// `None` advice — so a consumer must not depend on it (R7a §4). The default
+    /// test manager is LRU.
+    #[test]
+    fn non_lineage_backend_degrades_to_no_candidates() {
+        let manager = create_test_manager(8);
+        let block = manager
+            .allocate_blocks(1)
+            .expect("allocate one block")
+            .into_iter()
+            .next()
+            .unwrap();
+        let token_block = create_token_block(&[1, 2, 3, 4]);
+        let hash = token_block.kvbm_sequence_hash();
+        let immutable = manager.register_block(block.complete(&token_block).unwrap());
+        drop(immutable);
+
+        assert_eq!(manager.inactive_len(), 1, "the block really is inactive");
+        assert!(
+            manager.inactive_candidates(8).is_empty(),
+            "LRU exposes no candidates"
+        );
+        assert_eq!(manager.inactive_advice(&[hash]), vec![None]);
+    }
+}

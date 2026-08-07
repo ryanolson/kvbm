@@ -52,6 +52,22 @@ pub(crate) enum LeafPolicy {
     Valued(ValuedPolicy),
 }
 
+/// Policy-side half of a read-only
+/// [`InactiveFeatures`](crate::pools::InactiveFeatures) snapshot for one arena
+/// slot (R7a §2.2). The *structural* half — `is_leaf` — and the peek-relative
+/// `evict_rank` belong to the backend's graph, not to the leaf policy, so the
+/// backend fills those in.
+///
+/// The all-`None` [`Default`] is the honest answer for a policy that tracks no
+/// such signal (and for an untracked slot), never a zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct LeafAdvice {
+    pub(crate) poisoned: bool,
+    pub(crate) age_ticks: Option<u64>,
+    pub(crate) freq_estimate: Option<u32>,
+    pub(crate) max_fanout: Option<u32>,
+}
+
 impl LeafPolicy {
     /// Intrusive-FIFO policy, pre-sized for `capacity` slots.
     pub(crate) fn fifo(capacity: usize) -> Self {
@@ -140,6 +156,38 @@ impl LeafPolicy {
         }
     }
 
+    /// Read-only peek: slot indices of the next victims in eviction order,
+    /// worst-first, up to `max`. Takes `&self` — no clock stamp, no RNG draw,
+    /// no reordering (the determinism invariant on
+    /// [`InactiveIndex::peek_victims`](crate::pools::InactiveIndex::peek_victims)).
+    ///
+    /// `Fifo`/`Tick` return the exact head of their total order. `Valued` has
+    /// no total order, so it returns its poison set followed by a bounded
+    /// best-effort minimum — see [`ValuedPolicy::peek_slots`].
+    pub(crate) fn peek_slots(&self, max: usize) -> Vec<u32> {
+        match self {
+            Self::Fifo(p) => p.peek_slots(max),
+            Self::Tick(p) => p.peek_slots(max),
+            Self::Valued(p) => p.peek_slots(max),
+        }
+    }
+
+    /// Read-only per-node advice for slot `idx` — valid for interior nodes as
+    /// well as leaves. All-`None`/`false` for a slot this policy does not
+    /// track, and for policies that track no such signal (`Fifo` has ordering
+    /// but no age; neither `Fifo` nor `Tick` has a sketch, oracle, or poison
+    /// bit).
+    pub(crate) fn advice_for(&self, idx: u32) -> LeafAdvice {
+        match self {
+            Self::Fifo(_) => LeafAdvice::default(),
+            Self::Tick(p) => LeafAdvice {
+                age_ticks: p.age_of(idx),
+                ..LeafAdvice::default()
+            },
+            Self::Valued(p) => p.advice_for(idx),
+        }
+    }
+
     /// Number of currently-evictable leaves. Test-only.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
@@ -150,7 +198,8 @@ impl LeafPolicy {
         }
     }
 
-    /// Whether slot `idx` is marked poisoned (`Valued` only). Test-only.
+    /// Whether slot `idx` is marked poisoned (`Valued` only). Test-only —
+    /// production readers get the bit through [`Self::advice_for`].
     #[cfg(test)]
     pub(crate) fn test_is_poisoned(&self, idx: u32) -> bool {
         match self {
@@ -232,6 +281,26 @@ impl FifoPolicy {
         self.head
     }
 
+    /// Read-only walk from the head — the exact FIFO eviction order, at O(max).
+    /// Not required by R7a §3.2 (which names only `Tick` and `Valued`), but the
+    /// walk is exact and cheap, and a supported backend silently reporting "no
+    /// candidates" would be an unsanctioned degrade of the consumer contract.
+    fn peek_slots(&self, max: usize) -> Vec<u32> {
+        let mut out = Vec::with_capacity(max.min(self.links.len()));
+        let mut cur = self.head;
+        while out.len() < max {
+            let Some(idx) = cur else { break };
+            out.push(idx);
+            cur = self
+                .links
+                .get(idx as usize)
+                .copied()
+                .flatten()
+                .and_then(|link| link.next);
+        }
+        out
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         let mut n = 0;
@@ -309,6 +378,29 @@ impl TickPolicy {
 
     fn next_victim(&self) -> Option<u32> {
         self.queue.first_key_value().map(|(&(_, idx), _)| idx)
+    }
+
+    /// Read-only prefix of the `(tick, slot)` order — exact and deterministic,
+    /// at O(max) B-tree steps.
+    ///
+    /// This is the eviction order of the *current* leaf set. Draining the pool
+    /// can still diverge after the first victim: removing a leaf may re-leaf
+    /// its parent, which returns at its own (older) tick and jumps ahead of the
+    /// leaves peeked behind it.
+    fn peek_slots(&self, max: usize) -> Vec<u32> {
+        self.queue.keys().take(max).map(|&(_, idx)| idx).collect()
+    }
+
+    /// Pool-logical age of slot `idx`: ticks elapsed since it was Real-ified.
+    /// `None` once the node leaves the graph (its tick is cleared). Never
+    /// indexes — a read-only API must not inherit the mutating hooks' panic on
+    /// an out-of-range slot.
+    fn age_of(&self, idx: u32) -> Option<u64> {
+        self.ticks
+            .get(idx as usize)
+            .copied()
+            .flatten()
+            .map(|tick| self.next_tick.saturating_sub(tick))
     }
 }
 

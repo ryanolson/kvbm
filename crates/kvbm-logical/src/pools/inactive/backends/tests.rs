@@ -228,4 +228,47 @@ mod backend_tests {
 
         assert_eq!(backend.len(), 1, "Only block2 should remain");
     }
+
+    /// Backends that expose no eviction order inherit the default no-op
+    /// snapshot API (R7a §2.3): an empty peek and `None` advice, even for a
+    /// hash they are demonstrably holding. A consumer must degrade to its own
+    /// selection rather than depend on the signal.
+    #[rstest]
+    #[case::hashmap(BackendType::HashMap)]
+    #[case::lru(BackendType::Lru)]
+    #[case::multi_lru(BackendType::MultiLru)]
+    fn non_lineage_backends_inherit_the_empty_snapshot_defaults(#[case] backend_type: BackendType) {
+        let mut backend = create_backend(backend_type);
+
+        let (id, hash) = block_id_and_hash(1, &tokens_for_id(1));
+        backend.insert(hash, id);
+        assert!(backend.has(hash), "the block really is resident");
+
+        assert!(
+            backend.peek_victims(4).is_empty(),
+            "a backend with no exposed order advertises no candidates"
+        );
+        assert!(
+            backend.advice(hash).is_none(),
+            "a backend with no feature tracking gives no advice"
+        );
+        assert_eq!(backend.len(), 1, "the read-only API evicted nothing");
+    }
+
+    /// The lineage backend — the one implementor — does *not* inherit the
+    /// defaults. Guards against the whole R7a surface silently degrading to
+    /// the no-op impl.
+    #[rstest]
+    #[case::lineage(BackendType::Lineage)]
+    fn lineage_backend_overrides_the_snapshot_defaults(#[case] backend_type: BackendType) {
+        let mut backend = create_backend(backend_type);
+
+        let (id, hash) = block_id_and_hash(1, &tokens_for_id(1));
+        backend.insert(hash, id);
+
+        let peeked = backend.peek_victims(4);
+        assert_eq!(peeked.len(), 1, "the resident leaf is a candidate");
+        assert_eq!((peeked[0].0, peeked[0].1), (hash, id));
+        assert!(backend.advice(hash).is_some());
+    }
 }

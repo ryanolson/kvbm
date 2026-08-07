@@ -42,6 +42,7 @@ pub use integrations::{
     SchedulableSequenceBuilder, ScheduleError, SequenceDelegate, SequenceEvent, SequenceState,
 };
 pub use manager::{BlockEvictionObserver, BlockManager};
+pub use pools::{InactiveCandidate, InactiveFeatures};
 pub use registry::BlockRegistry;
 pub use resources::{BlockManagerSet, DuplicateLogicalResource, LogicalResourceId};
 pub use sequence::{
