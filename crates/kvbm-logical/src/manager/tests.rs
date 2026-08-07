@@ -4557,6 +4557,10 @@ mod inactive_snapshot_tests {
         let held_b = register_chain(&manager, &[50, 51]);
         drop(chain_a); // a0..a2 fall into the inactive pool; b0,b1 stay active
 
+        // Pool *depth*, not free-able supply: all three chain-A blocks are
+        // resident-inactive, but the two interior ones are structurally
+        // unevictable and never appear as candidates below. The gap is the
+        // documented contract of `inactive_len`, not an accounting slip.
         assert_eq!(manager.inactive_len(), 3, "chain A is resident-inactive");
         assert_eq!(
             manager.reset_len() + manager.inactive_len() + held_b.len(),
@@ -4579,7 +4583,11 @@ mod inactive_snapshot_tests {
             "the compaction hint reached the API"
         );
         assert!(leaf.features.is_leaf);
-        assert_eq!(leaf.features.evict_rank, Some(0), "rank 0 is next out");
+        assert_eq!(
+            leaf.features.evict_rank,
+            Some(0),
+            "rank 0 heads the returned batch"
+        );
         assert!(
             leaf.features.freq_estimate.is_some(),
             "the test registry has a frequency tracker attached"

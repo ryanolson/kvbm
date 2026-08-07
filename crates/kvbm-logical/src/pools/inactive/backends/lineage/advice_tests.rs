@@ -20,6 +20,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use super::valued::MAX_PEEK_SCAN;
 use super::{LeafPolicy, LineageBackend, ScorerParams};
 use crate::BlockId;
 use crate::blocks::SequenceHash;
@@ -229,7 +230,11 @@ fn peek_lists_poisoned_leaves_first_and_never_twice() {
         .iter()
         .map(|(_, _, f)| f.evict_rank.expect("valued exposes a peek-relative rank"))
         .collect();
-    assert_eq!(ranks[0], 0, "rank 0 is the next victim");
+    // Rank 0 is the head of the *batch*. Here it is also the real next victim,
+    // but only because a poison prefix is present — that much the valued
+    // policy does drain in order. Absent poison the head is a best-effort
+    // minimum; see `valued_peek_is_the_exact_scan_not_the_sampler`.
+    assert_eq!(ranks[0], 0, "rank 0 heads the returned batch");
     assert_eq!(*ranks.last().unwrap(), 255);
     assert!(ranks.windows(2).all(|w| w[0] <= w[1]));
 
@@ -251,6 +256,70 @@ fn peek_lists_poisoned_leaves_first_and_never_twice() {
     // into an overflowing (debug-panic) or multi-gigabyte reservation.
     let unbounded = backend.peek_victims(usize::MAX);
     assert_eq!(unbounded.len(), 5, "an unbounded request yields every leaf");
+}
+
+/// The valued peek is its own exact bounded scan — **not** the sampler real
+/// eviction uses — so its order is a pure function of the leaf scores and is
+/// invariant to `k_sample`.
+///
+/// This is the property [`crate::pools::InactiveFeatures::evict_rank`] now
+/// documents, and the reason rank 0 is only *best-effort* on this arm:
+/// `next_victim` takes the minimum of `k_sample` random draws, so with more
+/// leaves than `k_sample` it routinely picks a leaf the peek ranked well behind
+/// the head.
+///
+/// With no sketch and no oracle the score is `1/(age+1)`, monotone in age, so
+/// the expected peek is exactly the insertion order (oldest leaf first).
+/// Asserting *that* — rather than "the head differs from `allocate(1)` under
+/// some seed" — keeps the test seed-independent, and keeps it from false-
+/// alarming if the default `k_sample` ever rises above a typical leaf count.
+#[test]
+fn valued_peek_is_the_exact_scan_not_the_sampler() {
+    let leaves = 12;
+    let build = |k_sample: usize, seed: u64| {
+        let mut backend = valued_backend_seeded(None, k_sample, seed);
+        for (id, hash) in independent_roots(leaves) {
+            backend.insert(hash, id);
+        }
+        backend
+    };
+    let insertion_order: Vec<(u128, BlockId)> = independent_roots(leaves)
+        .into_iter()
+        .map(|(id, hash)| (hash.as_u128(), id))
+        .collect();
+
+    // K far below the leaf count (the sampling regime) and K above it (the
+    // exact-scan regime) must yield the identical peek.
+    let sampled = build(1, 0x51);
+    let exhaustive = build(64, 0x51);
+    assert_eq!(
+        identities(&sampled.peek_victims(leaves)),
+        insertion_order,
+        "the peek scores every scanned leaf: oldest-first, exactly"
+    );
+    assert_eq!(
+        identities(&exhaustive.peek_victims(leaves)),
+        insertion_order,
+        "and the same order once K exceeds the leaf count"
+    );
+
+    // Non-vacuity: at K = 1 the real victim IS a raw RNG draw, so it varies
+    // across seeds while the peek above does not. At most one of these seeds
+    // can therefore agree with the peek head — which is exactly why rank 0 is
+    // not a promise about the next eviction on the valued arm.
+    let first_victims: HashSet<BlockId> = [0x51_u64, 0xA7F1, 0x7, 0x63, 0xBEEF]
+        .into_iter()
+        .map(|seed| build(1, seed).allocate(1)[0].1)
+        .collect();
+    assert!(
+        first_victims.len() > 1,
+        "the sampled victim must depend on the RNG state; got {first_victims:?}"
+    );
+    let peek_head = sampled.peek_victims(1)[0].1;
+    assert!(
+        first_victims.iter().any(|id| *id != peek_head),
+        "some seed's real victim must differ from the peek head {peek_head}"
+    );
 }
 
 /// The opt-in `Fifo` leaf policy peeks its exact order too. Beyond R7a §3.2
@@ -481,4 +550,74 @@ fn tick_lineage_without_sketch_or_oracle_still_populates_features() {
     assert!(point.age_ticks.is_some());
     assert_eq!(point.freq_estimate, None);
     assert_eq!(point.evict_rank, None);
+}
+
+// ---------------------------------------------------------------------------
+// R7a §6 — the valued scan window bounds the returned *count*, not just its
+// quality
+// ---------------------------------------------------------------------------
+
+/// On the valued policy `peek_victims` scores at most [`MAX_PEEK_SCAN`] leaves,
+/// so past that pool size it truncates the returned **count** no matter how
+/// large `max` is: a short result never means "the pool is out of leaves".
+///
+/// The poison prefix is exempt — it is capped by `max` alone — so a peek can
+/// exceed the window when poisoned leaves sit outside it. That asymmetry is
+/// what `BlockManager::inactive_candidates`' public doc states in prose, and
+/// the reason the bound cannot be described as a flat cap on the result.
+///
+/// The rest of the branch's tests stay far under the window, so this is the
+/// only coverage of the truncating path.
+#[test]
+fn valued_peek_truncates_at_the_scan_window() {
+    let total = MAX_PEEK_SCAN + 40;
+    let mut backend = valued_backend(None, 16);
+    let roots = independent_roots(total);
+    for (id, hash) in &roots {
+        backend.insert(*hash, *id);
+    }
+    assert_eq!(
+        InactiveIndex::len(&backend),
+        total,
+        "every root is resident — the pool really is larger than the window"
+    );
+
+    // Under the window `max` is honoured exactly; over it the count saturates,
+    // and "give me everything" is not a special case.
+    assert_eq!(backend.peek_victims(64).len(), 64);
+    assert_eq!(backend.peek_victims(total).len(), MAX_PEEK_SCAN);
+    let unbounded = backend.peek_victims(usize::MAX);
+    assert_eq!(unbounded.len(), MAX_PEEK_SCAN);
+    assert_eq!(
+        identities(&unbounded),
+        identities(&backend.peek_victims(usize::MAX)),
+        "a bounded scan is still a pure function of policy state"
+    );
+    assert_eq!(InactiveIndex::len(&backend), total, "and it evicts nothing");
+
+    // Poison leaves that sit *beyond* the window: they still reach the head, on
+    // top of a full scan's worth of scored leaves.
+    let poisoned: Vec<SequenceHash> = roots[MAX_PEEK_SCAN..]
+        .iter()
+        .take(5)
+        .map(|(_, hash)| *hash)
+        .collect();
+    for hash in &poisoned {
+        backend.poison(*hash);
+    }
+    let with_poison = backend.peek_victims(usize::MAX);
+    assert_eq!(
+        with_poison.len(),
+        MAX_PEEK_SCAN + poisoned.len(),
+        "the poison prefix is not subject to the scan window"
+    );
+    let head: HashSet<u128> = with_poison[..poisoned.len()]
+        .iter()
+        .map(|(hash, _, _)| hash.as_u128())
+        .collect();
+    assert_eq!(
+        head,
+        poisoned.iter().map(|hash| hash.as_u128()).collect(),
+        "out-of-window poisoned leaves still head the batch"
+    );
 }

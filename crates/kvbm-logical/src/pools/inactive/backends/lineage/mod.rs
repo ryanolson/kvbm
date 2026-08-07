@@ -640,10 +640,25 @@ impl InactiveIndex for LineageBackend {
         }
     }
 
-    /// Up to `max` inactive blocks in leaf-eviction order, worst-first, with
-    /// their features. Only leaves are ever returned — an interior node is
-    /// structurally unevictable — so a consumer must reach interior nodes
-    /// through [`Self::advice`] instead.
+    /// Up to `max` of the *currently evictable* leaves, worst-first by the
+    /// leaf policy's ranking, with their features. Only leaves are ever
+    /// returned — an interior node is structurally unevictable — so a consumer
+    /// must reach interior nodes through [`Self::advice`] instead.
+    ///
+    /// # Why this is not a drain preview
+    ///
+    /// The ranking covers the leaf set as it stands. Evicting a leaf can
+    /// re-leaf its parent (`on_leaf_added`) — a node this peek could not have
+    /// listed, since it was interior at the time. `Tick`/`Fifo` re-admit it at
+    /// its own older position, ahead of leaves listed behind it; `Valued`
+    /// restamps `last_touch` there, so it re-enters as the *freshest* leaf and
+    /// sinks to the back instead. Either way the drain diverges, so only the
+    /// *head* is comparable to a real [`InactiveIndex::allocate`], and only where the
+    /// policy is exact: `Tick` and `Fifo` always, `Valued` for its poison
+    /// prefix (`Valued`'s unpoisoned pick is sampled, this scan is not). A
+    /// result shorter than `max` means "no more candidates were ranked", never
+    /// "the pool is empty" — `len` counts interior nodes too, and `Valued`
+    /// scores only a bounded window of `leaf_dense` per call.
     ///
     /// `evict_rank` is the entry's position *within this returned slice*
     /// scaled to `[0, 255]`; it says nothing about the rest of the pool.

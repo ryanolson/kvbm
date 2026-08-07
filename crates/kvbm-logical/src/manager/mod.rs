@@ -292,10 +292,37 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
             .collect()
     }
 
-    /// Read-only snapshot of up to `max` inactive blocks in this pool's
-    /// eviction-policy order (worst-first: poisoned leaves, then lowest-value
+    /// Read-only snapshot of up to `max` inactive blocks that this pool's
+    /// eviction policy ranks worst-first (poisoned leaves, then lowest-value
     /// or oldest). Non-destructive — it does not resurrect a block, touch its
     /// frequency, reorder the policy, or re-seed its sampling RNG.
+    ///
+    /// # What the order does and does not promise
+    ///
+    /// It ranks the blocks that are eviction candidates *right now*, which is
+    /// not the same as replaying the pool's next `max` evictions:
+    ///
+    /// * on the lineage backend only leaves are candidates, and draining one
+    ///   re-leafs its parent — a block this snapshot could not have listed,
+    ///   because it was structurally unevictable when the peek ran. Where the
+    ///   parent lands is policy-dependent: the total-order policies re-admit
+    ///   it at its own older tick, *ahead* of candidates listed behind it,
+    ///   while the valued policy restamps its recency so it re-enters as the
+    ///   freshest leaf and sinks to the *back*. Either way the real drain
+    ///   sequence diverges past the head. Interior nodes are absent here
+    ///   entirely; reach them with [`inactive_advice`](Self::inactive_advice).
+    /// * the head itself is exact for the total-order leaf policies (`Tick`,
+    ///   `Fifo`), and for the poison prefix under the valued policy. Under the
+    ///   valued policy with no poison it is a best-effort minimum, because real
+    ///   eviction samples rather than scanning — see
+    ///   [`InactiveFeatures::evict_rank`].
+    ///
+    /// A result shorter than `max` therefore does not mean the pool holds no
+    /// further blocks: the valued policy scores only a bounded window of its
+    /// leaf set per call (currently 4096 leaves, beyond any poison prefix,
+    /// which is not subject to the window), and blocks that are structurally
+    /// unevictable are never listed at all. Use
+    /// [`inactive_len`](Self::inactive_len) for pool depth.
     ///
     /// Advisory only: entries are stale the instant the store lock drops, so a
     /// consumer must re-acquire authority over any block it acts on through
@@ -322,7 +349,17 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
         self.store.inactive_advice(hashes)
     }
 
-    /// Number of blocks currently in the inactive (cached, evictable) pool.
+    /// Depth of the inactive (cached) pool: every registered block held there,
+    /// reclaimable by eviction but not necessarily a candidate today.
+    ///
+    /// This is **not** the count of blocks the pool could free right now. On
+    /// the lineage backend an interior node is structurally protected by its
+    /// descendants, so it is counted here yet never offered by
+    /// [`inactive_candidates`](Self::inactive_candidates) — a 3-block
+    /// single-owner chain reports `3` with exactly one candidate. Freeing an
+    /// interior node takes draining the leaves below it first. Size
+    /// immediately free-able supply from the candidate list, not from this.
+    ///
     /// Cheap: one store-lock acquisition. Named for the pool it reports, not
     /// for this type's `*_blocks` getters — it is the pressure-pass companion
     /// of [`reset_len`](Self::reset_len).

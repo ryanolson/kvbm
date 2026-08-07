@@ -118,10 +118,24 @@ pub(crate) trait InactiveIndex: Send + Sync {
         self.allocate(n)
     }
 
-    /// Read-only ranked peek: up to `max` inactive blocks in this index's
-    /// eviction order, worst-first. Default: empty — a backend that exposes no
+    /// Read-only ranked peek: up to `max` inactive blocks that this index
+    /// currently ranks worst-first. Default: empty — a backend that exposes no
     /// order simply advertises no candidates, and the consumer degrades to
     /// its own registration-driven selection (R7a §4).
+    ///
+    /// # Scope of the order (implementor contract)
+    ///
+    /// The result ranks the blocks that are candidates *at this instant*; it
+    /// is not required to predict the index's next `max` [`Self::allocate`]
+    /// results. An index whose candidate set changes as it drains (the lineage
+    /// backend re-leafs a parent when it evicts a leaf) will legitimately
+    /// diverge from a real drain past the head. Implementors should keep the
+    /// **head** exact wherever the policy admits an exact answer, and document
+    /// where it cannot.
+    ///
+    /// Returning fewer than `max` entries is likewise not a claim that the
+    /// index is exhausted — a bounded-scan implementation may report only what
+    /// it scanned.
     ///
     /// # Determinism (load-bearing)
     ///
@@ -482,9 +496,11 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         self.inner.lock().inactive.has(seq_hash)
     }
 
-    /// Bounded read-only snapshot of the inactive index in eviction order
-    /// (worst-first), up to `max` entries. Non-destructive: nothing is
-    /// resurrected, touched, reordered, or re-seeded — see
+    /// Bounded read-only snapshot of up to `max` blocks the inactive index
+    /// currently ranks worst-first. Non-destructive: nothing is resurrected,
+    /// touched, reordered, or re-seeded — and the order describes the present
+    /// candidate set rather than a replay of the next `max` evictions, so a
+    /// short result is not "the index is empty"; see
     /// [`InactiveIndex::peek_victims`]. Empty on backends with no exposed
     /// order. Backs
     /// [`BlockManager::inactive_candidates`](crate::manager::BlockManager::inactive_candidates).

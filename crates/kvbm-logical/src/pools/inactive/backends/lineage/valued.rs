@@ -428,6 +428,15 @@ impl ValuedPolicy {
     /// candidates feed an advisory consumer and the real eviction path is
     /// untouched.
     ///
+    /// The window also truncates the **count**, not just the quality: the
+    /// scored tail of the result can never exceed `MAX_PEEK_SCAN` however
+    /// large `max` is, so a caller cannot read a short result as "the pool has
+    /// no more leaves". The poison prefix is *not* subject to the window — it
+    /// is capped only by `max` — so the total is
+    /// `min(max, poison_dense.len()) + min(remaining, scanned non-poisoned)`.
+    /// [`BlockManager::inactive_candidates`](crate::manager::BlockManager::inactive_candidates)
+    /// states this bound in prose for consumers outside the crate.
+    ///
     /// A poisoned leaf lives in **both** dense vectors, so the scan phase skips
     /// any slot whose `poison_idx` is `Some` — exact arena-slot identity, not a
     /// hash comparison. Without that skip a poisoned leaf (which is also,
@@ -482,7 +491,10 @@ impl ValuedPolicy {
 /// Coverage bound for the read-only [`ValuedPolicy::peek_slots`] scan: at most
 /// this many `leaf_dense` entries are scored per peek. Documented as a
 /// coverage bound, not a correctness bound — see `peek_slots`.
-const MAX_PEEK_SCAN: usize = 4096;
+///
+/// `pub(super)` so the backend's own tests can pin the boundary against the
+/// constant instead of a magic number; it is crate-internal either way.
+pub(super) const MAX_PEEK_SCAN: usize = 4096;
 
 /// Heap entry for the bounded k-min peek scan.
 ///

@@ -79,7 +79,33 @@ pub struct InactiveFeatures {
     /// is no oracle *or* no record for the hash. Absent is not "linear" —
     /// consumers must fail open to "possibly shared".
     pub max_fanout: Option<u32>,
-    /// Eviction-order rank bucket in `[0, 255]`; `0` = next victim.
+    /// Rank bucket in `[0, 255]` for this entry's position in the peek that
+    /// produced it: the head of the batch is `0`, and for a batch of more than
+    /// one entry the tail is `255`.
+    ///
+    /// **The bucket is quantized, so `0` does not name a unique block.** Any
+    /// peek longer than 256 entries puts several candidates in each bucket —
+    /// a 4096-entry batch lands its first 17 in bucket `0`. Only an entry's
+    /// *position* in the returned slice identifies the head; filtering on
+    /// `evict_rank == Some(0)` selects a group, not a block.
+    ///
+    /// **Nor is rank a promise about the next eviction** — it is the peek's
+    /// own order. How tightly the head tracks the real victim depends on the
+    /// backend's leaf policy:
+    ///
+    /// * total-order policies (lineage `Tick`, `Fifo`) walk their order
+    ///   directly, so rank `0` *is* the block the pool would evict next;
+    /// * the valued policy (the G1 construction) has no total order. Rank `0`
+    ///   is the head of the poison prefix when one exists — also exact, since
+    ///   real eviction drains poison first — but otherwise it is only the
+    ///   *best-effort* minimum of the peek's bounded scan. The real eviction
+    ///   path instead takes a sampled minimum over `k_sample` random draws
+    ///   (that sampling is what the peek must not perturb; see
+    ///   [`crate::pools::advice`]), so with more resident leaves than
+    ///   `k_sample` the two routinely disagree.
+    ///
+    /// Consumers should read rank as "the pool ranks this low", never as "the
+    /// pool is about to evict this".
     ///
     /// Coarse **by design**: a byte, not a score. Rhino's controller has its
     /// own value model, so exporting the backend's raw score would invite
@@ -130,5 +156,27 @@ mod tests {
         assert_eq!(ranks.len(), 8);
         assert!(ranks.windows(2).all(|w| w[0] <= w[1]));
         assert_eq!(*ranks.last().unwrap(), 255);
+    }
+
+    /// The bucket is lossy once a batch outruns the byte, so rank `0` names a
+    /// *group*, not the head. Pinned because the field doc says so and a
+    /// consumer filtering on `Some(0)` would otherwise expect one block.
+    #[test]
+    fn rank_zero_is_a_bucket_not_a_unique_head() {
+        // 4096 is the valued policy's peek scan window — a realistic batch.
+        let zeros = (0..4096).filter(|&i| evict_rank_for(i, 4096) == Some(0));
+        assert_eq!(
+            zeros.count(),
+            17,
+            "a 4096-entry batch quantizes its first 17 positions into bucket 0"
+        );
+        // The head is still rank 0, and the boundary is where the doc says.
+        assert_eq!(evict_rank_for(0, 4096), Some(0));
+        assert_eq!(evict_rank_for(16, 4096), Some(0));
+        assert_eq!(evict_rank_for(17, 4096), Some(1));
+        // At or under the byte, every position gets its own bucket.
+        let distinct: std::collections::HashSet<u8> =
+            (0..256).filter_map(|i| evict_rank_for(i, 256)).collect();
+        assert_eq!(distinct.len(), 256, "a 256-entry batch is lossless");
     }
 }
