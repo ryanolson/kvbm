@@ -68,8 +68,15 @@ type PlacementKey = (SequenceHash, LogicalResourceId, u8, TierDepth);
 /// **A key is in at most one of the two maps.** Ready wins ⇒ tombstone dropped,
 /// record inserted. Remove wins ⇒ record dropped, tombstone raised. A Remove
 /// that *loses* (an older generation than the record it met) writes nothing at
-/// all: a tombstone from a losing Remove would break the invariant and would
-/// suppress the newer Ready that just beat it.
+/// all.
+///
+/// The cost of breaking that last rule is retention, not ordering: a losing
+/// Remove carries a generation below the record it met, so a tombstone it left
+/// could only suppress a Ready that would have lost to that record anyway. What
+/// it would do is count the key twice against `max_ready_per_instance` — and
+/// that guard empties the projection rather than truncating it, so a publisher
+/// emitting ordinary late invalidations would burn budget it never used and
+/// blank a healthy projection.
 ///
 /// # What bounds the tombstones
 ///

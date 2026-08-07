@@ -598,9 +598,17 @@ pub struct TierPlacementSnapshotV1 {
     /// Medium metadata for every depth referenced by `entries`. This is the
     /// only place medium/capability data travels, and it travels once.
     ///
-    /// Coverage is enforced, not merely documented:
+    /// Coverage of the *snapshot body* is enforced, not merely documented:
     /// [`Self::validate`] rejects a snapshot whose entries name a depth the
     /// header omits.
+    ///
+    /// It does not extend to deltas. [`TierPlacementOp::validate`] rejects only
+    /// G1, so a publisher that brings a new depth online may `Ready` at it
+    /// before its next snapshot describes it. That is deliberate — rejecting
+    /// such a delta would add an invalidation surface for a condition the next
+    /// periodic snapshot closes on its own — but it means a consumer must treat
+    /// a depth with no [`TierMedium`] as *capabilities unknown*, never as
+    /// capabilities zero.
     pub media: Vec<TierMedium>,
     /// Lineage manifests this snapshot installs, for later
     /// [`KeyRange::ManifestInterval`] deltas. `#[serde(default)]` so a publisher

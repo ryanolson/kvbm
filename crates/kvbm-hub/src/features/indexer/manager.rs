@@ -410,6 +410,13 @@ impl FeatureManager for IndexerManager {
         // `on_unregister`, and dropping advisory state is always safe — including
         // on the rollback path, where the publisher will push a snapshot for
         // whichever epoch it ends up holding.
+        //
+        // Ordering note: the epoch is bound above, so a snapshot authorized
+        // against the *new* epoch can install between the two statements and be
+        // dropped here. That is the safe direction — the projection is left
+        // empty, not stale — and it self-heals on the hub's next snapshot request
+        // or the publisher's periodic push. Dropping first would not fix it
+        // either; it would only move the window.
         self.tier_placements.remove_instance(instance_id);
         Ok(())
     }

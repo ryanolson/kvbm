@@ -556,32 +556,59 @@ fn a_late_ready_after_a_remove_cannot_resurrect_the_removed_copy() {
     assert!(harness.holds(keys[1]));
 }
 
-/// A Remove that *loses* must write nothing at all. A tombstone from a losing
-/// Remove would suppress the very Ready that beat it — and would break the
-/// invariant that a key is live or tombstoned, never both.
+/// A Remove that *loses* must write nothing at all: a key is live or
+/// tombstoned, never both.
+///
+/// The observable consequence is retention, not ordering — worth stating
+/// precisely, because the obvious framing ("a losing tombstone would suppress
+/// the Ready that beat it") does not hold. A losing Remove carries a generation
+/// *below* the record it met, so any Ready its tombstone could suppress would
+/// have lost to that record anyway, and any Remove strong enough to clear the
+/// record raises the tombstone above it. What a losing tombstone does do is
+/// count the key twice against `max_ready_per_instance`, and that guard is
+/// fail-safe: exceeding it invalidates and empties the projection. So a
+/// publisher emitting late invalidations — the normal shape after an eviction
+/// race — would burn retention budget it never used and blank an otherwise
+/// healthy projection.
+///
+/// The guard is therefore where this is asserted, tight enough that one
+/// spurious tombstone is the difference.
 #[test]
-fn a_losing_remove_leaves_no_tombstone_behind() {
-    let harness = Harness::new();
+fn a_losing_remove_consumes_neither_retention_budget_nor_the_record() {
+    let harness = Harness::with_limits(ProjectionLimits {
+        max_ready_per_instance: 2,
+        ..ProjectionLimits::default()
+    });
     let keys = chain(2);
     harness.install(&harness.snapshot(1, 0, Vec::new()));
 
-    harness
-        .projection
-        .apply_delta(&harness.batch(1, 1, vec![ready(G2, 7, vec![keys[0]])]));
-    // Loses against the generation-7 record.
-    harness
-        .projection
-        .apply_delta(&harness.batch(2, 1, vec![remove(G2, 5, vec![keys[0]])]));
-    assert!(harness.holds(keys[0]));
+    assert_eq!(
+        harness
+            .projection
+            .apply_delta(&harness.batch(1, 1, vec![ready(G2, 7, keys.clone())])),
+        DeltaOutcome::Applied { seq: 1, ready: 2 },
+        "exactly at the retention guard"
+    );
 
-    // A refresh at the same generation must still land — a tombstone at 5 would
-    // have been irrelevant here, but a tombstone at 7 (or one written by the
-    // losing Remove at all) would suppress this.
+    // Loses against the generation-7 record, so it must be a no-op in both
+    // dimensions: the record stays, and nothing new is retained.
+    assert_eq!(
+        harness
+            .projection
+            .apply_delta(&harness.batch(2, 1, vec![remove(G2, 5, vec![keys[0]])])),
+        DeltaOutcome::Applied { seq: 2, ready: 2 },
+        "a losing Remove that retained a tombstone would push past the guard here"
+    );
+    assert!(harness.holds(keys[0]));
+    assert!(harness.projection.is_valid(harness.cache, harness.instance));
+
+    // And a refresh still lands, so the no-op did not leave a suppressing
+    // tombstone either.
     assert_eq!(
         harness
             .projection
             .apply_delta(&harness.batch(3, 1, vec![ready(G2, 7, vec![keys[0]])])),
-        DeltaOutcome::Applied { seq: 3, ready: 1 }
+        DeltaOutcome::Applied { seq: 3, ready: 2 }
     );
     assert!(harness.holds(keys[0]));
 }
