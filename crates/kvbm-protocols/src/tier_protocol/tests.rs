@@ -7,10 +7,11 @@ use crate::cache_manifest::{BundleResourceLineage, CacheManifestId, Registration
 
 use super::{
     InstanceId, KeyRange, PhysicalPlacementMode, PlacementScope, TIER_MEDIUM_CAP_DIRECT_SERVABLE,
-    TIER_PLACEMENT_MAX_MEDIA, TIER_PLACEMENT_MAX_OPS_PER_BATCH,
+    TIER_PLACEMENT_MAX_MANIFESTS, TIER_PLACEMENT_MAX_MEDIA, TIER_PLACEMENT_MAX_OPS_PER_BATCH,
     TIER_PLACEMENT_MAX_SNAPSHOT_ENTRIES, TIER_PLACEMENT_SCHEMA_VERSION, TIER_PLACEMENT_SUBJECT,
     TierDepth, TierMedium, TierPlacementBatchV1, TierPlacementEntry, TierPlacementError,
-    TierPlacementOp, TierPlacementRejection, TierPlacementSequencer, TierPlacementSnapshotV1,
+    TierPlacementManifest, TierPlacementOp, TierPlacementRejection, TierPlacementSequencer,
+    TierPlacementSnapshotV1,
 };
 
 const RESOURCE: LogicalResourceId = LogicalResourceId(3);
@@ -98,7 +99,16 @@ fn snapshot(entries: Vec<TierPlacementEntry>) -> TierPlacementSnapshotV1 {
             medium: "pinned-host".to_string(),
             capabilities: TIER_MEDIUM_CAP_DIRECT_SERVABLE,
         }],
+        manifests: Vec::new(),
         entries,
+    }
+}
+
+fn manifest(manifest_id: u64, len: usize) -> TierPlacementManifest {
+    TierPlacementManifest {
+        manifest_id,
+        resource: RESOURCE,
+        hashes: chain(len),
     }
 }
 
@@ -468,6 +478,86 @@ fn snapshot_hashes_install_as_an_exact_lineage_manifest() {
     assert!(BundleResourceLineage::new(RESOURCE, broken).is_err());
 }
 
+#[test]
+fn snapshot_manifests_are_the_only_way_an_interval_becomes_resolvable() {
+    // Without an installed manifest, an interval delta is unresolvable by
+    // construction — nothing else on the wire binds an id to a chain. The
+    // snapshot header is that binding, and it validates through the same
+    // lineage constructor a bundle advertisement does.
+    let mut snap = snapshot(vec![entry(G2, KeyRange::Hashes(chain(3)))]);
+    snap.manifests = vec![manifest(42, 6)];
+    snap.validate().expect("manifest is a real chain");
+
+    let installed = snap.manifests[0].lineage().expect("lineage builds");
+    assert_eq!(installed.resource(), RESOURCE);
+    assert_eq!(installed.hashes(), chain(6).as_slice());
+}
+
+#[test]
+fn malformed_manifests_reject_the_whole_snapshot() {
+    // Rejection happens in `validate()`, before any install: a snapshot install
+    // is replace-all, so a manifest that failed halfway would leave a consumer
+    // holding state assembled from a body it had already decided to reject.
+    let mut broken = snapshot(vec![]);
+    let mut hashes = chain(5);
+    hashes.remove(2);
+    broken.manifests = vec![TierPlacementManifest {
+        manifest_id: 7,
+        resource: RESOURCE,
+        hashes,
+    }];
+    assert!(matches!(
+        broken.validate().expect_err("non-chain manifest"),
+        TierPlacementError::InvalidManifest { manifest_id: 7, .. }
+    ));
+    assert_eq!(
+        broken
+            .validate()
+            .expect_err("non-chain manifest")
+            .rejection(),
+        TierPlacementRejection::Invalid
+    );
+
+    let mut duplicated = snapshot(vec![]);
+    duplicated.manifests = vec![manifest(3, 2), manifest(3, 4)];
+    assert_eq!(
+        duplicated.validate().expect_err("duplicate id"),
+        TierPlacementError::DuplicateManifestId { manifest_id: 3 }
+    );
+
+    let mut too_many = snapshot(vec![]);
+    too_many.manifests = (0..=TIER_PLACEMENT_MAX_MANIFESTS as u64)
+        .map(|id| manifest(id, 1))
+        .collect();
+    assert!(matches!(
+        too_many.validate().expect_err("manifest count"),
+        TierPlacementError::TooLarge {
+            what: "snapshot manifests",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn snapshot_manifests_default_to_empty_for_publishers_that_never_use_intervals() {
+    // The snapshot rides the JSON control plane (map-encoded), so unlike the
+    // frozen delta envelope it may carry a `#[serde(default)]` field. A body
+    // written before the field existed still decodes.
+    let legacy = serde_json::json!({
+        "v": TIER_PLACEMENT_SCHEMA_VERSION,
+        "cache": CacheManifestId::from_bytes([9; 32]),
+        "instance_id": InstanceId::new_v4(),
+        "registration_epoch": RegistrationEpoch::new(),
+        "snapshot_generation": 3,
+        "seq_floor": 10,
+        "media": [],
+        "entries": [],
+    });
+    let decoded = TierPlacementSnapshotV1::decode_json(&serde_json::to_vec(&legacy).unwrap())
+        .expect("field defaults");
+    assert!(decoded.manifests.is_empty());
+}
+
 // ---------------------------------------------------------------------------
 // Publisher-side sequencing
 // ---------------------------------------------------------------------------
@@ -531,12 +621,14 @@ fn snapshot_bumps_generation_and_hands_the_consumer_a_resume_point() {
                 medium: "pinned-host".to_string(),
                 capabilities: TIER_MEDIUM_CAP_DIRECT_SERVABLE,
             }],
+            vec![manifest(1, 3)],
             vec![entry(G2, KeyRange::Hashes(chain(3)))],
         )
         .expect("valid snapshot");
 
     assert_eq!(snap.snapshot_generation, 1);
     assert_eq!(snap.seq_floor, 3);
+    assert_eq!(snap.manifests, vec![manifest(1, 3)]);
     assert_eq!(sequencer.snapshot_generation(), 1);
 
     // The consumer resumes at seq_floor + 1; that is exactly the next sealed seq.
@@ -553,6 +645,7 @@ fn rejected_snapshot_does_not_bump_the_generation() {
     assert!(
         sequencer
             .snapshot(
+                vec![],
                 vec![],
                 vec![entry(
                     G2,

@@ -126,6 +126,11 @@ pub(super) fn advertisement_record(
         requirements: advertisement.identity().resources().to_vec(),
         lineages: advertisement.lineages().cloned().collect(),
         expires_at_unix_ms: advertisement.expires_at_unix_ms(),
+        // Populated by the CT-2 publisher wiring; the hub stamps
+        // `advertised_at_unix_ms` itself at publish.
+        placements: Vec::new(),
+        stage_cost_hint_us: None,
+        advertised_at_unix_ms: None,
     }
 }
 

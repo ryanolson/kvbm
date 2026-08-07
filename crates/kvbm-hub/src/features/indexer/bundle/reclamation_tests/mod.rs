@@ -67,6 +67,9 @@ fn advertisement(
             requirements: requirements(),
             lineages: vec![BundleResourceLineage::new(RESOURCE, hashes(boundary_tokens)).unwrap()],
             expires_at_unix_ms,
+            placements: Vec::new(),
+            stage_cost_hint_us: None,
+            advertised_at_unix_ms: None,
         },
     }
 }

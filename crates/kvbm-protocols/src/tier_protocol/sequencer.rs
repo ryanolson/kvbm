@@ -18,7 +18,8 @@ use crate::cache_manifest::{CacheManifestId, RegistrationEpoch};
 
 use super::{
     InstanceId, TIER_PLACEMENT_SCHEMA_VERSION, TierMedium, TierPlacementBatchV1,
-    TierPlacementEntry, TierPlacementError, TierPlacementOp, TierPlacementSnapshotV1,
+    TierPlacementEntry, TierPlacementError, TierPlacementManifest, TierPlacementOp,
+    TierPlacementSnapshotV1,
 };
 
 /// Stamps identity, sequence, and generation onto outbound tier-placement
@@ -119,9 +120,14 @@ impl TierPlacementSequencer {
     /// at `seq_floor + 1` — exactly the number the next [`Self::seal`] will
     /// stamp. The generation is bumped only on success, for the same reason
     /// `seal` does not consume a sequence number on failure.
+    ///
+    /// `manifests` are the lineage chains subsequent deltas may address with
+    /// [`KeyRange::ManifestInterval`](super::KeyRange::ManifestInterval). A
+    /// publisher that always sends exact hashes passes an empty vector.
     pub fn snapshot(
         &mut self,
         media: Vec<TierMedium>,
+        manifests: Vec<TierPlacementManifest>,
         entries: Vec<TierPlacementEntry>,
     ) -> Result<TierPlacementSnapshotV1, TierPlacementError> {
         let snapshot = TierPlacementSnapshotV1 {
@@ -132,6 +138,7 @@ impl TierPlacementSequencer {
             snapshot_generation: self.snapshot_generation + 1,
             seq_floor: self.last_seq(),
             media,
+            manifests,
             entries,
         };
         snapshot.validate()?;

@@ -14,6 +14,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 use axum::{
     Json, Router,
     extract::{Path, State},
+    http::StatusCode,
     routing::{get, post},
 };
 use futures::future::BoxFuture;
@@ -21,11 +22,15 @@ use kvbm_protocols::cache_manifest::RegistrationEpoch;
 use tokio::task::JoinHandle;
 use velo_ext::{InstanceId, PeerInfo};
 
-use super::bundle::BundleDirectory;
+use super::bundle::{BundleDirectory, BundleDirectoryError};
 use super::index::PositionalIndex;
-use super::ingest::run_ingest_loop;
+use super::ingest::{IngestCounters, IngestSinks, run_ingest_loop};
 use super::protocol::{
-    self, ByPositionResponse, IndexerConfigResponse, InstancesResponse, QueryRequest, QueryResponse,
+    self, ByPositionResponse, IndexerConfigResponse, InstancesResponse, QueryRequest,
+    QueryResponse, TierPlacementSnapshotRequest, TierPlacementSnapshotResponse,
+};
+use super::tier_placement::{
+    SnapshotInstall, TierPlacementProjection, TierPlacementProjectionError, VeloSnapshotRequester,
 };
 use super::zmq::{bind_sub_socket, bound_endpoint, port_of};
 use crate::features::{FeatureError, FeatureManager, HubContext};
@@ -55,7 +60,15 @@ pub struct IndexerManager {
     /// the *registered* set, not the *emitting* set. Maintained by
     /// `on_register`/`on_unregister`; `GET /instances` sorts the output for a
     /// stable response (`InstanceId` is not `Ord`).
-    instances: RwLock<HashSet<InstanceId>>,
+    ///
+    /// Shared (not cloned) with [`Self::tier_placements`], which uses it as the
+    /// admission gate for creating a projection: one registered set, so the two
+    /// halves of the feature cannot disagree about who is participating.
+    instances: Arc<RwLock<HashSet<InstanceId>>>,
+    /// Advisory tier-placement projection (R7b §4).
+    tier_placements: Arc<TierPlacementProjection>,
+    /// Per-reason ZMQ ingest drop counters.
+    ingest_counters: Arc<IngestCounters>,
 }
 
 impl std::fmt::Debug for IndexerManager {
@@ -80,6 +93,7 @@ impl IndexerManager {
         advertise_host: Option<String>,
     ) -> anyhow::Result<Self> {
         let index = Arc::new(PositionalIndex::new(max_seq_len, block_size)?);
+        let instances = Arc::new(RwLock::new(HashSet::new()));
         Ok(Self {
             index,
             bundle_directory: Arc::new(BundleDirectory::new(DEFAULT_BUNDLE_LEASE_TTL_MS)),
@@ -87,7 +101,83 @@ impl IndexerManager {
             advertise_host: advertise_host.unwrap_or_else(|| DEFAULT_ADVERTISE_HOST.to_string()),
             endpoint: OnceLock::new(),
             ingest_task: OnceLock::new(),
-            instances: RwLock::new(HashSet::new()),
+            tier_placements: Arc::new(TierPlacementProjection::new(Arc::clone(&instances))),
+            ingest_counters: Arc::new(IngestCounters::default()),
+            instances,
+        })
+    }
+
+    /// Shared tier-placement projection handle (for tests / CT-2a consumers).
+    #[must_use]
+    pub fn tier_placements(&self) -> &Arc<TierPlacementProjection> {
+        &self.tier_placements
+    }
+
+    /// Per-reason ZMQ ingest drop counters.
+    #[must_use]
+    pub fn ingest_counters(&self) -> &Arc<IngestCounters> {
+        &self.ingest_counters
+    }
+
+    /// Authorize and install a publisher's full tier-placement state.
+    ///
+    /// Order is load-bearing: shape, then authority, then epoch agreement, then
+    /// the transactional install. Authorizing before validating would let an
+    /// unauthenticated caller learn whether a credential is valid from the
+    /// shape of the rejection.
+    fn install_tier_placement_snapshot(
+        &self,
+        request: &TierPlacementSnapshotRequest,
+    ) -> Result<TierPlacementSnapshotResponse, (StatusCode, String)> {
+        request
+            .snapshot
+            .validate()
+            .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+        let authorized_epoch = self
+            .bundle_directory
+            .authorize_owner_epoch(request.snapshot.instance_id, &request.credential)
+            .map_err(|error| {
+                let status = match error {
+                    BundleDirectoryError::UnknownOwner { .. }
+                    | BundleDirectoryError::UnauthorizedOwner { .. } => StatusCode::UNAUTHORIZED,
+                    BundleDirectoryError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+                    _ => StatusCode::CONFLICT,
+                };
+                (status, error.to_string())
+            })?;
+        let installed = self
+            .tier_placements
+            .install_snapshot(&request.snapshot, authorized_epoch)
+            .map_err(|error| {
+                let status = match error {
+                    TierPlacementProjectionError::Invalid(_) => StatusCode::BAD_REQUEST,
+                    TierPlacementProjectionError::EpochMismatch => StatusCode::CONFLICT,
+                    TierPlacementProjectionError::Capacity { .. } => {
+                        StatusCode::INSUFFICIENT_STORAGE
+                    }
+                    TierPlacementProjectionError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+                };
+                (status, error.to_string())
+            })?;
+        Ok(match installed {
+            SnapshotInstall::Installed {
+                installed_generation,
+                seq_floor,
+            } => TierPlacementSnapshotResponse {
+                installed: true,
+                installed_generation,
+                seq_floor,
+            },
+            // A periodic push the hub already has. Not an error: R7b §3 has the
+            // publisher pushing every 60 s regardless of whether anything was
+            // lost, so the common case is exactly this.
+            SnapshotInstall::AlreadyCurrent {
+                installed_generation,
+            } => TierPlacementSnapshotResponse {
+                installed: false,
+                installed_generation,
+                seq_floor: request.snapshot.seq_floor,
+            },
         })
     }
 
@@ -190,7 +280,12 @@ impl FeatureManager for IndexerManager {
             );
             let _ = self.endpoint.set(advertised);
 
-            let task = tokio::spawn(run_ingest_loop(sub, Arc::clone(&self.index), ctx.cancel));
+            let sinks = IngestSinks {
+                index: Arc::clone(&self.index),
+                tier_placements: Arc::clone(&self.tier_placements),
+                counters: Arc::clone(&self.ingest_counters),
+            };
+            let task = tokio::spawn(run_ingest_loop(sub, sinks, ctx.cancel));
             let _ = self.ingest_task.set(task);
 
             // Expose the velo-plane block lookup (`QUERY_HANDLER`) when the hub
@@ -212,6 +307,19 @@ impl FeatureManager for IndexerManager {
                         FeatureError::Other(anyhow::anyhow!("bundle directory handler: {error}"))
                     })?;
                 }
+                // The hub is the *caller* on the snapshot-request handler, not
+                // the callee: the responder is the publisher (CT-2, rhino side).
+                self.tier_placements
+                    .set_requester(Arc::new(VeloSnapshotRequester::new(messenger.clone())));
+            } else {
+                // A discovery-only hub can never ask for a snapshot, so a
+                // projection that loses continuity stays invalid and answers
+                // empty forever. That is the correct degradation (temporary miss
+                // semantics, indefinitely), not a reason to serve stale state.
+                tracing::warn!(
+                    "indexer attached without a transport: tier placement projections cannot \
+                     request snapshots and will answer empty after any loss"
+                );
             }
             Ok(())
         })
@@ -294,6 +402,9 @@ impl FeatureManager for IndexerManager {
         // format carries (publishers stamp `velo_id.as_u128()`).
         self.index.remove_instance(instance_id.as_u128());
         self.bundle_directory.remove_owner(instance_id);
+        // Advisory placement state is about a process that no longer exists, so
+        // it is dropped outright rather than aged out.
+        self.tier_placements.remove_instance(instance_id);
         if let Ok(mut set) = self.instances.write() {
             set.remove(&instance_id);
         }
@@ -321,21 +432,34 @@ impl FeatureManager for IndexerManager {
     }
 
     fn control_router(self: Arc<Self>) -> Router {
-        routes(self)
+        read_routes().merge(control_routes()).with_state(self)
     }
 
     fn public_router(self: Arc<Self>) -> Router {
-        routes(self)
+        read_routes().with_state(self)
     }
 }
 
-fn routes(manager: Arc<IndexerManager>) -> Router {
+/// Routes mounted on both ports. `POST /query` is here despite its verb: it is
+/// a lookup whose argument set is too large for a URL, not a mutation.
+fn read_routes() -> Router<Arc<IndexerManager>> {
     Router::new()
         .route(protocol::paths::CONFIG, get(get_config))
         .route(protocol::paths::INSTANCES, get(get_instances))
         .route(protocol::paths::BY_POSITION, get(get_by_position))
         .route(protocol::paths::QUERY, post(post_query))
-        .with_state(manager)
+}
+
+/// Routes mounted on the control port only.
+///
+/// The two routers used to be the same function, so anything added to it landed
+/// on the read-only discovery port as well. The snapshot install is a
+/// credential-authorized mutation and must not be reachable there.
+fn control_routes() -> Router<Arc<IndexerManager>> {
+    Router::new().route(
+        protocol::paths::TIER_PLACEMENT_SNAPSHOT,
+        post(post_tier_placement_snapshot),
+    )
 }
 
 async fn get_config(State(mgr): State<Arc<IndexerManager>>) -> Json<IndexerConfigResponse> {
@@ -360,6 +484,13 @@ async fn post_query(
     Json(QueryResponse {
         hit: mgr.index.query(&req.hashes),
     })
+}
+
+async fn post_tier_placement_snapshot(
+    State(mgr): State<Arc<IndexerManager>>,
+    Json(req): Json<TierPlacementSnapshotRequest>,
+) -> Result<Json<TierPlacementSnapshotResponse>, (StatusCode, String)> {
+    mgr.install_tier_placement_snapshot(&req).map(Json)
 }
 
 #[cfg(test)]
@@ -406,6 +537,9 @@ mod tests {
                 requirements: requirements.clone(),
                 lineages: vec![BundleResourceLineage::new(resource, hashes).unwrap()],
                 expires_at_unix_ms: 10_000,
+                placements: Vec::new(),
+                stage_cost_hint_us: None,
+                advertised_at_unix_ms: None,
             },
         };
         manager.bundle_directory.publish(publish.clone()).unwrap();
@@ -450,5 +584,59 @@ mod tests {
             BundleQueryOutcome::Miss(BundleQueryMissReason::NotFound)
         );
         assert!(manager.instances_response().instances.is_empty());
+    }
+
+    /// The router split is a security boundary, so it is asserted by routing a
+    /// request rather than by reading the code: before R7b both routers were the
+    /// same function, and anything added to it silently appeared on the
+    /// read-only discovery port too.
+    #[tokio::test]
+    async fn the_snapshot_mutation_is_reachable_only_on_the_control_router() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode, header::CONTENT_TYPE};
+        use kvbm_protocols::tier_protocol::{
+            TIER_PLACEMENT_SCHEMA_VERSION, TierPlacementSnapshotV1,
+        };
+        use tower::ServiceExt as _;
+
+        let manager = Arc::new(IndexerManager::new(128, 4, None, None).unwrap());
+        let body = serde_json::to_vec(&TierPlacementSnapshotRequest {
+            credential: MutationCredential::generate(),
+            snapshot: TierPlacementSnapshotV1 {
+                v: TIER_PLACEMENT_SCHEMA_VERSION,
+                cache: CacheManifestId::from_bytes([3; 32]),
+                instance_id: InstanceId::new_v4(),
+                registration_epoch: RegistrationEpoch::new(),
+                snapshot_generation: 1,
+                seq_floor: 0,
+                media: Vec::new(),
+                manifests: Vec::new(),
+                entries: Vec::new(),
+            },
+        })
+        .unwrap();
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri(protocol::paths::TIER_PLACEMENT_SNAPSHOT)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(body.clone()))
+                .unwrap()
+        };
+
+        let public = FeatureManager::public_router(Arc::clone(&manager));
+        assert_eq!(
+            public.oneshot(request()).await.unwrap().status(),
+            StatusCode::NOT_FOUND,
+            "a mutation must not exist on the read-only discovery port"
+        );
+
+        // On the control port the route exists and rejects on *authority* — an
+        // unregistered owner — which is the failure a 404 would have hidden.
+        let control = FeatureManager::control_router(manager);
+        assert_eq!(
+            control.oneshot(request()).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
     }
 }

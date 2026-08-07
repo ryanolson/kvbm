@@ -1233,6 +1233,9 @@ fn bundle_advertisement(
         ],
         lineages: vec![BundleResourceLineage::new(resource, hashes).unwrap()],
         expires_at_unix_ms: u64::MAX,
+        placements: Vec::new(),
+        stage_cost_hint_us: None,
+        advertised_at_unix_ms: None,
     }
 }
 

@@ -24,6 +24,9 @@ pub mod index;
 pub mod ingest;
 pub mod manager;
 pub mod protocol;
+/// Advisory tier-placement consumer (R7b §4): per-`(cache, instance)`
+/// projection, recovery rules, and snapshot install.
+pub mod tier_placement;
 pub mod zmq;
 
 pub use client::IndexerLookupClient;
@@ -35,5 +38,10 @@ pub use protocol::{
     BundleAdvertisementRecord, BundleInvalidateRequest, BundleInvalidationRecord,
     BundlePublishRequest, BundleQueryHit, BundleQueryMissReason, BundleQueryOutcome,
     BundleQueryRequest, ByPositionResponse, FindBlocksHit, IndexEntry, IndexerConfigResponse,
-    InstancesResponse, QUERY_HANDLER, QueryRequest, QueryResponse, ROUTE_PREFIX,
+    InstancesResponse, QUERY_HANDLER, QueryRequest, QueryResponse, ROUTE_PREFIX, ReadyPlacement,
+    TierPlacementSnapshotRequest, TierPlacementSnapshotResponse,
+};
+pub use tier_placement::{
+    TIER_PLACEMENT_SNAPSHOT_REQUEST_HANDLER, TierPlacementHolder, TierPlacementProjection,
+    TierPlacementSnapshotRequestAck, TierPlacementSnapshotRequestMsg,
 };

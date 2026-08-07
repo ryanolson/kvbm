@@ -82,13 +82,29 @@
 //! [`TierPlacementSnapshotV1::validate`] enforces it.
 //!
 //! [`BundleResourceLineage::new`]: crate::cache_manifest::BundleResourceLineage::new
+//!
+//! # Where manifests come from (v1: snapshots only)
+//!
+//! A manifest enters a consumer exactly one way in v1: the
+//! [`TierPlacementSnapshotV1::manifests`] header. R7b §2 also permits a manifest
+//! to be established by prior `Hashes` runs in the delta stream; that is
+//! **deferred**, because it needs a publisher-side rule for assigning a stable
+//! `manifest_id` to a run that CT-2 has not defined, and a consumer that guessed
+//! the rule would resolve intervals against a manifest the publisher never
+//! meant. Until then `ManifestInterval` is only usable after a snapshot, which
+//! is also when it pays: steady state, not recovery.
+//!
+//! Note the asymmetry with the frozen delta envelope above: the snapshot travels
+//! the JSON/HTTP control plane, which is map-encoded, so it *may* grow a
+//! `#[serde(default)]` field. The freeze applies to
+//! [`TierPlacementBatchV1`] alone.
 
 use std::fmt;
 
 use kvbm_common::{LogicalResourceId, SequenceHash};
 use serde::{Deserialize, Serialize};
 
-use crate::cache_manifest::{CacheManifestId, RegistrationEpoch};
+use crate::cache_manifest::{BundleResourceLineage, CacheManifestId, RegistrationEpoch};
 
 mod sequencer;
 
@@ -138,6 +154,8 @@ pub const TIER_PLACEMENT_MAX_KEYS_PER_MESSAGE: usize = 1 << 20;
 /// Anti-amplification bound on media described by one snapshot header. Each
 /// entry is one policy depth, and depth is a `u8`.
 pub const TIER_PLACEMENT_MAX_MEDIA: usize = 256;
+/// Anti-amplification bound on lineage manifests installed by one snapshot.
+pub const TIER_PLACEMENT_MAX_MANIFESTS: usize = 1 << 12;
 
 /// Capability bit: the medium can serve a transfer directly (no staging copy).
 pub const TIER_MEDIUM_CAP_DIRECT_SERVABLE: u32 = 1 << 0;
@@ -422,6 +440,53 @@ impl TierPlacementEntry {
     }
 }
 
+/// An immutable lineage manifest a snapshot installs under `manifest_id`, so
+/// that subsequent deltas can address its positions with
+/// [`KeyRange::ManifestInterval`] instead of repeating exact hashes.
+///
+/// This is the *only* way a manifest reaches a consumer in v1 (see the module
+/// docs). Without it `ManifestInterval` is unresolvable by construction: nothing
+/// else on this wire binds an id to a hash chain, so every interval would gap,
+/// request a snapshot, install no manifest, and gap again — a livelock, not the
+/// "temporary miss" R7b §4 promises.
+///
+/// The hashes are carried raw rather than as a [`BundleResourceLineage`] so that
+/// a malformed chain is a *validation* failure with a precise error, not a
+/// deserialization failure that reads as a corrupt frame.
+///
+/// [`BundleResourceLineage`]: crate::cache_manifest::BundleResourceLineage
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TierPlacementManifest {
+    /// Publisher-assigned identity. Unique within one snapshot; stable for as
+    /// long as the publisher references it from deltas.
+    pub manifest_id: u64,
+    /// Logical resource the chain belongs to. An interval whose op names a
+    /// different resource is rejected by the consumer.
+    pub resource: LogicalResourceId,
+    /// The exact ordered chain. Validated as a real lineage (adjacent-hash
+    /// position and parent-fragment continuity) by [`Self::lineage`].
+    pub hashes: Vec<SequenceHash>,
+}
+
+impl TierPlacementManifest {
+    /// Build (and thereby validate) the lineage this manifest describes.
+    ///
+    /// Delegates to [`BundleResourceLineage::new`] rather than re-implementing
+    /// continuity checks, so a manifest installed here and a bundle lineage
+    /// advertised through the directory can never disagree about what a valid
+    /// chain is.
+    ///
+    /// [`BundleResourceLineage::new`]: crate::cache_manifest::BundleResourceLineage::new
+    pub fn lineage(&self) -> Result<BundleResourceLineage, TierPlacementError> {
+        BundleResourceLineage::new(self.resource, self.hashes.clone()).map_err(|source| {
+            TierPlacementError::InvalidManifest {
+                manifest_id: self.manifest_id,
+                detail: source.to_string(),
+            }
+        })
+    }
+}
+
 /// Wire envelope, v1. Fields are ordered for cheap reject-before-interpret of
 /// stale publishers.
 ///
@@ -533,6 +598,13 @@ pub struct TierPlacementSnapshotV1 {
     /// Medium metadata for every depth referenced by `entries`. This is the
     /// only place medium/capability data travels, and it travels once.
     pub media: Vec<TierMedium>,
+    /// Lineage manifests this snapshot installs, for later
+    /// [`KeyRange::ManifestInterval`] deltas. `#[serde(default)]` so a publisher
+    /// that never uses intervals can omit the field entirely; the snapshot is
+    /// JSON/map-encoded on the control plane, so this is decode-compatible in
+    /// both directions.
+    #[serde(default)]
+    pub manifests: Vec<TierPlacementManifest>,
     /// The complete Ready set. Exact keys only.
     pub entries: Vec<TierPlacementEntry>,
 }
@@ -572,6 +644,36 @@ impl TierPlacementSnapshotV1 {
                 });
             }
             seen.push(medium.depth);
+        }
+        if self.manifests.len() > TIER_PLACEMENT_MAX_MANIFESTS {
+            return Err(TierPlacementError::TooLarge {
+                what: "snapshot manifests",
+                count: self.manifests.len(),
+                limit: TIER_PLACEMENT_MAX_MANIFESTS,
+            });
+        }
+        // Validate every manifest here, not at install time: a snapshot install
+        // is replace-all, so a manifest that fails halfway through would leave
+        // the consumer holding a projection assembled from a body it had already
+        // decided to reject.
+        let mut manifest_ids: Vec<u64> = Vec::with_capacity(self.manifests.len());
+        let mut manifest_keys = 0usize;
+        for manifest in &self.manifests {
+            if manifest_ids.contains(&manifest.manifest_id) {
+                return Err(TierPlacementError::DuplicateManifestId {
+                    manifest_id: manifest.manifest_id,
+                });
+            }
+            manifest_ids.push(manifest.manifest_id);
+            manifest.lineage()?;
+            manifest_keys = manifest_keys.saturating_add(manifest.hashes.len());
+        }
+        if manifest_keys > TIER_PLACEMENT_MAX_KEYS_PER_MESSAGE {
+            return Err(TierPlacementError::TooLarge {
+                what: "snapshot manifest keys",
+                count: manifest_keys,
+                limit: TIER_PLACEMENT_MAX_KEYS_PER_MESSAGE,
+            });
         }
         let mut keys = 0usize;
         for (index, entry) in self.entries.iter().enumerate() {
@@ -682,6 +784,20 @@ pub enum TierPlacementError {
         /// The repeated depth.
         depth: TierDepth,
     },
+    /// The snapshot header installed the same manifest id twice.
+    #[error("snapshot header installs manifest {manifest_id} more than once")]
+    DuplicateManifestId {
+        /// The repeated manifest id.
+        manifest_id: u64,
+    },
+    /// A snapshot manifest is not a valid lineage chain.
+    #[error("snapshot manifest {manifest_id} is not a valid lineage: {detail}")]
+    InvalidManifest {
+        /// Manifest that failed to build.
+        manifest_id: u64,
+        /// Lineage-constructor detail.
+        detail: String,
+    },
     /// The message exceeds an anti-amplification bound.
     #[error("tier placement message carries {count} {what}, above the limit of {limit}")]
     TooLarge {
@@ -707,6 +823,8 @@ impl TierPlacementError {
             | Self::EmptyKeys { .. }
             | Self::IntervalOverflow { .. }
             | Self::DuplicateMediumDepth { .. }
+            | Self::DuplicateManifestId { .. }
+            | Self::InvalidManifest { .. }
             | Self::TooLarge { .. } => TierPlacementRejection::Invalid,
         }
     }

@@ -213,9 +213,14 @@ mod tests {
                         .unwrap(),
                     ],
                     expires_at_unix_ms: 10_000,
+                    placements: Vec::new(),
+                    stage_cost_hint_us: None,
+                    advertised_at_unix_ms: None,
                 },
                 lease_id: uuid::Uuid::new_v4(),
                 lease_expires_at_unix_ms: 2_000,
+                ready_tier: None,
+                advertised_at_unix_ms: None,
             },
         )
         .unwrap();
@@ -250,9 +255,14 @@ mod tests {
                         .unwrap(),
                     ],
                     expires_at_unix_ms: 10_000,
+                    placements: Vec::new(),
+                    stage_cost_hint_us: None,
+                    advertised_at_unix_ms: None,
                 },
                 lease_id: uuid::Uuid::new_v4(),
                 lease_expires_at_unix_ms: 2_000,
+                ready_tier: None,
+                advertised_at_unix_ms: None,
             },
         );
 
@@ -286,9 +296,14 @@ mod tests {
                         .unwrap(),
                     ],
                     expires_at_unix_ms: 10_000,
+                    placements: Vec::new(),
+                    stage_cost_hint_us: None,
+                    advertised_at_unix_ms: None,
                 },
                 lease_id: uuid::Uuid::new_v4(),
                 lease_expires_at_unix_ms: 2_000,
+                ready_tier: None,
+                advertised_at_unix_ms: None,
             },
         );
 
@@ -342,6 +357,8 @@ mod tests {
             advertisement: record,
             lease_id: uuid::Uuid::new_v4(),
             lease_expires_at_unix_ms: 1_500,
+            ready_tier: None,
+            advertised_at_unix_ms: None,
         };
         assert_eq!(
             hit.advertisement.requirements.as_slice(),
