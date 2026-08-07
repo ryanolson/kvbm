@@ -1756,3 +1756,182 @@ async fn indexer_lookup_client_errs_when_hub_has_no_velo() {
         "unexpected error: {err}"
     );
 }
+
+// ---- tier-placement snapshot push (CT-2b) -----------------------------------
+
+/// Register declaring `Feature::Indexer` and wire both velo directions.
+///
+/// The feature declaration is load-bearing, not decoration: `stage_registration`
+/// stores the owner credential only for a *participating* registrant, so a hub
+/// client registered without it has no credential the snapshot install can
+/// authorize against and every push answers `401 UnknownOwner`.
+async fn wire_indexer_participant(
+    server: &HubServer,
+    client_velo: &Arc<velo::Velo>,
+) -> Arc<kvbm_hub::HubClient> {
+    let hub_client = build_client(server);
+    hub_client.register_handlers(client_velo).unwrap();
+    let hub_id = hub_client
+        .register_instance_with_features_and_runtime(
+            client_velo.peer_info(),
+            vec![Feature::Indexer(Default::default())],
+            kvbm_hub::protocol::RuntimeConfigSummary {
+                block_size: Some(IDX_BLOCK_SIZE),
+                block_layout: None,
+            },
+        )
+        .await
+        .unwrap()
+        .expect("hub should return its own instance id when running with a transport");
+    let hub_peer = hub_client.discover_by_instance_id(hub_id).await.unwrap();
+    client_velo.register_peer(hub_peer).unwrap();
+    hub_client
+}
+
+fn tier_snapshot(
+    cache: kvbm_protocols::cache_manifest::CacheManifestId,
+    instance_id: InstanceId,
+    registration_epoch: kvbm_protocols::cache_manifest::RegistrationEpoch,
+    generation: u64,
+    hash: SequenceHash,
+) -> kvbm_protocols::tier_protocol::TierPlacementSnapshotV1 {
+    use kvbm_protocols::tier_protocol::{
+        KeyRange, PhysicalPlacementMode, PlacementScope, TIER_MEDIUM_CAP_DIRECT_SERVABLE,
+        TIER_PLACEMENT_SCHEMA_VERSION, TierDepth, TierMedium, TierPlacementEntry,
+        TierPlacementSnapshotV1,
+    };
+    let tier = TierDepth(1);
+    TierPlacementSnapshotV1 {
+        v: TIER_PLACEMENT_SCHEMA_VERSION,
+        cache,
+        instance_id,
+        registration_epoch,
+        snapshot_generation: generation,
+        seq_floor: 0,
+        // `validate` rejects an entry whose depth the header omits, so the
+        // medium travels with the entry that names its depth.
+        media: vec![TierMedium {
+            depth: tier,
+            medium: "pinned-host".to_string(),
+            capabilities: TIER_MEDIUM_CAP_DIRECT_SERVABLE,
+        }],
+        manifests: Vec::new(),
+        entries: vec![TierPlacementEntry {
+            scope: PlacementScope::unitary(kvbm_common::LogicalResourceId(1)),
+            tier,
+            placement: PhysicalPlacementMode::Whole,
+            generation: 1,
+            keys: KeyRange::Hashes(vec![hash]),
+        }],
+    }
+}
+
+/// The publisher's recovery half, end to end against a live hub: the client
+/// pushes a snapshot with a credential it can never read, and the projection
+/// goes from "no entry, answers nothing" to valid and answering.
+///
+/// A re-push of the same generation is asserted too, because that is the
+/// steady-state case — R7b §3 pushes every 60 s whether or not anything was
+/// lost — and it answers `installed: false`, which a publisher must treat as
+/// success or its emission gate never releases.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn indexer_client_pushes_a_tier_placement_snapshot() {
+    use kvbm_protocols::cache_manifest::CacheManifestId;
+    use kvbm_protocols::tier_protocol::PlacementScope;
+
+    let (server, mgr, _transport) = start_server_with_indexer().await;
+    let client_velo = new_velo().await;
+    let hub_client = wire_indexer_participant(&server, &client_velo).await;
+    let lookup = hub_client
+        .indexer_lookup_client(client_velo.messenger().clone())
+        .await
+        .expect("indexer probe should succeed")
+        .expect("indexer is enabled on this hub");
+
+    let cache = CacheManifestId::from_bytes([21; 32]);
+    let scope = PlacementScope::unitary(kvbm_common::LogicalResourceId(1));
+    let hash = SequenceHash::root(0xC0FF_EE00_0000_0001);
+    let instance = client_velo.instance_id();
+    let epoch = lookup.registration_epoch();
+    assert!(
+        !mgr.tier_placements().is_valid(cache, instance),
+        "no projection exists before an authorized install"
+    );
+
+    let installed = lookup
+        .push_tier_placement_snapshot(tier_snapshot(cache, instance, epoch, 1, hash))
+        .await
+        .expect("an authorized push must be accepted");
+    assert!(installed.installed, "first generation installs");
+    assert_eq!(installed.installed_generation, 1);
+    assert_eq!(installed.seq_floor, 0);
+
+    assert!(mgr.tier_placements().is_valid(cache, instance));
+    let holders = mgr.tier_placements().holders(cache, scope, hash);
+    assert_eq!(holders.len(), 1, "the pushed key must be answerable");
+    assert_eq!(holders[0].instance, instance);
+
+    // The periodic re-push the hub already holds: not an error, and its
+    // generation still has to reach `note_snapshot_installed`.
+    let repeat = lookup
+        .push_tier_placement_snapshot(tier_snapshot(cache, instance, epoch, 1, hash))
+        .await
+        .expect("a duplicate generation is a success, not an error");
+    assert!(!repeat.installed, "already current");
+    assert_eq!(repeat.installed_generation, 1);
+    assert!(mgr.tier_placements().is_valid(cache, instance));
+}
+
+/// The two rejections a publisher must be able to tell apart: its own stale
+/// epoch (caught locally, no round trip) and pushing on behalf of an instance
+/// whose credential the hub never minted (caught by `authorize_owner_epoch`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tier_placement_snapshot_push_rejects_wrong_epoch_and_foreign_instance() {
+    use kvbm_protocols::cache_manifest::{CacheManifestId, RegistrationEpoch};
+
+    let (server, mgr, _transport) = start_server_with_indexer().await;
+    let client_velo = new_velo().await;
+    let hub_client = wire_indexer_participant(&server, &client_velo).await;
+    let lookup = hub_client
+        .indexer_lookup_client(client_velo.messenger().clone())
+        .await
+        .expect("indexer probe should succeed")
+        .expect("indexer is enabled on this hub");
+
+    let cache = CacheManifestId::from_bytes([22; 32]);
+    let hash = SequenceHash::root(7);
+    let instance = client_velo.instance_id();
+
+    let stale = lookup
+        .push_tier_placement_snapshot(tier_snapshot(
+            cache,
+            instance,
+            RegistrationEpoch::new(),
+            1,
+            hash,
+        ))
+        .await
+        .expect_err("a snapshot from a different registration lifecycle");
+    assert!(
+        stale.to_string().contains("registration epoch"),
+        "unexpected error: {stale}"
+    );
+
+    let foreign = InstanceId::new_v4();
+    let unauthorized = lookup
+        .push_tier_placement_snapshot(tier_snapshot(
+            cache,
+            foreign,
+            lookup.registration_epoch(),
+            1,
+            hash,
+        ))
+        .await
+        .expect_err("this credential does not own that instance");
+    assert!(
+        unauthorized.to_string().contains("401"),
+        "unexpected error: {unauthorized}"
+    );
+    assert!(!mgr.tier_placements().is_valid(cache, foreign));
+    assert!(!mgr.tier_placements().is_valid(cache, instance));
+}

@@ -420,11 +420,22 @@ impl HubClient {
                  register against a current hub first"
             )
         })?;
+        // The tier-placement snapshot install is a credential-authorized
+        // mutation, so it is mounted by the feature's `control_router` only.
+        // Resolved here, against the *control* base: `post_json` joins the
+        // discovery base and would 404 on this route.
+        let snapshot_url = self.control_url(&format!(
+            "/v1/features/{}{}",
+            crate::features::indexer::ROUTE_PREFIX,
+            crate::features::indexer::protocol::paths::TIER_PLACEMENT_SNAPSHOT
+        ))?;
         Ok(Some(crate::features::indexer::IndexerLookupClient::new(
             messenger,
             hub_id,
             credential,
             registration_epoch,
+            self.http.clone(),
+            snapshot_url,
         )))
     }
 
@@ -661,7 +672,9 @@ impl Drop for HubRegistrationGuard {
     }
 }
 
-async fn parse_json<T: serde::de::DeserializeOwned>(resp: reqwest::Response) -> Result<T> {
+pub(crate) async fn parse_json<T: serde::de::DeserializeOwned>(
+    resp: reqwest::Response,
+) -> Result<T> {
     let status = resp.status();
     if status.is_success() {
         return resp

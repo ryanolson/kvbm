@@ -49,6 +49,10 @@ use crate::worker::{
 };
 use crate::{G1, G2};
 
+/// One remote pull's announced residency: `resource -> lineage in position
+/// order`, the payload shape of a `PulledBundleReadyObserver`.
+type PulledLineages = BTreeMap<LogicalResourceId, Vec<SequenceHash>>;
+
 const BLOCK_SIZE: usize = 4;
 const RESOURCES: [LogicalResourceId; 3] = [
     LogicalResourceId(10),
@@ -1392,6 +1396,11 @@ async fn disconnected_chain_cannot_complete_pull_create_or_publish_a_bundle() ->
         BLOCK_SIZE,
         false,
     );
+    let announced = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&announced);
+    engine.set_pulled_bundle_ready_observer(Arc::new(move |_| {
+        counter.fetch_add(1, Ordering::SeqCst);
+    }));
     let key = BundleKey::new(&identity, hash(2), (2 * BLOCK_SIZE) as u64)?;
     let child_of_another_parent = SequenceHash::root(77).extend(2);
     let lineages = BTreeMap::from([
@@ -1446,6 +1455,11 @@ async fn disconnected_chain_cannot_complete_pull_create_or_publish_a_bundle() ->
     }
     tokio::task::yield_now().await;
     assert!(directory.advertisements.lock().unwrap().is_empty());
+    assert_eq!(
+        announced.load(Ordering::SeqCst),
+        0,
+        "a pull that never published must not announce residency"
+    );
     Ok(())
 }
 
@@ -1980,6 +1994,81 @@ async fn remote_pull_mints_a_local_publication_generation() -> Result<()> {
         lease.generation(),
         1,
         "the puller's owner-local generation must not reuse the source owner's generation"
+    );
+    Ok(())
+}
+
+/// Remote pull is the one route to a resident G2 copy that the offload
+/// pipeline's G1→G2 register observer cannot see, so a tier-placement publisher
+/// without this seam under-reports its own residency.
+///
+/// Both arms matter and only one of them is obvious:
+///   * a completed pull announces exactly the lineage it published, and
+///   * a same-generation re-commit — which `commit_materialized` short-circuits
+///     as idempotent, returning `Ok` **without** running the materializer —
+///     announces nothing. Firing there would advertise a publication this call
+///     did not make, i.e. over-reporting, the one direction the tier stream must
+///     never fail in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_completed_remote_pull_announces_its_residency_exactly_once() -> Result<()> {
+    let identity = manifest()?.identity();
+    let key = BundleKey::new(&identity, hash(1), BLOCK_SIZE as u64)?;
+    let (leader, managers) = build_resource_test_leader_for_capacity(&identity, 2).await?;
+    let engine = LocalConnectorEngine::with_offload_submit_and_admission(
+        Arc::new(leader),
+        kvbm_protocols::connector::NoopWorkerSink::new(),
+        BLOCK_SIZE,
+        true,
+        Arc::new(RegisteringOffloadSubmit {
+            managers: managers.clone(),
+        }),
+        None,
+        BundleAdmissionConfig::new(
+            policies(&identity, 0, None)?,
+            component_bytes(&identity, 1024)?,
+        ),
+    );
+    let observed: Arc<Mutex<Vec<PulledLineages>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&observed);
+    engine.set_pulled_bundle_ready_observer(Arc::new(move |lineages| {
+        sink.lock().unwrap().push(lineages.clone());
+    }));
+
+    let expected = RESOURCES
+        .into_iter()
+        .map(|resource| (resource, vec![hash(1)]))
+        .collect::<BTreeMap<_, _>>();
+    let target: Arc<dyn BundlePullTarget> = Arc::clone(&engine) as Arc<dyn BundlePullTarget>;
+    let generation = target.reserve_publication_generation()?;
+    target
+        .commit_pulled_bundle(
+            identity.clone(),
+            key,
+            generation,
+            stage_pulled_one_block_bundle(&managers, hash(1))?,
+        )
+        .await?;
+
+    assert_eq!(
+        observed.lock().unwrap().as_slice(),
+        std::slice::from_ref(&expected),
+        "a completed pull announces the lineage it published"
+    );
+
+    // Same key, same generation: idempotent, so nothing is materialized and
+    // nothing may be announced.
+    target
+        .commit_pulled_bundle(
+            identity.clone(),
+            key,
+            generation,
+            stage_pulled_one_block_bundle(&managers, hash(1))?,
+        )
+        .await?;
+    assert_eq!(
+        observed.lock().unwrap().len(),
+        1,
+        "an idempotent re-commit publishes nothing, so it announces nothing"
     );
     Ok(())
 }

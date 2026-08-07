@@ -805,6 +805,153 @@ fn a_superseding_snapshot_re_arms_the_gate_at_the_higher_generation() {
 }
 
 // ---------------------------------------------------------------------------
+// Publisher-forced divergence (the dropped-`Remove` resync)
+// ---------------------------------------------------------------------------
+
+/// The mechanism, asserted on the numbers a consumer keys on: a divergent
+/// publisher's next batch skips exactly one sequence number, which is a gap by
+/// the consumer's `last_seq + 1` rule. Emission is deliberately *not* held —
+/// holding it would leave the consumer valid-and-stale until an HTTP push
+/// lands, whereas emitting makes it invalid-and-empty on the next batch.
+#[test]
+fn marking_divergent_burns_one_sequence_number_and_keeps_emitting() {
+    let mut sequencer = TierPlacementSequencer::new(cache(), instance(), RegistrationEpoch::new());
+    let first = sealed(
+        sequencer
+            .seal(vec![ready(G2, 1, KeyRange::Hashes(chain(2)))])
+            .expect("valid ops"),
+    );
+    assert_eq!(first.seq, 1);
+    assert!(!sequencer.needs_snapshot());
+
+    assert!(sequencer.mark_divergent(), "arms on the first call");
+    assert!(sequencer.needs_snapshot());
+    // Idempotent while armed: one gap invalidates exactly as thoroughly as ten,
+    // and a burst of dropped Removes must not burn a number per drop.
+    for _ in 0..5 {
+        assert!(!sequencer.mark_divergent());
+    }
+
+    let after = sealed(
+        sequencer
+            .seal(vec![remove(G2, 1, KeyRange::Hashes(chain(2)))])
+            .expect("valid ops"),
+    );
+    assert_eq!(
+        after.seq,
+        first.seq + 2,
+        "exactly one number burned, however many drops were reported"
+    );
+    assert_eq!(
+        after.snapshot_generation, 0,
+        "divergence is a sequence-plane signal; it must not touch the generation"
+    );
+}
+
+/// The non-obvious interaction: a burned number must not survive as a hole
+/// across the snapshot that repairs it. `seq_floor` is derived from `last_seq`,
+/// so the consumer resumes at exactly the number the next `seal` stamps.
+#[test]
+fn a_snapshot_after_divergence_leaves_no_hole_and_disarms_the_request() {
+    let mut sequencer = TierPlacementSequencer::new(cache(), instance(), RegistrationEpoch::new());
+    sealed(
+        sequencer
+            .seal(vec![ready(G2, 1, KeyRange::Hashes(chain(2)))])
+            .expect("valid ops"),
+    );
+    sequencer.mark_divergent();
+
+    let snap = sequencer
+        .snapshot(
+            g2_medium(),
+            vec![],
+            vec![entry(G2, KeyRange::Hashes(chain(2)))],
+        )
+        .expect("valid snapshot");
+    assert!(
+        !sequencer.needs_snapshot(),
+        "a sealed snapshot is the resync; nothing is still owed"
+    );
+    assert_eq!(snap.seq_floor, 2, "the burned number is inside the floor");
+
+    assert!(sequencer.note_snapshot_installed(snap.snapshot_generation));
+    let resumed = sealed(
+        sequencer
+            .seal(vec![ready(G2, 1, KeyRange::Hashes(chain(2)))])
+            .expect("valid ops"),
+    );
+    assert_eq!(
+        resumed.seq,
+        snap.seq_floor + 1,
+        "the consumer's resume point and the publisher's next number agree"
+    );
+}
+
+/// Divergence recorded *after* a snapshot is sealed describes state that
+/// snapshot does not carry, so it must arm a fresh one rather than ride along.
+#[test]
+fn divergence_after_a_seal_survives_the_install_acknowledgement() {
+    let mut sequencer = TierPlacementSequencer::new(cache(), instance(), RegistrationEpoch::new());
+    let snap = sequencer
+        .snapshot(g2_medium(), vec![], vec![])
+        .expect("valid snapshot");
+    assert!(sequencer.mark_divergent());
+    assert!(sequencer.note_snapshot_installed(snap.snapshot_generation));
+    assert!(
+        sequencer.needs_snapshot(),
+        "the installed snapshot predates the loss it cannot describe"
+    );
+}
+
+/// The un-wedge. A publisher whose push can never succeed must not hold the
+/// gate forever: silence leaves the consumer serving the previous generation as
+/// *valid*, which is the one failure it cannot detect. Abandoning resumes
+/// emission at the bumped generation, which the consumer reads as
+/// `GenerationAhead` and answers empty for.
+#[test]
+fn abandoning_an_unpushable_snapshot_releases_emission_and_stays_divergent() {
+    let mut sequencer = TierPlacementSequencer::new(cache(), instance(), RegistrationEpoch::new());
+    let ops = vec![ready(G2, 1, KeyRange::Hashes(chain(2)))];
+    let snap = sequencer
+        .snapshot(g2_medium(), vec![], vec![])
+        .expect("valid snapshot");
+    assert!(matches!(
+        sequencer
+            .seal(ops.clone())
+            .expect("deferral is not an error"),
+        SealOutcome::Deferred(_)
+    ));
+
+    assert!(sequencer.abandon_pending_snapshot());
+    assert!(!sequencer.awaiting_snapshot_install());
+    assert!(
+        sequencer.needs_snapshot(),
+        "abandoning does not make the publisher continuous again"
+    );
+    assert!(
+        !sequencer.abandon_pending_snapshot(),
+        "nothing left to abandon"
+    );
+
+    let resumed = sealed(sequencer.seal(ops).expect("valid ops"));
+    assert_eq!(
+        resumed.snapshot_generation, snap.snapshot_generation,
+        "emission resumes at the generation no consumer installed — visible, not silent"
+    );
+    // The generation bump is what invalidates a consumer still on the old
+    // generation; it rejects on generation before it reads the sequence. The
+    // burned number covers the case the failed push cannot distinguish — the
+    // install landed and only the response was lost — where the consumer is at
+    // the new generation and the gap is the only thing left to tell it to
+    // resync.
+    assert_eq!(
+        resumed.seq,
+        snap.seq_floor + 2,
+        "the abandon burned one number on top of the deferred (unconsumed) seal"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // R6 — anti-amplification bounds
 // ---------------------------------------------------------------------------
 

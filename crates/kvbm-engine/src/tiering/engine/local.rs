@@ -46,7 +46,7 @@
 #![allow(dead_code)]
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use anyhow::Result;
 use dashmap::DashMap;
@@ -68,6 +68,7 @@ use super::bundle::{
     BundleAdmissionConfig, BundleCatalog, BundleDirectoryOrder, BundleLease,
     BundlePublicationRuntime,
 };
+use super::config::PulledBundleReadyObserver;
 use super::driver::{ActionRecord, FenceBarrier};
 use super::inflight::{InflightKey, InflightOnboards};
 use super::offload::{
@@ -235,6 +236,12 @@ pub(crate) struct LocalConnectorEngine {
     /// from [`super::DisaggOps`] at construction). The search path interposes
     /// CD when this is `Some`; `None` is a plain local-tiering engine.
     pub(super) cd: Option<CdRuntime>,
+    /// Advisory hook fired after a remotely-pulled bundle commits into G2 (see
+    /// [`PulledBundleReadyObserver`]). A `OnceLock` set by
+    /// [`build_local_connector_engine`](super::build_local_connector_engine)
+    /// rather than a constructor parameter: the construction seam is already at
+    /// clippy's argument ceiling, and this is an observer, not engine state.
+    pub(super) pulled_bundle_ready: OnceLock<PulledBundleReadyObserver>,
     /// In-flight onboard hash guard (see [`super::inflight`]). Recorded ONCE
     /// per lifecycle at the three onboard mint sites (keyed by the lifecycle
     /// generation), cleared at the lifecycle release funnels
@@ -533,10 +540,26 @@ impl LocalConnectorEngine {
                 offload_drains: DashMap::new(),
                 current_iteration: AtomicUsize::new(0),
                 weak_self: weak.clone(),
+                pulled_bundle_ready: OnceLock::new(),
                 cd,
                 inflight: Mutex::new(InflightOnboards::with_gauge(inflight_gauge)),
             }
         })
+    }
+
+    /// Install the remote-pull residency observer. First write wins; a second
+    /// install is a wiring bug and is ignored rather than allowed to silently
+    /// replace the first (two observers would each see only some of the pulls).
+    pub(in crate::tiering::engine) fn set_pulled_bundle_ready_observer(
+        &self,
+        observer: PulledBundleReadyObserver,
+    ) {
+        if self.pulled_bundle_ready.set(observer).is_err() {
+            tracing::warn!(
+                "a pulled-bundle residency observer is already installed on this engine; \
+                 keeping the first"
+            );
+        }
     }
 
     pub(super) fn bundle_onboard_watchdog(&self) -> std::time::Duration {

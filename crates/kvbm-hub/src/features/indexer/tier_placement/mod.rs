@@ -70,6 +70,17 @@
 //! accepting a delta past the resume point would be exactly the silent hole the
 //! sequence rule exists to catch.
 //!
+//! The gate is not the sequencer's only publisher-side lever, and the second
+//! one is what makes this module's invariant hold end to end. A publisher that
+//! loses an op *before* it reaches the wire — a dropped `Remove`, deferred ops
+//! discarded under buffer pressure — leaves the sequence contiguous, so nothing
+//! here can detect it, and the projection keeps answering with a copy that is
+//! gone. `TierPlacementSequencer::mark_divergent` is how the publisher says so:
+//! it burns one sequence number, which arrives as an ordinary
+//! `InvalidationReason::SequenceGap` and recovers through the path already
+//! documented above. No consumer-side change; the recovery machinery was
+//! already the right shape.
+//!
 //! Against a publisher that ignores the gate the degradation is still
 //! fail-safe, and it is visible rather than silent:
 //! `invalidated_generation_ahead` and `invalidated_sequence_gap` climb together

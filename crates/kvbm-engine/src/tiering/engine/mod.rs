@@ -44,7 +44,7 @@ mod prefill;
 mod prefill_validation;
 mod worker;
 
-pub use config::{ConnectorEngineConfig, RemoteOps};
+pub use config::{ConnectorEngineConfig, PulledBundleReadyObserver, RemoteOps};
 pub use worker::{PassOffload, PassOnboard, WorkerEngine, WorkerPassPlan};
 
 use std::sync::Arc;
@@ -130,7 +130,11 @@ fn build_local_connector_engine_inner(
         resource_policies,
         resource_component_bytes,
     } = config;
-    let RemoteOps { search, disagg } = remote;
+    let RemoteOps {
+        search,
+        disagg,
+        pulled_bundle_ready,
+    } = remote;
 
     // Install the discovery on the leader before constructing the engine — this
     // is the only place the remote-search discovery is wired. `set_remote_discovery`
@@ -189,6 +193,12 @@ fn build_local_connector_engine_inner(
         cd,
         BundleAdmissionConfig::new(resource_policies, resource_component_bytes),
     );
+    // Advisory, so it is installed unconditionally rather than gated on
+    // `search`: an observer on an engine that never pulls simply never fires,
+    // and refusing it here would make the wiring order load-bearing.
+    if let Some(observer) = pulled_bundle_ready {
+        engine.set_pulled_bundle_ready_observer(observer);
+    }
     (
         Arc::clone(&engine) as Arc<dyn LeaderEngine>,
         engine as Arc<dyn WorkerEngineDriver>,

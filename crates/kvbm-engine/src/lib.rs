@@ -31,8 +31,9 @@ pub mod collectives;
 /// factory plus the worker-side [`WorkerEngine`] and its pass-plan types.
 /// `LocalConnectorEngine` itself stays internal.
 pub use tiering::engine::{
-    ConnectorEngineConfig, PassOffload, PassOnboard, RemoteOps, WorkerEngine, WorkerPassPlan,
-    build_local_connector_engine, build_local_connector_engine_with_resources,
+    ConnectorEngineConfig, PassOffload, PassOnboard, PulledBundleReadyObserver, RemoteOps,
+    WorkerEngine, WorkerPassPlan, build_local_connector_engine,
+    build_local_connector_engine_with_resources,
 };
 
 /// Conditional-disagg transport seam consumed by the connector's CD wiring:

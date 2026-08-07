@@ -15,8 +15,11 @@
 //! without the needed dependency) is therefore unrepresentable rather than
 //! checked at runtime.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
+
+use kvbm_common::{LogicalResourceId, SequenceHash};
 
 use crate::p2p::session::{PeerResolver, SessionFactory};
 use crate::remote::cd::DisaggConfig;
@@ -44,6 +47,27 @@ pub struct ConnectorEngineConfig {
     pub resource_component_bytes: ResourceComponentBytes,
 }
 
+/// Observer invoked after a remotely-pulled bundle is committed to the local
+/// catalog, carrying the lineage that just became resident in G2.
+///
+/// The map is `resource → sequence hashes in position order`, i.e. exactly the
+/// keys a tier-placement publisher advertises `Ready`. Remote pull is the one
+/// route to a G2 copy that the offload pipeline's G1→G2 register observer
+/// cannot see, so without this seam a puller under-reports its own residency.
+///
+/// **Hashes, not `ImmutableBlock`s, deliberately.** The register-observer
+/// precedent hands out blocks and documents that cloning one retains a pin; an
+/// observer that leaked a clone here would pin pulled G2 slots against eviction
+/// and silently change cache behaviour. Nothing an advertiser needs is in the
+/// block beyond its hash.
+///
+/// Contract: fires **after** the catalog commit succeeds, so it can never
+/// announce a copy that failed to publish, and never on the idempotent
+/// already-committed path. Must not block — it runs on the pull-completion
+/// task, ahead of the directory advertisement.
+pub type PulledBundleReadyObserver =
+    Arc<dyn Fn(&BTreeMap<LogicalResourceId, Vec<SequenceHash>>) + Send + Sync + 'static>;
+
 /// The remote-block operations the engine offers.
 ///
 /// Each remote capability is an independent `Option` carrying its own required
@@ -52,9 +76,10 @@ pub struct ConnectorEngineConfig {
 /// Remote search-and-pull and conditional disagg are siblings — either, both,
 /// or neither.
 ///
-/// Both fields are `pub(crate)` to keep the public surface curated; callers
+/// All fields are `pub(crate)` to keep the public surface curated; callers
 /// construct via [`RemoteOps::default`] (all `None`), [`RemoteOps::with_search`],
-/// and/or [`RemoteOps::with_disagg_transports`].
+/// [`RemoteOps::with_disagg_transports`], and/or
+/// [`RemoteOps::observing_pulled_bundles`].
 #[derive(Clone, Default)]
 pub struct RemoteOps {
     /// Remote search-and-pull: install the discovery on the leader and request
@@ -62,6 +87,9 @@ pub struct RemoteOps {
     pub(crate) search: Option<RemoteSearchOps>,
     /// Conditional disaggregation: the decode-side remote-prefill plane.
     pub(crate) disagg: Option<DisaggOps>,
+    /// Notified when a remote pull publishes into G2 (advisory; not a
+    /// capability).
+    pub(crate) pulled_bundle_ready: Option<PulledBundleReadyObserver>,
 }
 
 impl RemoteOps {
@@ -71,7 +99,23 @@ impl RemoteOps {
         Self {
             search: Some(RemoteSearchOps { discovery }),
             disagg: None,
+            pulled_bundle_ready: None,
         }
+    }
+
+    /// Observe remotely-pulled bundles as they become resident in G2.
+    ///
+    /// Composable with the capability builders and independent of them: an
+    /// observer without [`Self::with_search`] simply never fires, because
+    /// nothing pulls. Kept here rather than on
+    /// [`ConnectorEngineConfig`] so adding it breaks no existing struct
+    /// literal, and rather than as a post-construction `add_*_observer` because
+    /// the built engine is returned only as trait objects — there is no
+    /// concrete receiver to call.
+    #[must_use]
+    pub fn observing_pulled_bundles(mut self, observer: PulledBundleReadyObserver) -> Self {
+        self.pulled_bundle_ready = Some(observer);
+        self
     }
 
     /// Add the conditional-disagg sibling with the full production transport
@@ -149,6 +193,13 @@ impl fmt::Debug for RemoteOps {
         f.debug_struct("RemoteOps")
             .field("search", &self.search.as_ref().map(|_| "<RemoteSearchOps>"))
             .field("disagg", &self.disagg.as_ref().map(|_| "<DisaggOps>"))
+            .field(
+                "pulled_bundle_ready",
+                &self
+                    .pulled_bundle_ready
+                    .as_ref()
+                    .map(|_| "<PulledBundleReadyObserver>"),
+            )
             .finish()
     }
 }
@@ -189,6 +240,44 @@ mod tests {
         ) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
             async { Ok(()) }.boxed()
         }
+    }
+
+    /// The observer composes with the capability builders instead of replacing
+    /// them, and survives being set alongside either one — a pull observer is
+    /// only useful on an engine that also has remote search.
+    #[test]
+    fn the_pulled_bundle_observer_composes_with_the_capability_builders() {
+        let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&fired);
+        let observer: PulledBundleReadyObserver = Arc::new(move |_| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let ops = RemoteOps::default()
+            .observing_pulled_bundles(Arc::clone(&observer))
+            .with_disagg_transports(
+                Arc::new(MockSessionFactory::default()),
+                Arc::new(NoopPlane),
+                Arc::new(TierCell::default()),
+                DisaggConfig::default(),
+                None,
+            );
+        let stored = ops
+            .pulled_bundle_ready
+            .as_ref()
+            .expect("the handed observer must be stored");
+        assert!(
+            Arc::ptr_eq(stored, &observer),
+            "the handed observer must be stored verbatim"
+        );
+        assert!(ops.disagg.is_some(), "and must not displace a capability");
+        stored(&BTreeMap::new());
+        assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        assert!(
+            RemoteOps::default().pulled_bundle_ready.is_none(),
+            "an engine observes nothing by default"
+        );
     }
 
     /// The production constructor stores every transport it is handed —

@@ -74,6 +74,14 @@ impl BundlePullTarget for LocalConnectorEngine {
             }
             BundleAdvertisement::validate_lineages(&identity, key, &advertisement_lineages)?;
             let resource_ids = bundle.resource_ids().collect();
+            // Snapshot the lineage for the residency observer before the bundle
+            // moves into the materializer. Only when one is installed: the
+            // clone is per-pull and the default engine has no observer.
+            let observed_lineages = engine
+                .pulled_bundle_ready
+                .get()
+                .map(|_| bundle.lineages().clone());
+            let mut published = false;
             {
                 engine
                     .bundle_catalog
@@ -85,8 +93,24 @@ impl BundlePullTarget for LocalConnectorEngine {
                         generation,
                         resource_ids,
                         dependency_lineages,
-                        || bundle.publish(),
+                        || {
+                            published = true;
+                            bundle.publish()
+                        },
                     )?;
+            }
+            // Fired here, not inside the materializer, and only if the
+            // materializer actually ran. `commit_materialized` returns `Ok`
+            // without publishing on the idempotent arm, and it can still fail
+            // ahead of the closure — announcing Ready in either case would be
+            // over-reporting residency, which is the one direction this stream
+            // must never fail in. Firing outside the closure also keeps a
+            // caller-supplied callback off the bundle-catalog lock.
+            if let (Some(observer), Some(lineages)) =
+                (engine.pulled_bundle_ready.get(), observed_lineages)
+                && published
+            {
+                observer(&lineages);
             }
             engine.queue_directory_update(BundleDirectoryUpdate::Advertise {
                 identity,
