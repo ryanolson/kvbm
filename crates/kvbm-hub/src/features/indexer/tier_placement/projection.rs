@@ -22,7 +22,7 @@
 //! one entry per publisher restart, which a crash-looping publisher turns into
 //! unbounded growth. The epoch lives inside the entry.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -80,12 +80,29 @@ type PlacementKey = (SequenceHash, LogicalResourceId, u8, TierDepth);
 /// delta sealed before a snapshot carries the older generation and is discarded
 /// as stale, and a delta sealed after it speaks for post-snapshot truth, so no
 /// reordering can cross the install boundary and no tombstone needs to.
+/// # Why the depth set exists
+///
+/// A reader knows the hash, the resource and the lane; it does **not** know the
+/// depth, which is the fourth component of the key. Without something standing
+/// in for it, answering one hash means iterating the whole ready map — up to
+/// `max_ready_per_instance` (1 Mi) entries per instance, per single-hash lookup,
+/// under the read lock. `depths` supplies the missing component, so a read is a
+/// handful of hash lookups instead.
+///
+/// It is a monotone superset by design: `apply_remove` never withdraws a depth.
+/// A stale member costs one wasted lookup that finds nothing, which cannot make
+/// a read wrong, and it is bounded twice over — by the `u8` depth space, and by
+/// the replace-all install that rebuilds it. Refcounting it exactly would buy
+/// nothing and would add a counter that could drift out of step with the map it
+/// describes.
 #[derive(Debug, Default)]
 struct PlacementSet {
     ready: HashMap<PlacementKey, ReadyRecord>,
     /// Highest generation a `Remove` has spoken for at a key whose Ready is
     /// gone.
     tombstones: HashMap<PlacementKey, u64>,
+    /// Ascending superset of the depths the live records use.
+    depths: BTreeSet<TierDepth>,
 }
 
 impl PlacementSet {
@@ -97,6 +114,20 @@ impl PlacementSet {
     fn clear(&mut self) {
         self.ready.clear();
         self.tombstones.clear();
+        self.depths.clear();
+    }
+
+    /// Live records for one `(hash, resource, lane)`, shallowest depth first.
+    fn at_scope(
+        &self,
+        hash: SequenceHash,
+        scope: PlacementScope,
+    ) -> impl Iterator<Item = (TierDepth, &ReadyRecord)> {
+        self.depths.iter().filter_map(move |tier| {
+            self.ready
+                .get(&(hash, scope.resource, scope.lane, *tier))
+                .map(|record| (*tier, record))
+        })
     }
 
     /// Apply a `Ready` at `generation`, honouring both order rules.
@@ -126,6 +157,7 @@ impl PlacementSet {
             return;
         }
         self.tombstones.remove(&key);
+        self.depths.insert(key.3);
         self.ready.insert(key, record);
     }
 
@@ -519,6 +551,17 @@ impl TierPlacementProjection {
     /// because there is no other public way to see a ready record.
     ///
     /// Sorted by depth then instance so a caller's tie-break is deterministic.
+    ///
+    /// # Cost
+    ///
+    /// A few hash lookups per projection, via
+    /// [`PlacementSet::at_scope`] — not a scan of any ready map. What remains
+    /// linear is the number of `(cache, instance)` entries, because the outer map
+    /// is keyed on the pair and a cache cannot narrow it. That factor is bounded
+    /// by `max_instances` (4096) and is the fleet size, unlike the ready-set size
+    /// it replaced, which was bounded only by `max_ready_per_instance` (1 Mi).
+    /// If a deployment ever makes 4096 lookups per candidate block matter, the
+    /// next step is a per-cache index, not a bigger scan.
     #[must_use]
     pub fn holders(
         &self,
@@ -535,14 +578,10 @@ impl TierPlacementProjection {
             .flat_map(|((_, instance), projection)| {
                 projection
                     .placements
-                    .ready
-                    .iter()
-                    .filter(move |((key_hash, resource, lane, _), _)| {
-                        *key_hash == hash && *resource == scope.resource && *lane == scope.lane
-                    })
-                    .map(move |((_, _, _, tier), record)| TierPlacementHolder {
+                    .at_scope(hash, scope)
+                    .map(move |(tier, record)| TierPlacementHolder {
                         instance: *instance,
-                        tier: *tier,
+                        tier,
                         placement: record.placement,
                         generation: record.generation,
                         observed_at_unix_ms: record.observed_at_unix_ms,
@@ -559,6 +598,11 @@ impl TierPlacementProjection {
 
     /// The shallowest depth at which `instance` holds `hash` Ready, or `None`
     /// when the projection is invalid or does not hold it.
+    ///
+    /// Answered from that instance's entry alone. Deriving it from
+    /// [`Self::holders`] would run the whole cross-instance walk to answer a
+    /// single-instance question, and the depth set already iterates ascending, so
+    /// the first hit *is* the shallowest.
     #[must_use]
     pub fn ready_placement(
         &self,
@@ -567,9 +611,24 @@ impl TierPlacementProjection {
         scope: PlacementScope,
         hash: SequenceHash,
     ) -> Option<TierPlacementHolder> {
-        self.holders(cache, scope, hash)
-            .into_iter()
-            .find(|holder| holder.instance == instance)
+        let state = self.state.read().ok()?;
+        let projection = state.get(&(cache, instance))?;
+        // Same `valid` gate as `holders`, and for the same reason: there must be
+        // no public path from a lost delta to "we told a caller a copy exists".
+        if !projection.valid {
+            return None;
+        }
+        projection
+            .placements
+            .at_scope(hash, scope)
+            .next()
+            .map(|(tier, record)| TierPlacementHolder {
+                instance,
+                tier,
+                placement: record.placement,
+                generation: record.generation,
+                observed_at_unix_ms: record.observed_at_unix_ms,
+            })
     }
 
     /// Drop every projection for `instance`, across every cache.
@@ -711,6 +770,7 @@ impl TierPlacementProjection {
             manifests.insert(manifest.manifest_id, manifest.lineage()?);
         }
         let mut ready: HashMap<PlacementKey, ReadyRecord> = HashMap::new();
+        let mut depths: BTreeSet<TierDepth> = BTreeSet::new();
         for entry in &snapshot.entries {
             let KeyRange::Hashes(hashes) = &entry.keys else {
                 // Unreachable after `validate()`; kept as a hard floor rather
@@ -735,6 +795,7 @@ impl TierPlacementProjection {
                         observed_at_unix_ms: now,
                     },
                 );
+                depths.insert(entry.tier);
             }
         }
 
@@ -783,6 +844,7 @@ impl TierPlacementProjection {
         projection.placements = PlacementSet {
             ready,
             tombstones: HashMap::new(),
+            depths,
         };
         projection.installed_generation = snapshot.snapshot_generation;
         projection.last_seq = snapshot.seq_floor;

@@ -1273,6 +1273,138 @@ fn ready_placement_answers_for_one_instance_only_and_respects_validity() {
     );
 }
 
+/// The reader supplies hash, resource and lane; depth is the fourth key
+/// component and it does not have one. The projection's depth set stands in for
+/// it, and it is deliberately a monotone *superset* — `Remove` never withdraws a
+/// depth.
+///
+/// So the property to pin is that a member with no records behind it is inert:
+/// it costs a lookup that finds nothing and cannot make an answer wrong, in
+/// either direction.
+#[test]
+fn the_depth_index_is_a_superset_that_never_changes_an_answer() {
+    let harness = Harness::new();
+    let keys = chain(2);
+    harness.install(&harness.snapshot(1, 0, Vec::new()));
+
+    harness.projection.apply_delta(&harness.batch(
+        1,
+        1,
+        vec![ready(G2, 1, vec![keys[0]]), ready(G3, 1, vec![keys[0]])],
+    ));
+    assert_eq!(
+        harness
+            .projection
+            .holders(harness.cache, scope(RESOURCE), keys[0])
+            .len(),
+        2
+    );
+
+    // Emptying a depth leaves it in the index. The answers must not notice.
+    harness
+        .projection
+        .apply_delta(&harness.batch(2, 1, vec![remove(G3, 1, vec![keys[0]])]));
+    let holders = harness
+        .projection
+        .holders(harness.cache, scope(RESOURCE), keys[0]);
+    assert_eq!(holders.len(), 1);
+    assert_eq!(holders[0].tier, G2);
+    assert_eq!(
+        harness
+            .projection
+            .ready_placement(harness.cache, harness.instance, scope(RESOURCE), keys[0])
+            .expect("still a holder at G2")
+            .tier,
+        G2
+    );
+
+    // A key that never existed at any depth answers nothing, however many
+    // depths the index carries.
+    assert!(!harness.holds(keys[1]));
+    // Nor does another scope pick up this key's records.
+    assert!(
+        harness
+            .projection
+            .holders(harness.cache, scope(OTHER_RESOURCE), keys[0])
+            .is_empty()
+    );
+    assert!(
+        harness
+            .projection
+            .holders(
+                harness.cache,
+                PlacementScope {
+                    resource: RESOURCE,
+                    lane: 1
+                },
+                keys[0]
+            )
+            .is_empty()
+    );
+
+    // And a depth can come back without a reinstall.
+    harness
+        .projection
+        .apply_delta(&harness.batch(3, 1, vec![ready(G3, 2, vec![keys[0]])]));
+    assert_eq!(
+        harness
+            .projection
+            .holders(harness.cache, scope(RESOURCE), keys[0])
+            .len(),
+        2
+    );
+}
+
+/// A single-hash read must not cost the ready set.
+///
+/// A wall-clock assertion, which normally earns a flaky test — this one is
+/// defensible because the margin is four orders of magnitude, not two. The
+/// lookup loop is ~1 ms with the depth index (each read is one outer-map visit,
+/// one depth, one hash lookup) against a 5 s budget. Restoring the scan this
+/// replaced was measured at 15.7 s for exactly this loop, so the test fails on
+/// the regression and has ~10,000x headroom on a loaded machine.
+///
+/// Worth an explicit gate because the cost is invisible from the outside: a
+/// scan-based read is *correct*, just quadratic in fleet size x ready set, and
+/// CT-2a calls this once per candidate block with the read lock held.
+#[test]
+fn a_single_hash_read_does_not_scan_the_ready_set() {
+    const READY: usize = 100_000;
+    const LOOKUPS: usize = 5_000;
+    const BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+    let harness = Harness::new();
+    let keys = chain(READY);
+    harness.install(&harness.snapshot(1, 0, vec![entry(G2, 1, keys.clone())]));
+
+    let started = std::time::Instant::now();
+    for index in 0..LOOKUPS {
+        let hash = keys[index * (READY / LOOKUPS)];
+        let holders = harness
+            .projection
+            .holders(harness.cache, scope(RESOURCE), hash);
+        assert_eq!(holders.len(), 1);
+        assert_eq!(holders[0].tier, G2);
+    }
+    // A miss is the same cost and the same answer.
+    assert!(
+        harness
+            .projection
+            .holders(
+                harness.cache,
+                scope(RESOURCE),
+                SequenceHash::root(0xDEAD_BEEF)
+            )
+            .is_empty()
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < BUDGET,
+        "{LOOKUPS} single-hash reads over {READY} ready records took {elapsed:?}; \
+         the read path is scanning the ready set again"
+    );
+}
+
 #[test]
 fn a_ready_set_beyond_the_guard_empties_the_projection_rather_than_truncating_it() {
     let harness = Harness::with_limits(ProjectionLimits {
