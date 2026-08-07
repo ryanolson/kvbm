@@ -1044,6 +1044,55 @@ fn a_re_push_at_the_installed_generation_un_sticks_an_invalid_projection() {
 }
 
 #[test]
+fn a_delta_that_outruns_its_snapshot_heals_when_the_snapshot_lands() {
+    // Deltas ride the fast lossy plane and snapshots the reliable slow one, so
+    // after every periodic push the new generation's deltas routinely arrive
+    // first. The projection is empty for that window and then heals — asserted
+    // here rather than reasoned about, because the difference between "heals"
+    // and "stuck" is the difference between lost reuse and a permanent outage.
+    let harness = Harness::new();
+    let keys = chain(3);
+    harness.install(&harness.snapshot(1, 0, vec![entry(G2, 1, vec![keys[0]])]));
+
+    // The publisher snapshotted (generation 2) and its next delta beats the
+    // HTTP push to the hub.
+    harness.tick();
+    assert_eq!(
+        harness
+            .projection
+            .apply_delta(&harness.batch(1, 2, vec![ready(G2, 1, vec![keys[1]])])),
+        DeltaOutcome::Invalidated(InvalidationReason::GenerationAhead)
+    );
+    assert!(!harness.holds(keys[0]), "empty for the window");
+
+    // The three counters an operator watches: a projection that never heals
+    // shows these climbing while `snapshots_installed` stays flat.
+    let counters = harness.projection.counters();
+    assert_eq!(
+        counters
+            .invalidated_generation_ahead
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(counters.snapshot_requests.load(Ordering::Relaxed), 1);
+    let installed_before = counters.snapshots_installed.load(Ordering::Relaxed);
+
+    // The push lands and the window closes.
+    harness.install(&harness.snapshot(2, 0, vec![entry(G2, 1, vec![keys[2]])]));
+    assert!(harness.holds(keys[2]));
+    assert_eq!(
+        counters.snapshots_installed.load(Ordering::Relaxed),
+        installed_before + 1
+    );
+    assert_eq!(
+        harness
+            .projection
+            .apply_delta(&harness.batch(1, 2, vec![ready(G2, 1, vec![keys[1]])])),
+        DeltaOutcome::Applied { seq: 1, ready: 2 }
+    );
+}
+
+#[test]
 fn a_snapshot_carrying_a_manifest_interval_is_refused() {
     let harness = Harness::new();
     let mut inexact = harness.snapshot(1, 0, Vec::new());

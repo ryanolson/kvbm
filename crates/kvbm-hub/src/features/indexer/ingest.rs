@@ -101,19 +101,8 @@ pub async fn run_ingest_loop(mut sub: Subscribe, sinks: IngestSinks, cancel: Can
                         tracing::trace!("indexer: empty multipart, skipping");
                         continue;
                     };
-                    // A single-frame message carries no topic. Every publisher
-                    // in this tree prepends one, but the pre-dispatch loop
-                    // decoded whatever it got as legacy, so an untopiced frame
-                    // keeps that meaning rather than silently becoming an
-                    // unknown-topic drop. It cannot be confused with a tier
-                    // frame: those always carry their subject.
-                    let topic = match multipart.iter().next() {
-                        Some(topic) if multipart.len() > 1 => topic,
-                        _ => {
-                            sinks.counters.legacy_untopiced.fetch_add(1, Ordering::Relaxed);
-                            LEGACY_INDEX_SUBJECT.as_bytes()
-                        }
-                    };
+                    let first = multipart.iter().next().map(|frame| &**frame);
+                    let topic = topic_of(&sinks, multipart.len(), first);
                     dispatch(&sinks, topic, payload);
                 }
                 Some(Err(e)) => {
@@ -127,6 +116,27 @@ pub async fn run_ingest_loop(mut sub: Subscribe, sinks: IngestSinks, cancel: Can
         }
     }
     tracing::info!("indexer ingest loop stopped");
+}
+
+/// Pick the topic a multipart message should be routed under.
+///
+/// A single-frame message carries no topic. Every publisher in this tree
+/// prepends one, but the pre-dispatch loop decoded whatever it received as
+/// legacy, so an untopiced frame keeps that meaning rather than silently
+/// becoming an unknown-topic drop. It cannot be mistaken for a tier frame: those
+/// always carry their subject, and the cross-decode tests in `kvbm-logical`
+/// prove neither stream decodes as the other regardless.
+fn topic_of<'a>(sinks: &IngestSinks, frames: usize, first: Option<&'a [u8]>) -> &'a [u8] {
+    match first {
+        Some(topic) if frames > 1 => topic,
+        _ => {
+            sinks
+                .counters
+                .legacy_untopiced
+                .fetch_add(1, Ordering::Relaxed);
+            LEGACY_INDEX_SUBJECT.as_bytes()
+        }
+    }
 }
 
 /// Route one frame by topic. Split out from the loop so the dispatch table is
@@ -311,6 +321,31 @@ mod tests {
         assert_eq!(sinks.counters.tier_undecodable.load(Ordering::Relaxed), 1);
 
         assert_eq!(sinks.counters.tier_accepted.load(Ordering::Relaxed), 0);
+    }
+
+    /// Every publisher in this tree prepends a topic frame, so this path is
+    /// defensive — but it is the one behaviour the dispatch could silently
+    /// change, so it is pinned rather than assumed. `topic_of` is the loop's
+    /// own selection logic, exercised without a socket.
+    #[test]
+    fn an_untopiced_frame_keeps_its_pre_dispatch_legacy_meaning() {
+        let instance = InstanceId::new_v4();
+        let sinks = sinks(instance);
+        let hash = SequenceHash::root(3);
+        let payload = legacy_payload(instance, hash);
+
+        let topic = topic_of(&sinks, 1, None);
+        assert_eq!(topic, LEGACY_INDEX_SUBJECT.as_bytes());
+        assert_eq!(sinks.counters.legacy_untopiced.load(Ordering::Relaxed), 1);
+        dispatch(&sinks, topic, &payload);
+        assert!(sinks.index.query(&[hash]).is_some());
+
+        // A two-frame message uses its topic, and does not count as untopiced.
+        assert_eq!(
+            topic_of(&sinks, 2, Some(TIER_PLACEMENT_SUBJECT.as_bytes())),
+            TIER_PLACEMENT_SUBJECT.as_bytes()
+        );
+        assert_eq!(sinks.counters.legacy_untopiced.load(Ordering::Relaxed), 1);
     }
 
     /// Misrouting must be loud, not silently corrupting. A tier frame delivered

@@ -42,6 +42,26 @@
 //! `Tier*`: it is `TierPlacement*` / `tier_placement` throughout, so no reader
 //! mistakes a placement record for breaker state.
 //!
+//! # The periodic-push window (known property, publisher-owned)
+//!
+//! Every snapshot bumps the generation, so the deltas that follow one carry a
+//! generation the hub has not installed until the snapshot's HTTP call lands.
+//! Deltas travel the fast lossy plane and snapshots the reliable slow one, so
+//! the deltas routinely win the race: the projection sees `GenerationAhead`,
+//! invalidates, requests, and answers empty until the snapshot installs. That
+//! is correct — it is a temporary miss, and the state it would otherwise serve
+//! genuinely predates a snapshot it has not seen — but it means a projection is
+//! briefly empty after *every* periodic push, not only after a loss.
+//!
+//! The window is bounded by the publisher's push latency, and the push cadence
+//! is publisher-side (CT-2). One failure mode is *not* bounded: if a publisher's
+//! snapshot pushes keep failing while its deltas keep flowing, the projection
+//! never recovers. That is visible rather than silent —
+//! `invalidated_generation_ahead` and `snapshot_requests` climb while
+//! `snapshots_installed` stays flat, and those three together are the signal to
+//! alert on. A projection stuck this way answers empty, never stale, so the cost
+//! is lost reuse rather than a bad transfer.
+//!
 //! # Trust
 //!
 //! The delta plane is unauthenticated (the same trust level as the legacy index
