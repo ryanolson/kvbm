@@ -394,6 +394,23 @@ impl FeatureManager for IndexerManager {
         self.bundle_directory
             .bind_owner_registration(instance_id, registration_epoch, incarnation)
             .map_err(anyhow::Error::from)?;
+        // Drop the advisory projection at every registration commit, not only at
+        // `on_unregister`. A publisher that restarts and re-registers under the
+        // *same* instance id with an unchanged feature set never reaches
+        // `on_unregister` (the registration transaction fires it only for
+        // features present before and absent now), so without this the previous
+        // process lifetime's Ready set would keep answering `valid` under a new
+        // `RegistrationEpoch` — an unbounded stale success across every restart
+        // that reuses its id. Self-healing on the next epoch-stamped delta is not
+        // a substitute: a publisher that has not yet emitted a placement change,
+        // or that runs with the tier stream off, would never emit one.
+        //
+        // Unconditional on purpose. A first registration has nothing to drop, a
+        // re-registration without the feature is already covered by
+        // `on_unregister`, and dropping advisory state is always safe — including
+        // on the rollback path, where the publisher will push a snapshot for
+        // whichever epoch it ends up holding.
+        self.tier_placements.remove_instance(instance_id);
         Ok(())
     }
 
@@ -584,6 +601,108 @@ mod tests {
             BundleQueryOutcome::Miss(BundleQueryMissReason::NotFound)
         );
         assert!(manager.instances_response().instances.is_empty());
+    }
+
+    /// A publisher that restarts and re-registers under the *same* instance id
+    /// with an unchanged feature set never reaches `on_unregister` — the
+    /// registration transaction fires that only for features present before and
+    /// absent now. So the advisory projection has to be dropped on the
+    /// registration commit, or the dead process lifetime's Ready set keeps
+    /// answering `valid` under a brand-new `RegistrationEpoch`: an unbounded
+    /// stale success across every restart that reuses its id.
+    ///
+    /// Routed through `IndexerManager` rather than the projection directly,
+    /// because the bug was in the lifecycle wiring, not in the projection.
+    #[tokio::test]
+    async fn re_registering_the_same_instance_drops_its_tier_placement_projection() {
+        use kvbm_protocols::tier_protocol::{KeyRange, PhysicalPlacementMode};
+        use kvbm_protocols::tier_protocol::{
+            PlacementScope, TIER_MEDIUM_CAP_DIRECT_SERVABLE, TIER_PLACEMENT_SCHEMA_VERSION,
+            TierDepth, TierMedium, TierPlacementEntry, TierPlacementSnapshotV1,
+        };
+
+        let manager = IndexerManager::new(128, 4, None, None).unwrap();
+        let owner = InstanceId::new_v4();
+        let feature = Feature::Indexer(Default::default());
+        manager.on_register(owner, &feature).await.unwrap();
+
+        let cache = CacheManifestId::from_bytes([7; 32]);
+        let resource = LogicalResourceId(1);
+        let hash = SequenceHash::root(1);
+        let epoch = crate::features::indexer::bundle::test_registration_epoch(owner);
+        let tier = TierDepth(1);
+        manager
+            .tier_placements()
+            .install_snapshot(
+                &TierPlacementSnapshotV1 {
+                    v: TIER_PLACEMENT_SCHEMA_VERSION,
+                    cache,
+                    instance_id: owner,
+                    registration_epoch: epoch,
+                    snapshot_generation: 1,
+                    seq_floor: 0,
+                    media: vec![TierMedium {
+                        depth: tier,
+                        medium: "pinned-host".to_string(),
+                        capabilities: TIER_MEDIUM_CAP_DIRECT_SERVABLE,
+                    }],
+                    manifests: Vec::new(),
+                    entries: vec![TierPlacementEntry {
+                        scope: PlacementScope::unitary(resource),
+                        tier,
+                        placement: PhysicalPlacementMode::Whole,
+                        generation: 1,
+                        keys: KeyRange::Hashes(vec![hash]),
+                    }],
+                },
+                epoch,
+            )
+            .expect("installs");
+        assert!(
+            !manager
+                .tier_placements()
+                .holders(cache, PlacementScope::unitary(resource), hash)
+                .is_empty()
+        );
+
+        // Re-register: same id, same feature set, new epoch. `on_unregister`
+        // does not fire on this path.
+        let replacement_epoch = RegistrationEpoch::new();
+        let incarnation = crate::registry::RegistryIncarnation::from_u64(2);
+        manager
+            .stage_registration(
+                owner,
+                &MutationCredential::generate(),
+                replacement_epoch,
+                true,
+            )
+            .unwrap();
+        manager
+            .commit_registration(
+                owner,
+                &MutationCredential::generate(),
+                replacement_epoch,
+                incarnation,
+                true,
+            )
+            .unwrap();
+        manager
+            .bundle_directory
+            .finalize_owner_registration(owner, incarnation)
+            .unwrap();
+        manager.on_register(owner, &feature).await.unwrap();
+
+        assert!(
+            !manager.tier_placements().is_valid(cache, owner),
+            "the previous lifetime's projection must not survive a re-registration"
+        );
+        assert!(
+            manager
+                .tier_placements()
+                .holders(cache, PlacementScope::unitary(resource), hash)
+                .is_empty(),
+            "and it must not still be answering"
+        );
     }
 
     /// The router split is a security boundary, so it is asserted by routing a

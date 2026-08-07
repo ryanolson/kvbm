@@ -22,6 +22,25 @@ use super::{
     TierPlacementSnapshotV1,
 };
 
+/// Outcome of sealing a delta batch.
+///
+/// A plain `Result` cannot express "not now, ask again": deferral is not an
+/// error, and adding a variant to [`TierPlacementError`] would put a
+/// flow-control state into a wire-rejection type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SealOutcome {
+    /// Sealed and ready to publish.
+    Batch(TierPlacementBatchV1),
+    /// A snapshot is sealed but not yet acknowledged installed, so no sequence
+    /// number was consumed and the ops are handed straight back.
+    ///
+    /// The caller must retain them and re-seal **these ops first** after
+    /// [`TierPlacementSequencer::note_snapshot_installed`]; the stream is
+    /// order-preserving, so emitting anything ahead of them would transmit an
+    /// inversion the consumer faithfully applies.
+    Deferred(Vec<TierPlacementOp>),
+}
+
 /// Stamps identity, sequence, and generation onto outbound tier-placement
 /// messages.
 ///
@@ -30,6 +49,26 @@ use super::{
 /// monotone *within* an epoch, and a consumer discards all prior state when the
 /// epoch changes, so restarting the counters is correct rather than merely
 /// tolerated.
+///
+/// # Why sealing a snapshot gates delta emission
+///
+/// A snapshot bumps the generation, and the deltas after it carry the new one.
+/// Snapshots travel the reliable slow plane (HTTP) and deltas the lossy fast one
+/// (ZMQ), so an ungated publisher's first post-snapshot delta routinely beats
+/// its own snapshot to the consumer. The consumer reads that as
+/// `GenerationAhead`, invalidates, and drops it — and the delta is never
+/// retransmitted, because pub/sub has no retransmission. When the snapshot then
+/// installs, the consumer resumes at `seq_floor + 1`, the next real delta is
+/// `seq_floor + 2`, and it gaps. Repeat every push: under sustained emission the
+/// projection is valid only for the instant between an install and the next
+/// delta, which is an availability collapse rather than the bounded window R7b
+/// §3 intends.
+///
+/// So [`Self::snapshot`] arms a gate and [`Self::seal`] defers until
+/// [`Self::note_snapshot_installed`] confirms the install landed. This is the
+/// publisher half of the contract; it does not change how a consumer behaves
+/// against a publisher that ignores it (that case still degrades to empty
+/// answers, never to stale ones).
 #[derive(Debug, Clone)]
 pub struct TierPlacementSequencer {
     cache: CacheManifestId,
@@ -37,6 +76,8 @@ pub struct TierPlacementSequencer {
     registration_epoch: RegistrationEpoch,
     snapshot_generation: u64,
     next_seq: u64,
+    /// Generation of a sealed-but-unacknowledged snapshot.
+    pending_install: Option<u64>,
 }
 
 impl TierPlacementSequencer {
@@ -57,6 +98,7 @@ impl TierPlacementSequencer {
             registration_epoch,
             snapshot_generation: 0,
             next_seq: 1,
+            pending_install: None,
         }
     }
 
@@ -90,16 +132,40 @@ impl TierPlacementSequencer {
         self.next_seq - 1
     }
 
+    /// Whether a sealed snapshot is still waiting to be acknowledged installed.
+    ///
+    /// While this is true, [`Self::seal`] defers every batch.
+    #[must_use]
+    pub const fn awaiting_snapshot_install(&self) -> bool {
+        self.pending_install.is_some()
+    }
+
+    /// Record that the consumer installed the snapshot at `installed_generation`,
+    /// releasing delta emission.
+    ///
+    /// Feed it the hub's `TierPlacementSnapshotResponse::installed_generation`.
+    /// Returns whether this released the gate; a stale or mismatched
+    /// acknowledgement leaves it armed, so a lost or superseded push cannot let
+    /// deltas outrun the state they describe.
+    pub fn note_snapshot_installed(&mut self, installed_generation: u64) -> bool {
+        if self.pending_install == Some(installed_generation) {
+            self.pending_install = None;
+            return true;
+        }
+        false
+    }
+
     /// Seal a delta batch.
     ///
     /// The sequence number is consumed **only on success**: a batch rejected by
     /// `validate()` never reaches the wire, so consuming its number would
     /// manufacture a gap the consumer would then recover from, turning a local
-    /// publisher bug into fleet-wide snapshot traffic.
-    pub fn seal(
-        &mut self,
-        ops: Vec<TierPlacementOp>,
-    ) -> Result<TierPlacementBatchV1, TierPlacementError> {
+    /// publisher bug into fleet-wide snapshot traffic. Deferral consumes nothing
+    /// either, for the same reason.
+    pub fn seal(&mut self, ops: Vec<TierPlacementOp>) -> Result<SealOutcome, TierPlacementError> {
+        if self.awaiting_snapshot_install() {
+            return Ok(SealOutcome::Deferred(ops));
+        }
         let batch = TierPlacementBatchV1 {
             v: TIER_PLACEMENT_SCHEMA_VERSION,
             cache: self.cache,
@@ -111,7 +177,7 @@ impl TierPlacementSequencer {
         };
         batch.validate()?;
         self.next_seq += 1;
-        Ok(batch)
+        Ok(SealOutcome::Batch(batch))
     }
 
     /// Seal a full snapshot, bumping the generation.
@@ -124,6 +190,13 @@ impl TierPlacementSequencer {
     /// `manifests` are the lineage chains subsequent deltas may address with
     /// [`KeyRange::ManifestInterval`](super::KeyRange::ManifestInterval). A
     /// publisher that always sends exact hashes passes an empty vector.
+    ///
+    /// On success the emission gate arms: [`Self::seal`] defers until
+    /// [`Self::note_snapshot_installed`] confirms this generation landed. A
+    /// publisher whose push fails re-pushes *this* snapshot, or seals a fresh one
+    /// (which supersedes it and re-arms at the higher generation); either way
+    /// deltas stay held, because a delta at a generation the consumer has not
+    /// installed is a delta the consumer will drop.
     pub fn snapshot(
         &mut self,
         media: Vec<TierMedium>,
@@ -143,6 +216,7 @@ impl TierPlacementSequencer {
         };
         snapshot.validate()?;
         self.snapshot_generation = snapshot.snapshot_generation;
+        self.pending_install = Some(snapshot.snapshot_generation);
         Ok(snapshot)
     }
 }

@@ -1769,3 +1769,40 @@ fn owner_rotation_cannot_interleave_between_publish_authorization_and_insert() {
         ))
         .unwrap();
 }
+
+/// `requirements` defines the bundle's resource set — "every listed resource is
+/// mandatory" — so a placement for a resource outside it is a claim about
+/// something this advertisement does not describe. It also feeds `ready_tier()`,
+/// which a CT-2a consumer reads as a stage-cost hint, so an unrequired claim is
+/// a cost signal derived from a resource the record does not own.
+#[test]
+fn a_placement_for_an_unrequired_resource_is_refused() {
+    use crate::features::indexer::protocol::ReadyPlacement;
+    use kvbm_protocols::tier_protocol::{PhysicalPlacementMode, TierDepth};
+
+    let directory = directory(1_000);
+    let owner = InstanceId::new_v4();
+    register_owner(&directory, owner);
+    let manifest = CacheManifestId::from_bytes([5; 32]);
+
+    let mut request = advertisement(owner, manifest, 8, 1, 10_000, vec![CSA, HCA, CAPSULE]);
+    request.advertisement.placements = vec![ReadyPlacement {
+        resource: LogicalResourceId(99),
+        lane: 0,
+        tier: TierDepth(1),
+        placement: PhysicalPlacementMode::Whole,
+    }];
+    assert!(matches!(
+        directory.publish(request.clone()),
+        Err(BundleDirectoryError::UnrequiredPlacement { resource, .. })
+            if resource == LogicalResourceId(99)
+    ));
+
+    // Additive-safe in both directions: a required resource is accepted, and a
+    // publisher that predates R7b sends no placements at all.
+    request.advertisement.placements[0].resource = CSA;
+    directory.publish(request.clone()).unwrap();
+    request.advertisement.generation = 2;
+    request.advertisement.placements.clear();
+    directory.publish(request).unwrap();
+}

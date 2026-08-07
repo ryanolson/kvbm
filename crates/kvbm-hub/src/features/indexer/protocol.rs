@@ -203,19 +203,47 @@ pub struct BundleAdvertisementRecord {
 }
 
 impl BundleAdvertisementRecord {
-    /// Shallowest publishable depth this advertisement claims, if any.
+    /// Depth a peer would have to reach to obtain the **whole** bundle, if the
+    /// advertisement claims every resource the bundle requires.
     ///
-    /// Depth 0 (G1) is filtered: it is not a remotely-Ready placement, and R7b
-    /// §1 rule 3 keeps it off the placement stream entirely. A record that only
-    /// claims G1 therefore reports `None`, which is the honest answer for
-    /// "ready at some tier a peer could pull from".
+    /// # Why not simply the shallowest claimed depth
+    ///
+    /// A bundle is only usable with *all* of its required resources, so the
+    /// depth that governs a puller's cost is the deepest one it must reach, not
+    /// the shallowest one it may. Reporting the minimum across all placements
+    /// lets a record whose `PrefixHistory` sits at depth 1 and whose other
+    /// required resource sits at depth 3 advertise `ready_tier = 1`, understating
+    /// the stage cost by two tiers to the CT-2a consumer that reads this as a
+    /// cost hint. So: per required resource, take the shallowest publishable
+    /// depth it is claimed at; the answer is the deepest of those.
+    ///
+    /// Depth 0 (G1) is filtered throughout: it is not a remotely-Ready
+    /// placement, and R7b §1 rule 3 keeps it off the placement stream entirely.
+    ///
+    /// # `None` is overloaded, and deliberately so
+    ///
+    /// It means "no publishable depth can be stated for the whole bundle" —
+    /// which covers both a publisher that predates the field (empty
+    /// `placements`, R7b §5's "unknown, never nowhere") and one that claims some
+    /// resources but not all. Distinguishing them would require the consumer to
+    /// act on a partial claim, and the only safe action on a partial claim is the
+    /// same as on no claim: do not assume a depth.
     #[must_use]
     pub fn ready_tier(&self) -> Option<TierDepth> {
-        self.placements
-            .iter()
-            .map(|placement| placement.tier)
-            .filter(|tier| tier.is_publishable())
-            .min()
+        let mut deepest: Option<TierDepth> = None;
+        for requirement in &self.requirements {
+            let resource = requirement.resource();
+            let shallowest = self
+                .placements
+                .iter()
+                .filter(|placement| placement.resource == resource)
+                .map(|placement| placement.tier)
+                .filter(|tier| tier.is_publishable())
+                .min()?;
+            deepest =
+                Some(deepest.map_or(shallowest, |current: TierDepth| current.max(shallowest)));
+        }
+        deepest
     }
 }
 
@@ -449,35 +477,67 @@ mod tests {
         assert_eq!(decoded.lease_expires_at_unix_ms, 2_000);
     }
 
+    /// `ResourceRequirement`'s own contract is "every listed resource is
+    /// mandatory", so the depth that governs a puller's cost is the deepest one
+    /// it must reach for the whole bundle, not the shallowest one some resource
+    /// happens to sit at.
     #[test]
-    fn ready_tier_is_the_shallowest_publishable_depth() {
+    fn ready_tier_is_the_deepest_depth_the_whole_bundle_requires() {
+        let history = LogicalResourceId(1);
+        let capsule = LogicalResourceId(2);
         let mut advertisement = record();
+        advertisement.requirements = vec![
+            ResourceRequirement::new(history, ResourceRole::PrefixHistory, 4).unwrap(),
+            ResourceRequirement::new(capsule, ResourceRole::BoundaryCapsule, 4).unwrap(),
+        ];
         advertisement.placements = vec![
             ReadyPlacement {
-                resource: LogicalResourceId(1),
+                resource: history,
                 lane: 0,
                 // G1 is not a remotely-Ready placement and R7b §1 rule 3 keeps
-                // it off the stream, so it must not win the minimum.
+                // it off the stream, so it must not win any comparison.
                 tier: TierDepth::G1,
                 placement: PhysicalPlacementMode::Whole,
             },
             ReadyPlacement {
-                resource: LogicalResourceId(1),
+                resource: history,
+                lane: 0,
+                tier: TierDepth(1),
+                placement: PhysicalPlacementMode::Whole,
+            },
+            ReadyPlacement {
+                resource: capsule,
                 lane: 0,
                 tier: TierDepth(3),
                 placement: PhysicalPlacementMode::Whole,
             },
-            ReadyPlacement {
-                resource: LogicalResourceId(2),
-                lane: 1,
-                tier: TierDepth(2),
-                placement: PhysicalPlacementMode::Whole,
-            },
         ];
+        assert_eq!(
+            advertisement.ready_tier(),
+            Some(TierDepth(3)),
+            "the shallowest depth alone would understate the stage cost by two tiers"
+        );
+
+        // Per resource it is still the shallowest: a second, deeper copy of the
+        // capsule does not make the bundle costlier than its cheapest complete
+        // set.
+        advertisement.placements.push(ReadyPlacement {
+            resource: capsule,
+            lane: 0,
+            tier: TierDepth(2),
+            placement: PhysicalPlacementMode::Whole,
+        });
         assert_eq!(advertisement.ready_tier(), Some(TierDepth(2)));
 
+        // A required resource with no publishable placement makes the whole
+        // answer unstatable, not "as good as the resources that are claimed".
+        advertisement
+            .placements
+            .retain(|placement| placement.resource != capsule);
+        assert_eq!(advertisement.ready_tier(), None);
+
         advertisement.placements = vec![ReadyPlacement {
-            resource: LogicalResourceId(1),
+            resource: history,
             lane: 0,
             tier: TierDepth::G1,
             placement: PhysicalPlacementMode::Whole,
@@ -488,6 +548,9 @@ mod tests {
             "a G1-only advertisement is not ready at any pullable tier"
         );
 
+        // Empty is the pre-R7b publisher: "unknown", which reads out the same
+        // way as incomplete — the only safe action on either is to assume no
+        // depth.
         advertisement.placements.clear();
         assert_eq!(advertisement.ready_tier(), None);
     }

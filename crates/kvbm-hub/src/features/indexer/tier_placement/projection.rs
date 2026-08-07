@@ -23,7 +23,6 @@
 //! unbounded growth. The epoch lives inside the entry.
 
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -51,6 +50,101 @@ const DEFAULT_SNAPSHOT_REQUEST_MIN_INTERVAL_MS: u64 = 1_000;
 /// them would let a G3 eviction silently remove the G2 copy.
 type PlacementKey = (SequenceHash, LogicalResourceId, u8, TierDepth);
 
+/// Placements retained for one instance: the live Ready set, plus the removal
+/// tombstones that keep a late `Ready` from resurrecting a copy the publisher
+/// already said is gone.
+///
+/// # Why two maps rather than one `Ready | Removed` record
+///
+/// [`TierPlacementProjection::holders`] reads `ready` and cannot see
+/// `tombstones` at all. With a single map carrying a `Removed` variant, a read
+/// path that forgot one filter would answer with removed copies — precisely the
+/// stale success this module exists to prevent. Splitting them makes that bug
+/// unrepresentable rather than merely tested. It also keeps `ready.len()` the
+/// honest live-placement count for `DeltaOutcome::Applied`.
+///
+/// # The invariant
+///
+/// **A key is in at most one of the two maps.** Ready wins ⇒ tombstone dropped,
+/// record inserted. Remove wins ⇒ record dropped, tombstone raised. A Remove
+/// that *loses* (an older generation than the record it met) writes nothing at
+/// all: a tombstone from a losing Remove would break the invariant and would
+/// suppress the newer Ready that just beat it.
+///
+/// # What bounds the tombstones
+///
+/// They share `max_ready_per_instance` with the live set, so the worst-case
+/// retained state is unchanged and overflow is the same fail-safe (invalidate
+/// and clear, never truncate). Every snapshot install drops them, and R7b §3
+/// makes installs periodic. That is not merely convenient, it is correct: a
+/// delta sealed before a snapshot carries the older generation and is discarded
+/// as stale, and a delta sealed after it speaks for post-snapshot truth, so no
+/// reordering can cross the install boundary and no tombstone needs to.
+#[derive(Debug, Default)]
+struct PlacementSet {
+    ready: HashMap<PlacementKey, ReadyRecord>,
+    /// Highest generation a `Remove` has spoken for at a key whose Ready is
+    /// gone.
+    tombstones: HashMap<PlacementKey, u64>,
+}
+
+impl PlacementSet {
+    /// Total records retained, live and tombstoned, for the capacity guard.
+    fn retained(&self) -> usize {
+        self.ready.len().saturating_add(self.tombstones.len())
+    }
+
+    fn clear(&mut self) {
+        self.ready.clear();
+        self.tombstones.clear();
+    }
+
+    /// Apply a `Ready` at `generation`, honouring both order rules.
+    fn apply_ready(&mut self, key: PlacementKey, generation: u64, record: ReadyRecord) {
+        // A `Remove` already spoke for this key at a generation this `Ready`
+        // does not beat, so the copy is gone and a late `Ready` must not
+        // resurrect it (R7b §7 test 4). Equality loses on purpose: `Remove`
+        // applies `<=` in the other direction, so at one generation the removal
+        // is the final word whichever order the two arrive in. The cost is that
+        // a block evicted and re-offloaded at the *same* bundle generation stays
+        // unadvertised until the next snapshot — a reuse loss deliberately
+        // accepted under "temporary miss, never stale success", and one a
+        // publisher avoids by bumping the generation when it re-offloads.
+        if self
+            .tombstones
+            .get(&key)
+            .is_some_and(|removed| *removed >= generation)
+        {
+            return;
+        }
+        // A late `Ready` cannot overwrite a newer copy either.
+        if self
+            .ready
+            .get(&key)
+            .is_some_and(|existing| existing.generation > generation)
+        {
+            return;
+        }
+        self.tombstones.remove(&key);
+        self.ready.insert(key, record);
+    }
+
+    /// Apply a `Remove` at `generation`.
+    fn apply_remove(&mut self, key: PlacementKey, generation: u64) {
+        // A late invalidation cannot remove a newer copy (R7b §4).
+        if self
+            .ready
+            .get(&key)
+            .is_some_and(|existing| existing.generation > generation)
+        {
+            return;
+        }
+        self.ready.remove(&key);
+        let tombstone = self.tombstones.entry(key).or_insert(generation);
+        *tombstone = (*tombstone).max(generation);
+    }
+}
+
 /// Capacity guards for the projection.
 ///
 /// [`BundleDirectory`](super::super::bundle::BundleDirectory) is fastidious
@@ -64,7 +158,8 @@ pub struct ProjectionLimits {
     /// Maximum `(cache, instance)` entries across the whole projection. A
     /// backstop behind the registered-instance admission gate.
     pub max_instances: usize,
-    /// Maximum Ready placements retained for one instance.
+    /// Maximum placement records retained for one instance, live Ready records
+    /// and removal tombstones together.
     pub max_ready_per_instance: usize,
     /// Maximum lineage manifests retained for one instance.
     pub max_manifests_per_instance: usize,
@@ -125,8 +220,15 @@ pub enum DiscardReason {
     StaleGeneration,
     /// The projection is invalid and waiting for a snapshot.
     AwaitingSnapshot,
-    /// The projection already tracks its maximum number of instances.
-    ProjectionCapacity,
+    /// The projection's state lock is poisoned.
+    ///
+    /// Distinct from [`Self::AwaitingSnapshot`] on purpose: that one is normal
+    /// recovery back-pressure a healthy projection bumps on every delta while it
+    /// waits, and burying an internal fault inside it would make the per-reason
+    /// counters unable to answer the one question they exist for. The snapshot
+    /// path already separates the two ([`TierPlacementProjectionError::Unavailable`],
+    /// surfaced as a 503).
+    Unavailable,
     /// The batch failed [`TierPlacementBatchV1::validate`].
     Rejected(TierPlacementRejection),
 }
@@ -214,8 +316,8 @@ pub struct TierPlacementCounters {
     pub discarded_stale_generation: AtomicU64,
     /// Batches dropped while waiting for a snapshot.
     pub discarded_awaiting_snapshot: AtomicU64,
-    /// Batches dropped because the projection is at its instance capacity.
-    pub discarded_projection_capacity: AtomicU64,
+    /// Batches dropped because the projection's state lock is poisoned.
+    pub discarded_unavailable: AtomicU64,
     /// Batches that failed `validate()` at the projection boundary.
     pub discarded_rejected: AtomicU64,
     /// Snapshot requests actually emitted.
@@ -246,7 +348,7 @@ impl TierPlacementCounters {
             DiscardReason::UnregisteredInstance => &self.discarded_unregistered,
             DiscardReason::StaleGeneration => &self.discarded_stale_generation,
             DiscardReason::AwaitingSnapshot => &self.discarded_awaiting_snapshot,
-            DiscardReason::ProjectionCapacity => &self.discarded_projection_capacity,
+            DiscardReason::Unavailable => &self.discarded_unavailable,
             DiscardReason::Rejected(_) => &self.discarded_rejected,
         };
         counter.fetch_add(1, Ordering::Relaxed);
@@ -275,15 +377,15 @@ struct InstanceProjection {
     installed_generation: u64,
     valid: bool,
     manifests: HashMap<u64, BundleResourceLineage>,
-    ready: HashMap<PlacementKey, ReadyRecord>,
+    placements: PlacementSet,
     snapshot_requested_at_ms: Option<u64>,
 }
 
 impl InstanceProjection {
-    /// Stop answering, keeping the ready map.
+    /// Stop answering, keeping the placement maps.
     ///
-    /// The map is unreadable while invalid, and an install replaces it wholesale
-    /// anyway, so freeing it here would only add allocator churn on a flapping
+    /// They are unreadable while invalid, and an install replaces them wholesale
+    /// anyway, so freeing them here would only add allocator churn on a flapping
     /// link. Capacity overflow is the one case that clears, because there the
     /// size *is* the problem.
     fn invalidate(&mut self) {
@@ -292,7 +394,7 @@ impl InstanceProjection {
 
     fn clear(&mut self) {
         self.valid = false;
-        self.ready.clear();
+        self.placements.clear();
         self.manifests.clear();
     }
 }
@@ -308,7 +410,20 @@ pub struct TierPlacementProjection {
     /// *genuine* instances cannot get an entry — a permanent empty answer rather
     /// than a temporary one. Gating creation on registration bounds the map by
     /// state the hub already authenticates.
+    ///
+    /// This gate bounds the *instance* axis only. The `cache` half of the key is
+    /// publisher-chosen and unauthenticated, which is why a delta never creates
+    /// an entry at all — see [`Self::apply_delta`].
     registered: Arc<RwLock<std::collections::HashSet<InstanceId>>>,
+    /// Rate-limit stamps for snapshot requests triggered by a delta for a
+    /// `(cache, instance)` the projection holds no entry for.
+    ///
+    /// Keyed by instance **alone**. A `(cache, instance)` stamp map would be the
+    /// same unbounded growth the no-create rule closes, since `cache` is
+    /// unauthenticated; the registered-instance set bounds this one, and
+    /// [`Self::remove_instance`] prunes it. The lock is never held together with
+    /// `state`.
+    unknown_request_stamps: RwLock<HashMap<InstanceId, u64>>,
     requester: OnceLock<Arc<dyn SnapshotRequester>>,
     clock: Arc<dyn Fn() -> u64 + Send + Sync>,
     limits: ProjectionLimits,
@@ -331,13 +446,23 @@ impl std::fmt::Debug for TierPlacementProjection {
 }
 
 impl TierPlacementProjection {
-    /// Build a projection sharing `registered` with its owning manager.
+    /// Build a projection sharing `registered` with its owning manager, with the
+    /// default capacity guards.
     #[must_use]
     pub fn new(registered: Arc<RwLock<std::collections::HashSet<InstanceId>>>) -> Self {
+        Self::with_limits(registered, ProjectionLimits::default())
+    }
+
+    /// Build a projection with explicit capacity guards.
+    #[must_use]
+    pub fn with_limits(
+        registered: Arc<RwLock<std::collections::HashSet<InstanceId>>>,
+        limits: ProjectionLimits,
+    ) -> Self {
         Self::with_parts(
             registered,
             Arc::new(super::super::bundle::unix_time_ms),
-            ProjectionLimits::default(),
+            limits,
         )
     }
 
@@ -349,6 +474,7 @@ impl TierPlacementProjection {
         Self {
             state: RwLock::new(HashMap::new()),
             registered,
+            unknown_request_stamps: RwLock::new(HashMap::new()),
             requester: OnceLock::new(),
             clock,
             limits,
@@ -408,6 +534,7 @@ impl TierPlacementProjection {
             .filter(|((entry_cache, _), projection)| *entry_cache == cache && projection.valid)
             .flat_map(|((_, instance), projection)| {
                 projection
+                    .placements
                     .ready
                     .iter()
                     .filter(move |((key_hash, resource, lane, _), _)| {
@@ -454,6 +581,12 @@ impl TierPlacementProjection {
         if let Ok(mut state) = self.state.write() {
             state.retain(|(_, entry_instance), _| *entry_instance != instance);
         }
+        // Pruned separately, and never under the `state` lock: the two are
+        // independent maps and holding both would be the only place in this
+        // module with a lock order to get wrong.
+        if let Ok(mut stamps) = self.unknown_request_stamps.write() {
+            stamps.remove(&instance);
+        }
     }
 
     /// Apply one delta batch.
@@ -481,22 +614,29 @@ impl TierPlacementProjection {
         let now = (self.clock)();
         let key = (batch.cache, batch.instance_id);
         let Ok(mut state) = self.state.write() else {
-            return self.discard(DiscardReason::AwaitingSnapshot);
+            return self.discard(DiscardReason::Unavailable);
         };
 
-        let known = state.contains_key(&key);
-        if !known && state.len() >= self.limits.max_instances {
+        // A delta never *creates* an entry. The registered-instance gate above
+        // bounds the instance axis, but `cache` is the other half of the key and
+        // is publisher-chosen on an unauthenticated plane: creating here would
+        // let one registered instance id plus N forged cache ids fill
+        // `max_instances` with entries that are inert by construction (only an
+        // authorized install writes `installed_epoch`, so they can never become
+        // valid) and that nothing ages out. Genuine caches would then be
+        // permanently unable to get an entry — and the documented recovery path
+        // would be blocked too, because `install_snapshot` refuses at the same
+        // bound. So the map grows only through authorized installs, and its
+        // single job on this path — carrying the request rate-limit stamp — moves
+        // to an instance-keyed side map the registered set already bounds.
+        let Some(projection) = state.get_mut(&key) else {
             drop(state);
-            return self.discard(DiscardReason::ProjectionCapacity);
-        }
-        // A fresh entry deliberately does not adopt `batch.registration_epoch`:
-        // only an authorized snapshot writes `installed_epoch`.
-        let projection = state.entry(key).or_default();
-        let outcome = if known {
-            Self::apply_to(projection, batch, now, &self.limits)
-        } else {
-            DeltaOutcome::Invalidated(InvalidationReason::NoProjection)
+            self.request_unknown_snapshot(batch.cache, batch.instance_id, now);
+            self.counters
+                .record_invalidation(InvalidationReason::NoProjection);
+            return DeltaOutcome::Invalidated(InvalidationReason::NoProjection);
         };
+        let outcome = Self::apply_to(projection, batch, now, &self.limits);
         match outcome {
             DeltaOutcome::Invalidated(reason) => {
                 Self::request_snapshot(
@@ -636,7 +776,14 @@ impl TierPlacementProjection {
         }
 
         projection.manifests = manifests;
-        projection.ready = ready;
+        // Replace-all, tombstones included: a delta sealed before this snapshot
+        // carries the older generation and is discarded as stale, and one sealed
+        // after it speaks for post-snapshot truth, so no reordering can cross
+        // the install boundary for a tombstone to guard against.
+        projection.placements = PlacementSet {
+            ready,
+            tombstones: HashMap::new(),
+        };
         projection.installed_generation = snapshot.snapshot_generation;
         projection.last_seq = snapshot.seq_floor;
         projection.installed_epoch = Some(authorized_epoch);
@@ -664,6 +811,34 @@ impl TierPlacementProjection {
     fn discard(&self, reason: DiscardReason) -> DeltaOutcome {
         self.counters.record_discard(reason);
         DeltaOutcome::Discarded(reason)
+    }
+
+    /// Ask for a snapshot for a `(cache, instance)` the projection holds no
+    /// entry for.
+    ///
+    /// Must be called with the `state` lock released — see
+    /// [`Self::unknown_request_stamps`].
+    fn request_unknown_snapshot(&self, cache: CacheManifestId, instance: InstanceId, now: u64) {
+        let Ok(mut stamps) = self.unknown_request_stamps.write() else {
+            return;
+        };
+        if let Some(last) = stamps.get(&instance)
+            && now.saturating_sub(*last) < self.limits.snapshot_request_min_interval_ms
+        {
+            self.counters
+                .snapshot_requests_suppressed
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        stamps.insert(instance, now);
+        drop(stamps);
+        self.counters
+            .snapshot_requests
+            .fetch_add(1, Ordering::Relaxed);
+        match self.requester.get() {
+            Some(requester) => requester.request(cache, instance),
+            None => UnavailableSnapshotRequester.request(cache, instance),
+        }
     }
 
     fn request_snapshot(
@@ -716,7 +891,14 @@ impl TierPlacementProjection {
             projection.invalidate();
             return DeltaOutcome::Invalidated(InvalidationReason::GenerationAhead);
         }
-        if batch.seq != projection.last_seq.saturating_add(1) {
+        // `checked_add`, not `saturating_add`: at the u64 ceiling a saturating
+        // successor equals `last_seq` itself, so a replayed batch would be
+        // accepted as the next one — an overflow silently converted into a
+        // duplicate application instead of the gap it is. Unreachable in
+        // practice (it needs 2^64 sealed batches from one instance/epoch), but
+        // the arithmetic should not be the thing standing between here and a
+        // duplicate.
+        if projection.last_seq.checked_add(1) != Some(batch.seq) {
             projection.invalidate();
             return DeltaOutcome::Invalidated(InvalidationReason::SequenceGap);
         }
@@ -745,27 +927,15 @@ impl TierPlacementProjection {
                     ..
                 } => {
                     for hash in keys {
-                        let key = (hash, scope.resource, scope.lane, *tier);
-                        match projection.ready.entry(key) {
-                            // A late Ready cannot resurrect an older copy over a
-                            // newer one.
-                            Entry::Occupied(existing)
-                                if existing.get().generation > *generation => {}
-                            Entry::Occupied(mut existing) => {
-                                existing.insert(ReadyRecord {
-                                    generation: *generation,
-                                    placement: *placement,
-                                    observed_at_unix_ms: now,
-                                });
-                            }
-                            Entry::Vacant(slot) => {
-                                slot.insert(ReadyRecord {
-                                    generation: *generation,
-                                    placement: *placement,
-                                    observed_at_unix_ms: now,
-                                });
-                            }
-                        }
+                        projection.placements.apply_ready(
+                            (hash, scope.resource, scope.lane, *tier),
+                            *generation,
+                            ReadyRecord {
+                                generation: *generation,
+                                placement: *placement,
+                                observed_at_unix_ms: now,
+                            },
+                        );
                     }
                 }
                 TierPlacementOp::Remove {
@@ -775,19 +945,15 @@ impl TierPlacementProjection {
                     ..
                 } => {
                     for hash in keys {
-                        let key = (hash, scope.resource, scope.lane, *tier);
-                        // A late invalidation cannot remove a newer copy (§4).
-                        if let Entry::Occupied(existing) = projection.ready.entry(key)
-                            && existing.get().generation <= *generation
-                        {
-                            existing.remove();
-                        }
+                        projection
+                            .placements
+                            .apply_remove((hash, scope.resource, scope.lane, *tier), *generation);
                     }
                 }
             }
         }
 
-        if projection.ready.len() > limits.max_ready_per_instance {
+        if projection.placements.retained() > limits.max_ready_per_instance {
             // The size *is* the problem here, so this is the one invalidation
             // that frees the map.
             projection.clear();
@@ -797,7 +963,7 @@ impl TierPlacementProjection {
         projection.last_seq = batch.seq;
         DeltaOutcome::Applied {
             seq: batch.seq,
-            ready: projection.ready.len(),
+            ready: projection.placements.ready.len(),
         }
     }
 
@@ -808,6 +974,18 @@ impl TierPlacementProjection {
         limits: ProjectionLimits,
     ) -> Self {
         Self::with_parts(registered, clock, limits)
+    }
+
+    /// Poison the state lock, so the tests can assert what a caller sees when it
+    /// is. There is no other way to reach the fault arms, and "an internal fault
+    /// is counted as an internal fault" is exactly the property worth pinning.
+    #[cfg(test)]
+    pub(super) fn poison_state_for_test(&self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = self.state.write().expect("not yet poisoned");
+            panic!("poisoning the projection state lock");
+        }));
+        assert!(self.state.write().is_err(), "lock should be poisoned");
     }
 
     #[cfg(test)]

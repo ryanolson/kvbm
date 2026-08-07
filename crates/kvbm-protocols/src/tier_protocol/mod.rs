@@ -108,7 +108,7 @@ use crate::cache_manifest::{BundleResourceLineage, CacheManifestId, Registration
 
 mod sequencer;
 
-pub use sequencer::TierPlacementSequencer;
+pub use sequencer::{SealOutcome, TierPlacementSequencer};
 
 #[cfg(test)]
 mod tests;
@@ -597,6 +597,10 @@ pub struct TierPlacementSnapshotV1 {
     pub seq_floor: u64,
     /// Medium metadata for every depth referenced by `entries`. This is the
     /// only place medium/capability data travels, and it travels once.
+    ///
+    /// Coverage is enforced, not merely documented:
+    /// [`Self::validate`] rejects a snapshot whose entries name a depth the
+    /// header omits.
     pub media: Vec<TierMedium>,
     /// Lineage manifests this snapshot installs, for later
     /// [`KeyRange::ManifestInterval`] deltas. `#[serde(default)]` so a publisher
@@ -678,6 +682,18 @@ impl TierPlacementSnapshotV1 {
         let mut keys = 0usize;
         for (index, entry) in self.entries.iter().enumerate() {
             entry.validate(index)?;
+            // Every depth the body references must be described by the header.
+            // The snapshot is the *only* place medium/capability metadata
+            // travels (R7b §2), so an undescribed depth leaves the consumer
+            // unable to tell direct-servable from staging-required and forced to
+            // guess a cost — the one thing the header exists to prevent. `seen`
+            // is at most 256 entries (depth is a `u8`), so the scan is bounded.
+            if !seen.contains(&entry.tier) {
+                return Err(TierPlacementError::UndescribedDepth {
+                    index,
+                    depth: entry.tier,
+                });
+            }
             keys = keys.saturating_add(entry.keys.key_count());
         }
         if keys > TIER_PLACEMENT_MAX_KEYS_PER_MESSAGE {
@@ -784,6 +800,16 @@ pub enum TierPlacementError {
         /// The repeated depth.
         depth: TierDepth,
     },
+    /// A snapshot entry names a depth the header did not describe.
+    #[error(
+        "snapshot entry at index {index} names depth {depth}, which the header does not describe"
+    )]
+    UndescribedDepth {
+        /// Index of the offending entry.
+        index: usize,
+        /// The undescribed depth.
+        depth: TierDepth,
+    },
     /// The snapshot header installed the same manifest id twice.
     #[error("snapshot header installs manifest {manifest_id} more than once")]
     DuplicateManifestId {
@@ -823,6 +849,7 @@ impl TierPlacementError {
             | Self::EmptyKeys { .. }
             | Self::IntervalOverflow { .. }
             | Self::DuplicateMediumDepth { .. }
+            | Self::UndescribedDepth { .. }
             | Self::DuplicateManifestId { .. }
             | Self::InvalidManifest { .. }
             | Self::TooLarge { .. } => TierPlacementRejection::Invalid,

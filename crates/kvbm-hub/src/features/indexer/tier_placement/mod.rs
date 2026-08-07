@@ -42,25 +42,41 @@
 //! `Tier*`: it is `TierPlacement*` / `tier_placement` throughout, so no reader
 //! mistakes a placement record for breaker state.
 //!
-//! # The periodic-push window (known property, publisher-owned)
+//! # The periodic-push window, and why the publisher must gate on the ack
 //!
 //! Every snapshot bumps the generation, so the deltas that follow one carry a
 //! generation the hub has not installed until the snapshot's HTTP call lands.
-//! Deltas travel the fast lossy plane and snapshots the reliable slow one, so
-//! the deltas routinely win the race: the projection sees `GenerationAhead`,
-//! invalidates, requests, and answers empty until the snapshot installs. That
-//! is correct — it is a temporary miss, and the state it would otherwise serve
-//! genuinely predates a snapshot it has not seen — but it means a projection is
-//! briefly empty after *every* periodic push, not only after a loss.
+//! Deltas travel the fast lossy plane and snapshots the reliable slow one, so an
+//! ungated publisher's deltas routinely win the race: the projection sees
+//! `GenerationAhead`, invalidates, requests, and answers empty until the
+//! snapshot installs.
 //!
-//! The window is bounded by the publisher's push latency, and the push cadence
-//! is publisher-side (CT-2). One failure mode is *not* bounded: if a publisher's
-//! snapshot pushes keep failing while its deltas keep flowing, the projection
-//! never recovers. That is visible rather than silent —
-//! `invalidated_generation_ahead` and `snapshot_requests` climb while
-//! `snapshots_installed` stays flat, and those three together are the signal to
-//! alert on. A projection stuck this way answers empty, never stale, so the cost
-//! is lost reuse rather than a bad transfer.
+//! It does **not** stop there, and an earlier version of this note wrongly said
+//! the window was bounded by the publisher's push latency. The delta that
+//! outran the snapshot is dropped, and ZMQ pub/sub has no retransmission, so
+//! after the install resumes the projection at `seq_floor + 1` the next real
+//! delta is `seq_floor + 2` and gaps. The publisher then pushes another
+//! snapshot, whose own successor delta outruns it in turn. Under sustained
+//! emission the projection is valid only for the instant between an install and
+//! the next delta — an availability collapse, not a bounded window.
+//!
+//! The fix is publisher-side and lives in
+//! [`TierPlacementSequencer`](kvbm_protocols::tier_protocol::TierPlacementSequencer):
+//! sealing a snapshot arms an emission gate that `seal` honours until
+//! `note_snapshot_installed` confirms the install landed, so the first
+//! post-snapshot delta cannot precede the state it describes. Nothing on the
+//! consumer side changes, and nothing on the consumer side *can* — buffering
+//! future-generation deltas here would contradict replace-all recovery, and
+//! accepting a delta past the resume point would be exactly the silent hole the
+//! sequence rule exists to catch.
+//!
+//! Against a publisher that ignores the gate the degradation is still
+//! fail-safe, and it is visible rather than silent:
+//! `invalidated_generation_ahead` and `invalidated_sequence_gap` climb together
+//! with `snapshot_requests` while `snapshots_installed` lags. The same signature
+//! covers the other unbounded case — snapshot pushes that keep failing while
+//! deltas keep flowing. Either way the projection answers empty, never stale, so
+//! the cost is lost reuse rather than a bad transfer.
 //!
 //! # Trust
 //!
@@ -70,15 +86,33 @@
 //! advisory:
 //!
 //! - `installed_epoch` is written **only** by a credential-authorized snapshot
-//!   install, so a forged batch cannot install an epoch that makes every genuine
-//!   delta mismatch.
-//! - Entry creation is gated on the registered-instance set, so a flood of
-//!   random instance ids cannot fill the map and starve genuine instances.
-//! - Snapshot requests are rate-limited per `(cache, instance)`, so a
-//!   persistently lossy or hostile link cannot amplify each dropped batch into
-//!   an active message.
+//!   install, so a forged batch cannot install an epoch and cannot make itself
+//!   authoritative.
+//! - A delta never creates a map entry. Both halves of the key would otherwise
+//!   need bounding, and only one of them is authenticated: the registered set
+//!   bounds `instance_id`, but `cache` is publisher-chosen, so entry creation on
+//!   the delta path would let one registered id plus N forged cache ids fill the
+//!   map — and starve the snapshot install that is the only route back to valid.
+//!   The map grows through authorized installs alone.
+//! - Snapshot requests are rate-limited, so a persistently lossy or hostile link
+//!   cannot amplify each dropped batch into an active message.
 //! - Every rejection path ends in *empty*. There is no rejection path that ends
 //!   in "serve what we had".
+//!
+//! What these do **not** buy, stated plainly: a forged batch carrying a wrong
+//! [`RegistrationEpoch`] clears an installed projection, and one such packet per
+//! rate-limit window holds it empty for as long as the attacker keeps sending.
+//! That is not a bug to fix here. [`RegistrationEpoch`] is a UUID, so epochs are
+//! unordered and "old" is not a thing the consumer can recognise; and the only
+//! alternative — ignoring mismatched-epoch deltas without clearing — would keep
+//! serving a dead process lifetime's Ready set as *valid* after a genuine
+//! publisher restart, which is the stale success this whole module exists to
+//! prevent. Fail-safe is the correct trade at this trust level, and the tier
+//! stream is strictly better off than the legacy index stream it rides beside,
+//! where a forged frame inserts a false holder outright. Authenticating the
+//! delta plane is the real answer and is a separate design change.
+//!
+//! [`RegistrationEpoch`]: kvbm_protocols::cache_manifest::RegistrationEpoch
 
 use std::sync::Arc;
 

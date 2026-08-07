@@ -406,6 +406,23 @@ impl BundleDirectory {
             &advertisement.requirements,
             &advertisement.lineages,
         )?;
+        // `requirements` defines the bundle's resource set, so a placement for a
+        // resource outside it is a claim about something this advertisement does
+        // not describe — and it feeds `ready_tier()`, which a CT-2a consumer
+        // reads as a stage-cost hint. Rejecting keeps the cost signal derived
+        // only from resources the record actually owns. Additive-safe: a
+        // publisher that predates R7b sends no placements at all.
+        if let Some(placement) = advertisement.placements.iter().find(|placement| {
+            !advertisement
+                .requirements
+                .iter()
+                .any(|requirement| requirement.resource() == placement.resource)
+        }) {
+            return Err(BundleDirectoryError::UnrequiredPlacement {
+                owner: advertisement.owner,
+                resource: placement.resource,
+            });
+        }
         let key = advertisement.key;
         let owner = advertisement.owner;
         let generation = advertisement.generation;
@@ -801,6 +818,13 @@ pub enum BundleDirectoryError {
     UnauthorizedOwner { owner: InstanceId },
     #[error("bundle advertisement does not match owner {owner}'s registration epoch")]
     RegistrationEpochMismatch { owner: InstanceId },
+    #[error(
+        "bundle advertisement from owner {owner} claims a placement for unrequired resource {resource:?}"
+    )]
+    UnrequiredPlacement {
+        owner: InstanceId,
+        resource: kvbm_common::LogicalResourceId,
+    },
     #[error("bundle owner {owner} registration transaction changed")]
     StaleOwnerTransaction { owner: InstanceId },
     #[error("bundle owner {owner} already has a registration transaction in progress")]

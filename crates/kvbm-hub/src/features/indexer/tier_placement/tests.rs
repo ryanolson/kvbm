@@ -17,9 +17,10 @@ use std::sync::{Arc, Mutex, RwLock};
 use kvbm_common::{LogicalResourceId, SequenceHash};
 use kvbm_protocols::cache_manifest::{CacheManifestId, RegistrationEpoch};
 use kvbm_protocols::tier_protocol::{
-    InstanceId, KeyRange, PhysicalPlacementMode, PlacementScope, TIER_MEDIUM_CAP_DIRECT_SERVABLE,
-    TIER_PLACEMENT_SCHEMA_VERSION, TierDepth, TierMedium, TierPlacementBatchV1, TierPlacementEntry,
-    TierPlacementManifest, TierPlacementOp, TierPlacementRejection, TierPlacementSnapshotV1,
+    InstanceId, KeyRange, PhysicalPlacementMode, PlacementScope, SealOutcome,
+    TIER_MEDIUM_CAP_DIRECT_SERVABLE, TIER_PLACEMENT_SCHEMA_VERSION, TierDepth, TierMedium,
+    TierPlacementBatchV1, TierPlacementEntry, TierPlacementManifest, TierPlacementOp,
+    TierPlacementRejection, TierPlacementSequencer, TierPlacementSnapshotV1,
 };
 
 use super::SnapshotRequester;
@@ -117,6 +118,10 @@ impl Harness {
         }
     }
 
+    /// `media` is derived from `entries` rather than fixed: the snapshot header
+    /// must describe every depth its body names, so a hard-coded G2-only header
+    /// would make every multi-depth fixture fail validation for a reason the
+    /// test is not about.
     fn snapshot(
         &self,
         generation: u64,
@@ -130,11 +135,7 @@ impl Harness {
             registration_epoch: self.epoch,
             snapshot_generation: generation,
             seq_floor,
-            media: vec![TierMedium {
-                depth: G2,
-                medium: "pinned-host".to_string(),
-                capabilities: TIER_MEDIUM_CAP_DIRECT_SERVABLE,
-            }],
+            media: media_for(&entries),
             manifests: Vec::new(),
             entries,
         }
@@ -156,6 +157,25 @@ impl Harness {
 
 fn scope(resource: LogicalResourceId) -> PlacementScope {
     PlacementScope::unitary(resource)
+}
+
+/// One medium per depth the entries name.
+///
+/// The snapshot header must describe every depth its body references, so a
+/// hard-coded header would make multi-depth fixtures fail validation for a
+/// reason no test here is about.
+fn media_for(entries: &[TierPlacementEntry]) -> Vec<TierMedium> {
+    let mut media: Vec<TierMedium> = Vec::new();
+    for depth in entries.iter().map(|entry| entry.tier) {
+        if !media.iter().any(|medium| medium.depth == depth) {
+            media.push(TierMedium {
+                depth,
+                medium: "pinned-host".to_string(),
+                capabilities: TIER_MEDIUM_CAP_DIRECT_SERVABLE,
+            });
+        }
+    }
+    media
 }
 
 /// A genuine PLH chain, built from parts so the fixtures depend on neither the
@@ -429,8 +449,9 @@ fn a_remove_cannot_evict_a_newer_ready_and_a_late_ready_cannot_resurrect_one() {
     );
     assert!(!harness.holds(keys[0]));
 
-    // The other direction: a Ready at an older generation cannot resurrect a
-    // copy over a newer record.
+    // The other direction, part one: a Ready at an older generation cannot
+    // *overwrite* a newer record. This is the Occupied case — the record is
+    // still present when the late Ready lands.
     harness
         .projection
         .apply_delta(&harness.batch(4, 1, vec![ready(G2, 7, vec![keys[1]])]));
@@ -445,6 +466,161 @@ fn a_remove_cannot_evict_a_newer_ready_and_a_late_ready_cannot_resurrect_one() {
         holders[0].generation, 7,
         "an older Ready must not overwrite a newer one"
     );
+}
+
+/// R7b §7 test 4, the half the Occupied case above cannot reach: *"late
+/// `Ready(gen=5)` after `Remove(gen=7)` is discarded"*.
+///
+/// Once the Remove has landed the key is absent, so a late Ready meets an empty
+/// slot — and an unconditional insert there resurrects a copy the publisher
+/// already said is gone, which `holders()` then reports as a live holder. That
+/// is a stale success, the one failure this module exists to make impossible.
+///
+/// Both arrival shapes are covered, because they need different things to be
+/// true. The intra-batch one needs no transport reordering at all: R7b §2 lists
+/// several independent emission pipelines (offload commit, the eviction observer
+/// batch, bundle invalidation), the batcher deliberately neither reorders nor
+/// coalesces, so a source-side inversion is transmitted faithfully inside one
+/// batch.
+#[test]
+fn a_late_ready_after_a_remove_cannot_resurrect_the_removed_copy() {
+    let keys = chain(3);
+
+    // Shape 1: one batch carrying the inversion.
+    let harness = Harness::new();
+    harness.install(&harness.snapshot(7, 0, vec![entry(G2, 7, vec![keys[0]])]));
+    assert!(harness.holds(keys[0]));
+    assert_eq!(
+        harness.projection.apply_delta(&harness.batch(
+            1,
+            7,
+            vec![remove(G2, 7, vec![keys[0]]), ready(G2, 5, vec![keys[0]])],
+        )),
+        DeltaOutcome::Applied { seq: 1, ready: 0 }
+    );
+    assert!(
+        !harness.holds(keys[0]),
+        "a Ready older than the Remove that preceded it resurrected the copy"
+    );
+
+    // Shape 2: the inversion split across batches, with the projection observed
+    // in the correct empty state in between.
+    let harness = Harness::new();
+    harness.install(&harness.snapshot(1, 0, Vec::new()));
+    harness
+        .projection
+        .apply_delta(&harness.batch(1, 1, vec![ready(G2, 7, vec![keys[1]])]));
+    harness
+        .projection
+        .apply_delta(&harness.batch(2, 1, vec![remove(G2, 7, vec![keys[1]])]));
+    assert!(!harness.holds(keys[1]));
+    assert_eq!(
+        harness
+            .projection
+            .apply_delta(&harness.batch(3, 1, vec![ready(G2, 5, vec![keys[1]])])),
+        DeltaOutcome::Applied { seq: 3, ready: 0 }
+    );
+    assert!(!harness.holds(keys[1]));
+
+    // Equality loses, matching Remove's `<=` in the other direction: at one
+    // generation the removal is the final word whichever order the two arrive
+    // in. The cost is a re-offload at an unchanged generation staying
+    // unadvertised until the next snapshot — a temporary miss, deliberately
+    // preferred to a possible stale success.
+    assert_eq!(
+        harness
+            .projection
+            .apply_delta(&harness.batch(4, 1, vec![ready(G2, 7, vec![keys[1]])])),
+        DeltaOutcome::Applied { seq: 4, ready: 0 }
+    );
+    assert!(!harness.holds(keys[1]));
+
+    // A genuinely newer copy is not suppressed: the tombstone bounds the past,
+    // it does not close the key.
+    assert_eq!(
+        harness
+            .projection
+            .apply_delta(&harness.batch(5, 1, vec![ready(G2, 8, vec![keys[1]])])),
+        DeltaOutcome::Applied { seq: 5, ready: 1 }
+    );
+    assert!(harness.holds(keys[1]));
+
+    // And the tombstone is gone with it, so a later Remove at a generation the
+    // *record* beats still loses.
+    assert_eq!(
+        harness
+            .projection
+            .apply_delta(&harness.batch(6, 1, vec![remove(G2, 7, vec![keys[1]])])),
+        DeltaOutcome::Applied { seq: 6, ready: 1 }
+    );
+    assert!(harness.holds(keys[1]));
+}
+
+/// A Remove that *loses* must write nothing at all. A tombstone from a losing
+/// Remove would suppress the very Ready that beat it — and would break the
+/// invariant that a key is live or tombstoned, never both.
+#[test]
+fn a_losing_remove_leaves_no_tombstone_behind() {
+    let harness = Harness::new();
+    let keys = chain(2);
+    harness.install(&harness.snapshot(1, 0, Vec::new()));
+
+    harness
+        .projection
+        .apply_delta(&harness.batch(1, 1, vec![ready(G2, 7, vec![keys[0]])]));
+    // Loses against the generation-7 record.
+    harness
+        .projection
+        .apply_delta(&harness.batch(2, 1, vec![remove(G2, 5, vec![keys[0]])]));
+    assert!(harness.holds(keys[0]));
+
+    // A refresh at the same generation must still land — a tombstone at 5 would
+    // have been irrelevant here, but a tombstone at 7 (or one written by the
+    // losing Remove at all) would suppress this.
+    assert_eq!(
+        harness
+            .projection
+            .apply_delta(&harness.batch(3, 1, vec![ready(G2, 7, vec![keys[0]])])),
+        DeltaOutcome::Applied { seq: 3, ready: 1 }
+    );
+    assert!(harness.holds(keys[0]));
+}
+
+/// Tombstones are retained state, so they are inside the capacity guard rather
+/// than beside it, and a snapshot install drops them: a delta sealed before an
+/// install carries the older generation and is discarded as stale, so no
+/// reordering can cross the boundary for a tombstone to guard against.
+#[test]
+fn tombstones_are_bounded_by_the_guard_and_cleared_by_an_install() {
+    let harness = Harness::with_limits(ProjectionLimits {
+        max_ready_per_instance: 4,
+        ..ProjectionLimits::default()
+    });
+    let keys = chain(6);
+    harness.install(&harness.snapshot(1, 0, Vec::new()));
+
+    // Two live records plus two tombstones is exactly the guard.
+    harness.projection.apply_delta(&harness.batch(
+        1,
+        1,
+        vec![
+            ready(G2, 1, keys[0..4].to_vec()),
+            remove(G2, 1, keys[0..2].to_vec()),
+        ],
+    ));
+    assert_eq!(
+        harness
+            .projection
+            .apply_delta(&harness.batch(2, 1, vec![remove(G2, 1, vec![keys[4]])])),
+        DeltaOutcome::Invalidated(InvalidationReason::CapacityExceeded),
+        "tombstones count against the retained-state guard"
+    );
+
+    // The install replaces everything, tombstones included, so the key that was
+    // tombstoned before is servable again from the snapshot body.
+    harness.tick();
+    harness.install(&harness.snapshot(2, 10, vec![entry(G2, 1, vec![keys[0]])]));
+    assert!(harness.holds(keys[0]));
 }
 
 #[test]
@@ -736,7 +912,7 @@ fn snapshot_install_is_atomic_against_a_concurrent_delta() {
             registration_epoch: epoch,
             snapshot_generation: generation,
             seq_floor,
-            media: Vec::new(),
+            media: media_for(&[entry(G2, 1, hashes.clone())]),
             manifests: Vec::new(),
             entries: vec![entry(G2, 1, hashes)],
         };
@@ -850,7 +1026,7 @@ fn a_hub_with_no_transport_stays_invalid_rather_than_serving_stale_state() {
                 registration_epoch: epoch,
                 snapshot_generation: 1,
                 seq_floor: 0,
-                media: Vec::new(),
+                media: media_for(&[entry(G2, 1, vec![keys[0]])]),
                 manifests: Vec::new(),
                 entries: vec![entry(G2, 1, vec![keys[0]])],
             },
@@ -935,6 +1111,166 @@ fn deltas_from_unregistered_instances_are_counted_and_dropped() {
         1
     );
     assert_eq!(harness.requester.count(), 0);
+}
+
+/// The registered-instance gate bounds the *instance* half of the key. `cache`
+/// is the other half, it is publisher-chosen, and the delta plane that carries
+/// it is unauthenticated — so a delta must never create an entry.
+///
+/// If it did, one registered instance id plus N forged cache ids would fill
+/// `max_instances` with entries that are inert by construction (only an
+/// authorized install writes `installed_epoch`, so they can never become valid)
+/// and that nothing ages out. And the damage would outlast the flood: the
+/// snapshot install is the only route back to valid, and it refuses at the same
+/// bound.
+#[test]
+fn forged_cache_ids_neither_fill_the_projection_nor_block_a_genuine_install() {
+    let harness = Harness::with_limits(ProjectionLimits {
+        max_instances: 2,
+        ..ProjectionLimits::default()
+    });
+    let keys = chain(2);
+
+    for byte in 0..8u8 {
+        let mut forged = harness.batch(1, 1, vec![ready(G2, 1, vec![keys[0]])]);
+        forged.cache = CacheManifestId::from_bytes([byte; 32]);
+        forged.registration_epoch = RegistrationEpoch::new();
+        assert_eq!(
+            harness.projection.apply_delta(&forged),
+            DeltaOutcome::Invalidated(InvalidationReason::NoProjection),
+            "a delta for an unknown (cache, instance) reports the miss and creates nothing"
+        );
+    }
+    // And the amplification is bounded too: the request rate limit is keyed on
+    // the instance, which the registered set bounds, not on the forged cache.
+    assert_eq!(harness.requester.count(), 1);
+
+    // The genuine cache installs, past a bound eight forged frames would have
+    // exhausted, and answers.
+    harness.install(&harness.snapshot(1, 0, vec![entry(G2, 1, vec![keys[0]])]));
+    assert!(harness.holds(keys[0]));
+
+    // Deregistration prunes the stamps alongside the projections, so a
+    // re-registered publisher is not silently rate-limited by its predecessor.
+    harness.projection.remove_instance(harness.instance);
+    let mut forged = harness.batch(1, 1, vec![ready(G2, 1, vec![keys[0]])]);
+    forged.cache = CacheManifestId::from_bytes([0; 32]);
+    harness.projection.apply_delta(&forged);
+    assert_eq!(harness.requester.count(), 2);
+}
+
+/// An internal fault must not be counted as normal recovery back-pressure: a
+/// healthy projection bumps `discarded_awaiting_snapshot` on every delta while
+/// it waits for a snapshot, so burying a poisoned lock there would make the
+/// per-reason counters unable to answer the question they exist for.
+#[test]
+fn a_poisoned_state_lock_is_reported_as_unavailable_not_as_back_pressure() {
+    let harness = Harness::new();
+    let keys = chain(1);
+    harness.install(&harness.snapshot(1, 0, vec![entry(G2, 1, vec![keys[0]])]));
+    harness.projection.poison_state_for_test();
+
+    assert_eq!(
+        harness
+            .projection
+            .apply_delta(&harness.batch(1, 1, vec![ready(G2, 1, vec![keys[0]])])),
+        DeltaOutcome::Discarded(DiscardReason::Unavailable)
+    );
+    let counters = harness.projection.counters();
+    assert_eq!(counters.discarded_unavailable.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        counters.discarded_awaiting_snapshot.load(Ordering::Relaxed),
+        0
+    );
+
+    // The install path already separated the two; assert the pair stays
+    // consistent rather than trusting that it does.
+    assert_eq!(
+        harness
+            .projection
+            .install_snapshot(&harness.snapshot(2, 0, Vec::new()), harness.epoch),
+        Err(TierPlacementProjectionError::Unavailable)
+    );
+    // And the read path degrades to empty rather than panicking.
+    assert!(!harness.holds(keys[0]));
+    assert!(!harness.projection.is_valid(harness.cache, harness.instance));
+}
+
+/// `ready_placement` is the single-instance question CT-2a asks once it has
+/// chosen a peer. It answers the shallowest depth that instance holds, ignores
+/// every other holder, and inherits the validity filter.
+///
+/// Also the one exercise of the public `with_limits` constructor: a
+/// `ProjectionLimits` an external caller can name but cannot pass would be dead
+/// public surface.
+#[test]
+fn ready_placement_answers_for_one_instance_only_and_respects_validity() {
+    let mine = InstanceId::new_v4();
+    let theirs = InstanceId::new_v4();
+    let registered = Arc::new(RwLock::new(HashSet::from([mine, theirs])));
+    let projection =
+        TierPlacementProjection::with_limits(Arc::clone(&registered), ProjectionLimits::default());
+    let cache = CacheManifestId::from_bytes([9; 32]);
+    let keys = chain(1);
+
+    let snapshot = |instance: InstanceId, epoch: RegistrationEpoch, tiers: &[TierDepth]| {
+        let entries: Vec<TierPlacementEntry> = tiers
+            .iter()
+            .map(|tier| entry(*tier, 1, vec![keys[0]]))
+            .collect();
+        TierPlacementSnapshotV1 {
+            v: TIER_PLACEMENT_SCHEMA_VERSION,
+            cache,
+            instance_id: instance,
+            registration_epoch: epoch,
+            snapshot_generation: 1,
+            seq_floor: 0,
+            media: media_for(&entries),
+            manifests: Vec::new(),
+            entries,
+        }
+    };
+    let my_epoch = RegistrationEpoch::new();
+    let their_epoch = RegistrationEpoch::new();
+    projection
+        .install_snapshot(&snapshot(mine, my_epoch, &[G3, G2]), my_epoch)
+        .expect("installs");
+    projection
+        .install_snapshot(&snapshot(theirs, their_epoch, &[G2]), their_epoch)
+        .expect("installs");
+
+    assert_eq!(
+        projection.holders(cache, scope(RESOURCE), keys[0]).len(),
+        3,
+        "two instances, three placements"
+    );
+    let placement = projection
+        .ready_placement(cache, mine, scope(RESOURCE), keys[0])
+        .expect("mine is a holder");
+    assert_eq!(placement.instance, mine);
+    assert_eq!(placement.tier, G2, "shallowest depth this instance holds");
+
+    // A different instance's placements never leak into the answer.
+    assert_eq!(
+        projection
+            .ready_placement(cache, theirs, scope(RESOURCE), keys[0])
+            .expect("theirs is a holder")
+            .instance,
+        theirs
+    );
+    assert!(
+        projection
+            .ready_placement(cache, InstanceId::new_v4(), scope(RESOURCE), keys[0])
+            .is_none()
+    );
+
+    // Same validity filter as `holders`: an invalid projection answers nothing.
+    projection.remove_instance(mine);
+    assert!(
+        projection
+            .ready_placement(cache, mine, scope(RESOURCE), keys[0])
+            .is_none()
+    );
 }
 
 #[test]
@@ -1043,53 +1379,142 @@ fn a_re_push_at_the_installed_generation_un_sticks_an_invalid_projection() {
     assert_eq!(harness.requester.count(), before + 1);
 }
 
+/// Seal a batch that must not be deferred.
+fn seal(publisher: &mut TierPlacementSequencer, ops: Vec<TierPlacementOp>) -> TierPlacementBatchV1 {
+    match publisher.seal(ops).expect("valid ops") {
+        SealOutcome::Batch(batch) => batch,
+        SealOutcome::Deferred(_) => panic!("the emission gate is armed here"),
+    }
+}
+
+/// A publisher that keeps emitting across its own snapshot push does not merely
+/// blink — it re-gaps after *every* install, indefinitely.
+///
+/// Driven by the real [`TierPlacementSequencer`] rather than by hand-written
+/// sequence numbers, because the number the publisher would actually stamp next
+/// is the whole point. An earlier version of this test re-applied the *same*
+/// batch at the same `seq` after the install and called the result "heals";
+/// that models a retransmission ZMQ pub/sub does not provide. The publisher's
+/// sequencer already consumed that number for the batch the hub dropped, so the
+/// real next batch is `seq_floor + 2` and it gaps — and the recovery snapshot
+/// that follows loses the same race again.
 #[test]
-fn a_delta_that_outruns_its_snapshot_heals_when_the_snapshot_lands() {
-    // Deltas ride the fast lossy plane and snapshots the reliable slow one, so
-    // after every periodic push the new generation's deltas routinely arrive
-    // first. The projection is empty for that window and then heals — asserted
-    // here rather than reasoned about, because the difference between "heals"
-    // and "stuck" is the difference between lost reuse and a permanent outage.
+fn an_ungated_publisher_re_gaps_after_every_snapshot_install() {
     let harness = Harness::new();
-    let keys = chain(3);
-    harness.install(&harness.snapshot(1, 0, vec![entry(G2, 1, vec![keys[0]])]));
+    let keys = chain(4);
+    let mut publisher = TierPlacementSequencer::new(harness.cache, harness.instance, harness.epoch);
 
-    // The publisher snapshotted (generation 2) and its next delta beats the
-    // HTTP push to the hub.
-    harness.tick();
+    let boot = publisher
+        .snapshot(media_for(&[]), Vec::new(), Vec::new())
+        .expect("valid snapshot");
+    // Ungated: the publisher releases emission without waiting for the install.
+    assert!(publisher.note_snapshot_installed(boot.snapshot_generation));
+    harness.install(&boot);
+    let first = seal(&mut publisher, vec![ready(G2, 1, vec![keys[0]])]);
     assert_eq!(
-        harness
-            .projection
-            .apply_delta(&harness.batch(1, 2, vec![ready(G2, 1, vec![keys[1]])])),
-        DeltaOutcome::Invalidated(InvalidationReason::GenerationAhead)
+        harness.projection.apply_delta(&first),
+        DeltaOutcome::Applied { seq: 1, ready: 1 }
     );
-    assert!(!harness.holds(keys[0]), "empty for the window");
 
-    // The three counters an operator watches: a projection that never heals
-    // shows these climbing while `snapshots_installed` stays flat.
+    for round in 0..3 {
+        harness.tick();
+        let entries = vec![entry(G2, 1, vec![keys[0]])];
+        let snapshot = publisher
+            .snapshot(media_for(&entries), Vec::new(), entries)
+            .expect("valid snapshot");
+        assert!(publisher.note_snapshot_installed(snapshot.snapshot_generation));
+
+        // The delta that beats the HTTP push. Dropped, and never retransmitted.
+        let outran = seal(&mut publisher, vec![ready(G2, 1, vec![keys[1]])]);
+        harness.projection.apply_delta(&outran);
+
+        // The push lands: valid again, for exactly one delta's worth of time.
+        harness.install(&snapshot);
+        assert!(harness.projection.is_valid(harness.cache, harness.instance));
+
+        let next = seal(&mut publisher, vec![ready(G2, 1, vec![keys[2]])]);
+        assert_eq!(
+            harness.projection.apply_delta(&next),
+            DeltaOutcome::Invalidated(InvalidationReason::SequenceGap),
+            "round {round}: the outrun delta is gone for good, so the next one gaps"
+        );
+        assert!(
+            !harness.holds(keys[0]),
+            "round {round}: back to answering empty"
+        );
+    }
+}
+
+/// The publisher-side fix: sealing a snapshot arms an emission gate, so the
+/// first post-snapshot delta cannot precede the state it describes. The ops are
+/// held, not dropped — `seal` hands them back and consumes no sequence number —
+/// and the re-seal after the ack lands exactly on the consumer's resume point.
+#[test]
+fn the_publisher_emission_gate_closes_the_outrun_race() {
+    let harness = Harness::new();
+    let keys = chain(4);
+    let mut publisher = TierPlacementSequencer::new(harness.cache, harness.instance, harness.epoch);
+
+    let boot = publisher
+        .snapshot(media_for(&[]), Vec::new(), Vec::new())
+        .expect("valid snapshot");
+    let SnapshotInstall::Installed {
+        installed_generation,
+        ..
+    } = harness.install(&boot)
+    else {
+        panic!("the bootstrap snapshot installs");
+    };
+    assert!(publisher.note_snapshot_installed(installed_generation));
+
+    for round in 0..3 {
+        harness.tick();
+        let entries = vec![entry(G2, 1, vec![keys[0]])];
+        let snapshot = publisher
+            .snapshot(media_for(&entries), Vec::new(), entries)
+            .expect("valid snapshot");
+
+        let held = vec![ready(G2, 1, vec![keys[1]])];
+        assert_eq!(
+            publisher
+                .seal(held.clone())
+                .expect("deferral is not an error"),
+            SealOutcome::Deferred(held.clone()),
+            "round {round}: emission is held across the push window"
+        );
+
+        let SnapshotInstall::Installed {
+            installed_generation,
+            seq_floor,
+        } = harness.install(&snapshot)
+        else {
+            panic!("round {round}: the snapshot installs");
+        };
+        assert!(publisher.note_snapshot_installed(installed_generation));
+
+        let released = seal(&mut publisher, held);
+        assert_eq!(released.seq, seq_floor + 1, "round {round}");
+        assert_eq!(
+            harness.projection.apply_delta(&released),
+            DeltaOutcome::Applied {
+                seq: seq_floor + 1,
+                ready: 2,
+            },
+            "round {round}: no gap, no generation-ahead"
+        );
+        assert!(harness.holds(keys[0]), "round {round}");
+        assert!(harness.holds(keys[1]), "round {round}");
+    }
+
+    // Nothing was lost across three pushes: no invalidation of any kind fired.
     let counters = harness.projection.counters();
     assert_eq!(
         counters
             .invalidated_generation_ahead
             .load(Ordering::Relaxed),
-        1
+        0
     );
-    assert_eq!(counters.snapshot_requests.load(Ordering::Relaxed), 1);
-    let installed_before = counters.snapshots_installed.load(Ordering::Relaxed);
-
-    // The push lands and the window closes.
-    harness.install(&harness.snapshot(2, 0, vec![entry(G2, 1, vec![keys[2]])]));
-    assert!(harness.holds(keys[2]));
-    assert_eq!(
-        counters.snapshots_installed.load(Ordering::Relaxed),
-        installed_before + 1
-    );
-    assert_eq!(
-        harness
-            .projection
-            .apply_delta(&harness.batch(1, 2, vec![ready(G2, 1, vec![keys[1]])])),
-        DeltaOutcome::Applied { seq: 1, ready: 2 }
-    );
+    assert_eq!(counters.invalidated_sequence_gap.load(Ordering::Relaxed), 0);
 }
 
 #[test]

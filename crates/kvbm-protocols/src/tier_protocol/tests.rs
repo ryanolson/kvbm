@@ -6,12 +6,12 @@ use kvbm_common::{LogicalResourceId, SequenceHash};
 use crate::cache_manifest::{BundleResourceLineage, CacheManifestId, RegistrationEpoch};
 
 use super::{
-    InstanceId, KeyRange, PhysicalPlacementMode, PlacementScope, TIER_MEDIUM_CAP_DIRECT_SERVABLE,
-    TIER_PLACEMENT_MAX_MANIFESTS, TIER_PLACEMENT_MAX_MEDIA, TIER_PLACEMENT_MAX_OPS_PER_BATCH,
-    TIER_PLACEMENT_MAX_SNAPSHOT_ENTRIES, TIER_PLACEMENT_SCHEMA_VERSION, TIER_PLACEMENT_SUBJECT,
-    TierDepth, TierMedium, TierPlacementBatchV1, TierPlacementEntry, TierPlacementError,
-    TierPlacementManifest, TierPlacementOp, TierPlacementRejection, TierPlacementSequencer,
-    TierPlacementSnapshotV1,
+    InstanceId, KeyRange, PhysicalPlacementMode, PlacementScope, SealOutcome,
+    TIER_MEDIUM_CAP_DIRECT_SERVABLE, TIER_PLACEMENT_MAX_MANIFESTS, TIER_PLACEMENT_MAX_MEDIA,
+    TIER_PLACEMENT_MAX_OPS_PER_BATCH, TIER_PLACEMENT_MAX_SNAPSHOT_ENTRIES,
+    TIER_PLACEMENT_SCHEMA_VERSION, TIER_PLACEMENT_SUBJECT, TierDepth, TierMedium,
+    TierPlacementBatchV1, TierPlacementEntry, TierPlacementError, TierPlacementManifest,
+    TierPlacementOp, TierPlacementRejection, TierPlacementSequencer, TierPlacementSnapshotV1,
 };
 
 const RESOURCE: LogicalResourceId = LogicalResourceId(3);
@@ -94,13 +94,28 @@ fn snapshot(entries: Vec<TierPlacementEntry>) -> TierPlacementSnapshotV1 {
         registration_epoch: RegistrationEpoch::new(),
         snapshot_generation: 3,
         seq_floor: 10,
-        media: vec![TierMedium {
-            depth: G2,
-            medium: "pinned-host".to_string(),
-            capabilities: TIER_MEDIUM_CAP_DIRECT_SERVABLE,
-        }],
+        media: g2_medium(),
         manifests: Vec::new(),
         entries,
+    }
+}
+
+/// A single G2 medium, the shape nearly every snapshot fixture needs now that
+/// [`TierPlacementSnapshotV1::validate`] requires header coverage for every
+/// depth the entries name.
+fn g2_medium() -> Vec<TierMedium> {
+    vec![TierMedium {
+        depth: G2,
+        medium: "pinned-host".to_string(),
+        capabilities: TIER_MEDIUM_CAP_DIRECT_SERVABLE,
+    }]
+}
+
+/// Unwrap a seal that must have produced a batch.
+fn sealed(outcome: SealOutcome) -> TierPlacementBatchV1 {
+    match outcome {
+        SealOutcome::Batch(batch) => batch,
+        SealOutcome::Deferred(_) => panic!("the emission gate is not armed here"),
     }
 }
 
@@ -569,15 +584,17 @@ fn sequencer_numbers_batches_monotonically_from_one() {
     assert_eq!(sequencer.snapshot_generation(), 0);
 
     for expected in 1..=4u64 {
-        let sealed = sequencer
-            .seal(vec![ready(G2, 1, KeyRange::Hashes(chain(2)))])
-            .expect("valid ops");
-        assert_eq!(sealed.seq, expected);
-        assert_eq!(sealed.v, TIER_PLACEMENT_SCHEMA_VERSION);
-        assert_eq!(sealed.cache, sequencer.cache());
-        assert_eq!(sealed.instance_id, sequencer.instance_id());
-        assert_eq!(sealed.registration_epoch, sequencer.registration_epoch());
-        assert_eq!(sealed.snapshot_generation, 0);
+        let batch = sealed(
+            sequencer
+                .seal(vec![ready(G2, 1, KeyRange::Hashes(chain(2)))])
+                .expect("valid ops"),
+        );
+        assert_eq!(batch.seq, expected);
+        assert_eq!(batch.v, TIER_PLACEMENT_SCHEMA_VERSION);
+        assert_eq!(batch.cache, sequencer.cache());
+        assert_eq!(batch.instance_id, sequencer.instance_id());
+        assert_eq!(batch.registration_epoch, sequencer.registration_epoch());
+        assert_eq!(batch.snapshot_generation, 0);
         assert_eq!(sequencer.last_seq(), expected);
     }
 }
@@ -599,9 +616,11 @@ fn sequencer_refuses_g1_without_burning_a_sequence_number() {
     // A rejected batch never reached the wire, so consuming its number would
     // manufacture a gap and trigger fleet-wide snapshot traffic for a purely
     // local bug.
-    let next = sequencer
-        .seal(vec![ready(G2, 1, KeyRange::Hashes(chain(2)))])
-        .expect("valid ops");
+    let next = sealed(
+        sequencer
+            .seal(vec![ready(G2, 1, KeyRange::Hashes(chain(2)))])
+            .expect("valid ops"),
+    );
     assert_eq!(next.seq, 2);
 }
 
@@ -616,11 +635,7 @@ fn snapshot_bumps_generation_and_hands_the_consumer_a_resume_point() {
 
     let snap = sequencer
         .snapshot(
-            vec![TierMedium {
-                depth: G2,
-                medium: "pinned-host".to_string(),
-                capabilities: TIER_MEDIUM_CAP_DIRECT_SERVABLE,
-            }],
+            g2_medium(),
             vec![manifest(1, 3)],
             vec![entry(G2, KeyRange::Hashes(chain(3)))],
         )
@@ -631,21 +646,24 @@ fn snapshot_bumps_generation_and_hands_the_consumer_a_resume_point() {
     assert_eq!(snap.manifests, vec![manifest(1, 3)]);
     assert_eq!(sequencer.snapshot_generation(), 1);
 
+    assert!(sequencer.note_snapshot_installed(snap.snapshot_generation));
     // The consumer resumes at seq_floor + 1; that is exactly the next sealed seq.
-    let resumed = sequencer
-        .seal(vec![ready(G2, 1, KeyRange::Hashes(chain(2)))])
-        .expect("valid ops");
+    let resumed = sealed(
+        sequencer
+            .seal(vec![ready(G2, 1, KeyRange::Hashes(chain(2)))])
+            .expect("valid ops"),
+    );
     assert_eq!(resumed.seq, snap.seq_floor + 1);
     assert_eq!(resumed.snapshot_generation, snap.snapshot_generation);
 }
 
 #[test]
-fn rejected_snapshot_does_not_bump_the_generation() {
+fn rejected_snapshot_does_not_bump_the_generation_or_arm_the_gate() {
     let mut sequencer = TierPlacementSequencer::new(cache(), instance(), RegistrationEpoch::new());
     assert!(
         sequencer
             .snapshot(
-                vec![],
+                g2_medium(),
                 vec![],
                 vec![entry(
                     G2,
@@ -659,6 +677,131 @@ fn rejected_snapshot_does_not_bump_the_generation() {
             .is_err()
     );
     assert_eq!(sequencer.snapshot_generation(), 0);
+    // A snapshot that never reached the wire must not hold deltas hostage: the
+    // consumer will never acknowledge a generation it was never offered, so an
+    // armed gate here would stop emission permanently.
+    assert!(!sequencer.awaiting_snapshot_install());
+    assert_eq!(
+        sealed(
+            sequencer
+                .seal(vec![ready(G2, 1, KeyRange::Hashes(chain(2)))])
+                .expect("valid ops")
+        )
+        .seq,
+        1
+    );
+}
+
+/// R7b §5 header contract: `media` describes every depth the entries name, and
+/// it is the only place capability bits travel. Without coverage a consumer must
+/// guess whether a depth is direct-servable or staging-required, which is the
+/// cost input CT-2a reads.
+#[test]
+fn a_snapshot_entry_at_an_undescribed_depth_is_rejected() {
+    let mut bare = snapshot(vec![entry(TierDepth(2), KeyRange::Hashes(chain(2)))]);
+    assert_eq!(
+        bare.validate().expect_err("depth 2 is not in the header"),
+        TierPlacementError::UndescribedDepth {
+            index: 0,
+            depth: TierDepth(2),
+        }
+    );
+    assert_eq!(
+        bare.validate().expect_err("bucket").rejection(),
+        TierPlacementRejection::Invalid
+    );
+
+    // An empty header is fine as long as the body references no depth.
+    let mut empty = snapshot(vec![]);
+    empty.media = Vec::new();
+    empty.validate().expect("no entries, nothing to describe");
+
+    bare.media.push(TierMedium {
+        depth: TierDepth(2),
+        medium: "nvme".to_string(),
+        capabilities: 0,
+    });
+    bare.validate().expect("described now");
+}
+
+/// The race the gate exists for: an ungated publisher's first post-snapshot
+/// delta beats its own snapshot to the consumer, the consumer drops it as
+/// `GenerationAhead`, and pub/sub never retransmits it — so the *next* delta
+/// gaps against the resume point forever after.
+///
+/// Asserted on the numbers rather than on a consumer, because those are what a
+/// consumer keys on: while the gate is armed nothing is sealed and no sequence
+/// number is consumed, and the batch released afterwards is exactly
+/// `seq_floor + 1` at the new generation.
+#[test]
+fn a_sealed_snapshot_holds_deltas_until_the_install_is_acknowledged() {
+    let mut sequencer = TierPlacementSequencer::new(cache(), instance(), RegistrationEpoch::new());
+    for _ in 0..2 {
+        sealed(
+            sequencer
+                .seal(vec![ready(G2, 1, KeyRange::Hashes(chain(2)))])
+                .expect("valid ops"),
+        );
+    }
+
+    let snap = sequencer
+        .snapshot(
+            g2_medium(),
+            vec![],
+            vec![entry(G2, KeyRange::Hashes(chain(3)))],
+        )
+        .expect("valid snapshot");
+    assert!(sequencer.awaiting_snapshot_install());
+
+    let ops = vec![ready(G2, 2, KeyRange::Hashes(chain(2)))];
+    let deferred = sequencer
+        .seal(ops.clone())
+        .expect("deferral is not an error");
+    assert_eq!(deferred, SealOutcome::Deferred(ops.clone()));
+    // Deferral consumes nothing, so a re-seal after the ack cannot leave a hole.
+    assert_eq!(sequencer.last_seq(), snap.seq_floor);
+
+    // A mismatched acknowledgement does not release the gate: a lost or
+    // superseded push must not let deltas outrun the state they describe.
+    assert!(!sequencer.note_snapshot_installed(snap.snapshot_generation + 1));
+    assert!(sequencer.awaiting_snapshot_install());
+    assert!(matches!(
+        sequencer.seal(ops.clone()).expect("still deferred"),
+        SealOutcome::Deferred(_)
+    ));
+
+    assert!(sequencer.note_snapshot_installed(snap.snapshot_generation));
+    assert!(!sequencer.awaiting_snapshot_install());
+    let released = sealed(sequencer.seal(ops).expect("valid ops"));
+    assert_eq!(released.seq, snap.seq_floor + 1);
+    assert_eq!(released.snapshot_generation, snap.snapshot_generation);
+}
+
+/// A second snapshot sealed while the first is unacknowledged supersedes it, and
+/// only the newer generation releases the gate. The older ack is stale by then
+/// and must not.
+#[test]
+fn a_superseding_snapshot_re_arms_the_gate_at_the_higher_generation() {
+    let mut sequencer = TierPlacementSequencer::new(cache(), instance(), RegistrationEpoch::new());
+    let first = sequencer
+        .snapshot(g2_medium(), vec![], vec![])
+        .expect("valid snapshot");
+    let second = sequencer
+        .snapshot(g2_medium(), vec![], vec![])
+        .expect("valid snapshot");
+    assert_eq!(second.snapshot_generation, first.snapshot_generation + 1);
+
+    assert!(!sequencer.note_snapshot_installed(first.snapshot_generation));
+    assert!(sequencer.awaiting_snapshot_install());
+    assert!(sequencer.note_snapshot_installed(second.snapshot_generation));
+
+    let released = sealed(
+        sequencer
+            .seal(vec![ready(G2, 1, KeyRange::Hashes(chain(2)))])
+            .expect("valid ops"),
+    );
+    assert_eq!(released.snapshot_generation, second.snapshot_generation);
+    assert_eq!(released.seq, second.seq_floor + 1);
 }
 
 // ---------------------------------------------------------------------------
