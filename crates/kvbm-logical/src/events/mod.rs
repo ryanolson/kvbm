@@ -3,6 +3,7 @@
 
 pub mod batcher;
 pub mod manager;
+pub mod ordered_batcher;
 pub mod policy;
 pub mod protocol;
 pub mod publisher;
@@ -12,6 +13,7 @@ mod tests;
 
 pub use batcher::{BatchingConfig, EventBatcher};
 pub use manager::{EventsManager, EventsManagerBuilder, EventsManagerSettings};
+pub use ordered_batcher::OrderedBatcher;
 pub use policy::{AllEventsPolicy, EventEmissionPolicy, PowerOfTwoPolicy};
 pub use protocol::{InstanceId, KvCacheEvent, KvCacheEvents, KvbmCacheEvents};
 pub use publisher::{KvbmCacheEventsPublisher, KvbmCacheEventsPublisherBuilder};

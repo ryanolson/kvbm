@@ -305,3 +305,113 @@ async fn test_msgpack_serialization() {
     assert_eq!(decoded.instance_id, 12345);
     assert!(matches!(decoded.events, KvCacheEvents::Create(ref h) if h.len() == 1));
 }
+
+// ---------------------------------------------------------------------------
+// R7b §7.8 — the legacy stream is byte-identical before and after
+// ---------------------------------------------------------------------------
+
+/// Fixed legacy batch, built from PLH parts rather than from a tokenized
+/// sequence.
+///
+/// `create_seq_hash_at_position` routes through `TokenBlockSequence` and the
+/// block-hash function, so a golden built on it would break on an upstream
+/// `dynamo-tokens` hash change and read as a kvbm wire regression. §7.8 asks
+/// whether *kvbm's encoding* moved, so the fixture pins the hash values
+/// directly.
+fn golden_legacy_batch() -> KvbmCacheEvents {
+    let root = SequenceHash::new(0x0102_0304_0506_0708, None, 0);
+    let child = SequenceHash::new(0x1112_1314_1516_1718, Some(0x0102_0304_0506_0708), 1);
+    KvbmCacheEvents {
+        events: KvCacheEvents::Create(vec![root, child]),
+        instance_id: 0x0000_0000_0000_0000_DEAD_BEEF_CAFE_F00D,
+    }
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The legacy wire encoding is frozen. R7b adds a *separate* stream on a
+/// separate subject; if this assertion moves, the consolidator
+/// (`kvbm_bridge.rs`) and the frozen dynamo `lib/kvbm-*` copy have been broken,
+/// which is exactly what "legacy stream untouched" is supposed to prevent.
+///
+/// This is a byte comparison on purpose: a round-trip assertion still passes
+/// after an encoding shift, so it does not test what §7.8 asks.
+#[test]
+fn legacy_wire_encoding_is_byte_identical() {
+    // Layout: 2-element array (the struct's fields, positionally)
+    //   [0] map {"Create": [<plh 16B>, <plh 16B>]}  — externally-tagged enum
+    //   [1] 16-byte big-endian instance_id (u128)
+    const GOLDEN_MSGPACK: &str = concat!(
+        "9281a643726561746592",
+        "c41000004080c1014181c200000000000000",
+        "c41000444484c5054585c602030405060708",
+        "c4100000000000000000deadbeefcafef00d",
+    );
+    let encoded = rmp_serde::to_vec(&golden_legacy_batch()).unwrap();
+    assert_eq!(to_hex(&encoded), GOLDEN_MSGPACK);
+
+    // ...and the golden bytes still decode to the same value.
+    let decoded: KvbmCacheEvents = rmp_serde::from_slice(&encoded).unwrap();
+    assert_eq!(decoded, golden_legacy_batch());
+}
+
+// ---------------------------------------------------------------------------
+// Cross-decode guard: the two streams can never be confused for each other
+// ---------------------------------------------------------------------------
+
+fn tier_batch_msgpack() -> Vec<u8> {
+    use kvbm_protocols::cache_manifest::{CacheManifestId, RegistrationEpoch};
+    use kvbm_protocols::tier_protocol::{
+        InstanceId, KeyRange, PhysicalPlacementMode, PlacementScope, TIER_PLACEMENT_SCHEMA_VERSION,
+        TierDepth, TierPlacementBatchV1, TierPlacementOp,
+    };
+
+    let batch = TierPlacementBatchV1 {
+        v: TIER_PLACEMENT_SCHEMA_VERSION,
+        cache: CacheManifestId::from_bytes([5; 32]),
+        instance_id: InstanceId::new_v4(),
+        registration_epoch: RegistrationEpoch::new(),
+        seq: 4,
+        snapshot_generation: 1,
+        ops: vec![TierPlacementOp::Ready {
+            scope: PlacementScope::unitary(kvbm_common::LogicalResourceId(0)),
+            tier: TierDepth(1),
+            placement: PhysicalPlacementMode::Whole,
+            generation: 2,
+            keys: KeyRange::Hashes(vec![SequenceHash::new(0x2122_2324_2526_2728, None, 0)]),
+        }],
+    };
+    rmp_serde::to_vec(&batch).unwrap()
+}
+
+/// A tier-placement frame must never decode as a legacy `KvbmCacheEvents`.
+///
+/// The hub's legacy indexer subscribes to `b""` — every ZMQ topic lands in the
+/// same ingest loop — so "a new subject means old subscribers never see the new
+/// frames" is false as written. Isolation has to come from the decoder, and a
+/// silent mis-decode here would corrupt the block index rather than merely drop
+/// a message. `rmp-serde` encodes structs positionally, so the 7-field tier
+/// envelope should fail the 2-field legacy visitor — but that is asserted here,
+/// not assumed.
+#[test]
+fn tier_frames_do_not_decode_as_legacy_events() {
+    let tier_bytes = tier_batch_msgpack();
+    assert!(
+        rmp_serde::from_slice::<KvbmCacheEvents>(&tier_bytes).is_err(),
+        "tier frame silently decoded as a legacy cache-event batch"
+    );
+}
+
+/// ...and the converse, so a topic-dispatch bug in either direction is loud.
+#[test]
+fn legacy_frames_do_not_decode_as_tier_batches() {
+    use kvbm_protocols::tier_protocol::TierPlacementBatchV1;
+
+    let legacy_bytes = rmp_serde::to_vec(&golden_legacy_batch()).unwrap();
+    assert!(
+        rmp_serde::from_slice::<TierPlacementBatchV1>(&legacy_bytes).is_err(),
+        "legacy frame silently decoded as a tier-placement batch"
+    );
+}

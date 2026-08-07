@@ -4,8 +4,21 @@
 //! Event types for KV cache coordination across workers.
 //!
 //! This module defines the event protocol used to track block registrations
-//! and removals across distributed workers. Events are emitted when blocks
-//! at power-of-2 positions are registered or released.
+//! and removals across distributed workers. *Which* blocks emit an event is not
+//! fixed here: emission is pluggable through
+//! [`EventEmissionPolicy`](super::policy::EventEmissionPolicy). The default
+//! wired by [`EventsManagerBuilder`](super::manager::EventsManagerBuilder) is
+//! [`AllEventsPolicy`](super::policy::AllEventsPolicy) — every registered block
+//! emits. [`PowerOfTwoPolicy`](super::policy::PowerOfTwoPolicy) is the opt-in
+//! sparse radix sampling (power-of-2 positions in `[2^4, 2^16]`) that lets the
+//! hub narrow a search without tracking every block. Do not assume either when
+//! reasoning about coverage — read the configured policy.
+//!
+//! This is the *legacy* untiered stream. It carries no tier, resource, lane,
+//! generation, sequence number, or recovery, and it stays byte-compatible for
+//! the consolidator and the hub's legacy indexer. The tiered, sequenced,
+//! recoverable stream is a separate wire schema
+//! (`kvbm_protocols::tier_protocol`) on a separate subject.
 //!
 //! The event types are organized in three layers:
 //! - [`KvCacheEvent`]: Individual events for internal streaming

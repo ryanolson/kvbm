@@ -2705,6 +2705,7 @@ dependencies = [
  "indexmap",
  "kvbm-common",
  "kvbm-observability",
+ "kvbm-protocols",
  "lru 0.16.4",
  "parking_lot",
  "proptest",

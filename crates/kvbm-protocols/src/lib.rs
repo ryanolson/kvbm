@@ -18,8 +18,15 @@
 //! - [`control`] — the public leader control plane: the `ControlReply`
 //!   envelope, per-module request/response types, the `ModuleId` registry,
 //!   and (with `--features client`) the `LeaderControlClient`.
+//! - [`tier_protocol`] — the versioned tier-placement event stream (R7b): the
+//!   `TierPlacementBatchV1` delta envelope, the `TierPlacementSnapshotV1`
+//!   recovery payload, and the publisher-side sequencer. Lives here rather than
+//!   in `kvbm-logical/src/events/` because it is built from this crate's
+//!   identity types (`CacheManifestId`, `RegistrationEpoch`,
+//!   `BundleResourceLineage`); see that module's docs.
 
 pub mod cache_manifest;
 pub mod connector;
 pub mod control;
 pub mod disagg;
+pub mod tier_protocol;

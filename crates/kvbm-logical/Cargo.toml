@@ -37,6 +37,15 @@ xxhash-rust = { workspace = true }
 testing = []
 
 [dev-dependencies]
+# Test-only edge. The tier-placement wire types live in `kvbm-protocols`
+# (they are built from its `CacheManifestId` / `RegistrationEpoch` identity
+# types), and this transport-free crate deliberately does not depend on it at
+# build time. The dev edge exists so `events::tests` can prove that a tier
+# frame never mis-decodes as a legacy `KvbmCacheEvents` — a silent mis-decode
+# there would be index corruption, the exact "stale success" the tier stream
+# is designed to make impossible.
+kvbm-protocols = { workspace = true }
+
 criterion = "0.5"
 proptest = "1.5.0"
 rand = { workspace = true }
