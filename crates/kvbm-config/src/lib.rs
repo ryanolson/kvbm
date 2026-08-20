@@ -706,25 +706,25 @@ mod tests {
             || {
                 // JSON with nested profiles - top-level keys are profile names
                 let json = r#"{
-                    "default": {"tokio": {"worker_threads": 4}},
-                    "leader": {"tokio": {"worker_threads": 2}},
-                    "worker": {"tokio": {"worker_threads": 8}}
+                    "default": {"tokio": {"max_blocking_threads": 4}},
+                    "leader": {"tokio": {"max_blocking_threads": 2}},
+                    "worker": {"tokio": {"max_blocking_threads": 8}}
                 }"#;
 
-                // Leader should get 2 threads (from leader profile)
+                // The leader profile sets two blocking threads.
                 let leader_config = KvbmConfig::from_figment_with_json_for_leader(json).unwrap();
                 assert_eq!(
-                    leader_config.tokio.worker_threads,
+                    leader_config.tokio.max_blocking_threads,
                     Some(2),
-                    "Leader should get leader profile's tokio.worker_threads"
+                    "leader profile selects tokio.max_blocking_threads"
                 );
 
-                // Worker should get 8 threads (from worker profile)
+                // The worker profile sets eight blocking threads.
                 let worker_config = KvbmConfig::from_figment_with_json_for_worker(json).unwrap();
                 assert_eq!(
-                    worker_config.tokio.worker_threads,
+                    worker_config.tokio.max_blocking_threads,
                     Some(8),
-                    "Worker should get worker profile's tokio.worker_threads"
+                    "worker profile selects tokio.max_blocking_threads"
                 );
             },
         );
@@ -964,17 +964,17 @@ mod tests {
             || {
                 let json = r#"{
                     "cache": {"host": {"cache_size_gb": 1.0}},
-                    "leader": {"tokio": {"worker_threads": 2}},
-                    "worker": {"tokio": {"worker_threads": 8}}
+                    "leader": {"tokio": {"max_blocking_threads": 2}},
+                    "worker": {"tokio": {"max_blocking_threads": 8}}
                 }"#;
 
                 let leader = KvbmConfig::from_figment_with_json_for_leader(json).unwrap();
                 assert_eq!(leader.cache.host.cache_size_gb, Some(1.0));
-                assert_eq!(leader.tokio.worker_threads, Some(2));
+                assert_eq!(leader.tokio.max_blocking_threads, Some(2));
 
                 let worker = KvbmConfig::from_figment_with_json_for_worker(json).unwrap();
                 assert_eq!(worker.cache.host.cache_size_gb, Some(1.0));
-                assert_eq!(worker.tokio.worker_threads, Some(8));
+                assert_eq!(worker.tokio.max_blocking_threads, Some(8));
             },
         );
     }
