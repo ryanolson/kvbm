@@ -86,6 +86,9 @@ nccl = []
 testing-nccl = ["collectives", "cudarc/nccl"]
 nats = ["dep:async-nats", "dep:flume"]
 testing = ["kvbm-logical/testing", "kvbm-physical/testing"]
+# These tests require a native NIXL runtime.
+# The CPU job uses stub mode and does not enable this feature.
+testing-nixl = ["testing"]
 testing-s3 = ["s3", "testing"]
 nvtx = ["kvbm-config/nvtx", "dep:nvtx"]
 bench = [

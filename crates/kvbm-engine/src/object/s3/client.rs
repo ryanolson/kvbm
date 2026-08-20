@@ -883,7 +883,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, feature = "testing"))]
+#[cfg(all(test, feature = "testing-nixl"))]
 mod bounds_check_tests {
     use super::*;
     use crate::object::LayoutConfigExt;
