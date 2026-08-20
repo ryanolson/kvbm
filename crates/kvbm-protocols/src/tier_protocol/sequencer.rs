@@ -5,11 +5,11 @@
 //! stream.
 //!
 //! This is the whole publisher contract the rhino-side wiring (CT-2) needs:
-//! pure, synchronous, transport-free. It owns the two counters a consumer uses
-//! to detect loss — `seq` and `snapshot_generation` — so no publisher has to
-//! reimplement the monotonicity rules, and it applies the same `validate()` the
-//! consumer applies, so a publisher cannot put a message on the wire that its
-//! own consumer would reject (R7b §7.6's publisher-side assertion).
+//! pure, synchronous, transport-free. It owns `seq` and
+//! `snapshot_generation`, which expose observed gaps and generation changes.
+//! Thus, no publisher must reimplement the monotonicity rules. It also applies
+//! the same `validate()` that the consumer applies. A publisher cannot put a
+//! message on the wire that its own consumer rejects.
 //!
 //! Not included here, deliberately: the emission points, the batching cadence,
 //! the ZMQ socket, and the periodic-snapshot timer. Those are rhino-side.
@@ -87,9 +87,8 @@ pub enum SealOutcome {
 ///
 /// So [`Self::snapshot`] arms a gate and [`Self::seal`] defers until
 /// [`Self::note_snapshot_installed`] confirms the install landed. This is the
-/// publisher half of the contract; it does not change how a consumer behaves
-/// against a publisher that ignores it (that case still degrades to empty
-/// answers, never to stale ones).
+/// publisher half of the contract. If a publisher ignores it, the generation
+/// race invalidates the projection and produces empty answers.
 ///
 /// # Why there is a second lever: publisher-side divergence
 ///
@@ -107,6 +106,11 @@ pub enum SealOutcome {
 /// invalidate, ask for a snapshot, answer empty until one installs. No new wire
 /// field, no new consumer state machine, and unforgeable in the useful
 /// direction: only the publisher can decide its own stream diverged.
+///
+/// This lever cannot detect a batch lost after the transport accepts it. A
+/// later batch exposes that gap. A successful snapshot repairs the state.
+/// Until either event occurs, a lost terminal `Remove` can remain visible as
+/// advisory placement data.
 #[derive(Debug, Clone)]
 pub struct TierPlacementSequencer {
     cache: CacheManifestId,

@@ -11,12 +11,14 @@
 //!
 //! # Design rules encoded here (R7b §1)
 //!
-//! 1. **Advisory with recovery.** A lossy transport is acceptable *because*
-//!    `seq` + [`RegistrationEpoch`] + `snapshot_generation` make loss
-//!    detectable, and the snapshot makes it recoverable. Authority stays with
-//!    owner-side bundle/manager state; this stream never becomes a source of
-//!    truth. A consumer that cannot prove continuity must answer **empty**,
-//!    never stale.
+//! 1. **Advisory with recovery.** `seq`, [`RegistrationEpoch`], and
+//!    `snapshot_generation` expose a continuity failure when evidence reaches
+//!    the consumer. A snapshot repairs detected loss. Authority stays with
+//!    owner-side bundle or manager state. This stream never becomes a source of
+//!    truth. A consumer that detects a continuity failure must answer **empty**.
+//!    A dropped terminal batch has no later sequence evidence. It can leave
+//!    stale advisory data until a successful snapshot installs. A caller must
+//!    acquire the exact owner `BundleLease` before it uses a holder.
 //! 2. **G1 is not publishable.** [`TierDepth::G1`] (depth 0) is rejected by
 //!    every `validate()` on this module, publisher side and consumer side.
 //!    G1-only visibility goes through the bundle-advertisement path with its

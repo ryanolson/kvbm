@@ -5,13 +5,16 @@
 //!
 //! # The state machine, in one paragraph
 //!
-//! A projection is either **valid** — every delta since the last install
-//! arrived, in order, at the installed generation and epoch — or **invalid**,
-//! in which case it answers nothing and asks for a snapshot. There are exactly
-//! three ways to become invalid: a sequence gap, an epoch the projection has
-//! not been authorized into, and a generation ahead of the installed one. There
-//! is exactly one way to become valid: a credential-authorized snapshot
-//! install, which replaces everything and resumes deltas at `seq_floor + 1`.
+//! A projection is either **valid** or **invalid**. Valid means that all observed
+//! deltas form one sequence at the installed generation and epoch. Invalid means
+//! that the projection answers nothing and asks for a snapshot. A sequence gap,
+//! an unauthorized epoch, or a future generation makes it invalid. Only a
+//! credential-authorized snapshot makes it valid. The snapshot replaces all
+//! state and resumes deltas at `seq_floor + 1`.
+//!
+//! A terminal transport loss has no later sequence evidence. It does not clear
+//! `valid`. Thus, callers must treat every holder as advisory and verify the
+//! exact owner before use.
 //!
 //! # Why the map is keyed on `(cache, instance)` and not `(cache, instance,
 //! epoch)`
@@ -553,9 +556,9 @@ impl TierPlacementProjection {
     /// for `cache`.
     ///
     /// This is the read path CT-2a consumes. It filters on `valid` before it
-    /// consults any ready map, which is the single place the "temporary miss,
-    /// never stale success" invariant is enforced — a reader cannot bypass it,
-    /// because there is no other public way to see a ready record.
+    /// consults any ready map. This filter enforces empty answers after a
+    /// detected failure. A reader cannot bypass it because no other public API
+    /// exposes a ready record.
     ///
     /// Sorted by depth then instance so a caller's tie-break is deterministic.
     ///
@@ -620,8 +623,8 @@ impl TierPlacementProjection {
     ) -> Option<TierPlacementHolder> {
         let state = self.state.read().ok()?;
         let projection = state.get(&(cache, instance))?;
-        // Same `valid` gate as `holders`, and for the same reason: there must be
-        // no public path from a lost delta to "we told a caller a copy exists".
+        // Same `valid` gate as `holders`. After the projection detects a
+        // continuity failure, no public path can expose its retained records.
         if !projection.valid {
             return None;
         }

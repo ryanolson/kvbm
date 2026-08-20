@@ -7,17 +7,21 @@
 //!
 //! One projection per `(cache, instance)` of "which keys this instance holds
 //! Ready, at which depth". Deltas arrive lossily over ZMQ; snapshots arrive
-//! reliably and authenticated over the HTTP control plane. The projection's
-//! entire job is to know when it has lost continuity, and to answer **empty**
-//! rather than stale while it has.
+//! reliably and authenticated over the HTTP control plane. The projection
+//! tracks the continuity evidence that reaches it. If it detects a
+//! failure, it answers **empty** until an authorized snapshot installs.
 //!
-//! # The one invariant
+//! # The invalid-state invariant
 //!
-//! *An invalid projection is a temporary miss, never a stale success.* Every
-//! read path filters on `valid` before it consults the ready map, so there is no
-//! code path from "we lost a delta" to "we told a caller a copy exists". The
-//! failure mode is a redundant transfer, never a transfer from a copy that is
-//! gone.
+//! *An invalid projection is a temporary miss.* Every read path filters on
+//! `valid` before it consults the ready map. Thus, a detected continuity failure
+//! cannot produce a holder.
+//!
+//! This guarantee starts after detection. ZMQ can drop a terminal delta with no
+//! later sequence evidence. The projection then remains valid by its local
+//! evidence. A lost terminal `Remove` can leave a stale holder until a
+//! successful snapshot installs. Every holder is advisory. The caller must
+//! acquire the exact owner `BundleLease` before it trusts that holder.
 //!
 //! # Why this is a sub-module of `indexer`, not its own feature
 //!
@@ -70,24 +74,22 @@
 //! accepting a delta past the resume point would be exactly the silent hole the
 //! sequence rule exists to catch.
 //!
-//! The gate is not the sequencer's only publisher-side lever, and the second
-//! one is what makes this module's invariant hold end to end. A publisher that
-//! loses an op *before* it reaches the wire — a dropped `Remove`, deferred ops
-//! discarded under buffer pressure — leaves the sequence contiguous, so nothing
-//! here can detect it, and the projection keeps answering with a copy that is
-//! gone. `TierPlacementSequencer::mark_divergent` is how the publisher says so:
-//! it burns one sequence number, which arrives as an ordinary
+//! The gate is not the sequencer's only publisher-side lever. A publisher that
+//! loses an op before transport handoff leaves the sequence contiguous. The
+//! projection cannot detect that loss. `TierPlacementSequencer::mark_divergent`
+//! reports it. The method burns one sequence number, which arrives as an ordinary
 //! `InvalidationReason::SequenceGap` and recovers through the path already
-//! documented above. No consumer-side change; the recovery machinery was
-//! already the right shape.
+//! documented above.
 //!
-//! Against a publisher that ignores the gate the degradation is still
-//! fail-safe, and it is visible rather than silent:
+//! The transport gives the publisher no result after handoff. Thus, a final
+//! dropped batch remains invisible to both sides. A later batch exposes the
+//! gap. A successful snapshot also replaces the stale state. Until one event
+//! occurs, a terminal lost `Remove` can remain visible.
+//!
+//! If a publisher ignores the gate, the generation race is visible:
 //! `invalidated_generation_ahead` and `invalidated_sequence_gap` climb together
-//! with `snapshot_requests` while `snapshots_installed` lags. The same signature
-//! covers the other unbounded case — snapshot pushes that keep failing while
-//! deltas keep flowing. Either way the projection answers empty, never stale, so
-//! the cost is lost reuse rather than a bad transfer.
+//! with `snapshot_requests` while `snapshots_installed` lags. The projection
+//! answers empty after either invalidation.
 //!
 //! # Trust
 //!

@@ -3,12 +3,11 @@
 
 //! R7b §7 recovery matrix for the tier-placement consumer.
 //!
-//! Every assertion here is ultimately about one property: *a projection that
-//! cannot prove continuity answers empty, and never answers stale*. The reads
-//! all go through the public [`TierPlacementProjection::holders`] a CT-2a caller
-//! would use, rather than a test accessor into the map — an assertion that
-//! reached inside the state would keep passing if the read path forgot its
-//! `valid` filter, which is the one bug that matters.
+//! Every assertion here checks one property. A projection answers empty after
+//! it detects a continuity failure. These tests do not claim that every
+//! transport loss is detectable. A final dropped batch has no later sequence
+//! evidence. All reads use the public [`TierPlacementProjection::holders`] API.
+//! Thus, a test cannot bypass the `valid` filter through an internal map.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,6 +34,8 @@ const OTHER_RESOURCE: LogicalResourceId = LogicalResourceId(9);
 /// names no depth but G1.
 const G2: TierDepth = TierDepth(1);
 const G3: TierDepth = TierDepth(2);
+
+mod gate9;
 
 // ---------------------------------------------------------------------------
 // Fixtures
