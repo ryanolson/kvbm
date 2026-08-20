@@ -8,6 +8,7 @@
 //! adds the registry coordination, allocation eviction policy, and metrics.
 
 mod builder;
+mod inactive_lineage_hold;
 
 #[cfg(test)]
 mod tests;
@@ -17,19 +18,25 @@ pub use builder::{
     BlockManagerBuilderError, BlockManagerConfigBuilder, BlockManagerResetError,
     FrequencyTrackingCapacity, InactiveBackendConfig, LineageEviction,
 };
+pub use inactive_lineage_hold::{
+    EvictionNotification, InactiveLineageHold, InactiveLineagePreflight,
+};
 
 use std::collections::HashMap;
-use std::sync::{Arc, Weak};
-
-use parking_lot::RwLock;
+use std::sync::Arc;
 
 use crate::blocks::{BlockMetadata, CompleteBlock, ImmutableBlock, MutableBlock};
 use crate::metrics::BlockPoolMetrics;
 use crate::pools::{
-    BlockDuplicationPolicy, BlockStore, InactiveCandidate, InactiveFeatures, ReleaseOpts,
-    SequenceHash,
+    BlockDuplicationPolicy, BlockStore, ExactReclaimEntryPlan, ExactReclaimExecuteError,
+    ExactReclaimNameError, ExactReclaimRefreshError, FreshExactReclaimPlan, InactiveCandidate,
+    InactiveFeatures, ReleaseOpts, SequenceHash,
 };
+#[cfg(test)]
+use crate::pools::{ExactAllocationError, ExactInactiveVictim};
 use crate::registry::BlockRegistry;
+
+use inactive_lineage_hold::EvictionNotifier;
 
 /// Manages the full block lifecycle over the unified [`BlockStore`].
 ///
@@ -42,8 +49,54 @@ pub struct BlockManager<T: BlockMetadata> {
     pub(crate) total_blocks: usize,
     pub(crate) block_size: usize,
     pub(crate) metrics: Arc<BlockPoolMetrics>,
-    eviction_observers: RwLock<Vec<Weak<dyn BlockEvictionObserver>>>,
+    eviction_notifier: EvictionNotifier,
 }
+
+/// Failed registration that preserves every staged input block.
+///
+/// [`BlockManager::try_register_blocks`] returns this when an input block
+/// belongs to another store. Call [`Self::into_blocks`] to recover unchanged
+/// guards and register them through their owning manager.
+#[must_use = "recover or drop the staged blocks"]
+pub struct BlockRegistrationError<T: BlockMetadata> {
+    blocks: Vec<CompleteBlock<T>>,
+}
+
+impl<T: BlockMetadata> BlockRegistrationError<T> {
+    fn foreign_store(blocks: Vec<CompleteBlock<T>>) -> Self {
+        Self { blocks }
+    }
+
+    /// Recover the unchanged staged blocks.
+    pub fn into_blocks(self) -> Vec<CompleteBlock<T>> {
+        self.blocks
+    }
+
+    fn block_count(&self) -> usize {
+        self.blocks.len()
+    }
+}
+
+impl<T: BlockMetadata> std::fmt::Debug for BlockRegistrationError<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BlockRegistrationError")
+            .field("block_count", &self.blocks.len())
+            .finish()
+    }
+}
+
+impl<T: BlockMetadata> std::fmt::Display for BlockRegistrationError<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} completed blocks belong to another BlockManager",
+            self.blocks.len()
+        )
+    }
+}
+
+impl<T: BlockMetadata> std::error::Error for BlockRegistrationError<T> {}
 
 /// Batch callback fired after inactive slots have been evicted and reset.
 pub trait BlockEvictionObserver: Send + Sync + 'static {
@@ -86,6 +139,15 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
             .map(|(blocks, _evicted)| blocks)
     }
 
+    /// Allocate exactly `count` mutable blocks from the reset pool.
+    ///
+    /// This does not evict or change inactive slots. It returns `None` when
+    /// fewer than `count` reset slots exist. A zero count returns an empty
+    /// allocation without changing the store.
+    pub fn allocate_blocks_from_reset(&self, count: usize) -> Option<Vec<MutableBlock<T>>> {
+        self.store.allocate_reset_blocks_atomic(count)
+    }
+
     /// Like [`allocate_blocks`](Self::allocate_blocks) but also reports the
     /// [`SequenceHash`] of each block evicted from the inactive pool.
     pub fn allocate_blocks_with_evictions(
@@ -95,6 +157,143 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
         let allocation = self.store.allocate_atomic(count)?;
         self.notify_evictions(&allocation.1);
         Some(allocation)
+    }
+
+    /// Name one complete inactive cache entry for a later exact reclaim.
+    ///
+    /// The retained name keeps its original leaf slot and mutable generation
+    /// private. A later refresh accepts a changed inactive epoch only when the
+    /// original leaf registration remains in the same mutable tenure.
+    #[cfg(test)]
+    pub(crate) fn name_complete_inactive_entry(
+        &self,
+        candidate: InactiveCandidate,
+    ) -> Result<ExactReclaimEntryPlan, ExactReclaimNameError> {
+        self.store.name_complete_inactive_entry(candidate)
+    }
+
+    /// Return whether the inactive backend supports exact reclaim proofs.
+    pub fn supports_exact_reclaim(&self) -> bool {
+        self.store.supports_exact_reclaim()
+    }
+
+    /// Name one complete inactive entry from its logical leaf hash.
+    ///
+    /// This point query reaches entries outside bounded eviction snapshots. It
+    /// does not expose physical block identities.
+    pub fn name_complete_inactive_entry_by_hash(
+        &self,
+        seq_hash: SequenceHash,
+    ) -> Result<ExactReclaimEntryPlan, ExactReclaimNameError> {
+        self.store.name_complete_inactive_entry_by_hash(seq_hash)
+    }
+
+    /// Refresh and atomically combine named inactive cache entries.
+    ///
+    /// This resolves every entry under one store lock. It rejects shared
+    /// physical slots and records the reset capacity for later execution.
+    pub fn refresh_and_combine_exact_reclaim(
+        &self,
+        entries: &[ExactReclaimEntryPlan],
+    ) -> Result<FreshExactReclaimPlan, ExactReclaimRefreshError> {
+        self.store.refresh_and_combine_exact_reclaim(entries)
+    }
+
+    /// Execute a fresh opaque exact-reclaim plan without notifying observers.
+    ///
+    /// The plan is consumed. Call [`EvictionNotification::notify`] after the
+    /// related source action commits.
+    pub fn allocate_blocks_with_fresh_exact_reclaim_silent(
+        &self,
+        count: usize,
+        plan: FreshExactReclaimPlan,
+    ) -> Result<(Vec<MutableBlock<T>>, EvictionNotification), ExactReclaimExecuteError> {
+        let FreshExactReclaimPlan {
+            manager_id,
+            expected_reset_slots,
+            victims_leaf_to_root,
+        } = plan;
+        if manager_id != self.id() {
+            return Err(ExactReclaimExecuteError::WrongManager);
+        }
+
+        let (blocks, evicted) = self
+            .store
+            .allocate_exact_reclaim(count, expected_reset_slots, &victims_leaf_to_root)
+            .map_err(ExactReclaimExecuteError::from)?;
+        let notification = self.eviction_notifier.deferred_notification(evicted);
+        Ok((blocks, notification))
+    }
+
+    /// Execute a fresh opaque exact-reclaim plan and notify observers.
+    pub fn allocate_blocks_with_fresh_exact_reclaim(
+        &self,
+        count: usize,
+        plan: FreshExactReclaimPlan,
+    ) -> Result<Vec<MutableBlock<T>>, ExactReclaimExecuteError> {
+        let (blocks, notification) =
+            self.allocate_blocks_with_fresh_exact_reclaim_silent(count, plan)?;
+        notification.notify();
+        Ok(blocks)
+    }
+
+    /// Allocate `count` mutable blocks with only caller-authorized inactive
+    /// reclaim. Bind an [`InactiveCandidate`] with
+    /// [`InactiveCandidate::exact_victim`] before this call. The request first
+    /// uses reset slots, then consumes exactly the supplied inactive victims.
+    /// A rejected request does not alter pool state.
+    #[cfg(test)]
+    pub(crate) fn allocate_blocks_with_exact_inactive(
+        &self,
+        count: usize,
+        victims: &[ExactInactiveVictim],
+    ) -> Result<Vec<MutableBlock<T>>, ExactAllocationError> {
+        let (blocks, evicted) = self.store.allocate_exact_inactive(count, victims)?;
+        self.notify_evictions(&evicted);
+        Ok(blocks)
+    }
+
+    /// Reclaim one complete caller-authorized inactive plan and allocate
+    /// `count` mutable destination blocks in the same store transaction.
+    ///
+    /// `expected_reset_slots` binds the pressure decision to the reset-pool
+    /// capacity observed before this call. The plan uses leaf-to-root order.
+    /// It can contain more slots than `count`. The transaction evicts every
+    /// listed block, leaves surplus slots in Reset, and rejects any changed
+    /// identity, capacity snapshot, or backend-invalid removal order without
+    /// changing pool state.
+    #[cfg(test)]
+    pub(crate) fn allocate_blocks_with_exact_reclaim(
+        &self,
+        count: usize,
+        expected_reset_slots: usize,
+        victims: &[ExactInactiveVictim],
+    ) -> Result<Vec<MutableBlock<T>>, ExactAllocationError> {
+        let (blocks, notification) =
+            self.allocate_blocks_with_exact_reclaim_silent(count, expected_reset_slots, victims)?;
+        notification.notify();
+        Ok(blocks)
+    }
+
+    /// Reclaim one complete inactive plan without calling eviction observers.
+    ///
+    /// The returned [`EvictionNotification`] owns the observer callback. The
+    /// transaction finishes its physical pool mutation and destination
+    /// allocation before this method returns. Call
+    /// [`EvictionNotification::notify`] after every related source action
+    /// commits.
+    #[cfg(test)]
+    pub(crate) fn allocate_blocks_with_exact_reclaim_silent(
+        &self,
+        count: usize,
+        expected_reset_slots: usize,
+        victims: &[ExactInactiveVictim],
+    ) -> Result<(Vec<MutableBlock<T>>, EvictionNotification), ExactAllocationError> {
+        let (blocks, evicted) =
+            self.store
+                .allocate_exact_reclaim(count, expected_reset_slots, victims)?;
+        let notification = self.eviction_notifier.deferred_notification(evicted);
+        Ok((blocks, notification))
     }
 
     /// Drain the inactive pool, returning all blocks to the reset pool.
@@ -115,33 +314,21 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
     }
 
     fn notify_evictions(&self, hashes: &[SequenceHash]) {
-        if hashes.is_empty() {
-            return;
-        }
-        let observers = {
-            let mut registered = self.eviction_observers.write();
-            let mut live = Vec::with_capacity(registered.len());
-            registered.retain(|observer| {
-                if let Some(observer) = observer.upgrade() {
-                    live.push(observer);
-                    true
-                } else {
-                    false
-                }
-            });
-            live
-        };
-        for observer in observers {
-            observer.on_blocks_evicted(hashes);
-        }
+        self.eviction_notifier.notify(hashes);
     }
 
     /// Register a batch of completed blocks.
+    ///
+    /// Panics if a block belongs to another manager. Use
+    /// [`try_register_blocks`](Self::try_register_blocks) when the caller can
+    /// receive blocks from an external source.
     pub fn register_blocks(&self, blocks: Vec<CompleteBlock<T>>) -> Vec<ImmutableBlock<T>> {
-        blocks
-            .into_iter()
-            .map(|block| self.register_block(block))
-            .collect()
+        self.try_register_blocks(blocks).unwrap_or_else(|error| {
+            panic!(
+                "BlockManager::register_blocks received {} blocks from another manager",
+                error.block_count()
+            )
+        })
     }
 
     /// Release a batch of immutable blocks under a *single* store-mutex
@@ -183,13 +370,66 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
     }
 
     /// Register a single completed block and return an immutable handle.
+    ///
+    /// Panics if the block belongs to another manager. Use
+    /// [`try_register_blocks`](Self::try_register_blocks) for a recoverable
+    /// foreign-store rejection.
     pub fn register_block(&self, block: CompleteBlock<T>) -> ImmutableBlock<T> {
+        self.try_register_blocks(vec![block])
+            .unwrap_or_else(|error| {
+                panic!(
+                    "BlockManager::register_block received {} block from another manager",
+                    error.block_count()
+                )
+            })
+            .into_iter()
+            .next()
+            .expect("one completed block registers to one immutable block")
+    }
+
+    /// Register completed blocks after an all-or-nothing store-provenance
+    /// preflight.
+    ///
+    /// If any block belongs to another manager, this method returns every
+    /// input block unchanged. It does not register a hash, touch a metric, or
+    /// change either store. A successful call preserves the existing
+    /// per-block registration behavior.
+    pub fn try_register_blocks(
+        &self,
+        blocks: Vec<CompleteBlock<T>>,
+    ) -> Result<Vec<ImmutableBlock<T>>, BlockRegistrationError<T>> {
+        if blocks.iter().any(|block| !block.is_from_store(&self.store)) {
+            return Err(BlockRegistrationError::foreign_store(blocks));
+        }
+
+        Ok(blocks
+            .into_iter()
+            .map(|block| self.register_verified_block(block))
+            .collect())
+    }
+
+    fn register_verified_block(&self, block: CompleteBlock<T>) -> ImmutableBlock<T> {
         self.metrics.inc_registrations();
         let handle = self
             .block_registry
             .register_sequence_hash(block.sequence_hash());
         let inner = handle.register_block(block, self.duplication_policy, &self.store);
         ImmutableBlock::from_inner(inner)
+    }
+
+    /// Return whether any supplied hash is physically registered in this
+    /// manager.
+    ///
+    /// The result includes active, inactive, and pressure-held residency.
+    /// It does not prove request availability. In particular, a held hash
+    /// returns `true` here but is unavailable from [`match_blocks`](Self::match_blocks)
+    /// and [`scan_matches`](Self::scan_matches).
+    ///
+    /// This read takes the store mutex once. It does not resurrect a cached
+    /// block, touch frequency tracking, reorder inactive candidates, or expose
+    /// physical block identities.
+    pub fn has_any_registered_hashes(&self, hashes: &[SequenceHash]) -> bool {
+        self.store.has_any_registered_hashes(hashes)
     }
 
     /// Linear prefix match: walks `seq_hash` left-to-right, stopping on
@@ -336,6 +576,70 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
         self.store.inactive_candidates(max)
     }
 
+    /// Atomically claim the exact inactive leaf and every real ancestor.
+    ///
+    /// The hold is available only when the inactive backend can prove a
+    /// complete lineage. A stale candidate, an active block, a non-leaf, or
+    /// a missing ancestor returns `None` without a partial state change.
+    pub fn try_hold_inactive_lineage(
+        &self,
+        candidate: InactiveCandidate,
+    ) -> Option<InactiveLineageHold<T>> {
+        self.store
+            .try_hold_inactive_lineage(candidate)
+            .map(|store_hold| {
+                InactiveLineageHold::new(self.id(), store_hold, self.eviction_notifier.clone())
+            })
+    }
+
+    /// Name the current complete inactive lineage for one later exact hold.
+    ///
+    /// This read-only preflight stores the manager identity, candidate tenure,
+    /// and complete root-to-leaf source set. A later prepared hold must still
+    /// find that exact set under the store lock.
+    pub fn preflight_inactive_lineage(
+        &self,
+        candidate: InactiveCandidate,
+    ) -> Option<InactiveLineagePreflight<T>> {
+        self.store
+            .preflight_inactive_lineage(candidate)
+            .map(|source_blocks| InactiveLineagePreflight::new(self.id(), candidate, source_blocks))
+    }
+
+    /// Name the current complete inactive lineage from its logical leaf hash.
+    ///
+    /// This point preflight does not depend on a bounded candidate snapshot.
+    /// The returned proof keeps the pool slot and mutable tenure private.
+    pub fn preflight_inactive_lineage_by_hash(
+        &self,
+        seq_hash: SequenceHash,
+    ) -> Option<InactiveLineagePreflight<T>> {
+        self.store
+            .preflight_inactive_lineage_by_hash(seq_hash)
+            .map(|(candidate, source_blocks)| {
+                InactiveLineagePreflight::new(self.id(), candidate, source_blocks)
+            })
+    }
+
+    /// Atomically claim a preflighted inactive lineage.
+    ///
+    /// The descriptor is single use. A different manager, a stale candidate,
+    /// or any changed source lineage returns `None` before the pool changes.
+    pub fn try_hold_prepared_inactive_lineage(
+        &self,
+        prepared: InactiveLineagePreflight<T>,
+    ) -> Option<InactiveLineageHold<T>> {
+        if !prepared.matches_manager(self.id()) {
+            return None;
+        }
+        let (candidate, source_blocks) = prepared.into_parts();
+        self.store
+            .try_hold_prepared_inactive_lineage(candidate, &source_blocks)
+            .map(|store_hold| {
+                InactiveLineageHold::new(self.id(), store_hold, self.eviction_notifier.clone())
+            })
+    }
+
     /// Membership-based point advice, positionally aligned with `hashes`.
     /// `None` = that hash is not currently resident-inactive in this pool
     /// (it is active, absent, or the backend tracks no features). Resolved
@@ -411,9 +715,7 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
 
     /// Observe future inactive-pool evictions while the caller retains `observer`.
     pub fn observe_evictions(&self, observer: &Arc<dyn BlockEvictionObserver>) {
-        self.eviction_observers
-            .write()
-            .push(Arc::downgrade(observer));
+        self.eviction_notifier.observe(observer);
     }
 
     /// Reference to the block pool metrics.

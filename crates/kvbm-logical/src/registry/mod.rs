@@ -19,7 +19,8 @@
 //!
 //! - **Handle**: One per sequence hash. Ties blocks across all pool tiers (active, inactive).
 //! - **Attachments**: Arbitrary typed data stored on handles (unique or multiple per type).
-//! - **Presence markers**: Track which `Block<T, Registered>` exist for a given handle.
+//! - **Presence markers**: Track physical registered residency per tier. They
+//!   include `Held` slots and do not prove request availability.
 //! - **Weak references**: Enable block resurrection during pool transitions.
 //!
 //! # Future directions
@@ -168,8 +169,8 @@ impl BlockRegistry {
 
     /// Check presence of sequence hashes for blocks with specific metadata type `T`.
     /// Returns `Vec<(SequenceHash, bool)>` where `bool` indicates whether a
-    /// `Block<T, Registered>` is currently believed to exist somewhere in
-    /// the active or inactive pool for this tier.
+    /// physically registered slot is currently believed to exist in the
+    /// active, inactive, or held state for this tier.
     ///
     /// # Consistency model
     ///
@@ -186,11 +187,12 @@ impl BlockRegistry {
     /// shadow count agrees with the authoritative state because the
     /// per-slot increments and decrements commute (refcounted). However,
     /// while a registration, eviction, or duplicate drop is mid-flight,
-    /// `check_presence` can briefly report the pre-update value. Callers
-    /// who need the exact current state must instead acquire a strong
-    /// reference via `BlockManager::match_blocks` /
-    /// `BlockManager::scan_matches` (which consult the store directly) or
-    /// otherwise serialize against the mutating operation.
+    /// `check_presence` can briefly report the pre-update value. A `true`
+    /// result proves physical registered residency only. It does not prove
+    /// request availability. A held block remains present, but
+    /// `BlockManager::match_blocks` and `BlockManager::scan_matches` must
+    /// not return it. Callers who need request availability must use those
+    /// store-backed operations or serialize against the mutating operation.
     ///
     /// Does NOT trigger frequency tracking.
     pub fn check_presence<T: crate::blocks::BlockMetadata>(
@@ -224,8 +226,9 @@ impl BlockRegistry {
     /// exists for at least one of the supplied tier `TypeId`s.
     ///
     /// Same consistency caveats as [`check_presence`]: this is a
-    /// refcounted shadow of authoritative store state, not a linearizable
-    /// snapshot. May briefly disagree with the store mid-mutation.
+    /// refcounted shadow of physical registered residency, not a
+    /// linearizable snapshot. A `true` result does not prove request
+    /// availability. It can briefly disagree with the store during a mutation.
     ///
     /// Does NOT trigger frequency tracking.
     pub fn check_presence_any(

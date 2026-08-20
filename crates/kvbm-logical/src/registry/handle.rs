@@ -184,19 +184,21 @@ impl BlockRegistrationHandle {
             .unwrap_or(false)
     }
 
-    /// Increment the refcounted presence marker for tier `T`. Each
-    /// presence-bearing slot transition (`Staged → Primary`,
-    /// `Staged → Duplicate`) calls this exactly once.
+    /// Increment the physical-residency marker for tier `T`. Each
+    /// registration transition (`Staged → Primary`, `Staged → Duplicate`)
+    /// calls this exactly once. The marker remains set while a slot is
+    /// `Primary`, `Duplicate`, `Inactive`, or `Held`.
     pub(crate) fn mark_present<T: BlockMetadata>(&self) {
         let type_id = TypeId::of::<T>();
         let mut attachments = self.inner.attachments.lock();
         *attachments.presence_markers.entry(type_id).or_insert(0) += 1;
     }
 
-    /// Decrement the refcounted presence marker for tier `T`. Each
+    /// Decrement the physical-residency marker for tier `T`. Each
     /// presence-removing slot transition (`Inactive → Mutable` via
-    /// eviction, `Duplicate → Reset` via last-duplicate drop) calls this
-    /// exactly once. The entry is removed on reaching zero.
+    /// eviction, `Held → Reset` via pressure commit, or `Duplicate → Reset`
+    /// via last-duplicate drop) calls this exactly once. The entry is removed
+    /// on reaching zero.
     pub(crate) fn mark_absent<T: BlockMetadata>(&self) {
         let type_id = TypeId::of::<T>();
         let mut attachments = self.inner.attachments.lock();
@@ -212,8 +214,9 @@ impl BlockRegistrationHandle {
         }
     }
 
-    /// Returns `true` if at least one `Block<T, Registered>` exists for
-    /// this sequence hash (i.e., the refcount is > 0).
+    /// Returns `true` if a physical registered slot exists for this sequence
+    /// hash and tier `T` (the refcount is greater than zero). This includes a
+    /// `Held` slot and does not prove request availability.
     ///
     /// This is a **refcounted shadow** of authoritative `BlockStore<T>`
     /// state, not a linearizable snapshot. The store is updated under
@@ -221,9 +224,10 @@ impl BlockRegistrationHandle {
     /// separate critical section that runs after the store lock is
     /// released. In steady state the shadow agrees with the store; while
     /// a registration, eviction, or duplicate drop is mid-flight it can
-    /// briefly report the pre-update value. Callers who need the exact
-    /// current state should go through `BlockManager::match_blocks`
-    /// (which consults the store directly).
+    /// briefly report the pre-update value. A held slot remains present, but
+    /// `BlockManager::match_blocks` and `BlockManager::scan_matches` cannot
+    /// return it. Callers who need request availability must use those
+    /// store-backed operations.
     pub fn has_block<T: BlockMetadata>(&self) -> bool {
         let type_id = TypeId::of::<T>();
         let attachments = self.inner.attachments.lock();
@@ -235,8 +239,9 @@ impl BlockRegistrationHandle {
             > 0
     }
 
-    /// Returns `true` if a block exists for at least one of the
-    /// specified metadata-tier `TypeId`s.
+    /// Returns `true` if physical registered residency exists for at least
+    /// one specified metadata-tier `TypeId`. This does not prove request
+    /// availability.
     pub fn has_any_block(&self, type_ids: &[TypeId]) -> bool {
         let attachments = self.inner.attachments.lock();
         type_ids.iter().any(|type_id| {

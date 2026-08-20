@@ -47,8 +47,16 @@ use crate::registry::BlockRegistrationHandle;
 
 // Identity hashing for `SequenceHash`-keyed maps lives in `pools` — it is
 // shared by `active_by_hash` here and by the inactive-pool backends.
-use super::SeqHashMap;
 use super::advice::{InactiveCandidate, InactiveFeatures};
+use super::{ExactInactiveVictim, SeqHashMap};
+
+#[cfg(test)]
+mod exact_inactive;
+mod exact_reclaim;
+mod inactive_lineage_hold;
+
+pub(crate) use exact_reclaim::ExactReclaimPlanError;
+pub(crate) use inactive_lineage_hold::StoreInactiveLineageHold;
 
 /// Index trait for inactive-pool eviction backends. T-free: backends only
 /// need `(SequenceHash, BlockId)` pairs.
@@ -90,9 +98,75 @@ pub(crate) trait InactiveIndex: Send + Sync {
 
     fn has(&self, seq_hash: SequenceHash) -> bool;
 
+    /// Test exact inactive reclaim eligibility without changing policy state.
+    ///
+    /// A `true` result must guarantee that the next [`Self::take`] succeeds
+    /// under the same store lock and that the pair is evictable under the
+    /// backend policy. The default rejects exact reclaim until a backend
+    /// provides that guarantee.
+    #[cfg(test)]
+    fn contains(&self, seq_hash: SequenceHash, block_id: BlockId) -> bool {
+        let _ = (seq_hash, block_id);
+        false
+    }
+
     /// Remove a specific `block_id`/`seq_hash` pair if present.
     #[allow(dead_code)]
     fn take(&mut self, seq_hash: SequenceHash, block_id: BlockId) -> bool;
+
+    /// Atomically remove the complete real lineage from root through the
+    /// exact inactive leaf. Backends without lineage data return `None`.
+    fn take_complete_lineage(
+        &mut self,
+        seq_hash: SequenceHash,
+        block_id: BlockId,
+    ) -> Option<Vec<(SequenceHash, BlockId)>> {
+        let _ = (seq_hash, block_id);
+        None
+    }
+
+    /// Read the complete real lineage without changing backend state.
+    ///
+    /// A backend that implements [`Self::take_complete_lineage`] must return
+    /// the same list here while the caller holds the store lock. The pressure
+    /// owner uses this preview to reject an overlap before extraction.
+    fn complete_lineage(
+        &self,
+        seq_hash: SequenceHash,
+        block_id: BlockId,
+    ) -> Option<Vec<(SequenceHash, BlockId)>> {
+        let _ = (seq_hash, block_id);
+        None
+    }
+
+    /// Return whether this backend can resolve and validate exact reclaim.
+    fn supports_exact_reclaim(&self) -> bool {
+        false
+    }
+
+    /// Resolve one exact inactive entry leaf without exposing its block identity.
+    fn exact_block_id(&self, seq_hash: SequenceHash) -> Option<BlockId> {
+        let _ = seq_hash;
+        None
+    }
+
+    /// Verify that `victims` names one complete, safe removal sequence.
+    ///
+    /// The store holds its mutex for this preflight and the later commit. A
+    /// successful result must guarantee that each subsequent [`Self::take`]
+    /// in the supplied order succeeds without a structural policy mutation
+    /// before the first take. Backends without this proof reject non-empty
+    /// plans. An empty plan needs no backend proof.
+    fn preflight_exact_reclaim(
+        &self,
+        victims: &[ExactInactiveVictim],
+    ) -> Result<(), ExactReclaimPlanError> {
+        if victims.is_empty() {
+            Ok(())
+        } else {
+            Err(ExactReclaimPlanError::Unsupported)
+        }
+    }
 
     /// Mark the single-owner lineage suffix ending at `seq_hash` for evict-first
     /// (compaction poison). Default is a no-op — only the lineage backend's valued leaf
@@ -214,6 +288,12 @@ pub(crate) enum SlotState<T: BlockMetadata> {
         seq_hash: SequenceHash,
         handle: BlockRegistrationHandle,
     },
+    /// Temporarily owned by an out-of-band pressure action. The slot is
+    /// registered but absent from both lookup maps and allocation pools.
+    Held {
+        seq_hash: SequenceHash,
+        handle: BlockRegistrationHandle,
+    },
 }
 
 impl<T: BlockMetadata> std::fmt::Debug for SlotState<T> {
@@ -237,6 +317,9 @@ impl<T: BlockMetadata> std::fmt::Debug for SlotState<T> {
                 .debug_struct("Inactive")
                 .field("seq_hash", seq_hash)
                 .finish(),
+            SlotState::Held { seq_hash, .. } => {
+                f.debug_struct("Held").field("seq_hash", seq_hash).finish()
+            }
         }
     }
 }
@@ -244,6 +327,14 @@ impl<T: BlockMetadata> std::fmt::Debug for SlotState<T> {
 #[derive(Debug)]
 pub(crate) struct BlockSlot<T: BlockMetadata> {
     pub(crate) block_size: usize,
+    /// Increments before every fresh mutable allocation for this slot.
+    generation: u64,
+    /// Increments every time this slot enters an inactive residency tenure.
+    ///
+    /// Unlike `generation`, this changes after a cache-hit resurrection
+    /// returns to inactive. It lets exact reclaim reject an inactive →
+    /// active → inactive ABA without changing fresh-allocation semantics.
+    inactive_epoch: u64,
     pub(crate) state: SlotState<T>,
 }
 
@@ -260,6 +351,12 @@ pub(crate) struct BlockStoreInner<T: BlockMetadata> {
     /// Uses the identity [`IdHasher`](super::IdHasher) — the key is
     /// already a content hash.
     active_by_hash: SeqHashMap<BlockId>,
+    /// Hashes whose canonical inactive lineage is owned by a pressure action.
+    ///
+    /// A concurrent registration can add a newer physical block with the
+    /// same hash. Request lookup must still stop at this ownership fence
+    /// until the action aborts or commits.
+    held_by_hash: SeqHashMap<BlockId>,
     /// Per-slot "reset on last drop" override, indexed by `BlockId`.
     /// Length is fixed to `total_blocks` at construction.
     ///
@@ -394,6 +491,8 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         for i in 0..total_blocks {
             slots.push(BlockSlot {
                 block_size,
+                generation: 0,
+                inactive_epoch: 0,
                 state: SlotState::Reset,
             });
             free.push_back(i);
@@ -406,6 +505,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
                 free,
                 inactive,
                 active_by_hash: SeqHashMap::default(),
+                held_by_hash: SeqHashMap::default(),
                 reset_on_release,
             }),
             block_size,
@@ -492,8 +592,23 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         inner.free.len() + inner.inactive.len()
     }
 
+    /// Return whether any supplied hash has physical registered residency.
+    ///
+    /// This reads the active, inactive, and pressure-held indexes under one
+    /// store lock. It does not make a held hash request-available, and it does
+    /// not touch the inactive index or any metric.
+    pub(crate) fn has_any_registered_hashes(&self, hashes: &[SequenceHash]) -> bool {
+        let inner = self.inner.lock();
+        hashes.iter().any(|hash| {
+            inner.active_by_hash.contains_key(hash)
+                || inner.held_by_hash.contains_key(hash)
+                || inner.inactive.has(*hash)
+        })
+    }
+
     pub(crate) fn has_inactive(&self, seq_hash: SequenceHash) -> bool {
-        self.inner.lock().inactive.has(seq_hash)
+        let inner = self.inner.lock();
+        !inner.held_by_hash.contains_key(&seq_hash) && inner.inactive.has(seq_hash)
     }
 
     /// Bounded read-only snapshot of up to `max` blocks the inactive index
@@ -505,14 +620,16 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
     /// order. Backs
     /// [`BlockManager::inactive_candidates`](crate::manager::BlockManager::inactive_candidates).
     pub(crate) fn inactive_candidates(&self, max: usize) -> Vec<InactiveCandidate> {
-        self.inner
-            .lock()
-            .inactive
-            .peek_victims(max)
+        let inner = self.inner.lock();
+        let candidates = inner.inactive.peek_victims(max);
+        candidates
             .into_iter()
+            .filter(|(seq_hash, _, _)| !inner.held_by_hash.contains_key(seq_hash))
             .map(|(seq_hash, block_id, features)| InactiveCandidate {
                 seq_hash,
                 block_id,
+                generation: inner.slots[block_id].generation,
+                inactive_epoch: inner.slots[block_id].inactive_epoch,
                 features,
             })
             .collect()
@@ -524,7 +641,14 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
     /// independently-timed ones. Mirrors [`Self::has_inactive`].
     pub(crate) fn inactive_advice(&self, hashes: &[SequenceHash]) -> Vec<Option<InactiveFeatures>> {
         let inner = self.inner.lock();
-        hashes.iter().map(|&h| inner.inactive.advice(h)).collect()
+        hashes
+            .iter()
+            .map(|&h| {
+                (!inner.held_by_hash.contains_key(&h))
+                    .then(|| inner.inactive.advice(h))
+                    .flatten()
+            })
+            .collect()
     }
 
     /// Mark the single-owner inactive lineage suffix ending at `seq_hash` for
@@ -552,24 +676,67 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
 
     // ---------- guard construction ----------
 
+    /// Enter a new mutable tenure for a reset or inactive slot.
+    fn allocate_mutable_slot(&self, inner: &mut BlockStoreInner<T>, block_id: BlockId) -> usize {
+        let block_size = {
+            let slot = &mut inner.slots[block_id];
+            debug_assert!(matches!(
+                slot.state,
+                SlotState::Reset | SlotState::Inactive { .. }
+            ));
+            assert_ne!(slot.generation, u64::MAX, "block slot generation exhausted");
+            slot.generation += 1;
+            slot.state = SlotState::Mutable;
+            slot.block_size
+        };
+        inner.reset_on_release[block_id] = self.default_reset_on_release;
+        block_size
+    }
+
+    fn allocate_reset_blocks_locked(
+        self: &Arc<Self>,
+        inner: &mut BlockStoreInner<T>,
+        count: usize,
+    ) -> Vec<MutableBlock<T>> {
+        debug_assert!(count <= inner.free.len());
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            let id = inner.free.pop_front().unwrap();
+            let block_size = self.allocate_mutable_slot(inner, id);
+            out.push(MutableBlock::from_store(self.clone(), id, block_size));
+        }
+        self.metrics.dec_reset_pool_size_by(count as i64);
+        self.metrics.inc_inflight_mutable_by(count as i64);
+        self.metrics.inc_allocations(count as u64);
+        self.metrics.inc_allocations_from_reset(count as u64);
+        out
+    }
+
     /// Allocate up to `count` MutableBlocks from the reset pool only.
     /// Returns however many were available (no eviction).
     pub(crate) fn allocate_reset_blocks(self: &Arc<Self>, count: usize) -> Vec<MutableBlock<T>> {
         let mut inner = self.inner.lock();
-        let take = std::cmp::min(count, inner.free.len());
-        let mut out = Vec::with_capacity(take);
-        for _ in 0..take {
-            let id = inner.free.pop_front().unwrap();
-            inner.slots[id].state = SlotState::Mutable;
-            inner.reset_on_release[id] = self.default_reset_on_release;
-            let block_size = inner.slots[id].block_size;
-            out.push(MutableBlock::from_store(self.clone(), id, block_size));
+        let count = std::cmp::min(count, inner.free.len());
+        self.allocate_reset_blocks_locked(&mut inner, count)
+    }
+
+    /// Allocate exactly `count` mutable blocks from the reset pool.
+    ///
+    /// A short reset pool returns `None` before any slot changes. This never
+    /// inspects or changes the inactive pool.
+    pub(crate) fn allocate_reset_blocks_atomic(
+        self: &Arc<Self>,
+        count: usize,
+    ) -> Option<Vec<MutableBlock<T>>> {
+        if count == 0 {
+            return Some(Vec::new());
         }
-        self.metrics.dec_reset_pool_size_by(take as i64);
-        self.metrics.inc_inflight_mutable_by(take as i64);
-        self.metrics.inc_allocations(take as u64);
-        self.metrics.inc_allocations_from_reset(take as u64);
-        out
+
+        let mut inner = self.inner.lock();
+        if inner.free.len() < count {
+            return None;
+        }
+        Some(self.allocate_reset_blocks_locked(&mut inner, count))
     }
 
     /// All-or-nothing allocation across the reset and inactive pools under a
@@ -624,9 +791,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         // Commit. Past this point we cannot fail.
         let mut blocks = Vec::with_capacity(count);
         for id in reset_ids {
-            inner.slots[id].state = SlotState::Mutable;
-            inner.reset_on_release[id] = self.default_reset_on_release;
-            let block_size = inner.slots[id].block_size;
+            let block_size = self.allocate_mutable_slot(&mut inner, id);
             blocks.push(MutableBlock::from_store(self.clone(), id, block_size));
         }
         let mut evicted = Vec::with_capacity(from_inactive);
@@ -634,9 +799,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         for (seq_hash, block_id) in evicted_pairs {
             // Eviction discards the override; the slot leaves Inactive.
             let handle = take_inactive_handle(&mut inner.slots[block_id], block_id);
-            inner.slots[block_id].state = SlotState::Mutable;
-            inner.reset_on_release[block_id] = self.default_reset_on_release;
-            let block_size = inner.slots[block_id].block_size;
+            let block_size = self.allocate_mutable_slot(&mut inner, block_id);
             blocks.push(MutableBlock::from_store(self.clone(), block_id, block_size));
             evicted.push(seq_hash);
             handles.push(handle);
@@ -672,10 +835,8 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         for (seq_hash, block_id) in drained {
             // Eviction discards the override; the slot leaves Inactive.
             let handle = take_inactive_handle(&mut inner.slots[block_id], block_id);
-            inner.slots[block_id].state = SlotState::Mutable;
-            inner.reset_on_release[block_id] = self.default_reset_on_release;
+            let block_size = self.allocate_mutable_slot(&mut inner, block_id);
             handles.push(handle);
-            let block_size = inner.slots[block_id].block_size;
             out.push(MutableBlock::from_store(self.clone(), block_id, block_size));
             evicted.push(seq_hash);
         }
@@ -718,6 +879,31 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
     /// 3. If the inactive index has the hash, resurrect it.
     /// 4. Else `None`.
     fn acquire_for_hash_locked(
+        self: &Arc<Self>,
+        inner: &mut BlockStoreInner<T>,
+        seq_hash: SequenceHash,
+        touch: bool,
+    ) -> Option<Arc<ImmutableBlockInner<T>>> {
+        if inner.held_by_hash.contains_key(&seq_hash) {
+            return None;
+        }
+        self.acquire_registered_for_hash_locked(inner, seq_hash, touch)
+    }
+
+    /// Registration-side lookup ignores a held ownership fence only to find
+    /// a newer primary or duplicate that arrived after the hold began. The
+    /// public request path always calls [`Self::acquire_for_hash_locked`].
+    fn acquire_for_registration_locked(
+        self: &Arc<Self>,
+        inner: &mut BlockStoreInner<T>,
+        seq_hash: SequenceHash,
+        touch: bool,
+    ) -> Option<Arc<ImmutableBlockInner<T>>> {
+        self.acquire_registered_for_hash_locked(inner, seq_hash, touch)
+    }
+
+    /// Active-or-inactive lookup without the held ownership fence.
+    fn acquire_registered_for_hash_locked(
         self: &Arc<Self>,
         inner: &mut BlockStoreInner<T>,
         seq_hash: SequenceHash,
@@ -818,7 +1004,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         block.disarm();
 
         let mut inner = self.inner.lock();
-        let existing = self.acquire_for_hash_locked(&mut inner, seq_hash, false);
+        let existing = self.acquire_for_registration_locked(&mut inner, seq_hash, false);
 
         // Whether we added a new presence-bearing slot (Primary or
         // Duplicate). Reject does not, since the slot returns to Reset.
@@ -964,7 +1150,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
                 let block_id = block.block_id();
                 let seq_hash = block.sequence_hash();
 
-                let existing = self.acquire_for_hash_locked(&mut inner, seq_hash, false);
+                let existing = self.acquire_for_registration_locked(&mut inner, seq_hash, false);
 
                 let inner_arc = if let Some(existing_primary) = existing {
                     assert_ne!(
@@ -1044,6 +1230,29 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         results
     }
 
+    /// Transition a slot into a new inactive residency tenure.
+    ///
+    /// The caller holds the store lock and must clear any active-map entry
+    /// that names this slot. A hold abort restores a paused tenure and does
+    /// not call this helper.
+    fn enter_inactive_tenure_locked(
+        &self,
+        inner: &mut BlockStoreInner<T>,
+        block_id: BlockId,
+        seq_hash: SequenceHash,
+        handle: BlockRegistrationHandle,
+    ) {
+        let slot = &mut inner.slots[block_id];
+        assert_ne!(
+            slot.inactive_epoch,
+            u64::MAX,
+            "block slot inactive epoch exhausted"
+        );
+        slot.inactive_epoch += 1;
+        slot.state = SlotState::Inactive { seq_hash, handle };
+        inner.inactive.insert(seq_hash, block_id);
+    }
+
     /// Internal helper: under the store lock, transition a Primary slot to
     /// Inactive without touching presence (the original Inner::drop's
     /// presence-side responsibilities are unchanged — it just no-ops the
@@ -1054,8 +1263,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         seq_hash: SequenceHash,
         block_id: BlockId,
     ) {
-        let slot = &mut inner.slots[block_id];
-        let handle = match &slot.state {
+        let handle = match &inner.slots[block_id].state {
             SlotState::Primary { handle, .. } => handle.clone(),
             other => panic!("eager_primary_to_inactive: slot {block_id} was {other:?}"),
         };
@@ -1067,8 +1275,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         // and the eventual `release_primary` read go through this same
         // store mutex, so the value is published reliably regardless of
         // which thread wins the race for the lock.
-        slot.state = SlotState::Inactive { seq_hash, handle };
-        inner.inactive.insert(seq_hash, block_id);
+        self.enter_inactive_tenure_locked(inner, block_id, seq_hash, handle);
         inner.active_by_hash.remove(&seq_hash);
         self.metrics.inc_inactive_pool_size();
         self.metrics.inc_eager_primary_to_inactive();
@@ -1091,7 +1298,12 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
     ) -> Vec<(SequenceHash, Arc<ImmutableBlockInner<T>>)> {
         let mut inner = self.inner.lock();
         let matched: Vec<(SequenceHash, BlockId)> = if scan {
-            inner.inactive.scan_matches(hashes, touch)
+            let visible_hashes = hashes
+                .iter()
+                .copied()
+                .filter(|hash| !inner.held_by_hash.contains_key(hash))
+                .collect::<Vec<_>>();
+            inner.inactive.scan_matches(&visible_hashes, touch)
         } else {
             // First-hash fast-path: probe the head via the
             // backend-specific `find_match` override before allocating
@@ -1100,13 +1312,21 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
             let Some((&first_hash, rest)) = hashes.split_first() else {
                 return Vec::new();
             };
+            if inner.held_by_hash.contains_key(&first_hash) {
+                return Vec::new();
+            }
             let Some(first_pair) = inner.inactive.find_match(first_hash, touch) else {
                 return Vec::new();
             };
             let mut matched = Vec::with_capacity(hashes.len());
             matched.push(first_pair);
             if !rest.is_empty() {
-                matched.extend(inner.inactive.find_matches(rest, touch));
+                let visible_rest = rest
+                    .iter()
+                    .copied()
+                    .take_while(|hash| !inner.held_by_hash.contains_key(hash))
+                    .collect::<Vec<_>>();
+                matched.extend(inner.inactive.find_matches(&visible_rest, touch));
             }
             matched
         };
@@ -1241,8 +1461,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
                 // The atomic carries the holder's override into the
                 // Inactive period untouched; a future resurrection will
                 // inherit it via the same atomic.
-                inner.slots[block_id].state = SlotState::Inactive { seq_hash, handle };
-                inner.inactive.insert(seq_hash, block_id);
+                self.enter_inactive_tenure_locked(&mut inner, block_id, seq_hash, handle);
                 inner.active_by_hash.remove(&seq_hash);
                 self.metrics.inc_inactive_pool_size();
                 tracing::trace!(?seq_hash, block_id, "Block stored in inactive pool");
@@ -1538,8 +1757,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
                     pending_mark_absent.push(handle);
                     report.primary_reset += 1;
                 } else {
-                    inner.slots[block_id].state = SlotState::Inactive { seq_hash, handle };
-                    inner.inactive.insert(seq_hash, block_id);
+                    self.enter_inactive_tenure_locked(inner, block_id, seq_hash, handle);
                     inner.active_by_hash.remove(&seq_hash);
                     self.metrics.inc_inactive_pool_size();
                     report.primary_inactive += 1;
@@ -1643,6 +1861,7 @@ pub(crate) enum SlotKind {
     Primary(SequenceHash),
     Duplicate(SequenceHash),
     Inactive(SequenceHash),
+    Held(SequenceHash),
 }
 
 /// Full test-only snapshot of a [`BlockStore`]'s bookkeeping, for
@@ -1675,6 +1894,16 @@ pub(crate) struct DebugStoreSnapshot {
 
 #[cfg(test)]
 impl<T: BlockMetadata + Sync> BlockStore<T> {
+    /// Test-only mutable-tenure counter for one physical slot.
+    pub(crate) fn slot_generation_for_test(&self, block_id: BlockId) -> u64 {
+        self.inner.lock().slots[block_id].generation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn slot_inactive_epoch_for_test(&self, block_id: BlockId) -> u64 {
+        self.inner.lock().slots[block_id].inactive_epoch
+    }
+
     /// Test-only deep snapshot of every piece of bookkeeping the unified
     /// mutex protects. Used to assert that `release_blocks` (batched) and
     /// dropping the same guards one at a time (per-block) leave the store
@@ -1691,6 +1920,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
                 SlotState::Primary { seq_hash, .. } => SlotKind::Primary(*seq_hash),
                 SlotState::Duplicate { seq_hash, .. } => SlotKind::Duplicate(*seq_hash),
                 SlotState::Inactive { seq_hash, .. } => SlotKind::Inactive(*seq_hash),
+                SlotState::Held { seq_hash, .. } => SlotKind::Held(*seq_hash),
             })
             .collect();
         // Exact FIFO order — see the `free` field docs.

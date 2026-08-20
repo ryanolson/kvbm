@@ -50,6 +50,8 @@ pub struct StatsSnapshot {
     pub inflight_mutable: i64,
     /// Current inflight immutable blocks.
     pub inflight_immutable: i64,
+    /// Current registered slots held by a pressure action.
+    pub held_residency: i64,
     /// Current reset pool size.
     pub reset_pool_size: i64,
     /// Current inactive pool size.
@@ -142,6 +144,7 @@ impl StatsCollector {
                     eviction_gradient,
                     inflight_mutable: raw.inflight_mutable,
                     inflight_immutable: raw.inflight_immutable,
+                    held_residency: raw.held_residency,
                     reset_pool_size: raw.reset_pool_size,
                     inactive_pool_size: raw.inactive_pool_size,
                 }
@@ -208,6 +211,7 @@ fn zero_stats(raw: &MetricsSnapshot) -> StatsSnapshot {
         eviction_gradient: 0.0,
         inflight_mutable: raw.inflight_mutable,
         inflight_immutable: raw.inflight_immutable,
+        held_residency: raw.held_residency,
         reset_pool_size: raw.reset_pool_size,
         inactive_pool_size: raw.inactive_pool_size,
     }

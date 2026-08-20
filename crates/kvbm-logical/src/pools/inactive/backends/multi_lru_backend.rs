@@ -176,6 +176,13 @@ impl InactiveIndex for MultiLruBackend {
             .any(|pool| pool.peek(&seq_hash).is_some())
     }
 
+    #[cfg(test)]
+    fn contains(&self, seq_hash: SequenceHash, block_id: BlockId) -> bool {
+        self.priority_pools
+            .iter()
+            .any(|pool| pool.peek(&seq_hash) == Some(&block_id))
+    }
+
     fn take(&mut self, seq_hash: SequenceHash, block_id: BlockId) -> bool {
         for pool in &mut self.priority_pools {
             if pool.peek(&seq_hash) == Some(&block_id) {

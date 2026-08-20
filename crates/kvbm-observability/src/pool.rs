@@ -40,6 +40,7 @@ pub struct BlockPoolMetrics {
     // Gauges (bidirectional)
     inflight_mutable: AtomicI64,
     inflight_immutable: AtomicI64,
+    held_residency: AtomicI64,
     reset_pool_size: AtomicI64,
     inactive_pool_size: AtomicI64,
 }
@@ -66,6 +67,7 @@ impl BlockPoolMetrics {
             release_duplicate_noop_total: AtomicU64::new(0),
             inflight_mutable: AtomicI64::new(0),
             inflight_immutable: AtomicI64::new(0),
+            held_residency: AtomicI64::new(0),
             reset_pool_size: AtomicI64::new(0),
             inactive_pool_size: AtomicI64::new(0),
         }
@@ -174,6 +176,18 @@ impl BlockPoolMetrics {
     #[inline(always)]
     pub fn dec_inflight_immutable_by(&self, n: i64) {
         self.inflight_immutable.fetch_sub(n, Ordering::Relaxed);
+    }
+
+    /// Count registered slots owned by an out-of-band pressure action.
+    #[inline(always)]
+    pub fn inc_held_residency_by(&self, n: i64) {
+        self.held_residency.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Remove registered slots from out-of-band pressure ownership.
+    #[inline(always)]
+    pub fn dec_held_residency_by(&self, n: i64) {
+        self.held_residency.fetch_sub(n, Ordering::Relaxed);
     }
 
     #[inline(always)]
@@ -290,6 +304,7 @@ impl BlockPoolMetrics {
             release_duplicate_noop_total: self.release_duplicate_noop_total.load(Ordering::Relaxed),
             inflight_mutable: self.inflight_mutable.load(Ordering::Relaxed),
             inflight_immutable: self.inflight_immutable.load(Ordering::Relaxed),
+            held_residency: self.held_residency.load(Ordering::Relaxed),
             reset_pool_size: self.reset_pool_size.load(Ordering::Relaxed),
             inactive_pool_size: self.inactive_pool_size.load(Ordering::Relaxed),
         }
@@ -297,7 +312,7 @@ impl BlockPoolMetrics {
 }
 
 /// Point-in-time snapshot of all atomic metrics, used by the stats collector and prometheus collector.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MetricsSnapshot {
     pub allocations: u64,
     pub allocations_from_reset: u64,
@@ -316,6 +331,7 @@ pub struct MetricsSnapshot {
     pub release_duplicate_noop_total: u64,
     pub inflight_mutable: i64,
     pub inflight_immutable: i64,
+    pub held_residency: i64,
     pub reset_pool_size: i64,
     pub inactive_pool_size: i64,
 }
@@ -361,6 +377,16 @@ mod tests {
         let snap = m.snapshot();
         assert_eq!(snap.inflight_mutable, 1);
         assert_eq!(snap.inflight_immutable, 2);
+    }
+
+    #[test]
+    fn test_held_residency_gauge() {
+        let m = BlockPoolMetrics::new("G2".to_string());
+
+        m.inc_held_residency_by(3);
+        m.dec_held_residency_by(1);
+
+        assert_eq!(m.snapshot().held_residency, 2);
     }
 
     #[test]

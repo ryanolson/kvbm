@@ -23,7 +23,7 @@ use crate::{
     registry::BlockRegistry,
 };
 
-use super::BlockManager;
+use super::{BlockManager, EvictionNotifier};
 
 /// Capacity settings for the TinyLFU frequency tracker used by
 /// [`BlockRegistry`] and the multi-level LRU backend.
@@ -558,7 +558,7 @@ impl<T: BlockMetadata> BlockManagerConfigBuilder<T> {
             total_blocks: block_count,
             block_size,
             metrics,
-            eviction_observers: Default::default(),
+            eviction_notifier: EvictionNotifier::default(),
         })
     }
 }

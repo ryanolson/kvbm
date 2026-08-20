@@ -113,5 +113,6 @@ All metrics carry a `pool` label identifying the storage tier.
 |------|-------------|
 | `kvbm_inflight_mutable` | Current MutableBlocks held outside pool |
 | `kvbm_inflight_immutable` | Current ImmutableBlocks held outside pool |
+| `kvbm_held_residency` | Current registered slots held by a pressure action |
 | `kvbm_reset_pool_size` | Current reset pool size |
 | `kvbm_inactive_pool_size` | Current inactive pool size |

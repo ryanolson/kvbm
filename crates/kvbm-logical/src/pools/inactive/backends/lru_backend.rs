@@ -93,6 +93,11 @@ impl InactiveIndex for LruBackend {
         self.cache.peek(&seq_hash).is_some()
     }
 
+    #[cfg(test)]
+    fn contains(&self, seq_hash: SequenceHash, block_id: BlockId) -> bool {
+        self.cache.peek(&seq_hash) == Some(&block_id)
+    }
+
     fn take(&mut self, seq_hash: SequenceHash, block_id: BlockId) -> bool {
         if self.cache.peek(&seq_hash) == Some(&block_id) {
             self.cache.pop(&seq_hash);

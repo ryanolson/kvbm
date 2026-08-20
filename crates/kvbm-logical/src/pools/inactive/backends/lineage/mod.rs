@@ -37,6 +37,7 @@
 #[cfg(test)]
 mod advice_tests;
 mod eviction;
+mod hold;
 #[cfg(test)]
 mod trace_tests;
 mod valued;
@@ -52,7 +53,7 @@ use dynamo_tokens::PositionalLineageHash;
 use crate::BlockId;
 use crate::blocks::SequenceHash;
 use crate::pools::advice::{InactiveFeatures, evict_rank_for};
-use crate::pools::store::InactiveIndex;
+use crate::pools::store::{ExactReclaimPlanError, InactiveIndex};
 
 // ---------------------------------------------------------------------------
 // `(position, fragment)` index hasher
@@ -605,6 +606,25 @@ impl InactiveIndex for LineageBackend {
         })
     }
 
+    #[cfg(test)]
+    fn contains(&self, seq_hash: SequenceHash, block_id: BlockId) -> bool {
+        let position = seq_hash.position();
+        let fragment = seq_hash.parent_fragment_for_child_position(position + 1);
+        self.index.get(&(position, fragment)).is_some_and(|&idx| {
+            match self.slots[idx as usize].data {
+                SlotData::Real {
+                    seq_hash: stored,
+                    block_id: stored_id,
+                } => {
+                    stored == seq_hash
+                        && stored_id == block_id
+                        && self.slots[idx as usize].is_leaf()
+                }
+                _ => false,
+            }
+        })
+    }
+
     fn take(&mut self, seq_hash: SequenceHash, block_id: BlockId) -> bool {
         // Match on the full `SequenceHash` AND the block id — the
         // `(position, fragment)` key alone can collide across distinct PLHs.
@@ -624,6 +644,46 @@ impl InactiveIndex for LineageBackend {
         } else {
             false
         }
+    }
+
+    fn take_complete_lineage(
+        &mut self,
+        seq_hash: SequenceHash,
+        block_id: BlockId,
+    ) -> Option<Vec<(SequenceHash, BlockId)>> {
+        self.take_exact_complete_lineage(seq_hash, block_id)
+    }
+
+    fn complete_lineage(
+        &self,
+        seq_hash: SequenceHash,
+        block_id: BlockId,
+    ) -> Option<Vec<(SequenceHash, BlockId)>> {
+        self.exact_complete_lineage(seq_hash, block_id)
+    }
+
+    fn supports_exact_reclaim(&self) -> bool {
+        true
+    }
+
+    fn exact_block_id(&self, seq_hash: SequenceHash) -> Option<BlockId> {
+        let position = seq_hash.position();
+        let fragment = seq_hash.parent_fragment_for_child_position(position + 1);
+        let index = *self.index.get(&(position, fragment))?;
+        match self.slots[index as usize].data {
+            SlotData::Real {
+                seq_hash: stored,
+                block_id,
+            } if stored == seq_hash => Some(block_id),
+            _ => None,
+        }
+    }
+
+    fn preflight_exact_reclaim(
+        &self,
+        victims: &[crate::ExactInactiveVictim],
+    ) -> Result<(), ExactReclaimPlanError> {
+        LineageBackend::preflight_exact_reclaim(self, victims)
     }
 
     fn poison(&mut self, seq_hash: SequenceHash) {

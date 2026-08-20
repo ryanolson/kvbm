@@ -16,7 +16,9 @@
 //! cache hit, or be evicted before the consumer acts. Nothing in this module
 //! confers authority over a block — a transfer must re-acquire it through the
 //! ordinary match / pin / hold path, and a candidate that moved on is a
-//! *skipped* candidate, never an error.
+//! *skipped* candidate, never an error. Exact reclaim binds this snapshot to
+//! a manager, a mutable generation, and an inactive epoch. It rejects a
+//! moved candidate without mutation.
 //!
 //! # Non-mutation
 //!
@@ -37,6 +39,17 @@ pub struct InactiveCandidate {
     /// Pool slot holding it. Together with the manager's
     /// [`ManagerId`](crate::ManagerId) this names a physical slot.
     pub block_id: BlockId,
+    /// Mutable-allocation tenure of this physical slot.
+    ///
+    /// A fresh mutable allocation changes this value. Exact reclaim names bind
+    /// this generation to the candidate's current manager and physical slot.
+    pub generation: u64,
+    /// Inactive residency tenure of this physical slot.
+    ///
+    /// A cache hit keeps the mutable-allocation generation, but it ends this
+    /// tenure when its returned `ImmutableBlock` drops. Exact reclaim refresh
+    /// resolves the current epoch and rejects a changed mutable generation.
+    pub inactive_epoch: u64,
     /// Advisory features for this block; see [`InactiveFeatures`].
     pub features: InactiveFeatures,
 }

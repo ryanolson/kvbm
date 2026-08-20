@@ -58,6 +58,14 @@ impl<T: BlockMetadata + Sync> CompleteBlock<T> {
         self.seq_hash
     }
 
+    /// Return whether this staged block belongs to `store`.
+    ///
+    /// Registration uses this before it changes any slot. Block IDs only name
+    /// slots within one store, so equal IDs from separate stores are not valid.
+    pub(crate) fn is_from_store(&self, store: &Arc<BlockStore<T>>) -> bool {
+        Arc::ptr_eq(&self.store, store)
+    }
+
     /// Roll back to a [`MutableBlock`].
     pub fn reset(mut self) -> MutableBlock<T> {
         self.store.transition_back_to_mutable(self.block_id);

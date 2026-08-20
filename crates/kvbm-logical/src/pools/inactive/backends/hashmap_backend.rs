@@ -102,6 +102,11 @@ impl InactiveIndex for HashMapBackend {
         self.blocks.contains_key(&seq_hash)
     }
 
+    #[cfg(test)]
+    fn contains(&self, seq_hash: SequenceHash, block_id: BlockId) -> bool {
+        self.blocks.get(&seq_hash) == Some(&block_id)
+    }
+
     fn take(&mut self, seq_hash: SequenceHash, block_id: BlockId) -> bool {
         if self.blocks.get(&seq_hash) == Some(&block_id) {
             self.blocks.remove(&seq_hash);

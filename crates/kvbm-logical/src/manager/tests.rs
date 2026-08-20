@@ -9,6 +9,15 @@ use crate::testing::{
 };
 use rstest::rstest;
 
+mod exact_inactive_allocation;
+mod exact_reclaim_allocation;
+mod exact_reclaim_by_hash;
+mod inactive_lineage_hold;
+mod opaque_exact_reclaim;
+mod registered_presence;
+mod registration_provenance;
+mod reset_only_allocation;
+
 // Type alias for backward compatibility
 type TestBlockData = TestMeta;
 
@@ -3029,8 +3038,10 @@ mod audit_counter_tests {
             .into_iter()
             .next()
             .unwrap();
+        let block_id = immutable.block_id();
 
         let store = manager.store_for_test();
+        let inactive_epoch_before = store.slot_inactive_epoch_for_test(block_id);
 
         let snap_before = manager.metrics().snapshot();
         assert_eq!(snap_before.eager_primary_to_inactive_total, 0);
@@ -3062,6 +3073,11 @@ mod audit_counter_tests {
         assert_eq!(
             snap_mid.eager_primary_to_inactive_total, 1,
             "eager-transition counter must tick exactly once"
+        );
+        assert_eq!(
+            store.slot_inactive_epoch_for_test(block_id),
+            inactive_epoch_before + 1,
+            "the eager path starts a new inactive tenure before resurrection"
         );
 
         // Release the gate FIRST so the parked drop_t can run. We

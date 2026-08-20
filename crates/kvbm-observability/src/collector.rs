@@ -89,6 +89,10 @@ const GAUGE_DEFS: &[(&str, &str)] = &[
         "kvbm_inflight_immutable",
         "Current ImmutableBlocks held outside pool",
     ),
+    (
+        "kvbm_held_residency",
+        "Current registered slots held by a pressure action",
+    ),
     ("kvbm_reset_pool_size", "Current reset pool size"),
     ("kvbm_inactive_pool_size", "Current inactive pool size"),
 ];
@@ -238,9 +242,10 @@ impl Collector for MetricsAggregator {
             }
 
             // Gauge values in order matching GAUGE_DEFS
-            let gauge_values: [i64; 4] = [
+            let gauge_values: [i64; 5] = [
                 snap.inflight_mutable,
                 snap.inflight_immutable,
+                snap.held_residency,
                 snap.reset_pool_size,
                 snap.inactive_pool_size,
             ];
@@ -323,6 +328,22 @@ mod tests {
             .expect("should have reset pool size family");
         assert_eq!(reset_family.get_field_type(), MetricType::GAUGE);
         assert_eq!(reset_family.get_metric()[0].get_gauge().value(), 42.0);
+    }
+
+    #[test]
+    fn test_held_residency_gauge_is_collected() {
+        let agg = MetricsAggregator::new();
+        let metrics = Arc::new(BlockPoolMetrics::new("G1".to_string()));
+        metrics.inc_held_residency_by(2);
+        agg.register_source(metrics);
+
+        let family = agg
+            .collect()
+            .into_iter()
+            .find(|family| family.get_name() == "kvbm_held_residency")
+            .expect("held residency metric family");
+        assert_eq!(family.get_field_type(), MetricType::GAUGE);
+        assert_eq!(family.get_metric()[0].get_gauge().value(), 2.0);
     }
 
     #[test]

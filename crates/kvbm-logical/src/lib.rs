@@ -41,8 +41,17 @@ pub use integrations::{
     ApplyError, DecodeOutcome, NoopDelegate, RequestSequence, SchedulableSequence,
     SchedulableSequenceBuilder, ScheduleError, SequenceDelegate, SequenceEvent, SequenceState,
 };
-pub use manager::{BlockEvictionObserver, BlockManager};
-pub use pools::{InactiveCandidate, InactiveFeatures};
+pub use manager::{
+    BlockEvictionObserver, BlockManager, BlockRegistrationError, EvictionNotification,
+    InactiveLineageHold, InactiveLineagePreflight,
+};
+#[cfg(test)]
+pub(crate) use pools::ExactAllocationError;
+pub(crate) use pools::ExactInactiveVictim;
+pub use pools::{
+    ExactReclaimEntryPlan, ExactReclaimExecuteError, ExactReclaimNameError,
+    ExactReclaimRefreshError, FreshExactReclaimPlan, InactiveCandidate, InactiveFeatures,
+};
 pub use registry::BlockRegistry;
 pub use resources::{BlockManagerSet, DuplicateLogicalResource, LogicalResourceId};
 pub use sequence::{

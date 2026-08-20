@@ -14,6 +14,8 @@
 //!   the store on drop.
 
 pub mod advice;
+mod exact;
+mod exact_reclaim;
 mod inactive;
 pub(crate) mod store;
 
@@ -24,6 +26,11 @@ pub mod tests;
 mod block_proptest;
 
 pub use advice::{InactiveCandidate, InactiveFeatures};
+pub(crate) use exact::{ExactAllocationError, ExactInactiveVictim};
+pub use exact_reclaim::{
+    ExactReclaimEntryPlan, ExactReclaimExecuteError, ExactReclaimNameError,
+    ExactReclaimRefreshError, FreshExactReclaimPlan,
+};
 pub(crate) use inactive::backends;
 pub(crate) use store::{BlockStore, InactiveIndex, ReleaseOpts};
 
