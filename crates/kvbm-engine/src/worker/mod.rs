@@ -85,6 +85,7 @@ impl LocalTransferPlacements {
             .transpose()
     }
 
+    #[cfg(feature = "collectives")]
     pub(crate) fn primary(&self) -> LogicalResourceId {
         self.primary
     }
@@ -93,10 +94,12 @@ impl LocalTransferPlacements {
         self.resources.get(&resource).copied()
     }
 
+    #[cfg(feature = "collectives")]
     pub(crate) fn resources(&self) -> Vec<LogicalResourceId> {
         self.resources.keys().copied().collect()
     }
 
+    #[cfg(feature = "collectives")]
     pub(crate) fn has_replicated(&self) -> bool {
         self.resources
             .values()
