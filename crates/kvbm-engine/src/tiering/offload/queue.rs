@@ -3,20 +3,21 @@
 
 //! Cancellable queue implementation using crossbeam SegQueue.
 //!
-//! Provides a lock-free queue wrapper that supports active cancellation via
+//! Provides a concurrent queue wrapper that supports active cancellation via
 //! a sweeper task that can iterate through queued items and remove those
 //! belonging to cancelled transfers.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crossbeam_queue::SegQueue;
 use dashmap::DashSet;
+use parking_lot::Mutex;
 use tokio::sync::Notify;
 
 use super::handle::TransferId;
 
 /// A queued item with its associated transfer ID.
-pub struct QueueItem<T> {
+pub(crate) struct QueueItem<T> {
     /// The transfer this item belongs to
     pub transfer_id: TransferId,
     /// The actual data
@@ -30,7 +31,7 @@ impl<T> QueueItem<T> {
     }
 }
 
-/// A lock-free queue that supports active cancellation via sweeping.
+/// A concurrent queue that supports active cancellation via sweeping.
 ///
 /// Unlike mpsc channels where cancellation can only be checked at dequeue time,
 /// this queue allows a dedicated sweeper task to iterate through queued items
@@ -47,7 +48,7 @@ impl<T> QueueItem<T> {
 ///                  │
 ///            (removes cancelled items)
 /// ```
-pub struct CancellableQueue<T> {
+pub(crate) struct CancellableQueue<T> {
     /// The underlying lock-free queue
     inner: SegQueue<QueueItem<T>>,
     /// Set of cancelled transfer IDs
@@ -56,6 +57,13 @@ pub struct CancellableQueue<T> {
     len: AtomicUsize,
     /// Wakes consumers without waiting for a wall-clock poll interval.
     notify: Notify,
+    /// Serializes producer admission, sweeping, and queue closure.
+    producer_gate: Mutex<()>,
+    /// Rejects work after the pipeline owner starts shutdown.
+    closed: AtomicBool,
+    /// Pauses one sweep before requeue for deterministic concurrency tests.
+    #[cfg(test)]
+    before_sweep_requeue: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl<T> CancellableQueue<T> {
@@ -66,28 +74,82 @@ impl<T> CancellableQueue<T> {
             cancelled: DashSet::new(),
             len: AtomicUsize::new(0),
             notify: Notify::new(),
+            producer_gate: Mutex::new(()),
+            closed: AtomicBool::new(false),
+            #[cfg(test)]
+            before_sweep_requeue: Mutex::new(None),
         }
     }
 
     /// Push an item onto the queue.
     ///
-    /// If the transfer has already been cancelled, the item is dropped immediately.
-    /// Returns `true` if the item was queued, `false` if it was dropped due to cancellation.
-    pub fn push(&self, transfer_id: TransferId, data: T) -> bool {
+    /// If cancellation or closure rejects the item, this method drops it.
+    /// The return value is true only when the queue accepts the item.
+    #[cfg(test)]
+    pub(crate) fn push(&self, transfer_id: TransferId, data: T) -> bool {
+        self.push_or_return(transfer_id, data).is_ok()
+    }
+
+    /// Push an item, or return ownership after cancellation or closure.
+    pub(crate) fn push_or_return(&self, transfer_id: TransferId, data: T) -> Result<(), T> {
+        let _producer = self.producer_gate.lock();
+        if self.closed.load(Ordering::Acquire) {
+            return Err(data);
+        }
+
         // Fast path: check if already cancelled before queuing
         if self.cancelled.contains(&transfer_id) {
-            return false;
+            return Err(data);
         }
 
         self.inner.push(QueueItem::new(transfer_id, data));
         self.len.fetch_add(1, Ordering::Relaxed);
         self.notify.notify_one();
-        true
+        Ok(())
     }
 
     /// Wait until a producer pushes new work or cancellation changes.
     pub async fn notified(&self) {
         self.notify.notified().await;
+    }
+
+    /// Close producer admission and return all queued payloads.
+    ///
+    /// The returned vector keeps each payload alive after the admission gate
+    /// releases. The caller owns terminal handling for these payloads.
+    pub(crate) fn close_and_drain(&self) -> Vec<T> {
+        let drained = {
+            let _producer = self.producer_gate.lock();
+            self.closed.store(true, Ordering::Release);
+
+            let mut drained = Vec::new();
+            while let Some(QueueItem { data, .. }) = self.inner.pop() {
+                drained.push(data);
+            }
+            if !drained.is_empty() {
+                self.len.fetch_sub(drained.len(), Ordering::Relaxed);
+            }
+            drained
+        };
+        self.notify.notify_waiters();
+        self.notify.notify_one();
+        drained
+    }
+
+    /// Return true after producer admission closes.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn pause_next_sweep_before_requeue(&self, pause: impl FnOnce() + Send + 'static) {
+        *self.before_sweep_requeue.lock() = Some(Box::new(pause));
+    }
+
+    /// Hold producer admission for a deterministic queue close-and-drain test.
+    #[cfg(test)]
+    pub(crate) fn lock_admission_for_test(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.producer_gate.lock()
     }
 
     /// Pop an item from the queue.
@@ -135,7 +197,8 @@ impl<T> CancellableQueue<T> {
     }
 
     /// Check if a transfer has been cancelled.
-    pub fn is_cancelled(&self, transfer_id: TransferId) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_cancelled(&self, transfer_id: TransferId) -> bool {
         self.cancelled.contains(&transfer_id)
     }
 
@@ -153,34 +216,58 @@ impl<T> CancellableQueue<T> {
     /// very large queues, it ensures correctness with the lock-free SegQueue.
     /// For typical offload workloads (batches of 64-256 blocks), this is efficient.
     pub fn sweep(&self) -> usize {
-        if self.cancelled.is_empty() {
-            return 0;
-        }
-
-        // Drain all items and requeue non-cancelled ones
-        let mut removed = 0;
-        let mut kept = Vec::new();
-
-        while let Some(item) = self.inner.pop() {
-            if self.cancelled.contains(&item.transfer_id) {
-                removed += 1;
-                // Item is dropped here, releasing any held resources
-            } else {
-                kept.push(item);
+        let removed = {
+            let _producer = self.producer_gate.lock();
+            if self.closed.load(Ordering::Acquire) {
+                return 0;
             }
-        }
 
-        // Requeue kept items
-        for item in kept {
-            self.inner.push(item);
-        }
+            if self.cancelled.is_empty() {
+                return 0;
+            }
 
-        // Update length counter
-        if removed > 0 {
-            self.len.fetch_sub(removed, Ordering::Relaxed);
-        }
+            // Drain all items and requeue non-cancelled ones.
+            let mut removed = Vec::new();
+            let mut kept = Vec::new();
 
-        removed
+            while let Some(item) = self.inner.pop() {
+                if self.cancelled.contains(&item.transfer_id) {
+                    removed.push(item);
+                } else {
+                    kept.push(item);
+                }
+            }
+
+            #[cfg(test)]
+            if let Some(pause) = self.before_sweep_requeue.lock().take() {
+                pause();
+            }
+
+            let restored_work = !kept.is_empty();
+
+            // Requeue kept items.
+            for item in kept {
+                self.inner.push(item);
+            }
+
+            // A concurrent consumer can observe the queue as empty while this
+            // sweep owns the retained items. Store one availability permit after
+            // requeue so that a consumer which has not yet registered cannot
+            // remain asleep until unrelated work arrives.
+            if restored_work {
+                self.notify.notify_one();
+            }
+
+            if !removed.is_empty() {
+                self.len.fetch_sub(removed.len(), Ordering::Relaxed);
+            }
+
+            removed
+        };
+
+        let removed_count = removed.len();
+        drop(removed);
+        removed_count
     }
 
     /// Clear the cancelled set for a specific transfer.
@@ -193,17 +280,20 @@ impl<T> CancellableQueue<T> {
     /// Get the approximate queue length.
     ///
     /// This is not exact due to concurrent modifications but useful for monitoring.
-    pub fn len_approx(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn len_approx(&self) -> usize {
         self.len.load(Ordering::Relaxed)
     }
 
     /// Check if the queue is approximately empty.
-    pub fn is_empty_approx(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_empty_approx(&self) -> bool {
         self.len_approx() == 0
     }
 
     /// Get the number of cancelled transfers being tracked.
-    pub fn cancelled_count(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn cancelled_count(&self) -> usize {
         self.cancelled.len()
     }
 }
@@ -216,6 +306,10 @@ impl<T> Default for CancellableQueue<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, mpsc};
+
+    use tokio::sync::oneshot;
+
     use super::*;
 
     #[test]
@@ -240,6 +334,216 @@ mod tests {
         queue.mark_cancelled(id);
         assert!(!queue.push(id, 42));
         assert_eq!(queue.len_approx(), 0);
+    }
+
+    #[tokio::test]
+    async fn close_and_drain_wakes_the_consumer_and_rejects_late_work() {
+        let queue = Arc::new(CancellableQueue::<i32>::new());
+        let waiting_queue = Arc::clone(&queue);
+        let waiter = tokio::spawn(async move {
+            waiting_queue.notified().await;
+            waiting_queue.is_closed()
+        });
+        tokio::task::yield_now().await;
+
+        let drained = queue.close_and_drain();
+
+        assert!(waiter.await.expect("queue waiter must finish"));
+        assert!(drained.is_empty());
+        assert!(!queue.push(TransferId::new(), 42));
+        assert!(queue.is_empty_approx());
+    }
+
+    #[test]
+    fn close_and_drain_returns_queued_payloads_and_rejects_late_work() {
+        let queue: CancellableQueue<i32> = CancellableQueue::new();
+        let first_id = TransferId::new();
+        let second_id = TransferId::new();
+
+        assert!(queue.push(first_id, 7));
+        assert!(queue.push(second_id, 9));
+
+        let mut drained = queue.close_and_drain();
+        drained.sort_unstable();
+
+        assert!(queue.is_closed());
+        assert_eq!(drained, vec![7, 9]);
+        assert!(queue.is_empty_approx());
+        assert!(queue.pop().is_none());
+        assert_eq!(queue.push_or_return(TransferId::new(), 11), Err(11));
+    }
+
+    #[test]
+    fn close_and_drain_waits_for_sweep_and_returns_live_work() {
+        enum Item {
+            Live(u8),
+            #[allow(dead_code)]
+            Cancelled,
+        }
+
+        let queue = Arc::new(CancellableQueue::new());
+        let live_id = TransferId::new();
+        let cancelled_id = TransferId::new();
+        let (drained_tx, drained_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        assert!(queue.push(live_id, Item::Live(7)));
+        assert!(queue.push(cancelled_id, Item::Cancelled));
+        queue.mark_cancelled(cancelled_id);
+        queue.pause_next_sweep_before_requeue(move || {
+            drained_tx.send(()).expect("test observes the sweep drain");
+            release_rx.recv().expect("test releases the sweep");
+        });
+
+        let sweep_queue = Arc::clone(&queue);
+        let sweep = std::thread::spawn(move || sweep_queue.sweep());
+        drained_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("sweep removes live work before it waits");
+
+        let close_queue = Arc::clone(&queue);
+        let (close_started_tx, close_started_rx) = mpsc::channel();
+        let (close_finished_tx, close_finished_rx) = mpsc::channel();
+        let close = std::thread::spawn(move || {
+            close_started_tx
+                .send(())
+                .expect("test starts close and drain");
+            let drained = close_queue.close_and_drain();
+            close_finished_tx
+                .send(())
+                .expect("test observes close and drain");
+            drained
+        });
+        close_started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("close and drain starts after the sweep drains live work");
+
+        let close_completed_while_live_work_was_held = close_finished_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_ok();
+
+        release_tx.send(()).expect("test releases the sweep");
+        assert_eq!(sweep.join().expect("sweep thread exits"), 1);
+        if !close_completed_while_live_work_was_held {
+            close_finished_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("close and drain finishes after the sweep requeues live work");
+        }
+        let drained = close.join().expect("close and drain thread exits");
+
+        assert!(
+            !close_completed_while_live_work_was_held,
+            "close and drain must wait for the sweep to requeue live work"
+        );
+        assert_eq!(drained.len(), 1);
+        assert!(matches!(drained.into_iter().next(), Some(Item::Live(7))));
+        assert!(queue.is_empty_approx());
+        assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn sweep_after_close_and_drain_leaves_no_queued_work() {
+        let queue: CancellableQueue<i32> = CancellableQueue::new();
+        let live_id = TransferId::new();
+        let cancelled_id = TransferId::new();
+
+        assert!(queue.push(live_id, 7));
+        assert!(queue.push(cancelled_id, 9));
+        queue.mark_cancelled(cancelled_id);
+        let mut drained = queue.close_and_drain();
+        drained.sort_unstable();
+
+        assert_eq!(queue.sweep(), 0);
+        assert_eq!(drained, vec![7, 9]);
+        assert!(queue.is_empty_approx());
+        assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn sweep_drops_cancelled_items_after_releasing_the_admission_gate() {
+        struct DropProbe {
+            queue: std::sync::Weak<CancellableQueue<DropProbe>>,
+            gate_available: mpsc::Sender<bool>,
+        }
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                let gate_available = self
+                    .queue
+                    .upgrade()
+                    .and_then(|queue| queue.producer_gate.try_lock().map(|_| ()))
+                    .is_some();
+                self.gate_available
+                    .send(gate_available)
+                    .expect("test observes the cancelled item drop");
+            }
+        }
+
+        let queue = Arc::new(CancellableQueue::new());
+        let cancelled_id = TransferId::new();
+        let (gate_available_tx, gate_available_rx) = mpsc::channel();
+
+        assert!(queue.push(
+            cancelled_id,
+            DropProbe {
+                queue: Arc::downgrade(&queue),
+                gate_available: gate_available_tx,
+            },
+        ));
+        queue.mark_cancelled(cancelled_id);
+
+        assert_eq!(queue.sweep(), 1);
+        assert!(
+            gate_available_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("cancelled item drops during sweep"),
+            "a cancelled item destructor must not run under the admission gate"
+        );
+    }
+
+    #[test]
+    fn close_and_drain_returns_payloads_before_their_destructors_run() {
+        struct DropProbe {
+            queue: std::sync::Weak<CancellableQueue<DropProbe>>,
+            gate_available: mpsc::Sender<bool>,
+        }
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                let gate_available = self
+                    .queue
+                    .upgrade()
+                    .and_then(|queue| queue.producer_gate.try_lock().map(|_| ()))
+                    .is_some();
+                self.gate_available
+                    .send(gate_available)
+                    .expect("test observes the drained item drop");
+            }
+        }
+
+        let queue = Arc::new(CancellableQueue::new());
+        let (gate_available_tx, gate_available_rx) = mpsc::channel();
+
+        assert!(queue.push(
+            TransferId::new(),
+            DropProbe {
+                queue: Arc::downgrade(&queue),
+                gate_available: gate_available_tx,
+            },
+        ));
+
+        let drained = queue.close_and_drain();
+        assert!(
+            gate_available_rx.try_recv().is_err(),
+            "close and drain must return the payload before it drops"
+        );
+        drop(drained);
+        assert!(
+            gate_available_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("drained item drops after close and drain"),
+            "a drained item destructor must not run under the admission gate"
+        );
     }
 
     #[test]
@@ -430,5 +734,74 @@ mod tests {
 
         assert_eq!(removed, 3);
         assert_eq!(drop_count.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn sweep_wakes_consumer_after_it_temporarily_observes_empty_queue() {
+        enum Item {
+            Kept(u8),
+            #[allow(dead_code)]
+            Cancelled,
+        }
+
+        let queue = Arc::new(CancellableQueue::new());
+        let kept_id = TransferId::new();
+        let cancelled_id = TransferId::new();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        assert!(queue.push(kept_id, Item::Kept(7)));
+        assert!(queue.push(cancelled_id, Item::Cancelled));
+
+        // `Notify` retains one producer permit. Consume it before this test
+        // registers the consumer that must wake only after requeue.
+        queue.notified().await;
+        queue.mark_cancelled(cancelled_id);
+        queue.pause_next_sweep_before_requeue(move || {
+            entered_tx.send(()).expect("test observes the sweep drain");
+            release_rx.recv().expect("test releases the sweep");
+        });
+
+        let sweep_queue = Arc::clone(&queue);
+        let sweep = std::thread::spawn(move || sweep_queue.sweep());
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("sweep drains the cancelled item after it retains live work");
+
+        let (observed_empty_tx, observed_empty_rx) = oneshot::channel();
+        let (start_wait_tx, start_wait_rx) = oneshot::channel();
+        let consumer_queue = Arc::clone(&queue);
+        let consumer = tokio::spawn(async move {
+            assert!(
+                consumer_queue.pop_valid().is_none(),
+                "consumer observes the sweep's temporary empty queue"
+            );
+            observed_empty_tx
+                .send(())
+                .expect("test observes the empty queue");
+            start_wait_rx
+                .await
+                .expect("test starts the consumer wait after requeue");
+            consumer_queue.notified().await;
+            consumer_queue
+                .pop_valid()
+                .expect("requeue restores live work")
+        });
+        observed_empty_rx
+            .await
+            .expect("consumer observes the temporary empty queue");
+
+        release_tx.send(()).expect("release requeue");
+        assert_eq!(sweep.join().expect("sweep thread exits"), 1);
+        start_wait_tx
+            .send(())
+            .expect("start consumer wait after durable requeue notification");
+
+        let item = tokio::time::timeout(std::time::Duration::from_secs(1), consumer)
+            .await
+            .expect("requeue wakes the sleeping consumer")
+            .expect("consumer task exits");
+        assert_eq!(item.transfer_id, kept_id);
+        assert!(matches!(item.data, Item::Kept(7)));
     }
 }

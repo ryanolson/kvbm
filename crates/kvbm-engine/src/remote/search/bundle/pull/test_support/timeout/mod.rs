@@ -17,8 +17,10 @@ use kvbm_protocols::disagg::SessionEndpoint;
 use tokio_util::sync::CancellationToken;
 
 use super::super::deadline::BundlePullLimits;
-use super::super::transfer::{BundleTransfer, BundleTransferError, OpenedResource};
-use super::super::{BundlePullOutcome, BundlePullTarget, pull_remote_bundle_with_transfer};
+use super::super::transfer::{BundleTransfer, BundleTransferError};
+use super::super::{
+    BundlePullOutcome, BundlePullTarget, OpenedResource, pull_remote_bundle_with_transfer,
+};
 use super::RemoteBundleCandidate;
 use crate::InstanceId;
 

@@ -83,8 +83,7 @@ impl<P: BundleResourcePin> BundleCatalog<P> {
 
     /// Validate a remote transaction before making any staged physical block
     /// visible, then materialize and install it while the catalog lock remains
-    /// held. The materializer is infallible by contract; all manager/resource
-    /// checks must be completed by the caller first.
+    /// held.
     pub(in crate::tiering::engine) fn commit_materialized<F>(
         &mut self,
         identity: &CacheIdentity,
@@ -95,7 +94,7 @@ impl<P: BundleResourcePin> BundleCatalog<P> {
         materialize: F,
     ) -> Result<(), BundleCatalogError>
     where
-        F: FnOnce() -> BTreeMap<LogicalResourceId, P>,
+        F: FnOnce() -> Result<BTreeMap<LogicalResourceId, P>, BundleCatalogError>,
     {
         self.prune_retired_generations();
         if let Some(retired) = self
@@ -127,14 +126,11 @@ impl<P: BundleResourcePin> BundleCatalog<P> {
             return Ok(());
         }
 
-        // No fallible operation may follow materialization: failure after this
-        // point would expose only part of a physical transaction. This closure
-        // may only register already-staged CompleteBlocks. BlockManager emits
+        // No fallible catalog operation follows materialization. This closure
+        // only registers already-staged CompleteBlocks. BlockManager emits
         // eviction callbacks during allocation, before catalog preflight, and
-        // never from register_blocks; that invariant makes it safe to retain
-        // the catalog lock here. The one-slot remote-pull regression test pins
-        // this assumption against future manager lifecycle changes.
-        let resources = materialize();
+        // never from register_blocks.
+        let resources = materialize()?;
         let bundle = BundleIndex::prepare_validated(generation, &resources);
         self.dependencies.install(key, dependencies);
         self.index.install(key, bundle);
@@ -287,6 +283,8 @@ pub(in crate::tiering::engine) enum BundleCatalogError {
     },
     #[error("bundle generation {attempted} was already retired through generation {retired}")]
     RetiredGeneration { retired: u64, attempted: u64 },
+    #[error("bundle materialization failed: {0}")]
+    Materialization(String),
 }
 
 #[cfg(test)]

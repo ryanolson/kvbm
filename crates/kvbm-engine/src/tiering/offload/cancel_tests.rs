@@ -1,592 +1,897 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Comprehensive cancellation tests for the offload pipeline.
-//!
-//! These tests verify the cancellation invariants documented in README.md:
-//! - P1: Container is the unit of cancellation
-//! - P2: Token travels with container
-//! - P3: Upgrade is the commitment boundary
-//! - P4: Sweep before upgrade
-//!
-//! Key invariant: Cancellation is only confirmed when:
-//! 1. All source block lists are removed from queues
-//! 2. All in-flight transfers have completed
+//! Production cancellation regressions for the offload pipeline.
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use tokio::sync::Barrier;
+    use futures::future::BoxFuture;
+    use tokio::sync::{Notify, mpsc, watch};
 
-    use crate::offload::cancel::{CancelState, CancellationToken};
-    use crate::offload::handle::TransferId;
-    use crate::offload::queue::CancellableQueue;
+    use super::super::batch::{BatchCollector, BatchConfig, TransferBatch};
+    use super::super::container::{EvaluatedBlock, OffloadContainer, UpgradedContainer};
+    use super::super::handle::{
+        TransferHandle, TransferId, TransferState, TransferStatus, settle_transfer_unit,
+    };
+    use super::super::pending::PendingTracker;
+    use super::super::pipeline::{ObjectTransferExecutor, PreconditionAwaiter, upgrade_batch};
+    use super::super::queue::CancellableQueue;
+    use super::super::source::{ExternalBlock, SourceBlock, SourceBlocks};
+    use crate::leader::InstanceLeader;
+    use crate::object::ObjectBlockOps;
+    use crate::testing::{TestManagerBuilder, TestRegistryBuilder, create_messenger_tcp};
+    use crate::{BlockId, G2, SequenceHash};
+    use kvbm_common::LogicalLayoutHandle;
 
-    // =========================================================================
-    // Draining Invariant Tests
-    // =========================================================================
+    fn test_hash(value: u64) -> SequenceHash {
+        SequenceHash::new(value, None, 0)
+    }
 
-    /// Test that confirmation does NOT resolve while in-flight transfers remain.
-    #[tokio::test]
-    async fn test_confirmation_waits_for_in_flight_to_drain() {
-        let (token, updater) = CancellationToken::new();
+    fn external_blocks(ids: &[BlockId]) -> Vec<ExternalBlock<G2>> {
+        ids.iter()
+            .copied()
+            .map(|id| ExternalBlock::new(id, test_hash(id as u64)))
+            .collect()
+    }
 
-        // Request cancellation
-        token.request();
-        assert!(token.is_requested());
+    fn new_container(
+        transfer_id: TransferId,
+        ids: &[BlockId],
+        precondition: Option<velo::EventHandle>,
+    ) -> (
+        Arc<std::sync::Mutex<TransferState>>,
+        TransferHandle,
+        OffloadContainer<G2>,
+    ) {
+        let (state, handle) = TransferState::new(transfer_id, ids.to_vec());
+        let state = Arc::new(std::sync::Mutex::new(state));
+        let container = OffloadContainer::new(
+            transfer_id,
+            SourceBlocks::External(external_blocks(ids)),
+            Arc::clone(&state),
+            precondition,
+        );
+        (state, handle, container)
+    }
 
-        // Set draining with 3 in-flight
-        updater.set_draining(3);
-        assert_eq!(token.state(), CancelState::Draining { in_flight: 3 });
+    fn evaluated_container(
+        transfer_id: TransferId,
+        ids: &[BlockId],
+    ) -> (
+        Arc<std::sync::Mutex<TransferState>>,
+        TransferHandle,
+        OffloadContainer<G2>,
+    ) {
+        let (state, handle, mut container) = new_container(transfer_id, ids, None);
+        drop(container.take_source());
+        let evaluated = external_blocks(ids)
+            .into_iter()
+            .map(|block| EvaluatedBlock::new(SourceBlock::External(block), None))
+            .collect();
+        container.finish_evaluation(evaluated, Vec::new());
+        {
+            let mut state_guard = state.lock().unwrap();
+            state_guard.total_expected_blocks = ids.len();
+            state_guard.add_passed(ids.iter().copied());
+            state_guard.set_status(TransferStatus::Queued);
+        }
+        (state, handle, container)
+    }
 
-        // Confirmation should NOT resolve yet
-        let confirmation = token.wait_confirmed();
-        let result = tokio::time::timeout(Duration::from_millis(50), confirmation.wait()).await;
-        assert!(
-            result.is_err(),
-            "Confirmation should timeout while in-flight > 0"
+    fn evaluated_container_for_state(
+        transfer_id: TransferId,
+        ids: &[BlockId],
+        state: Arc<std::sync::Mutex<TransferState>>,
+        cancellation: super::super::cancel::CancellationUnit,
+        precondition: Option<velo::EventHandle>,
+    ) -> OffloadContainer<G2> {
+        let mut container = OffloadContainer::with_cancellation(
+            transfer_id,
+            SourceBlocks::External(external_blocks(ids)),
+            Arc::clone(&state),
+            precondition,
+            cancellation,
+        );
+        drop(container.take_source());
+        let evaluated = external_blocks(ids)
+            .into_iter()
+            .map(|block| EvaluatedBlock::new(SourceBlock::External(block), None))
+            .collect();
+        container.finish_evaluation(evaluated, Vec::new());
+        {
+            let mut state_guard = state.lock().unwrap();
+            state_guard.total_expected_blocks += ids.len();
+            state_guard.add_passed(ids.iter().copied());
+            state_guard.set_status(TransferStatus::Queued);
+        }
+        container
+    }
+
+    fn evaluated_container_with_precondition(
+        transfer_id: TransferId,
+        ids: &[BlockId],
+        precondition: velo::EventHandle,
+        pending_tracker: &Arc<PendingTracker>,
+    ) -> OffloadContainer<G2> {
+        let (state, _handle) = TransferState::new(transfer_id, ids.to_vec());
+        let state = Arc::new(std::sync::Mutex::new(state));
+        let mut container = OffloadContainer::new(
+            transfer_id,
+            SourceBlocks::External(external_blocks(ids)),
+            Arc::clone(&state),
+            Some(precondition),
+        );
+        drop(container.take_source());
+        let evaluated = external_blocks(ids)
+            .into_iter()
+            .map(|block| {
+                let pending_guard = pending_tracker
+                    .try_claim(block.sequence_hash)
+                    .expect("each helper block claims a unique hash");
+                EvaluatedBlock::new(SourceBlock::External(block), Some(pending_guard))
+            })
+            .collect();
+        container.finish_evaluation(evaluated, Vec::new());
+        {
+            let mut state_guard = state.lock().unwrap();
+            state_guard.total_expected_blocks = ids.len();
+            state_guard.add_passed(ids.iter().copied());
+            state_guard.set_status(TransferStatus::Queued);
+        }
+        container
+    }
+
+    async fn test_leader() -> Arc<InstanceLeader> {
+        let messenger = create_messenger_tcp().await.expect("create messenger");
+        let registry = TestRegistryBuilder::new().build();
+        let g2_manager = Arc::new(
+            TestManagerBuilder::<G2>::new()
+                .block_count(8)
+                .block_size(4)
+                .registry(registry.clone())
+                .build(),
         );
 
-        // Drain to 1
-        updater.update_draining(1);
-        assert_eq!(token.state(), CancelState::Draining { in_flight: 1 });
-
-        // Still should not resolve
-        let confirmation = token.wait_confirmed();
-        let result = tokio::time::timeout(Duration::from_millis(50), confirmation.wait()).await;
-        assert!(
-            result.is_err(),
-            "Confirmation should timeout while in-flight > 0"
-        );
-
-        // Drain to 0 - this should trigger confirmation
-        updater.update_draining(0);
-        assert_eq!(token.state(), CancelState::Confirmed);
-
-        // Now confirmation should resolve immediately
-        let confirmation = token.wait_confirmed();
-        tokio::time::timeout(Duration::from_millis(50), confirmation.wait())
-            .await
-            .expect("Confirmation should resolve when in-flight = 0");
+        Arc::new(
+            InstanceLeader::builder()
+                .messenger(messenger)
+                .registry(registry)
+                .g2_manager(g2_manager)
+                .workers(Vec::new())
+                .build()
+                .expect("build test leader"),
+        )
     }
 
-    /// Test that draining countdown correctly transitions to confirmed.
-    #[tokio::test]
-    async fn test_draining_countdown_to_confirmation() {
-        let (token, updater) = CancellationToken::new();
-        let in_flight = Arc::new(AtomicUsize::new(5));
-        let in_flight_clone = in_flight.clone();
-
-        token.request();
-        updater.set_draining(in_flight.load(Ordering::SeqCst));
-
-        // Spawn task to simulate transfers completing
-        // We need to move updater into the spawned task
-        tokio::spawn(async move {
-            for _ in 0..5 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                let remaining = in_flight_clone.fetch_sub(1, Ordering::SeqCst) - 1;
-                updater.update_draining(remaining);
-            }
-        });
-
-        // Wait for confirmation
-        let confirmation = token.wait_confirmed();
-        tokio::time::timeout(Duration::from_millis(200), confirmation.wait())
-            .await
-            .expect("Should confirm after all in-flight complete");
-
-        assert!(token.is_confirmed());
-        assert_eq!(in_flight.load(Ordering::SeqCst), 0);
-    }
-
-    /// Test concurrent cancellation requests are idempotent.
-    #[tokio::test]
-    async fn test_concurrent_cancel_requests() {
-        let (token, updater) = CancellationToken::new();
-        let barrier = Arc::new(Barrier::new(3));
-
-        // Spawn multiple tasks requesting cancellation
-        let token1 = token.clone();
-        let barrier1 = barrier.clone();
-        let t1 = tokio::spawn(async move {
-            barrier1.wait().await;
-            token1.request();
-        });
-
-        let token2 = token.clone();
-        let barrier2 = barrier.clone();
-        let t2 = tokio::spawn(async move {
-            barrier2.wait().await;
-            token2.request();
-        });
-
-        barrier.wait().await;
-        token.request();
-
-        t1.await.unwrap();
-        t2.await.unwrap();
-
-        // Should still be requested (idempotent)
-        assert!(token.is_requested());
-
-        // Confirm and verify
-        updater.set_confirmed();
-        assert!(token.is_confirmed());
-    }
-
-    // =========================================================================
-    // Token-Based Cancellation Tests
-    // =========================================================================
-
-    /// Container that carries its own CancellationToken.
-    struct MockContainer {
-        id: usize,
-        cancel_token: CancellationToken,
-    }
-
-    impl MockContainer {
-        fn new(id: usize, token: CancellationToken) -> Self {
-            Self {
-                id,
-                cancel_token: token,
-            }
-        }
-
-        fn is_cancelled(&self) -> bool {
-            self.cancel_token.is_requested()
-        }
-    }
-
-    /// Test that container carries its own token and can check cancellation.
     #[test]
-    fn test_container_carries_token() {
-        let (token, _updater) = CancellationToken::new();
-        let container = MockContainer::new(1, token.clone());
+    fn container_owns_the_whole_transfer_cancellation_unit() {
+        let transfer_id = TransferId::new();
+        let (_state, handle, container) = new_container(transfer_id, &[11, 12], None);
 
+        assert_eq!(container.transfer_id(), transfer_id);
+        assert_eq!(container.source_len(), 2);
         assert!(!container.is_cancelled());
 
-        // Cancel via the original token
-        token.request();
+        let _confirmation = handle.cancel();
 
-        // Container should see cancellation via its cloned token
         assert!(container.is_cancelled());
+        assert_eq!(container.source_len(), 2);
     }
 
-    /// Test multiple containers sharing same token (from same TransferHandle).
-    #[test]
-    fn test_multiple_containers_same_token() {
-        let (token, _updater) = CancellationToken::new();
-
-        let c1 = MockContainer::new(1, token.clone());
-        let c2 = MockContainer::new(2, token.clone());
-        let c3 = MockContainer::new(3, token.clone());
-
-        assert!(!c1.is_cancelled());
-        assert!(!c2.is_cancelled());
-        assert!(!c3.is_cancelled());
-
-        // Cancel via handle's token
-        token.request();
-
-        // All containers should see cancellation
-        assert!(c1.is_cancelled());
-        assert!(c2.is_cancelled());
-        assert!(c3.is_cancelled());
-    }
-
-    /// Test containers from different handles have independent cancellation.
-    #[test]
-    fn test_independent_container_cancellation() {
-        let (token1, _updater1) = CancellationToken::new();
-        let (token2, _updater2) = CancellationToken::new();
-
-        let c1 = MockContainer::new(1, token1.clone());
-        let c2 = MockContainer::new(2, token2.clone());
-
-        // Cancel only token1
-        token1.request();
-
-        assert!(c1.is_cancelled());
-        assert!(!c2.is_cancelled());
-    }
-
-    // =========================================================================
-    // Queue + Token Integration Tests
-    // =========================================================================
-
-    /// Wrapper that includes a CancellationToken for queue testing.
-    struct TokenWrapper {
-        data: i32,
-        cancel_token: CancellationToken,
-    }
-
-    /// Test queue sweep using token-based cancellation check.
-    #[test]
-    fn test_queue_sweep_with_token_check() {
-        let queue: CancellableQueue<TokenWrapper> = CancellableQueue::new();
-
-        let (token1, _) = CancellationToken::new();
-        let (token2, _) = CancellationToken::new();
-
-        let id1 = TransferId::new();
-        let id2 = TransferId::new();
-
-        // Push items with different tokens
-        queue.push(
-            id1,
-            TokenWrapper {
-                data: 1,
-                cancel_token: token1.clone(),
-            },
-        );
-        queue.push(
-            id2,
-            TokenWrapper {
-                data: 2,
-                cancel_token: token2.clone(),
-            },
-        );
-        queue.push(
-            id1,
-            TokenWrapper {
-                data: 3,
-                cancel_token: token1.clone(),
-            },
-        );
-
-        assert_eq!(queue.len_approx(), 3);
-
-        // Cancel token1 (and mark in queue for sweep)
-        token1.request();
-        queue.mark_cancelled(id1);
-
-        // Sweep should remove token1's items
-        let removed = queue.sweep();
-        assert_eq!(removed, 2);
-        assert_eq!(queue.len_approx(), 1);
-
-        // Remaining item should be from token2
-        let item = queue.pop().unwrap();
-        assert_eq!(item.data.data, 2);
-        assert!(!item.data.cancel_token.is_requested());
-    }
-
-    // =========================================================================
-    // Batch Partial Cancellation Tests
-    // =========================================================================
-
-    /// Mock batch of containers for testing partial cancellation.
-    struct MockBatch {
-        containers: Vec<MockContainer>,
-    }
-
-    impl MockBatch {
-        fn new(containers: Vec<MockContainer>) -> Self {
-            Self { containers }
-        }
-
-        /// Remove cancelled containers, return count removed.
-        fn sweep_cancelled(&mut self) -> usize {
-            let before = self.containers.len();
-            self.containers.retain(|c| !c.is_cancelled());
-            before - self.containers.len()
-        }
-
-        fn len(&self) -> usize {
-            self.containers.len()
-        }
-
-        fn is_empty(&self) -> bool {
-            self.containers.is_empty()
-        }
-    }
-
-    /// Test partial batch cancellation - some containers cancelled, others proceed.
-    #[test]
-    fn test_batch_partial_cancellation() {
-        let (token1, _updater1) = CancellationToken::new();
-        let (token2, _updater2) = CancellationToken::new();
-        let (token3, _updater3) = CancellationToken::new();
-
-        // Create container with cloned token
-        let c1 = MockContainer::new(1, token1.clone());
-        let c2 = MockContainer::new(2, token2.clone());
-        let c3 = MockContainer::new(3, token3.clone());
-        let c4 = MockContainer::new(4, token1.clone()); // Same token as c1
-
-        // Verify tokens work before batching
-        assert!(!c1.is_cancelled());
-        assert!(!c4.is_cancelled());
-
-        let mut batch = MockBatch::new(vec![c1, c2, c3, c4]);
-        assert_eq!(batch.len(), 4);
-
-        // Cancel token1 (affects containers 1 and 4)
-        token1.request();
-        assert!(token1.is_requested());
-
-        // Verify containers in batch see the cancellation
-        assert!(
-            batch.containers[0].is_cancelled(),
-            "Container 1 should be cancelled"
-        );
-        assert!(
-            !batch.containers[1].is_cancelled(),
-            "Container 2 should NOT be cancelled"
-        );
-        assert!(
-            !batch.containers[2].is_cancelled(),
-            "Container 3 should NOT be cancelled"
-        );
-        assert!(
-            batch.containers[3].is_cancelled(),
-            "Container 4 should be cancelled"
-        );
-
-        let removed = batch.sweep_cancelled();
-        assert_eq!(removed, 2);
-        assert_eq!(batch.len(), 2);
-
-        // Remaining containers should be 2 and 3
-        assert_eq!(batch.containers[0].id, 2);
-        assert_eq!(batch.containers[1].id, 3);
-    }
-
-    /// Test batch where all containers are cancelled.
-    #[test]
-    fn test_batch_full_cancellation() {
-        let (token, _updater) = CancellationToken::new();
-
-        // Create containers with cloned tokens
-        let c1 = MockContainer::new(1, token.clone());
-        let c2 = MockContainer::new(2, token.clone());
-        let c3 = MockContainer::new(3, token.clone());
-
-        // Verify token clone works
-        assert!(!c1.is_cancelled());
-        assert!(!c2.is_cancelled());
-        assert!(!c3.is_cancelled());
-
-        let mut batch = MockBatch::new(vec![c1, c2, c3]);
-
-        token.request();
-        assert!(token.is_requested());
-
-        // Verify containers see cancellation
-        assert!(
-            batch.containers[0].is_cancelled(),
-            "Container 1 should be cancelled"
-        );
-        assert!(
-            batch.containers[1].is_cancelled(),
-            "Container 2 should be cancelled"
-        );
-        assert!(
-            batch.containers[2].is_cancelled(),
-            "Container 3 should be cancelled"
-        );
-
-        let removed = batch.sweep_cancelled();
-        assert_eq!(removed, 3);
-        assert!(batch.is_empty());
-    }
-
-    /// Test batch where no containers are cancelled.
-    #[test]
-    fn test_batch_no_cancellation() {
-        let (token1, _updater1) = CancellationToken::new();
-        let (token2, _updater2) = CancellationToken::new();
-
-        let mut batch = MockBatch::new(vec![
-            MockContainer::new(1, token1.clone()),
-            MockContainer::new(2, token2.clone()),
-        ]);
-
-        // Don't cancel anything
-        let removed = batch.sweep_cancelled();
-        assert_eq!(removed, 0);
-        assert_eq!(batch.len(), 2);
-    }
-
-    // =========================================================================
-    // Select-Based Cancellation Tests
-    // =========================================================================
-
-    /// Simulate precondition awaiter with select on event OR cancel.
     #[tokio::test]
-    async fn test_select_cancellation_during_wait() {
-        let (token, _updater) = CancellationToken::new();
-        let (event_tx, event_rx) = tokio::sync::oneshot::channel::<()>();
+    async fn precommit_confirmation_waits_for_the_container_drop() {
+        let transfer_id = TransferId::new();
+        let (_state, handle, container) = new_container(transfer_id, &[13], None);
+        let confirmation = handle.cancel();
 
-        // Verify initial state
-        assert!(!token.is_requested());
-
-        let token_clone = token.clone();
-        let result = tokio::spawn(async move {
-            // Poll-based cancellation check with timeout
-            let cancel_check = async {
-                loop {
-                    if token_clone.is_requested() {
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-            };
-
-            tokio::select! {
-                biased;  // Prefer first branch to complete
-
-                _ = event_rx => {
-                    "event"
-                }
-                _ = cancel_check => {
-                    "cancelled"
-                }
-            }
-        });
-
-        // Give the task time to start and enter select
-        tokio::time::sleep(Duration::from_millis(20)).await;
-
-        // Cancel (don't send event)
-        token.request();
-        assert!(token.is_requested());
-
-        let outcome = tokio::time::timeout(Duration::from_millis(200), result)
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), confirmation.wait())
+                .await
+                .is_err(),
+            "pre-commit confirmation must wait for the container drop"
+        );
+        drop(container);
+        tokio::time::timeout(Duration::from_millis(250), handle.cancel().wait())
             .await
-            .expect("Should complete within timeout")
-            .expect("Task should not panic");
-
-        assert_eq!(outcome, "cancelled");
-
-        // Event sender still exists - wasn't used
-        drop(event_tx);
+            .expect("container drop settles cancellation");
     }
 
-    /// Test that event completes before cancellation.
     #[tokio::test]
-    async fn test_select_event_before_cancel() {
-        let (token, _) = CancellationToken::new();
-        let (event_tx, event_rx) = tokio::sync::oneshot::channel::<()>();
+    async fn precondition_awaiter_selects_cancellation_and_drops_the_container() {
+        let leader = test_leader().await;
+        let event = leader
+            .messenger()
+            .events()
+            .new_event()
+            .expect("create pending precondition");
+        let transfer_id = TransferId::new();
+        let (state, handle, container) = new_container(transfer_id, &[21], Some(event.handle()));
+        let input = Arc::new(CancellableQueue::new());
+        let output = Arc::new(CancellableQueue::new());
+        let awaiter = PreconditionAwaiter::new(Arc::clone(&input), Arc::clone(&output), leader, 8);
+        let task = tokio::spawn(awaiter.run());
 
-        let token_clone = token.clone();
-        let result = tokio::spawn(async move {
-            tokio::select! {
-                _ = event_rx => {
-                    "event"
-                }
-                _ = async {
-                    loop {
-                        if token_clone.is_requested() {
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(5)).await;
-                    }
-                } => {
-                    "cancelled"
-                }
-            }
-        });
-
-        // Give the task time to start
+        assert!(input.push(transfer_id, container));
         tokio::time::sleep(Duration::from_millis(10)).await;
+        let confirmation = handle.cancel();
 
-        // Send event (before cancellation)
-        event_tx.send(()).unwrap();
-
-        let outcome = tokio::time::timeout(Duration::from_millis(100), result)
+        tokio::time::timeout(Duration::from_millis(250), confirmation.wait())
             .await
-            .expect("Should complete")
-            .expect("Should not panic");
+            .expect("precondition cancellation settles");
+        assert!(output.pop_valid().is_none());
+        assert_eq!(state.lock().unwrap().status, TransferStatus::Cancelled);
 
-        assert_eq!(outcome, "event");
-        assert!(!token.is_requested());
+        task.abort();
     }
 
-    // =========================================================================
-    // End-to-End Cancellation Flow Tests
-    // =========================================================================
-
-    /// Test complete cancellation flow: request → sweep → drain → confirm.
     #[tokio::test]
-    async fn test_end_to_end_cancellation_flow() {
-        let (token, updater) = CancellationToken::new();
-        let queue: CancellableQueue<i32> = CancellableQueue::new();
-        let id = TransferId::new();
+    async fn precondition_awaiter_does_not_block_a_later_ready_container() {
+        let leader = test_leader().await;
+        let event = leader
+            .messenger()
+            .events()
+            .new_event()
+            .expect("create pending precondition");
+        let pending_id = TransferId::new();
+        let ready_id = TransferId::new();
+        let (_pending_state, pending_handle, pending) =
+            new_container(pending_id, &[22], Some(event.handle()));
+        let (_ready_state, _ready_handle, ready) = new_container(ready_id, &[23], None);
+        let input = Arc::new(CancellableQueue::new());
+        let output = Arc::new(CancellableQueue::new());
+        let awaiter = PreconditionAwaiter::new(Arc::clone(&input), Arc::clone(&output), leader, 8);
+        let task = tokio::spawn(awaiter.run());
 
-        // Simulate: 3 items in queue, 2 in-flight
-        queue.push(id, 1);
-        queue.push(id, 2);
-        queue.push(id, 3);
-        let in_flight = Arc::new(AtomicUsize::new(2));
+        assert!(input.push(pending_id, pending));
+        assert!(input.push(ready_id, ready));
 
-        // Request cancellation
-        token.request();
-        assert!(token.is_requested());
-
-        // Mark cancelled in queue
-        queue.mark_cancelled(id);
-
-        // Sweep queue
-        let removed = queue.sweep();
-        assert_eq!(removed, 3);
-        assert_eq!(queue.len_approx(), 0);
-
-        // Set draining for in-flight
-        updater.set_draining(in_flight.load(Ordering::SeqCst));
-        assert!(token.state().is_draining());
-
-        // Simulate in-flight completing
-        let in_flight_clone = in_flight.clone();
-        tokio::spawn(async move {
-            for _ in 0..2 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                let remaining = in_flight_clone.fetch_sub(1, Ordering::SeqCst) - 1;
-                updater.update_draining(remaining);
+        let output_item = tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                if let Some(item) = output.pop_valid() {
+                    return item;
+                }
+                tokio::task::yield_now().await;
             }
+        })
+        .await
+        .expect("ready container reaches the output");
+        assert_eq!(output_item.transfer_id, ready_id);
+        drop(output_item);
+
+        tokio::time::timeout(Duration::from_millis(250), pending_handle.cancel().wait())
+            .await
+            .expect("pending container cancellation settles");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn precondition_awaiter_enforces_its_concurrency_cap() {
+        let leader = test_leader().await;
+        let first_event = leader
+            .messenger()
+            .events()
+            .new_event()
+            .expect("create first pending precondition");
+        let second_event = leader
+            .messenger()
+            .events()
+            .new_event()
+            .expect("create second pending precondition");
+        let first_id = TransferId::new();
+        let second_id = TransferId::new();
+        let ready_id = TransferId::new();
+        let (_first_state, first_handle, first) =
+            new_container(first_id, &[24], Some(first_event.handle()));
+        let (_second_state, second_handle, second) =
+            new_container(second_id, &[25], Some(second_event.handle()));
+        let (_ready_state, _ready_handle, ready) = new_container(ready_id, &[26], None);
+        let input = Arc::new(CancellableQueue::new());
+        let output = Arc::new(CancellableQueue::new());
+        let awaiter = PreconditionAwaiter::new(Arc::clone(&input), Arc::clone(&output), leader, 2);
+        let task = tokio::spawn(awaiter.run());
+
+        assert!(input.push(first_id, first));
+        assert!(input.push(second_id, second));
+        assert!(input.push(ready_id, ready));
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while input.len_approx() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("only two preconditions leave the queue");
+        assert!(output.pop_valid().is_none());
+
+        let first_confirmation = first_handle.cancel();
+        let ready = tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                if let Some(item) = output.pop_valid() {
+                    return item;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a released slot admits the ready container");
+        assert_eq!(ready.transfer_id, ready_id);
+        drop(ready);
+        first_confirmation.wait().await;
+        second_handle.cancel().wait().await;
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn precondition_awaiter_shutdown_drops_all_tracked_tasks() {
+        let leader = test_leader().await;
+        let first_event = leader
+            .messenger()
+            .events()
+            .new_event()
+            .expect("create first pending precondition");
+        let second_event = leader
+            .messenger()
+            .events()
+            .new_event()
+            .expect("create second pending precondition");
+        let pending_tracker = Arc::new(PendingTracker::new());
+        let first_id = TransferId::new();
+        let second_id = TransferId::new();
+        let first = evaluated_container_with_precondition(
+            first_id,
+            &[27],
+            first_event.handle(),
+            &pending_tracker,
+        );
+        let second = evaluated_container_with_precondition(
+            second_id,
+            &[28],
+            second_event.handle(),
+            &pending_tracker,
+        );
+        let input = Arc::new(CancellableQueue::new());
+        let output = Arc::new(CancellableQueue::new());
+        let awaiter = PreconditionAwaiter::new(Arc::clone(&input), Arc::clone(&output), leader, 2);
+        let task = tokio::spawn(awaiter.run());
+
+        assert!(input.push(first_id, first));
+        assert!(input.push(second_id, second));
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while !input.is_empty_approx() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both preconditions start");
+        assert_eq!(pending_tracker.len(), 2);
+
+        task.abort();
+        let _ = task.await;
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while !pending_tracker.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("awaiter shutdown drops all retained containers");
+    }
+
+    #[tokio::test]
+    async fn aborted_precondition_task_fails_its_uncommitted_container() {
+        let leader = test_leader().await;
+        let event = leader
+            .messenger()
+            .events()
+            .new_event()
+            .expect("create pending precondition");
+        let transfer_id = TransferId::new();
+        let (_state, mut handle, container) =
+            new_container(transfer_id, &[29], Some(event.handle()));
+        let input = Arc::new(CancellableQueue::new());
+        let output = Arc::new(CancellableQueue::new());
+        let awaiter = PreconditionAwaiter::new(Arc::clone(&input), output, leader, 1);
+        let task = tokio::spawn(awaiter.run());
+
+        assert!(input.push(transfer_id, container));
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while !input.is_empty_approx() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("precondition task owns the container");
+
+        task.abort();
+        task.await.expect_err("abort the precondition awaiter");
+
+        let result = tokio::time::timeout(Duration::from_millis(250), handle.wait())
+            .await
+            .expect("aborted child publishes a terminal result")
+            .expect("transfer handle returns a result");
+        assert_eq!(result.status, TransferStatus::Failed);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("precommit offload container dropped before settlement")
+        );
+    }
+
+    #[tokio::test]
+    async fn panicking_precommit_task_fails_its_uncommitted_container() {
+        let transfer_id = TransferId::new();
+        let (_state, mut handle, container) = new_container(transfer_id, &[30], None);
+        let task = tokio::spawn(async move {
+            let _container = container;
+            panic!("injected precommit task panic");
         });
 
-        // Wait for confirmation
-        let confirmation = token.wait_confirmed();
-        tokio::time::timeout(Duration::from_millis(100), confirmation.wait())
+        assert!(task.await.expect_err("precommit task panics").is_panic());
+        let result = tokio::time::timeout(Duration::from_millis(250), handle.wait())
             .await
-            .expect("Should confirm after queue swept and in-flight drained");
-
-        assert!(token.is_confirmed());
-        assert_eq!(queue.len_approx(), 0);
-        assert_eq!(in_flight.load(Ordering::SeqCst), 0);
+            .expect("panicking task publishes a terminal result")
+            .expect("transfer handle returns a result");
+        assert_eq!(result.status, TransferStatus::Failed);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("precommit offload container dropped before settlement")
+        );
     }
 
-    /// Test cancellation with nothing in-flight (immediate confirmation after sweep).
+    #[test]
+    fn transfer_batch_sweeps_cancelled_containers_before_upgrade() {
+        let cancelled_id = TransferId::new();
+        let live_id = TransferId::new();
+        let (cancelled_state, cancelled_handle, cancelled) =
+            evaluated_container(cancelled_id, &[31, 32]);
+        let (_live_state, _live_handle, live) = evaluated_container(live_id, &[41]);
+        let batch = TransferBatch::from_containers(vec![cancelled, live]);
+
+        let _confirmation = cancelled_handle.cancel();
+        let resolved = upgrade_batch(batch);
+
+        assert_eq!(resolved.blocks.len(), 1);
+        assert_eq!(resolved.blocks[0].transfer_id, live_id);
+        assert_eq!(resolved.blocks[0].block_id, 41);
+        assert_eq!(
+            cancelled_state.lock().unwrap().status,
+            TransferStatus::Cancelled
+        );
+    }
+
     #[tokio::test]
-    async fn test_cancellation_nothing_in_flight() {
-        let (token, updater) = CancellationToken::new();
-        let queue: CancellableQueue<i32> = CancellableQueue::new();
-        let id = TransferId::new();
+    async fn batch_collector_never_splits_a_container() {
+        let transfer_id = TransferId::new();
+        let (_state, _handle, container) = evaluated_container(transfer_id, &[35, 36]);
+        let input = Arc::new(CancellableQueue::new());
+        let (output_tx, mut output_rx) = mpsc::channel(1);
+        let (cancel_tx, cancel_rx) = watch::channel(HashSet::new());
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let config = BatchConfig::default().with_max_size(1);
+        let collector = BatchCollector::new(
+            config,
+            Arc::clone(&input),
+            output_tx,
+            cancel_rx,
+            shutdown_rx,
+        );
+        let task = tokio::spawn(collector.run());
 
-        // Items only in queue, nothing in-flight
-        queue.push(id, 1);
-        queue.push(id, 2);
-
-        // Request and sweep
-        token.request();
-        queue.mark_cancelled(id);
-        let removed = queue.sweep();
-        assert_eq!(removed, 2);
-
-        // No in-flight, go directly to confirmed
-        updater.update_draining(0); // This sets Confirmed when in_flight = 0
-
-        assert!(token.is_confirmed());
-
-        // Confirmation should resolve immediately
-        let confirmation = token.wait_confirmed();
-        tokio::time::timeout(Duration::from_millis(10), confirmation.wait())
+        assert!(input.push(transfer_id, container));
+        let batch = tokio::time::timeout(Duration::from_millis(250), output_rx.recv())
             .await
-            .expect("Should confirm immediately with nothing in-flight");
+            .expect("collector flushes the oversized container")
+            .expect("collector output stays open");
+
+        assert_eq!(batch.container_len(), 1);
+        assert_eq!(batch.len(), 2);
+        drop(cancel_tx);
+        task.abort();
+    }
+
+    #[test]
+    fn cancellation_between_final_sweep_and_commitment_claim_wins() {
+        let transfer_id = TransferId::new();
+        let (state, handle, container) = evaluated_container(transfer_id, &[45]);
+        let mut batch = TransferBatch::from_containers(vec![container]);
+
+        assert_eq!(batch.sweep_cancelled(), 0);
+        let _confirmation = handle.cancel();
+        let container = batch
+            .containers
+            .pop()
+            .expect("final sweep kept the live container");
+
+        assert!(container.upgrade().is_none());
+        assert_eq!(state.lock().unwrap().status, TransferStatus::Cancelled);
+    }
+
+    #[test]
+    fn cancellation_after_upstream_commit_cannot_split_a_chain() {
+        let transfer_id = TransferId::new();
+        let (state, handle, upstream) = evaluated_container(transfer_id, &[46]);
+        let upstream = upstream.upgrade().expect("upstream claims commitment");
+        let mut continuations = upstream.cancellation.fan_out(1);
+        let downstream = evaluated_container_for_state(
+            transfer_id,
+            &[47],
+            Arc::clone(&state),
+            continuations.pop().expect("one downstream route"),
+            None,
+        );
+        let _confirmation = handle.cancel();
+        let downstream = downstream
+            .upgrade()
+            .expect("the shared commitment applies to the downstream stage");
+
+        assert_eq!(upstream.blocks.len(), 1);
+        assert_eq!(downstream.blocks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn postcommit_cancel_does_not_drop_a_waiting_downstream_stage() {
+        let leader = test_leader().await;
+        let event = leader
+            .messenger()
+            .events()
+            .new_event()
+            .expect("create downstream precondition");
+        let transfer_id = TransferId::new();
+        let (state, handle, upstream) = evaluated_container(transfer_id, &[48]);
+        let upstream = upstream.upgrade().expect("upstream claims commitment");
+        let mut continuations = upstream.cancellation.fan_out(1);
+        let downstream = evaluated_container_for_state(
+            transfer_id,
+            &[49],
+            Arc::clone(&state),
+            continuations.pop().expect("one downstream route"),
+            Some(event.handle()),
+        );
+        let input = Arc::new(CancellableQueue::new());
+        let output = Arc::new(CancellableQueue::new());
+        let awaiter = PreconditionAwaiter::new(Arc::clone(&input), Arc::clone(&output), leader, 1);
+        let task = tokio::spawn(awaiter.run());
+
+        assert!(input.push(transfer_id, downstream));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let confirmation = handle.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), confirmation.wait())
+                .await
+                .is_err(),
+            "committed downstream work keeps cancellation pending",
+        );
+
+        event.trigger().expect("release downstream precondition");
+        let downstream = tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                if let Some(item) = output.pop_valid() {
+                    return item.data;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("postcommit downstream work reaches the next stage");
+        let downstream = downstream
+            .upgrade()
+            .expect("the downstream commitment remains valid");
+        assert_eq!(downstream.blocks.len(), 1);
+        drop(downstream);
+        handle.cancel().wait().await;
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_branch_enqueue_releases_only_its_child_unit() {
+        let transfer_id = TransferId::new();
+        let (state, handle) = TransferState::new(transfer_id, vec![50]);
+        let state = Arc::new(std::sync::Mutex::new(state));
+        let token = state.lock().unwrap().cancellation_token();
+        let root = token.root_unit().expect("create root cancellation unit");
+        assert!(root.claim_commitment());
+        let mut branches = root.fan_out(2);
+        let rejected = OffloadContainer::with_cancellation(
+            transfer_id,
+            SourceBlocks::External(external_blocks(&[50])),
+            Arc::clone(&state),
+            None,
+            branches.pop().expect("rejected branch unit"),
+        );
+        let surviving = branches.pop().expect("surviving branch unit");
+        let queue = CancellableQueue::new();
+        queue.mark_cancelled(transfer_id);
+
+        let confirmation = handle.cancel();
+        assert!(!queue.push(transfer_id, rejected));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), confirmation.wait())
+                .await
+                .is_err(),
+            "the surviving branch keeps cancellation pending",
+        );
+
+        drop(surviving);
+        handle.cancel().wait().await;
+    }
+
+    #[tokio::test]
+    async fn logical_transfer_waits_for_all_route_units_before_terminal_failure() {
+        let transfer_id = TransferId::new();
+        let (mut state, mut handle) = TransferState::new(transfer_id, vec![50]);
+        let token = state.cancellation_token();
+        let root = token.root_unit().expect("create root cancellation unit");
+        assert!(root.claim_commitment());
+        state.add_passed([50]);
+        state.mark_committed_blocks([50]);
+        let state = Arc::new(std::sync::Mutex::new(state));
+        let mut routes = root.fan_out(2);
+        let first = routes.pop().expect("first route unit");
+        let second = routes.pop().expect("second route unit");
+
+        state.lock().unwrap().mark_completed([50]);
+        let first_state = Arc::clone(&state);
+        first.settle(move || {
+            first_state.lock().unwrap().finish_logical_operation();
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), handle.wait())
+                .await
+                .is_err(),
+            "one completed route must not publish a terminal result",
+        );
+
+        state
+            .lock()
+            .unwrap()
+            .record_error("late downstream route failure".to_string());
+        let second_state = Arc::clone(&state);
+        second.settle(move || {
+            second_state.lock().unwrap().finish_logical_operation();
+        });
+
+        let result = tokio::time::timeout(Duration::from_millis(100), handle.wait())
+            .await
+            .expect("the last route publishes the terminal result")
+            .expect("the handle returns a transfer result");
+        assert_eq!(result.status, TransferStatus::Failed);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("late downstream route failure")
+        );
+    }
+
+    #[tokio::test]
+    async fn abandoned_committed_route_records_failure_before_sibling_completion() {
+        let transfer_id = TransferId::new();
+        let (state, mut handle, container) = evaluated_container(transfer_id, &[51]);
+        let UpgradedContainer {
+            blocks,
+            cancellation,
+            ..
+        } = container.upgrade().expect("upgrade the complete container");
+        drop(blocks);
+        state.lock().unwrap().mark_completed([51]);
+
+        let mut routes = cancellation.fan_out(2);
+        let abandoned = routes.pop().expect("abandoned route unit");
+        let completed = routes.pop().expect("completed route unit");
+        drop(abandoned);
+        settle_transfer_unit(completed, Arc::clone(&state));
+
+        let result = tokio::time::timeout(Duration::from_millis(100), handle.wait())
+            .await
+            .expect("the final route publishes a terminal result")
+            .expect("the handle returns a transfer result");
+        assert_eq!(result.status, TransferStatus::Failed);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("committed offload route dropped before settlement")
+        );
+    }
+
+    #[tokio::test]
+    async fn precondition_failure_releases_guards_before_terminal_status() {
+        let manager = Arc::new(
+            TestManagerBuilder::<G2>::new()
+                .block_count(1)
+                .block_size(4)
+                .build(),
+        );
+        let token_block = crate::testing::create_sequential_block(0, manager.block_size());
+        let sequence_hash = crate::testing::populate_manager_with_blocks(
+            manager.as_ref(),
+            std::slice::from_ref(&token_block),
+        )
+        .expect("populate source manager")[0];
+        let source = manager
+            .match_blocks(&[sequence_hash])
+            .pop()
+            .expect("match source block");
+        let source_observer = source.clone();
+        let pending_tracker = Arc::new(PendingTracker::new());
+        let transfer_id = TransferId::new();
+        let block_id = source.block_id();
+        let (mut state, mut handle) = TransferState::new(transfer_id, vec![block_id]);
+        state.total_expected_blocks = 1;
+        state.add_passed([block_id]);
+        state.set_status(TransferStatus::Queued);
+        let state = Arc::new(std::sync::Mutex::new(state));
+        let mut container = OffloadContainer::new(
+            transfer_id,
+            SourceBlocks::Strong(vec![source]),
+            Arc::clone(&state),
+            None,
+        );
+        let SourceBlocks::Strong(mut blocks) = container.take_source() else {
+            panic!("strong source remains strong");
+        };
+        let pending_guard = pending_tracker
+            .try_claim(sequence_hash)
+            .expect("claim the source hash");
+        container.finish_evaluation(
+            vec![EvaluatedBlock::new(
+                SourceBlock::Strong(blocks.pop().expect("one source block")),
+                Some(pending_guard),
+            )],
+            Vec::new(),
+        );
+
+        container.fail("precondition poisoned: injected failure".to_string());
+
+        let result = handle.wait().await.expect("failure publishes a result");
+        assert_eq!(result.status, TransferStatus::Failed);
+        assert!(pending_tracker.is_empty());
+        assert_eq!(source_observer.use_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn closed_batch_output_fails_the_retained_container() {
+        let transfer_id = TransferId::new();
+        let (_state, mut handle, container) = evaluated_container(transfer_id, &[52]);
+        let input = Arc::new(CancellableQueue::new());
+        let (output_tx, output_rx) = mpsc::channel(1);
+        let (_cancel_tx, cancel_rx) = watch::channel(HashSet::new());
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let collector = BatchCollector::new(
+            BatchConfig::default().with_max_size(1),
+            Arc::clone(&input),
+            output_tx,
+            cancel_rx,
+            shutdown_rx,
+        );
+        drop(output_rx);
+        let task = tokio::spawn(collector.run());
+
+        assert!(input.push(transfer_id, container));
+        let result = tokio::time::timeout(Duration::from_millis(250), handle.wait())
+            .await
+            .expect("closed batch output publishes a terminal result")
+            .expect("the handle returns a transfer result");
+        assert_eq!(result.status, TransferStatus::Failed);
+        assert_eq!(result.error.as_deref(), Some("batch output channel closed"));
+        tokio::time::timeout(Duration::from_millis(100), handle.cancel().wait())
+            .await
+            .expect("batch rejection releases its cancellation unit");
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn post_upgrade_cancellation_waits_for_physical_completion() {
+        let transfer_id = TransferId::new();
+        let (state, handle, container) = evaluated_container(transfer_id, &[51]);
+        let (input_tx, input_rx) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let object_ops = Arc::new(GatedObjectBlockOps::default());
+        let executor = ObjectTransferExecutor::new(
+            input_rx,
+            Arc::clone(&object_ops) as Arc<dyn ObjectBlockOps>,
+            LogicalLayoutHandle::G2,
+            false,
+            1,
+            None,
+            shutdown_rx,
+        );
+        let executor_task = tokio::spawn(executor.run());
+
+        input_tx
+            .send(TransferBatch::from_containers(vec![container]))
+            .await
+            .expect("send transfer batch");
+        object_ops.wait_until_started().await;
+
+        let confirmation = handle.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), confirmation.wait())
+                .await
+                .is_err(),
+            "post-upgrade cancellation must wait for physical work"
+        );
+        assert_eq!(object_ops.calls.load(Ordering::SeqCst), 1);
+
+        object_ops.release.notify_one();
+        drop(input_tx);
+        tokio::time::timeout(Duration::from_millis(250), executor_task)
+            .await
+            .expect("physical executor drains")
+            .expect("executor task completes");
+        tokio::time::timeout(Duration::from_millis(250), handle.cancel().wait())
+            .await
+            .expect("cancellation confirms after physical completion");
+        assert_eq!(state.lock().unwrap().status, TransferStatus::Complete);
+    }
+
+    #[test]
+    fn surviving_containers_flat_map_only_after_upgrade() {
+        let first_id = TransferId::new();
+        let second_id = TransferId::new();
+        let (_first_state, _first_handle, first) = evaluated_container(first_id, &[61, 62]);
+        let (_second_state, _second_handle, second) = evaluated_container(second_id, &[71]);
+
+        let resolved = upgrade_batch(TransferBatch::from_containers(vec![first, second]));
+
+        let identities: Vec<_> = resolved
+            .blocks
+            .iter()
+            .map(|block| (block.transfer_id, block.block_id))
+            .collect();
+        assert_eq!(
+            identities,
+            vec![(first_id, 61), (first_id, 62), (second_id, 71)]
+        );
+    }
+
+    #[derive(Default)]
+    struct GatedObjectBlockOps {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+        entered: AtomicBool,
+        calls: AtomicUsize,
+    }
+
+    impl GatedObjectBlockOps {
+        async fn wait_until_started(&self) {
+            while !self.entered.load(Ordering::SeqCst) {
+                self.started.notified().await;
+            }
+        }
+    }
+
+    impl ObjectBlockOps for GatedObjectBlockOps {
+        fn has_blocks(
+            &self,
+            keys: Vec<SequenceHash>,
+        ) -> BoxFuture<'static, Vec<(SequenceHash, Option<usize>)>> {
+            Box::pin(async move { keys.into_iter().map(|key| (key, None)).collect() })
+        }
+
+        fn put_blocks(
+            &self,
+            keys: Vec<SequenceHash>,
+            _layout: LogicalLayoutHandle,
+            _block_ids: Vec<BlockId>,
+        ) -> BoxFuture<'static, Vec<Result<SequenceHash, SequenceHash>>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.entered.store(true, Ordering::SeqCst);
+            self.started.notify_waiters();
+            let release = self.release.clone();
+            Box::pin(async move {
+                release.notified().await;
+                keys.into_iter().map(Ok).collect()
+            })
+        }
+
+        fn get_blocks(
+            &self,
+            keys: Vec<SequenceHash>,
+            _layout: LogicalLayoutHandle,
+            _block_ids: Vec<BlockId>,
+        ) -> BoxFuture<'static, Vec<Result<SequenceHash, SequenceHash>>> {
+            Box::pin(async move { keys.into_iter().map(Ok).collect() })
+        }
     }
 }

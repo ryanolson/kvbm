@@ -8,11 +8,17 @@
 //!
 //! # Example
 //! ```ignore
+//! use std::sync::Arc;
+//! use kvbm_engine::{G1, G2, G3};
+//! use kvbm_engine::offload::{
+//!     OffloadEngine, PipelineBuilder, PresenceAndLFUFilter, PresenceFilter,
+//! };
+//!
 //! let engine = OffloadEngine::builder(leader.clone())
-//!     .with_registry(registry.clone())
+//!     .with_g3_manager(g3_manager.clone())
 //!     .with_g1_to_g2_pipeline(
 //!         PipelineBuilder::<G1, G2>::new()
-//!             .policy(Arc::new(PresenceFilter::new(registry.clone())))
+//!             .policy(Arc::new(PresenceFilter::<G1, G2>::new(registry.clone())))
 //!             .batch_size(32)
 //!             .auto_chain(true)
 //!             .build()
@@ -25,32 +31,30 @@
 //!     )
 //!     .build()?;
 //!
-//! let handle = engine.enqueue_g2_to_g3(blocks);
-//! handle.wait().await?;
+//! let mut handle = engine.enqueue_g2_to_g3(blocks)?;
+//! let result = handle.wait().await?;
 //! ```
 
 use std::sync::Arc;
 
 use anyhow::Result;
 use dashmap::DashMap;
-use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::g2_capacity::G2Capacity;
 use crate::leader::InstanceLeader;
 use crate::object::ObjectBlockOps;
-use crate::worker::RemoteDescriptor;
-use crate::{BlockId, G1, G2, G3, SequenceHash};
+use crate::{BlockId, G1, G2, G3};
 use kvbm_common::LogicalLayoutHandle;
-use kvbm_logical::blocks::{BlockMetadata, BlockRegistry, WeakBlock};
+use kvbm_logical::blocks::BlockMetadata;
 use kvbm_logical::manager::BlockManager;
-use kvbm_physical::transfer::{PhysicalLayout, TransferOptions};
 
+use super::chain_router;
 use super::handle::{TransferHandle, TransferId, TransferState};
 use super::pipeline::{
-    ChainOutput, ChainOutputRx, ObjectPipeline, ObjectPipelineConfig, Pipeline, PipelineConfig,
-    PipelineInput, RegisterObserver,
+    ObjectPipeline, ObjectPipelineConfig, Pipeline, PipelineConfig, RegisterObserver,
 };
-use super::queue::CancellableQueue;
+use super::remote_g4::{self, RemoteG4OffloadRequest};
 use super::source::SourceBlocks;
 
 /// Central coordinator for offload pipelines.
@@ -60,7 +64,7 @@ use super::source::SourceBlocks;
 ///
 /// # Storage Tier Model
 ///
-/// - G1→G2: `BlockManager<G2>` destination (host memory)
+/// - G1→G2: `G2Capacity` destination facade (host memory)
 /// - G2→G3: `BlockManager<G3>` destination (disk/NVMe)
 /// - G1→G3: `BlockManager<G3>` destination (disk, bypass-host) — used when
 ///   G2 is intentionally unconfigured (`cache.bypass_host_cache() == true`).
@@ -70,16 +74,15 @@ use super::source::SourceBlocks;
 ///
 /// # Distributed G2→G4 Offloading
 ///
-/// For distributed setups where the leader doesn't have physical layouts (only workers do),
-/// use `with_enable_remote_g4(true)` instead of `with_g2_to_g4_pipeline()`. This enables
-/// remote G4 offloading where workers execute object storage uploads via their local
-/// `ObjectBlockOps` implementations.
+/// Use `with_g2_to_g4_pipeline()` when the leader has an `ObjectBlockOps`
+/// implementation. The implementation resolves the logical G2 source layout.
+///
+/// Use `with_enable_remote_g4(true)` when workers own the object upload path.
+/// The leader then sends committed G2 blocks through its worker group.
 #[allow(dead_code)]
 pub struct OffloadEngine {
     /// Reference to the instance leader for transfers
     leader: Arc<InstanceLeader>,
-    /// Block registry for policy evaluation
-    registry: Arc<BlockRegistry>,
     /// G1→G2 pipeline (BlockManager destination)
     g1_to_g2: Option<Pipeline<G1, G2>>,
     /// G2→G3 pipeline (BlockManager destination)
@@ -88,8 +91,8 @@ pub struct OffloadEngine {
     g1_to_g3: Option<Pipeline<G1, G3>>,
     /// G2→G4 pipeline (Object storage destination) - for local mode only
     g2_to_g4: Option<ObjectPipeline<G2>>,
-    /// Active transfer tracking
-    transfers: Arc<DashMap<TransferId, Arc<std::sync::Mutex<TransferState>>>>,
+    /// Weak active-transfer tracking with terminal pruning.
+    transfers: TransferRegistry,
     /// Chain router task handle (routes G1→G2 output to downstream pipelines)
     _chain_router_handle: Option<JoinHandle<()>>,
     /// Remote G4 offload task handle (for distributed mode)
@@ -202,7 +205,7 @@ impl OffloadEngine {
         let transfer_id = TransferId::new();
         let (state, handle) = TransferState::new(transfer_id, input_block_ids);
         let state = Arc::new(std::sync::Mutex::new(state));
-        self.transfers.insert(transfer_id, state.clone());
+        self.transfers.insert(transfer_id, &state);
         (transfer_id, state, handle)
     }
 
@@ -269,7 +272,7 @@ impl OffloadEngine {
 
     /// Get the number of active transfers.
     pub fn active_transfer_count(&self) -> usize {
-        self.transfers.len()
+        self.transfers.active_count()
     }
 
     /// Check if G1→G2 pipeline is configured.
@@ -279,8 +282,8 @@ impl OffloadEngine {
 
     /// Register an observer on the G1→G2 pipeline. Returns `Err` if the
     /// pipeline isn't configured. The observer fires after each batch's
-    /// destination-tier register step; see
-    /// [`Pipeline::add_register_observer`] for the contract.
+    /// destination-tier register step. The callback receives the registered
+    /// immutable G2 blocks for that batch.
     pub fn add_g1_to_g2_register_observer(&self, observer: RegisterObserver<G2>) -> Result<()> {
         let pipeline = self
             .g1_to_g2
@@ -306,17 +309,48 @@ impl OffloadEngine {
     }
 }
 
+#[derive(Default)]
+struct TransferRegistry {
+    states: DashMap<TransferId, std::sync::Weak<std::sync::Mutex<TransferState>>>,
+}
+
+impl TransferRegistry {
+    fn insert(&self, transfer_id: TransferId, state: &Arc<std::sync::Mutex<TransferState>>) {
+        self.prune();
+        self.states.insert(transfer_id, Arc::downgrade(state));
+    }
+
+    fn remove(&self, transfer_id: &TransferId) {
+        self.states.remove(transfer_id);
+    }
+
+    fn active_count(&self) -> usize {
+        self.prune();
+        self.states.len()
+    }
+
+    fn prune(&self) {
+        self.states.retain(|_, weak_state| {
+            let Some(state) = weak_state.upgrade() else {
+                return false;
+            };
+            let is_terminal = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .status
+                .is_terminal();
+            !is_terminal
+        });
+    }
+}
+
 /// Builder for OffloadEngine.
 pub struct OffloadEngineBuilder {
     leader: Arc<InstanceLeader>,
-    registry: Option<Arc<BlockRegistry>>,
-    g1_manager: Option<Arc<BlockManager<G1>>>,
-    g2_manager: Option<Arc<BlockManager<G2>>>,
+    g2_capacity: Option<Arc<dyn G2Capacity>>,
     g3_manager: Option<Arc<BlockManager<G3>>>,
     /// Object storage operations for G4 (replaces `BlockManager<G4>`)
     object_ops: Option<Arc<dyn ObjectBlockOps>>,
-    /// G2 physical layout for object transfers (needed by ObjectTransferExecutor)
-    g2_physical_layout: Option<PhysicalLayout>,
     g1_to_g2_config: Option<PipelineConfig<G1, G2>>,
     g2_to_g3_config: Option<PipelineConfig<G2, G3>>,
     g1_to_g3_config: Option<PipelineConfig<G1, G3>>,
@@ -333,12 +367,9 @@ impl OffloadEngineBuilder {
     pub fn new(leader: Arc<InstanceLeader>) -> Self {
         Self {
             leader,
-            registry: None,
-            g1_manager: None,
-            g2_manager: None,
+            g2_capacity: None,
             g3_manager: None,
             object_ops: None,
-            g2_physical_layout: None,
             g1_to_g2_config: None,
             g2_to_g3_config: None,
             g1_to_g3_config: None,
@@ -357,21 +388,12 @@ impl OffloadEngineBuilder {
         self
     }
 
-    /// Set the block registry.
-    pub fn with_registry(mut self, registry: Arc<BlockRegistry>) -> Self {
-        self.registry = Some(registry);
-        self
-    }
-
-    /// Set the G1 block manager.
-    pub fn with_g1_manager(mut self, manager: Arc<BlockManager<G1>>) -> Self {
-        self.g1_manager = Some(manager);
-        self
-    }
-
-    /// Set the G2 block manager.
-    pub fn with_g2_manager(mut self, manager: Arc<BlockManager<G2>>) -> Self {
-        self.g2_manager = Some(manager);
+    /// Set the G2 destination capacity facade.
+    ///
+    /// This facade owns G1→G2 admission. If omitted, the builder uses the
+    /// leader's primary capacity facade.
+    pub fn with_g2_capacity(mut self, capacity: Arc<dyn G2Capacity>) -> Self {
+        self.g2_capacity = Some(capacity);
         self
     }
 
@@ -385,17 +407,9 @@ impl OffloadEngineBuilder {
     ///
     /// G4 is object storage (S3, MinIO, etc.) and uses `ObjectBlockOps`
     /// instead of a `BlockManager`. This replaces `with_g4_manager`.
+    /// The implementation resolves `LogicalLayoutHandle::G2` internally.
     pub fn with_object_ops(mut self, object_ops: Arc<dyn ObjectBlockOps>) -> Self {
         self.object_ops = Some(object_ops);
-        self
-    }
-
-    /// Set the G2 physical layout for object transfers.
-    ///
-    /// Required when using G2→G4 pipeline. The ObjectTransferExecutor needs
-    /// the physical layout to read block data for upload to object storage.
-    pub fn with_g2_physical_layout(mut self, layout: PhysicalLayout) -> Self {
-        self.g2_physical_layout = Some(layout);
         self
     }
 
@@ -426,8 +440,7 @@ impl OffloadEngineBuilder {
     /// Uses `ObjectPipelineConfig` instead of `PipelineConfig` since G4
     /// is object storage, not a BlockManager destination.
     ///
-    /// For distributed setups where the leader doesn't have physical layouts,
-    /// use `with_enable_remote_g4(true)` instead.
+    /// Use `with_enable_remote_g4(true)` when workers own the object upload path.
     pub fn with_g2_to_g4_pipeline(mut self, config: ObjectPipelineConfig<G2>) -> Self {
         self.g2_to_g4_config = Some(config);
         self
@@ -435,8 +448,7 @@ impl OffloadEngineBuilder {
 
     /// Enable remote G4 offloading via workers' ObjectBlockOps.
     ///
-    /// In distributed setups, the leader doesn't have physical layouts (only workers do).
-    /// This enables G2→G4 offloading where:
+    /// This enables G2→G4 work where:
     /// 1. G1→G2 chain output is routed to a remote offload task
     /// 2. The task calls workers' ObjectBlockOps::put_blocks() via RPC
     /// 3. Workers upload blocks from their local G2 to object storage
@@ -450,10 +462,9 @@ impl OffloadEngineBuilder {
 
     /// Build the offload engine.
     pub fn build(self) -> Result<OffloadEngine> {
-        let registry = self
-            .registry
-            .ok_or_else(|| anyhow::anyhow!("Block registry required"))?;
-
+        if self.enable_remote_g4 && self.g2_to_g4_config.is_some() {
+            anyhow::bail!("local and remote G2-to-G4 offload modes are mutually exclusive");
+        }
         // Get the runtime handle for spawning background tasks
         // Use explicit override if provided, otherwise get from leader
         let runtime = self.runtime.unwrap_or_else(|| self.leader.runtime());
@@ -462,20 +473,32 @@ impl OffloadEngineBuilder {
         // Note: G1 is externally owned (vLLM GPU cache), so no G1 manager needed.
         // Pipeline works with ExternalBlock<G1> which contains block_id + sequence_hash.
         let mut g1_to_g2 = if let Some(config) = self.g1_to_g2_config {
-            let g2_manager = self
-                .g2_manager
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("G2 manager required for G1→G2 pipeline"))?;
+            let resource = config
+                .options
+                .resource
+                .unwrap_or_else(|| self.leader.primary_g2_resource());
+            let manager = self.leader.g2_manager_for(resource).ok_or_else(|| {
+                anyhow::anyhow!("no G2 manager configured for offload resource {resource:?}")
+            })?;
+            let g2_capacity = match self.g2_capacity.clone() {
+                Some(capacity) => capacity,
+                None => self.leader.g2_capacity_for(resource).ok_or_else(|| {
+                    anyhow::anyhow!("no G2 capacity configured for offload resource {resource:?}")
+                })?,
+            };
+            anyhow::ensure!(
+                g2_capacity.manager_id() == manager.id(),
+                "G2 capacity manager does not match selected resource {resource:?}"
+            );
 
             Some(Pipeline::new(
                 config,
-                registry.clone(),
-                g2_manager,
+                g2_capacity,
                 self.leader.clone(),
                 LogicalLayoutHandle::G1,
                 LogicalLayoutHandle::G2,
                 runtime.clone(),
-            ))
+            )?)
         } else {
             None
         };
@@ -489,13 +512,12 @@ impl OffloadEngineBuilder {
 
             Some(Pipeline::new(
                 config,
-                registry.clone(),
                 g3_manager,
                 self.leader.clone(),
                 LogicalLayoutHandle::G2,
                 LogicalLayoutHandle::G3,
                 runtime.clone(),
-            ))
+            )?)
         } else {
             None
         };
@@ -510,13 +532,12 @@ impl OffloadEngineBuilder {
 
             Some(Pipeline::new(
                 config,
-                registry.clone(),
                 g3_manager,
                 self.leader.clone(),
                 LogicalLayoutHandle::G1,
                 LogicalLayoutHandle::G3,
                 runtime.clone(),
-            ))
+            )?)
         } else {
             None
         };
@@ -536,14 +557,14 @@ impl OffloadEngineBuilder {
                 LogicalLayoutHandle::G2,
                 self.leader.clone(),
                 runtime.clone(),
-            ))
+            )?)
         } else {
             None
         };
 
         // Create channel for remote G4 offload if enabled
         let (remote_g4_tx, remote_g4_rx) = if self.enable_remote_g4 {
-            let (tx, rx) = mpsc::channel::<RemoteG4OffloadRequest>(64);
+            let (tx, rx) = tokio::sync::mpsc::channel::<RemoteG4OffloadRequest>(64);
             (Some(tx), Some(rx))
         } else {
             (None, None)
@@ -554,8 +575,8 @@ impl OffloadEngineBuilder {
             if g1_to_g2_pipeline.auto_chain() {
                 if let Some(chain_rx) = g1_to_g2_pipeline.take_chain_rx() {
                     // Get references to downstream pipeline queues
-                    let g2_to_g3_queue = g2_to_g3.as_ref().map(|p| p.eval_queue.clone());
-                    let g2_to_g4_queue = g2_to_g4.as_ref().map(|p| p.eval_queue.clone());
+                    let g2_to_g3_queue = g2_to_g3.as_ref().map(Pipeline::ingress);
+                    let g2_to_g4_queue = g2_to_g4.as_ref().map(ObjectPipeline::ingress);
 
                     // Check if we have any downstream target (local pipelines or remote G4)
                     let has_g2_to_g4_local = g2_to_g4_queue.is_some();
@@ -569,7 +590,7 @@ impl OffloadEngineBuilder {
                             has_g2_to_g4_remote,
                             "Spawning chain router for G1→G2 auto-chaining"
                         );
-                        Some(runtime.spawn(chain_router_task(
+                        Some(runtime.spawn(chain_router::run(
                             chain_rx,
                             g2_to_g3_queue,
                             g2_to_g4_queue,
@@ -594,200 +615,23 @@ impl OffloadEngineBuilder {
         // Spawn remote G4 offload task if enabled
         let remote_g4_offload_handle = if let Some(rx) = remote_g4_rx {
             tracing::info!("Enabling remote G4 offload via workers' ObjectBlockOps");
-            Some(runtime.spawn(remote_g4_offload_task(rx, self.leader.clone())))
+            Some(runtime.spawn(remote_g4::run(rx, self.leader.clone())))
         } else {
             None
         };
 
         Ok(OffloadEngine {
             leader: self.leader,
-            registry,
             g1_to_g2,
             g2_to_g3,
             g1_to_g3,
             g2_to_g4,
-            transfers: Arc::new(DashMap::new()),
+            transfers: TransferRegistry::default(),
             _chain_router_handle: chain_router_handle,
             _remote_g4_offload_handle: remote_g4_offload_handle,
         })
     }
 }
 
-/// Request for remote G4 offload (distributed mode).
-///
-/// Contains the information needed to call workers' ObjectBlockOps::put_blocks().
-struct RemoteG4OffloadRequest {
-    /// Transfer ID for tracking
-    transfer_id: TransferId,
-    /// Sequence hashes (keys for object storage)
-    keys: Vec<SequenceHash>,
-    /// Block IDs in G2 layout
-    block_ids: Vec<BlockId>,
-}
-
-/// Routes chain output from G1→G2 to downstream G2→G3/G2→G4 pipelines.
-///
-/// Blocks are converted to WeakBlocks for best-effort offloading - if they're
-/// evicted before the downstream pipeline processes them, that's acceptable.
-/// This enables graceful degradation under memory pressure.
-async fn chain_router_task(
-    mut chain_rx: ChainOutputRx<G2>,
-    g2_to_g3_queue: Option<Arc<CancellableQueue<PipelineInput<G2>>>>,
-    g2_to_g4_queue: Option<Arc<CancellableQueue<PipelineInput<G2>>>>,
-    remote_g4_tx: Option<mpsc::Sender<RemoteG4OffloadRequest>>,
-) {
-    while let Some(output) = chain_rx.recv().await {
-        let ChainOutput {
-            transfer_id,
-            blocks,
-            state,
-        } = output;
-
-        if blocks.is_empty() {
-            continue;
-        }
-
-        // Convert strong blocks to weak blocks for best-effort downstream processing
-        // This allows blocks to be evicted if memory pressure requires it
-        let weak_blocks: Vec<WeakBlock<G2>> =
-            blocks.iter().map(|block| block.downgrade()).collect();
-
-        // Extract sequence hashes and block IDs for remote G4 offload before dropping
-        let remote_g4_data: Option<(Vec<SequenceHash>, Vec<BlockId>)> = if remote_g4_tx.is_some() {
-            Some((
-                blocks.iter().map(|b| b.sequence_hash()).collect(),
-                blocks.iter().map(|b| b.block_id()).collect(),
-            ))
-        } else {
-            None
-        };
-
-        // Drop strong references - blocks can now be evicted if needed
-        drop(blocks);
-
-        tracing::debug!(
-            %transfer_id,
-            num_blocks = weak_blocks.len(),
-            "Routing chain output to downstream pipelines as WeakBlocks"
-        );
-
-        // Enqueue to G2→G3 if available
-        if let Some(ref queue) = g2_to_g3_queue {
-            let input = PipelineInput {
-                transfer_id,
-                source: SourceBlocks::Weak(weak_blocks.clone()),
-                state: state.clone(),
-            };
-            if !queue.push(transfer_id, input) {
-                tracing::debug!(%transfer_id, "G2→G3 chain enqueue skipped (cancelled)");
-            }
-        }
-
-        // Enqueue to local G2→G4 pipeline if available
-        if let Some(ref queue) = g2_to_g4_queue {
-            let input = PipelineInput {
-                transfer_id,
-                source: SourceBlocks::Weak(weak_blocks.clone()),
-                state: state.clone(),
-            };
-            if !queue.push(transfer_id, input) {
-                tracing::debug!(%transfer_id, "G2→G4 chain enqueue skipped (cancelled)");
-            }
-        }
-
-        // Send to remote G4 offload if enabled (distributed mode)
-        if let (Some(tx), Some((keys, block_ids))) = (&remote_g4_tx, remote_g4_data) {
-            let request = RemoteG4OffloadRequest {
-                transfer_id,
-                keys,
-                block_ids,
-            };
-            if tx.send(request).await.is_err() {
-                tracing::debug!(%transfer_id, "Remote G4 offload channel closed");
-            }
-        }
-    }
-
-    tracing::debug!("Chain router task shutting down");
-}
-
-/// Task that processes remote G4 offload requests.
-///
-/// In distributed mode, this task receives requests from the chain router
-/// and calls workers' ObjectBlockOps to upload blocks to object storage.
-/// Uses execute_remote_offload with RemoteDescriptor::Object to coordinate
-/// workers uploading their local G2 data to S3.
-async fn remote_g4_offload_task(
-    mut rx: mpsc::Receiver<RemoteG4OffloadRequest>,
-    leader: Arc<InstanceLeader>,
-) {
-    tracing::info!("Remote G4 offload task started");
-
-    while let Some(request) = rx.recv().await {
-        let num_blocks = request.keys.len();
-        tracing::debug!(
-            %request.transfer_id,
-            num_blocks,
-            "Processing remote G4 offload request"
-        );
-
-        // Use the leader's execute_remote_offload with RemoteDescriptor::Object
-        // This coordinates all workers to upload from their local G2 to object storage
-        let result = leader.execute_remote_offload(
-            LogicalLayoutHandle::G2, // Source is G2 (host memory)
-            RemoteDescriptor::Object {
-                keys: request.keys.clone(),
-            },
-            request.block_ids.clone(),
-            TransferOptions::default(),
-        );
-
-        match result {
-            Ok(notification) => {
-                // Wait for all workers to complete
-                match notification.await {
-                    Ok(()) => {
-                        tracing::info!(
-                            %request.transfer_id,
-                            num_blocks,
-                            "Remote G4 offload completed successfully"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            %request.transfer_id,
-                            num_blocks,
-                            error = %e,
-                            "Remote G4 offload failed"
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    %request.transfer_id,
-                    num_blocks,
-                    error = %e,
-                    "Failed to initiate remote G4 offload"
-                );
-            }
-        }
-    }
-
-    tracing::info!("Remote G4 offload task shutting down");
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Note: Full tests require complex infrastructure setup (InstanceLeader, BlockManagers, etc.)
-    // Basic API tests here.
-
-    #[test]
-    fn test_transfer_id_generation() {
-        let id1 = TransferId::new();
-        let id2 = TransferId::new();
-        assert_ne!(id1, id2);
-    }
-}
+mod tests;

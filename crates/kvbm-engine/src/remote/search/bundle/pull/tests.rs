@@ -65,7 +65,7 @@ impl BundlePullTarget for RecordingTarget {
                 .g2_manager_for(*resource)
                 .is_some_and(|manager| manager.match_blocks(hashes).is_empty())
         });
-        let published = bundle.publish();
+        let published = bundle.publish().expect("publish staged bundle");
         let complete = published.iter().all(|(resource, blocks)| {
             leader.g2_manager_for(*resource).is_some_and(|manager| {
                 let hashes = blocks
@@ -506,7 +506,7 @@ impl BundleTransfer for OwnerLossTransfer {
         resource: &OpenedResource,
     ) -> BoxFuture<'_, Result<StagedPull, BundleTransferError>> {
         let attempt = self.pulls.fetch_add(1, Ordering::AcqRel);
-        let resource = resource.resource;
+        let resource = resource.resource();
         Box::pin(async move {
             if attempt == 0 {
                 Err(BundleTransferError::TransferFailed {
@@ -584,8 +584,8 @@ impl BundleTransfer for PartialFailureTransfer {
         opened: &OpenedResource,
     ) -> BoxFuture<'_, Result<StagedPull, BundleTransferError>> {
         self.pulls.fetch_add(1, Ordering::AcqRel);
-        let resource = opened.resource;
-        let hashes = opened.hashes.clone();
+        let resource = opened.resource();
+        let hashes = opened.hashes().to_vec();
         let manager = self.leader.g2_manager_for(resource).unwrap().clone();
         let failed = resource == self.failed_resource;
         Box::pin(async move {
@@ -687,8 +687,8 @@ impl BundleTransfer for CorruptingTransfer {
         opened: &OpenedResource,
     ) -> BoxFuture<'_, Result<StagedPull, BundleTransferError>> {
         self.pulls.fetch_add(1, Ordering::AcqRel);
-        let resource = opened.resource;
-        let hashes = opened.hashes.clone();
+        let resource = opened.resource();
+        let hashes = opened.hashes().to_vec();
         let manager = self.leader.g2_manager_for(resource).unwrap().clone();
         let corrupted = resource == self.corrupted_resource;
         Box::pin(async move {
@@ -807,8 +807,8 @@ impl BundleTransfer for LaunchedNotificationTransfer {
         &self,
         opened: &OpenedResource,
     ) -> BoxFuture<'_, Result<StagedPull, BundleTransferError>> {
-        let resource = opened.resource;
-        let hashes = opened.hashes.clone();
+        let resource = opened.resource();
+        let hashes = opened.hashes().to_vec();
         let manager = self.leader.g2_manager_for(resource).unwrap().clone();
         let events = Arc::clone(&self.events);
         Box::pin(async move {

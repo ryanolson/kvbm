@@ -4,13 +4,111 @@
 #![allow(clippy::disallowed_macros)]
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Weak};
+use std::num::NonZeroU64;
+use std::sync::{Arc, Mutex, Weak};
 
-use kvbm_common::LogicalResourceId;
+use anyhow::Result;
+use kvbm_common::{LogicalResourceId, SequenceHash};
+use kvbm_logical::manager::InactiveBackendConfig;
+use kvbm_logical::{BlockManagerSet, BlockRegistry};
+use kvbm_protocols::cache_manifest::BundleKey;
+use kvbm_protocols::connector::{
+    ActionFailure, ActionStatus, BundleOffloadPlan, EngineWorkerSink, FenceToken, LeaderEngine,
+    LoadOutcome, RequestId, ResourceOffload, SaveOutcome,
+};
 
 use super::{BundleOffload, BundleOffloadState, OffloadTransition};
+use crate::tiering::engine::bundle::BundleAdmissionConfig;
 use crate::tiering::engine::bundle::test_support::{CAPSULE, CSA, HCA, bundle_key, identity};
+use crate::tiering::engine::local::LocalConnectorEngine;
+use crate::tiering::engine::offload::{BufferedOffload, OffloadSubmit, OffloadTransfer};
+use crate::tiering::policy::{ResourceComponentBytes, ResourcePolicies, ResourcePolicy};
+use crate::{G1, G2};
 use kvbm_protocols::connector::OffloadMode;
+
+#[derive(Default)]
+struct RecordingSaveSink {
+    saves: Mutex<Vec<(RequestId, SaveOutcome)>>,
+}
+
+impl RecordingSaveSink {
+    fn saves(&self) -> Vec<(RequestId, SaveOutcome)> {
+        self.saves.lock().unwrap().clone()
+    }
+}
+
+impl EngineWorkerSink for RecordingSaveSink {
+    fn mark_load_finished(&self, _request: &RequestId, _outcome: LoadOutcome) {}
+
+    fn mark_save_finished(&self, request: &RequestId, outcome: SaveOutcome) {
+        self.saves.lock().unwrap().push((request.clone(), outcome));
+    }
+
+    fn mark_fence_complete(&self, _token: FenceToken) {}
+}
+
+struct BufferOnlySubmit;
+
+impl OffloadSubmit for BufferOnlySubmit {
+    fn supports_resource(&self, _resource: LogicalResourceId) -> bool {
+        true
+    }
+
+    fn submit_g1_to_g2(
+        &self,
+        _resource: Option<LogicalResourceId>,
+        _blocks: Vec<crate::offload::ExternalBlock<G1>>,
+        _precondition: Option<velo::EventHandle>,
+    ) -> Result<Box<dyn OffloadTransfer>> {
+        unreachable!("this regression drives buffered child terminals directly")
+    }
+}
+
+async fn bundle_engine() -> Result<(Arc<LocalConnectorEngine>, Arc<RecordingSaveSink>)> {
+    let identity = identity();
+    let mut managers = BlockManagerSet::new();
+    for requirement in identity.resources() {
+        let manager = Arc::new(
+            crate::testing::managers::TestManagerBuilder::<G2>::new()
+                .block_count(2)
+                .block_size(usize::try_from(requirement.native_block_tokens().get())?)
+                .registry(BlockRegistry::new())
+                .build(),
+        );
+        managers.insert(requirement.resource(), manager)?;
+    }
+    let leader = Arc::new(
+        crate::leader::InstanceLeader::builder()
+            .messenger(crate::testing::messenger::create_messenger_tcp().await?)
+            .registry(BlockRegistry::new())
+            .g2_manager_set(Arc::new(managers), CSA)
+            .build()?,
+    );
+    let mut policies = ResourcePolicies::new();
+    let mut component_bytes = ResourceComponentBytes::new();
+    for requirement in identity.resources() {
+        policies.insert(
+            requirement.resource(),
+            ResourcePolicy::new(
+                requirement.role(),
+                InactiveBackendConfig::default(),
+                InactiveBackendConfig::default(),
+            ),
+        )?;
+        component_bytes.insert(requirement.resource(), [NonZeroU64::MIN])?;
+    }
+    let sink = Arc::new(RecordingSaveSink::default());
+    let engine = LocalConnectorEngine::with_offload_submit_and_admission(
+        leader,
+        sink.clone(),
+        256,
+        true,
+        Arc::new(BufferOnlySubmit),
+        None,
+        BundleAdmissionConfig::new(policies, component_bytes),
+    );
+    Ok((engine, sink))
+}
 
 fn pins() -> (BTreeMap<LogicalResourceId, Arc<()>>, Vec<Weak<()>>) {
     let pins = [CSA, HCA, CAPSULE]
@@ -19,6 +117,82 @@ fn pins() -> (BTreeMap<LogicalResourceId, Arc<()>>, Vec<Weak<()>>) {
         .collect::<BTreeMap<_, _>>();
     let weak = pins.values().map(Arc::downgrade).collect();
     (pins, weak)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropped_bundle_handle_holds_drain_until_every_child_settles() -> Result<()> {
+    let (engine, sink) = bundle_engine().await?;
+    let identity = identity();
+    let boundary_hash = SequenceHash::root(7);
+    let key = BundleKey::new(&identity, boundary_hash, 256)?;
+    let request: RequestId = "dropped-bundle".into();
+    let handle = engine.clone().offload_bundle(
+        &request,
+        BundleOffloadPlan {
+            identity,
+            key,
+            mode: OffloadMode::Move,
+            resources: [CSA, HCA, CAPSULE]
+                .into_iter()
+                .enumerate()
+                .map(|(index, resource)| ResourceOffload {
+                    resource,
+                    blocks: vec![(boundary_hash, 20 + index)],
+                })
+                .collect(),
+        },
+    )?;
+    let action_id = *handle.id();
+    let children = {
+        let mut buffer = engine
+            .offload_buffer
+            .lock()
+            .expect("offload-buffer mutex poisoned");
+        std::mem::take(&mut *buffer)
+    };
+    assert_eq!(children.len(), 3);
+
+    drop(handle);
+    engine
+        .take_offload_drain(&request)
+        .expect("bundle offload registered a drain")
+        .commit();
+    assert!(sink.saves().is_empty());
+
+    let child_count = children.len();
+    for (index, child) in children.into_iter().enumerate() {
+        let BufferedOffload {
+            action_id: child_action_id,
+            request_id,
+            resource,
+            pairs,
+            completion,
+            ..
+        } = child;
+        assert_eq!(child_action_id, action_id);
+        engine.finish_offload_child(
+            child_action_id,
+            &request_id,
+            resource,
+            pairs,
+            None,
+            completion,
+            ActionStatus::Failed(ActionFailure::AllBlocks),
+        );
+
+        if index + 1 < child_count {
+            assert!(
+                sink.saves().is_empty(),
+                "a partial bundle terminal must retain the request drain"
+            );
+            assert!(engine.actions.contains_key(&action_id));
+        }
+    }
+
+    assert_eq!(sink.saves(), vec![(request.clone(), SaveOutcome::Done)]);
+    assert!(!engine.actions.contains_key(&action_id));
+    assert!(!engine.by_request.contains_key(&request));
+    Ok(())
 }
 
 #[test]

@@ -95,7 +95,9 @@ impl BundlePullTarget for LocalConnectorEngine {
                         dependency_lineages,
                         || {
                             published = true;
-                            bundle.publish()
+                            bundle.publish().map_err(|error| {
+                                BundleCatalogError::Materialization(error.to_string())
+                            })
                         },
                     )?;
             }

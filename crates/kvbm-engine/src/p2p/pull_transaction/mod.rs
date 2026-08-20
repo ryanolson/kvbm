@@ -8,12 +8,16 @@
 //! publish them only after the whole transaction succeeds. Dropping the value
 //! rolls every slot back through [`CompleteBlock`]'s RAII guard.
 
+mod complete;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use futures::StreamExt;
 use kvbm_common::{LogicalResourceId, SequenceHash};
-use kvbm_logical::{BlockManager, CompleteBlock, ImmutableBlock};
+#[cfg(test)]
+use kvbm_logical::CompleteBlock;
+use kvbm_logical::{BlockManager, ImmutableBlock};
 use kvbm_protocols::control::ControlError;
 use kvbm_protocols::control::modules::transfer::{
     MatchBreakdown, PullFromSessionRequest, PullFromSessionResponse,
@@ -22,15 +26,26 @@ use kvbm_protocols::control::modules::transfer::{
 use super::PayloadBlock;
 use super::session::{AvailabilityDelta, CommitDelta, Session};
 use crate::G2;
+#[cfg(test)]
+use crate::g2_capacity::direct_g2_capacity;
+use crate::g2_capacity::{
+    G2AllocationKind, G2Capacity, G2StagedAllocation, RequiredStagingPublishedAllocation,
+    RequiredStagingStagedAllocation, reserve_compatibility,
+};
 use crate::leader::InstanceLeader;
+use crate::remote::search::bundle::OpenedResource;
 
 /// One resource pulled into private destination slots but not yet registered.
 pub(crate) struct StagedPull {
     resource: LogicalResourceId,
     hashes: Vec<SequenceHash>,
-    blocks: Vec<CompleteBlock<G2>>,
-    manager: Arc<BlockManager<G2>>,
+    allocation: RequiredStagingStagedAllocation,
     breakdown: MatchBreakdown,
+}
+
+enum PullStagingMode {
+    CompatibilityChunks,
+    CompleteLineage,
 }
 
 impl StagedPull {
@@ -44,10 +59,17 @@ impl StagedPull {
 
     /// Make the staged hashes visible in the resource registry.
     ///
-    /// All fallible validation occurs before this method is called. Registering
-    /// complete blocks is an infallible ownership transition.
-    pub(crate) fn publish(self) -> Vec<ImmutableBlock<G2>> {
-        self.manager.register_blocks(self.blocks)
+    /// The source capacity can reject a compatibility allocation that it does not own.
+    pub(crate) fn publish(
+        self,
+    ) -> Result<Vec<ImmutableBlock<G2>>, crate::g2_capacity::G2CapacityError> {
+        self.allocation.publish()
+    }
+
+    pub(crate) fn publish_reversible(
+        self,
+    ) -> Result<RequiredStagingPublishedAllocation, crate::g2_capacity::G2CapacityError> {
+        self.allocation.publish_reversible()
     }
 
     pub(crate) fn response(&self) -> PullFromSessionResponse {
@@ -64,11 +86,43 @@ impl StagedPull {
         blocks: Vec<CompleteBlock<G2>>,
         manager: Arc<BlockManager<G2>>,
     ) -> Self {
+        Self::from_test_parts_with_capacity(resource, hashes, blocks, direct_g2_capacity(manager))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_parts_with_capacity(
+        resource: LogicalResourceId,
+        hashes: Vec<SequenceHash>,
+        blocks: Vec<CompleteBlock<G2>>,
+        capacity: Arc<dyn G2Capacity>,
+    ) -> Self {
+        Self {
+            resource,
+            allocation: RequiredStagingStagedAllocation::from_compatibility(
+                G2StagedAllocation::direct(
+                    G2AllocationKind::RequiredStaging,
+                    hashes.clone(),
+                    blocks,
+                )
+                .expect("test staged pull has matching hashes and blocks"),
+                capacity,
+            )
+            .expect("test staged pull uses required-staging allocation"),
+            hashes,
+            breakdown: MatchBreakdown::default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_required_staging(
+        resource: LogicalResourceId,
+        hashes: Vec<SequenceHash>,
+        allocation: RequiredStagingStagedAllocation,
+    ) -> Self {
         Self {
             resource,
             hashes,
-            blocks,
-            manager,
+            allocation,
             breakdown: MatchBreakdown::default(),
         }
     }
@@ -79,7 +133,32 @@ pub(crate) async fn stage_from_session(
     leader: &Arc<InstanceLeader>,
     req: PullFromSessionRequest,
 ) -> Result<StagedPull, ControlError> {
-    let (resource, manager) = resolve_g2_manager(leader, req.resource)?;
+    stage_from_session_with_mode(leader, req, PullStagingMode::CompatibilityChunks).await
+}
+
+/// Attach and pull one complete lineage through one G2 reservation.
+pub(crate) async fn stage_complete_from_session(
+    leader: &Arc<InstanceLeader>,
+    opened: &OpenedResource,
+) -> Result<StagedPull, ControlError> {
+    let capability = opened.capability();
+    let req = PullFromSessionRequest {
+        session_id: capability.session_id,
+        source_instance_id: capability.instance_id,
+        endpoint: Some(capability.endpoint.clone()),
+        selector: Some(opened.hashes().to_vec()),
+        resource: Some(opened.resource()),
+        require_payload_integrity: true,
+    };
+    stage_from_session_with_mode(leader, req, PullStagingMode::CompleteLineage).await
+}
+
+async fn stage_from_session_with_mode(
+    leader: &Arc<InstanceLeader>,
+    req: PullFromSessionRequest,
+    mode: PullStagingMode,
+) -> Result<StagedPull, ControlError> {
+    let (resource, capacity) = resolve_g2_capacity(leader, req.resource)?;
     let endpoint = req.endpoint.ok_or_else(|| {
         ControlError::Internal(
             "endpoint_required: pull_from_session requires an explicit endpoint in v1 \
@@ -105,15 +184,30 @@ pub(crate) async fn stage_from_session(
         .attach(req.session_id, req.source_instance_id, endpoint)
         .await
         .map_err(|error| ControlError::Internal(format!("attach: {error:#}")))?;
-    let result = stage_attached(
-        leader,
-        resource,
-        manager,
-        Arc::clone(&session),
-        req.selector,
-        req.require_payload_integrity,
-    )
-    .await;
+    let result = match mode {
+        PullStagingMode::CompatibilityChunks => {
+            stage_attached(
+                leader,
+                resource,
+                capacity,
+                Arc::clone(&session),
+                req.selector,
+                req.require_payload_integrity,
+            )
+            .await
+        }
+        PullStagingMode::CompleteLineage => {
+            complete::stage_attached(
+                leader,
+                resource,
+                capacity,
+                Arc::clone(&session),
+                req.selector,
+                req.require_payload_integrity,
+            )
+            .await
+        }
+    };
     match &result {
         Ok(_) => session.finalize(None),
         Err(error) => session.close(Some(format!("pull failed: {error}"))),
@@ -124,7 +218,7 @@ pub(crate) async fn stage_from_session(
 async fn stage_attached(
     leader: &Arc<InstanceLeader>,
     resource: LogicalResourceId,
-    manager: Arc<BlockManager<G2>>,
+    capacity: Arc<dyn G2Capacity>,
     session: Arc<dyn Session>,
     selector: Option<Vec<SequenceHash>>,
     require_payload_integrity: bool,
@@ -133,17 +227,24 @@ async fn stage_attached(
     let source_ordinals = source_ordinals(&committed)?;
     let target_hashes = select_hashes(committed, selector)?;
     if target_hashes.is_empty() {
+        let allocation = RequiredStagingStagedAllocation::from_compatibility(
+            G2StagedAllocation::direct(G2AllocationKind::RequiredStaging, Vec::new(), Vec::new())
+                .expect("empty staged pull is valid"),
+            capacity,
+        )
+        .map_err(|error| {
+            ControlError::Internal(format!("bind empty required-staging allocation: {error}"))
+        })?;
         return Ok(StagedPull {
             resource,
             hashes: Vec::new(),
-            blocks: Vec::new(),
-            manager,
+            allocation,
             breakdown: MatchBreakdown::default(),
         });
     }
 
     let target_set = target_hashes.iter().copied().collect::<HashSet<_>>();
-    let block_size = manager.block_size();
+    let block_size = capacity.block_size();
     let mut pulled_set = HashSet::new();
     let mut staged = Vec::with_capacity(target_set.len());
     let mut availability = session.availability();
@@ -169,13 +270,22 @@ async fn stage_attached(
                     continue;
                 }
                 let chunk_len = chunk_hashes.len();
-                let destinations = manager.allocate_blocks(chunk_len).ok_or_else(|| {
+                let destinations = reserve_compatibility(
+                    capacity.as_ref(),
+                    G2AllocationKind::RequiredStaging,
+                    chunk_len,
+                )
+                .map_err(|error| {
                     ControlError::Internal(format!(
-                        "pull: failed to allocate {chunk_len} G2 mutable blocks"
+                        "pull: failed to reserve {chunk_len} G2 mutable blocks: {error}"
                     ))
                 })?;
-                let filled = session
-                    .pull_resource(resource, chunk_hashes.clone(), destinations)
+                let session_for_pull = Arc::clone(&session);
+                let hashes_for_pull = chunk_hashes.clone();
+                let filled = destinations
+                    .transfer_with(move |mutables| {
+                        session_for_pull.pull_resource(resource, hashes_for_pull, mutables)
+                    })
                     .await
                     .map_err(|error| ControlError::Internal(format!("session.pull: {error:#}")))?;
                 if filled.len() != chunk_len {
@@ -184,12 +294,14 @@ async fn stage_attached(
                         filled.len()
                     )));
                 }
-                for (mutable, hash) in filled.into_iter().zip(chunk_hashes.iter().copied()) {
-                    let block = mutable.stage(hash, block_size).map_err(|error| {
-                        ControlError::Internal(format!("stage pulled block: {error:#}"))
-                    })?;
-                    staged.push((hash, block));
-                }
+                staged.extend(
+                    filled
+                        .stage_all(&chunk_hashes, block_size)
+                        .map_err(|error| {
+                            ControlError::Internal(format!("stage pulled block: {error:#}"))
+                        })?
+                        .into_entries(),
+                );
                 pulled_set.extend(chunk_hashes);
                 if pulled_set.len() == target_set.len() {
                     break 'drain;
@@ -211,13 +323,22 @@ async fn stage_attached(
                     .map(|record| record.block.hash)
                     .collect::<Vec<_>>();
                 let chunk_len = chunk.len();
-                let destinations = manager.allocate_blocks(chunk_len).ok_or_else(|| {
+                let destinations = reserve_compatibility(
+                    capacity.as_ref(),
+                    G2AllocationKind::RequiredStaging,
+                    chunk_len,
+                )
+                .map_err(|error| {
                     ControlError::Internal(format!(
-                        "pull: failed to allocate {chunk_len} G2 mutable blocks"
+                        "pull: failed to reserve {chunk_len} G2 mutable blocks: {error}"
                     ))
                 })?;
-                let filled = session
-                    .pull_resource(resource, chunk_hashes.clone(), destinations)
+                let session_for_pull = Arc::clone(&session);
+                let hashes_for_pull = chunk_hashes.clone();
+                let filled = destinations
+                    .transfer_with(move |mutables| {
+                        session_for_pull.pull_resource(resource, hashes_for_pull, mutables)
+                    })
                     .await
                     .map_err(|error| ControlError::Internal(format!("session.pull: {error:#}")))?;
                 if filled.len() != chunk_len {
@@ -227,14 +348,17 @@ async fn stage_attached(
                     )));
                 }
                 if require_payload_integrity {
-                    verify_payloads(leader, resource, &source_ordinals, &chunk, &filled).await?;
+                    verify_payloads(leader, resource, &source_ordinals, &chunk, filled.blocks())
+                        .await?;
                 }
-                for (mutable, hash) in filled.into_iter().zip(chunk_hashes.iter().copied()) {
-                    let block = mutable.stage(hash, block_size).map_err(|error| {
-                        ControlError::Internal(format!("stage pulled block: {error:#}"))
-                    })?;
-                    staged.push((hash, block));
-                }
+                staged.extend(
+                    filled
+                        .stage_all(&chunk_hashes, block_size)
+                        .map_err(|error| {
+                            ControlError::Internal(format!("stage pulled block: {error:#}"))
+                        })?
+                        .into_entries(),
+                );
                 pulled_set.extend(chunk_hashes);
                 if pulled_set.len() == target_set.len() {
                     break 'drain;
@@ -252,7 +376,19 @@ async fn stage_attached(
             target_set.len()
         )));
     }
-    let staged = order_selected(&target_hashes, staged)?;
+    let staged = order_selected(
+        &target_hashes,
+        staged
+            .into_iter()
+            .map(|(hash, block, guard)| (hash, (block, guard)))
+            .collect(),
+    )?;
+    let staged = target_hashes
+        .iter()
+        .copied()
+        .zip(staged)
+        .map(|(hash, (block, guard))| (hash, block, guard))
+        .collect();
 
     crate::engine_audit!(
         "transfer_pull_staged",
@@ -260,11 +396,17 @@ async fn stage_attached(
         resource = ?resource,
         pulled = target_hashes.len()
     );
+    let allocation = RequiredStagingStagedAllocation::from_compatibility(
+        G2StagedAllocation::from_entries(G2AllocationKind::RequiredStaging, staged),
+        capacity,
+    )
+    .map_err(|error| {
+        ControlError::Internal(format!("bind required-staging allocation: {error}"))
+    })?;
     Ok(StagedPull {
         resource,
         hashes: target_hashes,
-        blocks: staged,
-        manager,
+        allocation,
         breakdown: MatchBreakdown {
             host_blocks: pulled_set.len(),
             disk_blocks: 0,
@@ -428,22 +570,208 @@ pub(super) fn resolve_g2_manager(
     Ok((resource, manager))
 }
 
+fn resolve_g2_capacity(
+    leader: &InstanceLeader,
+    requested: Option<LogicalResourceId>,
+) -> Result<(LogicalResourceId, Arc<dyn G2Capacity>), ControlError> {
+    let resource = requested.unwrap_or_else(|| leader.primary_g2_resource());
+    let capacity = leader.g2_capacity_for(resource).ok_or_else(|| {
+        ControlError::Internal(format!(
+            "logical_resource_not_found: no G2 capacity for resource {resource:?}"
+        ))
+    })?;
+    Ok((resource, capacity))
+}
+
 #[cfg(test)]
 mod integrity_tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::g2_capacity::DirectG2Capacity;
+    use crate::g2_capacity::test_support::RecordingG2Capacity;
     use crate::p2p::PayloadChecksum;
-    use crate::p2p::session::{CommittedBlock, VerifiedCommittedBlock};
-    use crate::testing::managers::TestManagerBuilder;
+    use crate::p2p::session::{
+        CommittedBlock, MockSessionFactory, SessionFactory, VerifiedCommittedBlock,
+    };
+    use crate::testing::{create_messenger_tcp, managers::TestManagerBuilder};
+    use kvbm_logical::blocks::BlockRegistry;
+
+    #[tokio::test]
+    async fn staged_pull_uses_the_injected_capacity_for_reserve_and_publish() {
+        let registry = BlockRegistry::builder().build();
+        let manager = Arc::new(
+            TestManagerBuilder::<G2>::new()
+                .block_count(1)
+                .block_size(4)
+                .registry(registry.clone())
+                .build(),
+        );
+        let capacity = Arc::new(RecordingG2Capacity::new(Arc::clone(&manager)));
+        let leader = Arc::new(
+            InstanceLeader::builder()
+                .messenger(create_messenger_tcp().await.expect("test messenger"))
+                .registry(registry)
+                .g2_manager(manager)
+                .g2_capacity(capacity.clone())
+                .build()
+                .expect("test leader"),
+        );
+        let hash = SequenceHash::new(11, None, 0);
+        let factory = MockSessionFactory::new();
+        factory
+            .open(uuid::Uuid::new_v4())
+            .expect("test session open");
+        let session = factory.last_opened().expect("opened test session");
+        session.inject_peer_commit(vec![hash]);
+        session.inject_peer_finish_commits();
+        session.inject_peer_available(vec![CommittedBlock {
+            hash,
+            peer_block_id: 0,
+        }]);
+        session.inject_peer_drained();
+
+        let task = tokio::spawn({
+            let leader = Arc::clone(&leader);
+            let session: Arc<dyn Session> = session.clone();
+            let capacity: Arc<dyn G2Capacity> = capacity.clone();
+            async move {
+                stage_attached(
+                    &leader,
+                    LogicalResourceId(0),
+                    capacity,
+                    session,
+                    None,
+                    false,
+                )
+                .await
+            }
+        });
+        session.wait_pull_count(1).await;
+        session.resolve_pull(0, Ok(()));
+
+        let staged = task.await.expect("staged pull task").expect("staged pull");
+        assert_eq!(
+            capacity.allocation_kinds(),
+            vec![G2AllocationKind::RequiredStaging]
+        );
+        assert_eq!(capacity.allocation_count(), 1);
+        assert_eq!(capacity.registration_count(), 0);
+
+        let registered = staged.publish().expect("publish staged pull");
+
+        assert_eq!(registered.len(), 1);
+        assert_eq!(capacity.registration_count(), 1);
+        assert_eq!(capacity.registrations_with_live_lease(), 1);
+        assert_eq!(capacity.lease_drop_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn compatibility_staging_keeps_fragmented_reservations() {
+        let registry = BlockRegistry::builder().build();
+        let manager = Arc::new(
+            TestManagerBuilder::<G2>::new()
+                .block_count(3)
+                .block_size(4)
+                .registry(registry.clone())
+                .build(),
+        );
+        let capacity = Arc::new(RecordingG2Capacity::new(Arc::clone(&manager)));
+        let leader = Arc::new(
+            InstanceLeader::builder()
+                .messenger(create_messenger_tcp().await.expect("test messenger"))
+                .registry(registry)
+                .g2_manager(manager.clone())
+                .g2_capacity(capacity.clone())
+                .build()
+                .expect("test leader"),
+        );
+        let hashes = vec![
+            SequenceHash::new(21, None, 0),
+            SequenceHash::new(22, Some(21), 1),
+            SequenceHash::new(23, Some(22), 2),
+        ];
+        let factory = MockSessionFactory::new();
+        factory
+            .open(uuid::Uuid::new_v4())
+            .expect("test session open");
+        let session = factory.last_opened().expect("opened test session");
+        session.inject_peer_commit(hashes.clone());
+        session.inject_peer_finish_commits();
+        session.inject_peer_available(vec![CommittedBlock {
+            hash: hashes[0],
+            peer_block_id: 0,
+        }]);
+
+        let task = tokio::spawn({
+            let leader = Arc::clone(&leader);
+            let session: Arc<dyn Session> = session.clone();
+            let capacity: Arc<dyn G2Capacity> = capacity.clone();
+            async move {
+                stage_attached(
+                    &leader,
+                    LogicalResourceId(0),
+                    capacity,
+                    session,
+                    None,
+                    false,
+                )
+                .await
+            }
+        });
+        session.wait_pull_count(1).await;
+
+        assert_eq!(capacity.allocation_count(), 1);
+        assert_eq!(session.pull_calls().len(), 1);
+        assert_eq!(session.pull_calls()[0].0, hashes[..1]);
+        assert_eq!(manager.available_blocks(), 2);
+
+        session.inject_peer_available(vec![
+            CommittedBlock {
+                hash: hashes[1],
+                peer_block_id: 1,
+            },
+            CommittedBlock {
+                hash: hashes[2],
+                peer_block_id: 2,
+            },
+        ]);
+        session.inject_peer_drained();
+        session.resolve_pull(0, Ok(()));
+        session.wait_pull_count(2).await;
+
+        assert_eq!(capacity.allocation_count(), 2);
+        assert_eq!(session.pull_calls().len(), 2);
+        assert_eq!(session.pull_calls()[1].0, hashes[1..]);
+        assert_eq!(manager.available_blocks(), 0);
+
+        session.resolve_pull(1, Ok(()));
+        let staged = task.await.expect("staged pull task").expect("staged pull");
+
+        assert_eq!(staged.hashes(), hashes);
+        assert_eq!(capacity.registration_count(), 0);
+
+        let registered = staged.publish().expect("publish staged pull");
+
+        assert_eq!(registered.len(), hashes.len());
+        assert_eq!(capacity.registration_count(), 1);
+        assert_eq!(manager.match_blocks(&hashes).len(), hashes.len());
+        assert_eq!(capacity.lease_drop_count(), 2);
+    }
 
     #[test]
     fn advertised_payload_ordinal_must_match_source_commit_position() {
         let resource = LogicalResourceId(7);
         let hash = SequenceHash::new(11, None, 0);
-        let manager = TestManagerBuilder::<G2>::new()
-            .block_count(2)
-            .block_size(4)
-            .build();
-        let actual = manager.allocate_blocks(1).unwrap();
+        let manager = Arc::new(
+            TestManagerBuilder::<G2>::new()
+                .block_count(2)
+                .block_size(4)
+                .build(),
+        );
+        let capacity = DirectG2Capacity::new(manager);
+        let actual = reserve_compatibility(&capacity, G2AllocationKind::RequiredStaging, 1)
+            .expect("test allocation");
         let expected = [VerifiedCommittedBlock {
             block: CommittedBlock {
                 hash,
@@ -454,7 +782,7 @@ mod integrity_tests {
         }];
         let ordinals = std::collections::HashMap::from([(hash, 0)]);
 
-        let error = prepare_payload_verification(resource, &ordinals, &expected, &actual)
+        let error = prepare_payload_verification(resource, &ordinals, &expected, actual.blocks())
             .expect_err("wrong advertised order must fail before checksum comparison");
         assert!(
             error

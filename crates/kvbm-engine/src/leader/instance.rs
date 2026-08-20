@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::time::SystemTime;
 
 use ::velo::Messenger;
@@ -22,6 +22,7 @@ use kvbm_protocols::control::{
 
 use crate::{
     BlockId, G2, G3, InstanceId, SequenceHash,
+    g2_capacity::{G2Capacity, G2CapacitySet, direct_g2_capacity_set},
     object::ObjectBlockOps,
     p2p::{
         RemoteBlockSet,
@@ -78,6 +79,25 @@ use super::{
 ///   instances so workers can perform RDMA transfers.
 /// - **Velo RPC**: registering handlers via `VeloLeaderService` so remote
 ///   leaders can initiate sessions and exchange metadata.
+///
+/// Raw G2 managers stay inside `kvbm-engine`.
+///
+/// ```compile_fail
+/// use kvbm_engine::leader::InstanceLeader;
+///
+/// fn bypass_capacity(leader: &InstanceLeader) {
+///     let _ = leader.g2_manager();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use kvbm_common::LogicalResourceId;
+/// use kvbm_engine::leader::InstanceLeader;
+///
+/// fn bypass_capacity(leader: &InstanceLeader, resource: LogicalResourceId) {
+///     let _ = leader.g2_manager_for(resource);
+/// }
+/// ```
 #[derive(Clone)]
 pub struct InstanceLeader {
     /// Velo instance for distributed communication.
@@ -99,6 +119,9 @@ pub struct InstanceLeader {
 
     /// G2 (host memory) block manager (wrapped in Arc since BlockManager doesn't implement Clone).
     pub(crate) g2_manager: Arc<BlockManager<G2>>,
+
+    /// Destination-side G2 capacity and registry facades by logical resource.
+    g2_capacities: Arc<G2CapacitySet>,
 
     /// All model-owned G2 managers keyed by stable logical resource identity.
     g2_managers: Arc<BlockManagerSet<G2>>,
@@ -276,6 +299,8 @@ pub struct InstanceLeaderBuilder {
     velo: Option<Arc<velo::Velo>>,
     registry: Option<BlockRegistry>,
     g2_manager: Option<Arc<BlockManager<G2>>>,
+    g2_capacity: Option<Arc<dyn G2Capacity>>,
+    g2_capacities: Option<Arc<G2CapacitySet>>,
     g2_managers: Option<Arc<BlockManagerSet<G2>>>,
     primary_g2_resource: LogicalResourceId,
     g3_manager: Option<Arc<BlockManager<G3>>>,
@@ -347,6 +372,18 @@ impl InstanceLeaderBuilder {
 
     pub fn g2_manager(mut self, manager: Arc<BlockManager<G2>>) -> Self {
         self.g2_manager = Some(manager);
+        self
+    }
+
+    /// Set the primary resource G2 capacity facade.
+    pub fn g2_capacity(mut self, capacity: Arc<dyn G2Capacity>) -> Self {
+        self.g2_capacity = Some(capacity);
+        self
+    }
+
+    /// Set capacity facades for every logical G2 resource.
+    pub fn g2_capacity_set(mut self, capacities: Arc<G2CapacitySet>) -> Self {
+        self.g2_capacities = Some(capacities);
         self
     }
 
@@ -474,7 +511,7 @@ impl InstanceLeaderBuilder {
             .ok_or_else(|| anyhow::anyhow!("Velo instance required"))?;
         let transport = Arc::new(MetadataTransport::new(messenger.clone()));
 
-        // Create event system for notification aggregation
+        // Share the messenger event manager with worker coordination.
         let events = Arc::new(messenger.event_manager());
 
         // Get current tokio runtime handle
@@ -536,6 +573,12 @@ impl InstanceLeaderBuilder {
 
         let resolved_g2 =
             resolve_g2_managers(self.g2_manager, self.g2_managers, self.primary_g2_resource)?;
+        let g2_capacities = resolve_g2_capacities(
+            self.g2_capacity,
+            self.g2_capacities,
+            &resolved_g2.all,
+            self.primary_g2_resource,
+        )?;
 
         Ok(InstanceLeader {
             messenger,
@@ -544,6 +587,7 @@ impl InstanceLeaderBuilder {
                 .registry
                 .ok_or_else(|| anyhow::anyhow!("block registry required"))?,
             g2_manager: resolved_g2.primary,
+            g2_capacities,
             g2_managers: resolved_g2.all,
             primary_g2_resource: self.primary_g2_resource,
             g3_manager: self.g3_manager,
@@ -610,6 +654,60 @@ fn resolve_g2_managers(
     }
 }
 
+fn resolve_g2_capacities(
+    single: Option<Arc<dyn G2Capacity>>,
+    configured: Option<Arc<G2CapacitySet>>,
+    managers: &BlockManagerSet<G2>,
+    primary: LogicalResourceId,
+) -> Result<Arc<G2CapacitySet>> {
+    match (single, configured) {
+        (Some(_), Some(_)) => {
+            anyhow::bail!("configure either g2_capacity or g2_capacity_set, not both")
+        }
+        (None, None) => Ok(Arc::new(direct_g2_capacity_set(managers))),
+        (Some(capacity), None) if managers.len() == 1 => {
+            let manager = managers
+                .get(primary)
+                .expect("the primary G2 manager was validated before capacity resolution");
+            if capacity.manager_id() != manager.id() {
+                anyhow::bail!("G2 capacity for {primary:?} does not own the configured G2 manager");
+            }
+            let mut capacities = G2CapacitySet::new();
+            capacities.insert(primary, capacity);
+            Ok(Arc::new(capacities))
+        }
+        (Some(_), None) => anyhow::bail!(
+            "g2_capacity_set is required when multiple logical G2 resources are configured"
+        ),
+        (None, Some(capacities)) => {
+            let expected = managers
+                .iter()
+                .map(|(resource, _)| resource)
+                .collect::<BTreeSet<_>>();
+            let actual = capacities
+                .iter()
+                .map(|(resource, _)| resource)
+                .collect::<BTreeSet<_>>();
+            if expected != actual {
+                anyhow::bail!(
+                    "G2 capacity resources {actual:?} differ from manager resources {expected:?}"
+                );
+            }
+            for (resource, capacity) in capacities.iter() {
+                let manager = managers
+                    .get(resource)
+                    .expect("matching resource sets contain every G2 manager");
+                if capacity.manager_id() != manager.id() {
+                    anyhow::bail!(
+                        "G2 capacity for {resource:?} does not own the configured G2 manager"
+                    );
+                }
+            }
+            Ok(capacities)
+        }
+    }
+}
+
 /// Internal session state for holding matched blocks.
 #[allow(dead_code)] // Used for RAII block lifetime management
 struct SessionState {
@@ -642,12 +740,28 @@ pub struct ScanBlocksResult {
 
 impl InstanceLeader {
     /// Get a reference to the G2 BlockManager.
-    pub fn g2_manager(&self) -> &Arc<BlockManager<G2>> {
+    pub(crate) fn g2_manager(&self) -> &Arc<BlockManager<G2>> {
         &self.g2_manager
     }
 
+    /// Get the primary-resource G2 capacity facade.
+    pub fn g2_capacity(&self) -> &Arc<dyn G2Capacity> {
+        self.g2_capacities
+            .get(self.primary_g2_resource)
+            .expect("InstanceLeader validates the primary G2 capacity")
+    }
+
+    /// Get the G2 capacity facade for a model resource.
+    ///
+    pub fn g2_capacity_for(&self, resource: LogicalResourceId) -> Option<Arc<dyn G2Capacity>> {
+        self.g2_capacities.get(resource).cloned()
+    }
+
     /// Get the G2 manager that owns a specific model resource.
-    pub fn g2_manager_for(&self, resource: LogicalResourceId) -> Option<&Arc<BlockManager<G2>>> {
+    pub(crate) fn g2_manager_for(
+        &self,
+        resource: LogicalResourceId,
+    ) -> Option<&Arc<BlockManager<G2>>> {
         self.g2_managers.get(resource)
     }
 
@@ -858,14 +972,12 @@ impl InstanceLeader {
         crate::leader::control::modules::transfer::pull_from_session(self, req).await
     }
 
-    /// PULLER-SIDE. Pull into private staged G2 slots without registering
-    /// their hashes. Complete-bundle transactions use this to make several
-    /// logical resources visible together or roll them all back on failure.
-    pub(crate) async fn stage_from_session(
+    /// Pull one complete resource lineage through one G2 reservation.
+    pub(crate) async fn stage_complete_from_session(
         self: &Arc<Self>,
-        req: kvbm_protocols::control::modules::transfer::PullFromSessionRequest,
+        opened: &crate::remote::search::bundle::OpenedResource,
     ) -> Result<crate::p2p::StagedPull, kvbm_protocols::control::ControlError> {
-        crate::p2p::stage_from_session(self, req).await
+        crate::p2p::stage_complete_from_session(self, opened).await
     }
 
     // ========================================================================
@@ -2486,6 +2598,94 @@ mod tests {
         assert_eq!(resolved.primary.id(), secondary.id());
         assert_eq!(resolved.all.len(), 2);
         assert!(resolve_g2_managers(Some(primary), Some(managers), LogicalResourceId(2)).is_err());
+    }
+
+    #[test]
+    fn multiple_g2_resources_require_a_complete_capacity_set() {
+        let primary_resource = LogicalResourceId(2);
+        let secondary_resource = LogicalResourceId(9);
+        let primary = g2_manager(4);
+        let secondary = g2_manager(8);
+        let mut managers = BlockManagerSet::new();
+        managers
+            .insert(primary_resource, Arc::clone(&primary))
+            .unwrap();
+        managers
+            .insert(secondary_resource, Arc::clone(&secondary))
+            .unwrap();
+        let managers = Arc::new(managers);
+
+        assert!(
+            resolve_g2_capacities(
+                Some(crate::g2_capacity::direct_g2_capacity(Arc::clone(&primary))),
+                None,
+                managers.as_ref(),
+                primary_resource,
+            )
+            .is_err()
+        );
+
+        let mut incomplete = G2CapacitySet::new();
+        incomplete.insert(
+            primary_resource,
+            crate::g2_capacity::direct_g2_capacity(Arc::clone(&primary)),
+        );
+        assert!(
+            resolve_g2_capacities(
+                None,
+                Some(Arc::new(incomplete)),
+                managers.as_ref(),
+                primary_resource,
+            )
+            .is_err()
+        );
+
+        let mut complete = G2CapacitySet::new();
+        complete.insert(
+            primary_resource,
+            crate::g2_capacity::direct_g2_capacity(primary),
+        );
+        complete.insert(
+            secondary_resource,
+            crate::g2_capacity::direct_g2_capacity(secondary),
+        );
+        let resolved = resolve_g2_capacities(
+            None,
+            Some(Arc::new(complete)),
+            managers.as_ref(),
+            primary_resource,
+        )
+        .unwrap();
+
+        assert!(resolved.get(primary_resource).is_some());
+        assert!(resolved.get(secondary_resource).is_some());
+    }
+
+    #[test]
+    fn g2_capacity_must_name_the_exact_runtime_manager() {
+        let resource = LogicalResourceId(7);
+        let runtime_manager = g2_manager(4);
+        let foreign_manager = g2_manager(4);
+        let mut managers = BlockManagerSet::new();
+        managers
+            .insert(resource, Arc::clone(&runtime_manager))
+            .unwrap();
+
+        let error = match resolve_g2_capacities(
+            Some(crate::g2_capacity::direct_g2_capacity(foreign_manager)),
+            None,
+            &managers,
+            resource,
+        ) {
+            Ok(_) => panic!("a capacity from another manager must fail construction"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("does not own the configured G2 manager")
+        );
     }
 
     /// Regression: `find_matches` must never report more matched blocks than it

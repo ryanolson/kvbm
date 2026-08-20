@@ -864,7 +864,7 @@ impl LocalConnectorEngine {
         let cell = Arc::new(Mutex::new(ActionStatus::Pending));
         self.actions.insert(
             action_id,
-            ActionRecord::new(req.clone(), Arc::downgrade(&cell)),
+            ActionRecord::new_save(req.clone(), Arc::downgrade(&cell)),
         );
         self.by_request
             .entry(req.clone())
@@ -917,7 +917,7 @@ impl LeaderEngine for LocalConnectorEngine {
     }
 
     fn evict(&self, req: &RequestId) -> EvictionOutcome {
-        // Find in-flight onboard actions for this request and, if any, flag them
+        // Find in-flight actions for this request and, if any, flag them
         // cancelled-for-emission: their terminal fires `mark_fence_complete`
         // (not `mark_load_finished`) and mints one barrier token per worker.
         let action_ids: Vec<ActionId> = self
@@ -940,18 +940,12 @@ impl LeaderEngine for LocalConnectorEngine {
         let mut cancellations = Vec::new();
         for id in &action_ids {
             if let Some(mut record) = self.actions.get_mut(id) {
-                let still_pending = record.cell.upgrade().is_some_and(|cell| {
-                    matches!(
-                        *cell.lock().expect("action-status mutex poisoned"),
-                        ActionStatus::Pending
-                    )
-                });
                 // Arm only an unfenced action. The drain-holder/fresh-GNMT design
                 // precludes re-evicting the same in-flight action, but guarding
                 // `fence.is_none()` is a cheap strict improvement: it stops a second
                 // evict from reassigning a live barrier (which would drop the prior
                 // clone and complete that fence one drain early).
-                if (still_pending || record.physical_pending) && record.fence.is_none() {
+                if record.has_pending_work() && record.fence.is_none() {
                     let shared = barrier.get_or_insert_with(|| {
                         let worker_count = self.leader.worker_count().max(1);
                         let tokens = (0..worker_count as u32).map(FenceToken::new).collect();
@@ -959,10 +953,8 @@ impl LeaderEngine for LocalConnectorEngine {
                     });
                     record.fence = Some(Arc::clone(shared));
                 }
-                if record.physical_pending
-                    && let Some(cancel) = record.cancel.as_ref()
-                {
-                    cancellations.push(cancel.clone());
+                if let Some(cancel) = record.physical_load_cancel() {
+                    cancellations.push(cancel);
                 }
             }
         }
@@ -1040,12 +1032,9 @@ impl LeaderEngine for LocalConnectorEngine {
         if let Some(cell) = live {
             return cell.lock().expect("action-status mutex poisoned").clone();
         }
-        // No entry, or the handle dropped (dead `Weak`). Self-clean any dead entry
-        // on access so the map cannot grow without bound, then report the
-        // stateless default: a vanished action has no observer to mislead, and a
-        // never-minted id has nothing in flight — matching the noop answer.
-        self.actions
-            .remove_if(id, |_, r| r.cell.strong_count() == 0);
+        // A missing entry and a dropped handle both use the stateless default.
+        // Record removal belongs to handle release or the physical terminal.
+        // Polling cannot prove that a dead cell has no physical work.
         ActionStatus::Complete
     }
 
@@ -1088,33 +1077,19 @@ impl LeaderEngine for LocalConnectorEngine {
         // an unknown or already-released id finds no entry and does nothing (the noop
         // offload path and a second drop are both no-ops).
         //
-        // DEFER if a fence/drain is armed or a direct bundle onboard is still
-        // pending. Removing early could complete a fence, fire a drain, or clear
-        // the bundle overlap guard before the transfer drains. Instead flag
+        // DEFER if a fence/drain is armed or physical work is still pending.
+        // Early removal can complete a fence, fire a drain, or clear the
+        // bundle overlap guard before the transfer drains. Instead flag
         // `dropped_by_handle` under the per-action guard; the driver's terminal
         // then removes the record. Legacy actions with no in-flight key retain
         // the original lock-free status path.
         let (defer, cancel) = {
             if let Some(mut record) = self.actions.get_mut(id) {
-                let bundle_pending = record.inflight.is_some()
-                    && record.cell.upgrade().is_some_and(|cell| {
-                        matches!(
-                            *cell.lock().expect("action-status mutex poisoned"),
-                            ActionStatus::Pending
-                        )
-                    });
-                let armed = record.fence.is_some()
-                    || record.drain.is_some()
-                    || bundle_pending
-                    || record.physical_pending;
-                if armed {
+                let retain = record.must_retain_after_handle_drop();
+                if retain {
                     record.dropped_by_handle = true;
                 }
-                let cancel = record
-                    .physical_pending
-                    .then(|| record.cancel.as_ref().cloned())
-                    .flatten();
-                (armed, cancel)
+                (retain, record.physical_load_cancel())
             } else {
                 (false, None)
             }
@@ -2189,12 +2164,34 @@ impl WorkerEngineDriver for LocalConnectorEngine {
     }
 
     fn shutdown(&self) {
-        // Drop buffered-but-unflushed offloads; their handles' cells stay
-        // `Pending` and free by RAII on drop. Orderly teardown sequencing is P-D.
-        self.offload_buffer
-            .lock()
-            .expect("offload-buffer mutex poisoned")
-            .clear();
+        // Settle buffered offloads after the buffer lock releases. A dropped
+        // handle must not leave its physical-save record pending forever.
+        let buffered = {
+            let mut buffer = self
+                .offload_buffer
+                .lock()
+                .expect("offload-buffer mutex poisoned");
+            std::mem::take(&mut *buffer)
+        };
+        for BufferedOffload {
+            action_id,
+            request_id,
+            resource,
+            pairs,
+            completion,
+            ..
+        } in buffered
+        {
+            self.finish_offload_child(
+                action_id,
+                &request_id,
+                resource,
+                pairs,
+                None,
+                completion,
+                ActionStatus::Failed(ActionFailure::AllBlocks),
+            );
+        }
     }
 }
 
@@ -2215,6 +2212,9 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use tokio::sync::{Mutex as TokioMutex, watch};
     use uuid::Uuid;
+
+    #[path = "offload_action_retention.rs"]
+    mod offload_action_retention;
 
     fn connector_config(block_size: usize, remote: RemoteOps) -> ConnectorEngineConfig {
         ConnectorEngineConfig {
@@ -2799,18 +2799,8 @@ mod tests {
         Ok(())
     }
 
-    /// Production-path boundedness for terminal onboards. Pre-fix, a terminal
-    /// onboard left a strong `ActionRecord` in `actions` forever on the in-process
-    /// path: the connector reads `handle.outcome()` (a local cell read) and never
-    /// calls `poll_action` (the only pruner then), so the by-id key — and its
-    /// `by_request` link — leaked once a real caller was wired. With RAII
-    /// `OnboardHandle::drop -> release_action` (the action analogue of
-    /// `release_search`), dropping each terminal handle prunes BOTH maps.
-    ///
-    /// This proves the fix **without calling `poll_action`**: `finish_load_action`
-    /// never removes from `actions`, so `actions.len() == 0` can only be reached by
-    /// the handle Drop -> `release_action` path. If these assertions held only
-    /// after a `poll_action` self-prune, the RAII fix would be wrong.
+    /// Each terminal onboard stays indexed while its handle is live.
+    /// Handle drop calls `release_action`, which clears both indexes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn failed_then_dropped_onboards_retain_no_strong_cell() -> Result<()> {
         let leader = Arc::new(build_test_leader().await?);
@@ -2848,14 +2838,11 @@ mod tests {
                 })
             );
 
-            // Drop the terminal handle. Its RAII `Drop -> release_action` is the
-            // ONLY pruner exercised here — no `poll_action` call anywhere.
+            // Drop the terminal handle. This test does not call `poll_action`.
             drop(onboard);
         }
 
-        // Teeth (no `poll_action` involved): handle Drop alone kept both maps
-        // bounded. `actions` can only reach 0 via `release_action`, since
-        // `finish_load_action` never removes from it — so this isolates the RAII fix.
+        // Handle drop alone keeps both maps bounded in this live-handle path.
         assert_eq!(
             engine.actions.len(),
             0,
@@ -2957,9 +2944,10 @@ mod tests {
         let req: RequestId = "rq".into();
         let a1 = ActionId::new();
         let cell = Arc::new(Mutex::new(ActionStatus::Pending));
-        engine
-            .actions
-            .insert(a1, ActionRecord::new(req.clone(), Arc::downgrade(&cell)));
+        engine.actions.insert(
+            a1,
+            ActionRecord::new_save(req.clone(), Arc::downgrade(&cell)),
+        );
         engine.by_request.insert(req.clone(), vec![a1]);
 
         let fence = engine.evict(&req).fence;
@@ -3774,12 +3762,14 @@ mod tests {
         let (a1, a2) = (ActionId::new(), ActionId::new());
         let cell1 = Arc::new(Mutex::new(ActionStatus::Pending));
         let cell2 = Arc::new(Mutex::new(ActionStatus::Pending));
-        engine
-            .actions
-            .insert(a1, ActionRecord::new(req.clone(), Arc::downgrade(&cell1)));
-        engine
-            .actions
-            .insert(a2, ActionRecord::new(req.clone(), Arc::downgrade(&cell2)));
+        engine.actions.insert(
+            a1,
+            ActionRecord::new_save(req.clone(), Arc::downgrade(&cell1)),
+        );
+        engine.actions.insert(
+            a2,
+            ActionRecord::new_save(req.clone(), Arc::downgrade(&cell2)),
+        );
         engine.by_request.insert(req.clone(), vec![a1, a2]);
         engine.offload_drains.insert(req.clone(), ());
 
@@ -3874,9 +3864,10 @@ mod tests {
         let req: RequestId = "rq".into();
         let a1 = ActionId::new();
         let cell1 = Arc::new(Mutex::new(ActionStatus::Pending));
-        engine
-            .actions
-            .insert(a1, ActionRecord::new(req.clone(), Arc::downgrade(&cell1)));
+        engine.actions.insert(
+            a1,
+            ActionRecord::new_save(req.clone(), Arc::downgrade(&cell1)),
+        );
         engine.by_request.insert(req.clone(), vec![a1]);
         engine.offload_drains.insert(req.clone(), ());
 
@@ -3965,10 +3956,8 @@ mod tests {
         Ok(())
     }
 
-    /// RAII: dropping each terminal offload handle prunes BOTH the `actions` map
-    /// and the `by_request` index (the action analogue of the onboard RAII test;
-    /// `finish_save_action` never removes from `actions`, so reaching 0 isolates
-    /// the handle-Drop → `release_action` path).
+    /// Each terminal offload stays indexed while its handle is live.
+    /// Handle drop calls `release_action`, which clears both indexes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn offload_handle_drop_prunes_actions_and_by_request() -> Result<()> {
         let leader = Arc::new(build_test_leader().await?);
@@ -3993,7 +3982,7 @@ mod tests {
             engine.finish_forward_pass(i);
             wait_offload_complete(&handle).await;
             assert_eq!(handle.outcome(), Some(SaveOutcome::Done));
-            // RAII Drop -> release_action is the ONLY pruner exercised here.
+            // This live-handle path releases through `release_action`.
             drop(handle);
         }
 

@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::BlockId;
 
-use super::cancel::{CancelConfirmation, CancelStateUpdater, CancellationToken};
+use super::cancel::{CancelConfirmation, CancellationToken, CancellationUnit};
 
 /// Unique identifier for a transfer operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -106,9 +106,9 @@ pub struct TransferResult {
 
 /// Handle for tracking and controlling an offload transfer.
 ///
-/// Obtained from `OffloadEngine::enqueue()`. Use this to:
+/// Tier-specific `OffloadEngine::enqueue_*` methods return this handle. Use it to:
 /// - Monitor transfer progress via `status()`, `passed_blocks()`, etc.
-/// - Cancel the transfer via `cancel()` and await confirmation
+/// - Request cancellation via `cancel()` and await ownership confirmation
 /// - Wait for completion via `wait()`
 #[derive(Clone)]
 pub struct TransferHandle {
@@ -158,16 +158,16 @@ impl TransferHandle {
         self.status().is_terminal()
     }
 
-    /// Cancel the transfer and await confirmation.
+    /// Request cancellation and return a confirmation future.
     ///
-    /// Returns a future that resolves when all blocks are confirmed released
-    /// with no outstanding operations.
+    /// This method requests cancellation and returns a confirmation future.
+    /// The future resolves after every route releases its work unit.
+    /// An unproven physical drain retains ownership and keeps the future pending.
     ///
     /// # Example
     /// ```ignore
-    /// // Request cancellation and wait for confirmation
     /// handle.cancel().wait().await;
-    /// // All blocks are now released
+    /// // Every route has now released its owned resources.
     /// ```
     pub fn cancel(&self) -> CancelConfirmation {
         self.cancel_token.request();
@@ -215,6 +215,26 @@ impl TransferHandle {
     }
 }
 
+/// Settle one physical route and publish terminal state only for the last route.
+pub(crate) fn settle_transfer_unit(
+    cancellation: CancellationUnit,
+    state: std::sync::Arc<std::sync::Mutex<TransferState>>,
+) {
+    cancellation.settle(move || {
+        state.lock().unwrap().finish_logical_operation();
+    });
+}
+
+/// Record one physical route failure before its unit joins the terminal fan-in.
+pub(crate) fn fail_transfer_unit(
+    cancellation: CancellationUnit,
+    state: std::sync::Arc<std::sync::Mutex<TransferState>>,
+    error: String,
+) {
+    state.lock().unwrap().record_error(error);
+    settle_transfer_unit(cancellation, state);
+}
+
 impl std::fmt::Debug for TransferHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TransferHandle")
@@ -250,16 +270,19 @@ pub(crate) struct TransferState {
     pub(crate) error: Option<String>,
     /// Notifier channels
     pub(crate) notifiers: TransferNotifiers,
-    /// Cancel state updater
-    pub(crate) cancel_updater: CancelStateUpdater,
+    /// Shared cancellation token. The handle and the pipeline container each
+    /// own a clone of this token.
+    pub(crate) cancel_token: CancellationToken,
+    /// True after the container crosses the weak-to-strong upgrade boundary.
+    /// Cancellation can no longer discard its physical work after this point.
+    pub(crate) committed: bool,
     /// Total blocks expected in this transfer (set by PolicyEvaluator)
     pub(crate) total_expected_blocks: usize,
     /// Blocks that have been processed through policy evaluation (for sentinel flush)
     pub(crate) blocks_processed: usize,
     /// Precondition event that must be satisfied before processing this transfer.
-    /// Set by the caller when enqueuing offload operations. BatchCollector will
-    /// attach this to the TransferBatch, and PreconditionAwaiter will await it
-    /// before forwarding to TransferExecutor.
+    /// Set by the caller when it enqueues offload operations. The container
+    /// carries this event to PreconditionAwaiter before BatchCollector runs.
     pub(crate) precondition: Option<velo::EventHandle>,
 }
 
@@ -273,7 +296,7 @@ impl TransferState {
         let (failed_tx, failed_rx) = watch::channel(Vec::new());
         let (remaining_tx, remaining_rx) = watch::channel(input_blocks.clone());
         let (result_tx, result_rx) = watch::channel(None);
-        let (cancel_token, cancel_updater) = CancellationToken::new();
+        let cancel_token = CancellationToken::new();
 
         let notifiers = TransferNotifiers {
             status_tx,
@@ -295,7 +318,8 @@ impl TransferState {
             filtered_out: Vec::new(),
             error: None,
             notifiers,
-            cancel_updater,
+            cancel_token: cancel_token.clone(),
+            committed: false,
             total_expected_blocks: 0, // Set by PolicyEvaluator when transfer starts
             blocks_processed: 0,
             precondition: None, // Set by caller via enqueue_with_precondition
@@ -317,7 +341,33 @@ impl TransferState {
 
     /// Check if cancellation has been requested.
     pub(crate) fn is_cancel_requested(&self) -> bool {
-        self.cancel_updater.is_requested()
+        self.cancel_token.is_requested()
+    }
+
+    /// Subscribe to terminal status changes for a token watcher.
+    pub(crate) fn subscribe_status(&self) -> watch::Receiver<TransferStatus> {
+        self.notifiers.status_tx.subscribe()
+    }
+
+    /// Clone the cancellation token that belongs to this transfer handle.
+    pub(crate) fn cancellation_token(&self) -> CancellationToken {
+        self.cancel_token.clone()
+    }
+
+    /// Record a cancellation request at the current pipeline boundary.
+    pub(crate) fn begin_cancellation(&mut self) {
+        debug_assert!(self.cancel_token.is_requested());
+    }
+
+    /// Mark the transfer as committed at the upgrade boundary.
+    pub(crate) fn mark_committed(&mut self) {
+        self.committed = true;
+    }
+
+    /// Record blocks that must drain after commitment.
+    pub(crate) fn mark_committed_blocks(&mut self, block_ids: impl IntoIterator<Item = BlockId>) {
+        self.mark_committed();
+        self.mark_in_flight(block_ids);
     }
 
     /// Update status and notify.
@@ -377,21 +427,54 @@ impl TransferState {
 
     /// Set error and mark as failed.
     pub(crate) fn set_error(&mut self, error: String) {
+        if self.status.is_terminal() {
+            return;
+        }
         self.error = Some(error);
         self.set_status(TransferStatus::Failed);
         self.finalize();
     }
 
+    /// Record a route error without publishing a terminal result.
+    pub(crate) fn record_error(&mut self, error: String) {
+        if self.status.is_terminal() || self.error.is_some() {
+            return;
+        }
+        self.error = Some(error);
+    }
+
     /// Mark as cancelled.
     pub(crate) fn set_cancelled(&mut self) {
+        if self.committed {
+            return;
+        }
+        if self.status.is_terminal() {
+            return;
+        }
         self.set_status(TransferStatus::Cancelled);
-        self.cancel_updater.set_confirmed();
         self.finalize();
     }
 
     /// Mark as complete (all blocks transferred).
     pub(crate) fn set_complete(&mut self) {
+        if self.status.is_terminal() {
+            return;
+        }
         self.set_status(TransferStatus::Complete);
+        self.finalize();
+    }
+
+    /// Publish the final result after the last logical route settles.
+    pub(crate) fn finish_logical_operation(&mut self) {
+        if self.status.is_terminal() {
+            return;
+        }
+        let status = if self.error.is_some() || !self.failed.is_empty() {
+            TransferStatus::Failed
+        } else {
+            TransferStatus::Complete
+        };
+        self.set_status(status);
         self.finalize();
     }
 
@@ -412,16 +495,6 @@ impl TransferState {
     /// Get current in-flight count (for draining).
     pub(crate) fn in_flight_count(&self) -> usize {
         self.in_flight.len()
-    }
-
-    /// Begin draining (cancellation in progress).
-    pub(crate) fn begin_draining(&self) {
-        self.cancel_updater.set_draining(self.in_flight.len());
-    }
-
-    /// Update draining count.
-    pub(crate) fn update_draining(&self) {
-        self.cancel_updater.update_draining(self.in_flight.len());
     }
 }
 
@@ -558,6 +631,21 @@ mod tests {
         assert!(remaining.contains(&1));
         assert!(!remaining.contains(&2));
         assert!(remaining.contains(&3));
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_completion_confirms_without_a_pipeline_watcher() {
+        let id = TransferId::new();
+        let (mut state, handle) = TransferState::new(id, vec![1]);
+        state.mark_committed();
+        state.set_complete();
+
+        tokio::time::timeout(
+            tokio::time::Duration::from_millis(50),
+            handle.cancel().wait(),
+        )
+        .await
+        .expect("terminal handle cancellation confirms");
     }
 
     #[test]

@@ -59,7 +59,7 @@ impl LocalConnectorEngine {
         let cell = Arc::new(Mutex::new(ActionStatus::Pending));
         self.actions.insert(
             action_id,
-            ActionRecord::new(req.clone(), Arc::downgrade(&cell)),
+            ActionRecord::new_save(req.clone(), Arc::downgrade(&cell)),
         );
         self.by_request
             .entry(req.clone())

@@ -156,7 +156,13 @@ impl OnboardingComposer {
             return;
         };
         let holder = BlockHolder::new(self.matched_g3_blocks.clone());
-        if let Err(e) = stage_g3_to_g2(&holder, self.leader.g2_manager(), &*parallel_worker).await {
+        if let Err(e) = stage_g3_to_g2(
+            &holder,
+            Arc::clone(self.leader.g2_capacity()),
+            &*parallel_worker,
+        )
+        .await
+        {
             tracing::warn!(
                 session_id = %self.session_id,
                 error = %e,

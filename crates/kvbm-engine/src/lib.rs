@@ -26,6 +26,7 @@ pub struct G4;
 pub mod audit;
 #[cfg(feature = "collectives")]
 pub mod collectives;
+pub mod g2_capacity;
 
 /// The connector's connector engine construction entry points: the leader-side
 /// factory plus the worker-side [`WorkerEngine`] and its pass-plan types.

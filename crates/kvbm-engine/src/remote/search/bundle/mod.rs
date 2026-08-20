@@ -17,7 +17,7 @@ mod pull;
 
 #[cfg(any(test, feature = "testing"))]
 pub(crate) use pull::test_support;
-pub(crate) use pull::{BundlePullTarget, StagedBundle, pull_remote_bundle};
+pub(crate) use pull::{BundlePullTarget, OpenedResource, StagedBundle, pull_remote_bundle};
 
 /// One owner's complete, manifest-scoped bundle advertisement.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -102,10 +102,6 @@ impl BundleAdvertisement {
 
     pub fn lineages(&self) -> impl Iterator<Item = &BundleResourceLineage> {
         self.lineages.values()
-    }
-
-    pub(crate) fn lineage(&self, resource: LogicalResourceId) -> Option<&BundleResourceLineage> {
-        self.lineages.get(&resource)
     }
 
     pub fn matches(&self, query: &BundleDiscoveryQuery) -> bool {

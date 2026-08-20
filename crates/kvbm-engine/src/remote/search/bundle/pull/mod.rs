@@ -4,6 +4,7 @@
 //! Bounded all-resource remote acquisition and atomic local publication.
 
 mod deadline;
+mod lineage;
 mod metrics;
 #[cfg(any(test, feature = "testing"))]
 pub(crate) mod test_support;
@@ -14,9 +15,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, bail};
 use futures::future::{BoxFuture, join_all};
-use kvbm_common::{LogicalResourceId, SequenceHash};
+use kvbm_common::LogicalResourceId;
+#[cfg(test)]
+use kvbm_common::SequenceHash;
 use kvbm_protocols::cache_manifest::{BundleKey, CacheIdentity};
 use kvbm_protocols::control::modules::transfer::OpenTransferSessionResponse;
 use tokio_util::sync::CancellationToken;
@@ -25,13 +28,13 @@ use crate::leader::InstanceLeader;
 
 use super::{BundleMissReason, BundlePullOutcome, RemoteBundleCandidate, unix_time_ms};
 use deadline::{BundlePullLimits, PullDeadline, bounded};
+use lineage::CompleteG2Lineage;
+pub(crate) use lineage::OpenedResource;
 use metrics::PullMetrics;
 pub(crate) use transaction::StagedBundle;
 #[cfg(test)]
 use transfer::BundleTransferError;
-use transfer::{
-    BundleTransfer, LeaderBundleTransfer, OpenedResource, close_all, spawn_draining_pull,
-};
+use transfer::{BundleTransfer, LeaderBundleTransfer, close_all, spawn_draining_pull};
 
 /// One complete-bundle acquisition attempt.
 ///
@@ -101,7 +104,8 @@ impl RemoteBundlePull {
             self.search_deadline,
         );
         let mut opened = Vec::with_capacity(lineages.len());
-        for (&resource, hashes) in &lineages {
+        let mut open_session_ids = Vec::with_capacity(lineages.len());
+        for lineage in lineages.values() {
             let watchdog = deadline
                 .remaining()
                 .min(self.limits.holder_watchdog)
@@ -109,7 +113,7 @@ impl RemoteBundlePull {
             let response = bounded(
                 &self.cancel,
                 deadline.at,
-                self.transfer.open(resource, hashes.clone(), watchdog),
+                lineage.open_full(self.transfer.as_ref(), watchdog),
             )
             .await;
             let response = match response {
@@ -117,7 +121,7 @@ impl RemoteBundlePull {
                 Ok(Err(error)) => {
                     close_all(
                         &self.transfer,
-                        &opened,
+                        &open_session_ids,
                         "bundle acquisition failed",
                         self.limits.cleanup_timeout,
                     )
@@ -127,7 +131,7 @@ impl RemoteBundlePull {
                 Err(interruption) => {
                     close_all(
                         &self.transfer,
-                        &opened,
+                        &open_session_ids,
                         "bundle acquisition interrupted",
                         self.limits.cleanup_timeout,
                     )
@@ -141,15 +145,11 @@ impl RemoteBundlePull {
                     committed,
                     ..
                 } => {
+                    open_session_ids.push(capability.session_id);
                     if capability.instance_id != expected_owner {
-                        opened.push(OpenedResource {
-                            resource,
-                            hashes: hashes.clone(),
-                            capability,
-                        });
                         close_all(
                             &self.transfer,
-                            &opened,
+                            &open_session_ids,
                             "bundle holder identity changed",
                             self.limits.cleanup_timeout,
                         )
@@ -161,7 +161,7 @@ impl RemoteBundlePull {
                 OpenTransferSessionResponse::NoBlocksFound => {
                     close_all(
                         &self.transfer,
-                        &opened,
+                        &open_session_ids,
                         "bundle resource omitted",
                         self.limits.cleanup_timeout,
                     )
@@ -169,19 +169,15 @@ impl RemoteBundlePull {
                     return Ok(BundlePullOutcome::Miss(BundleMissReason::Incomplete));
                 }
                 OpenTransferSessionResponse::Async { capability } => {
+                    open_session_ids.push(capability.session_id);
                     let reason = if capability.instance_id == expected_owner {
                         BundleMissReason::Incomplete
                     } else {
                         BundleMissReason::OwnerLost
                     };
-                    opened.push(OpenedResource {
-                        resource,
-                        hashes: hashes.clone(),
-                        capability,
-                    });
                     close_all(
                         &self.transfer,
-                        &opened,
+                        &open_session_ids,
                         "unexpected async bundle acquisition",
                         self.limits.cleanup_timeout,
                     )
@@ -189,26 +185,17 @@ impl RemoteBundlePull {
                     return Ok(BundlePullOutcome::Miss(reason));
                 }
             };
-            if capability.resource != resource || committed != *hashes {
-                opened.push(OpenedResource {
-                    resource,
-                    hashes: hashes.clone(),
-                    capability,
-                });
+            let Some(opened_resource) = lineage.bind_open(capability, &committed) else {
                 close_all(
                     &self.transfer,
-                    &opened,
+                    &open_session_ids,
                     "incomplete bundle acquisition",
                     self.limits.cleanup_timeout,
                 )
                 .await;
                 return Ok(BundlePullOutcome::Miss(BundleMissReason::Incomplete));
-            }
-            opened.push(OpenedResource {
-                capability,
-                resource,
-                hashes: hashes.clone(),
-            });
+            };
+            opened.push(opened_resource);
         }
 
         let pulls = opened.iter().cloned().map(|resource| {
@@ -223,8 +210,8 @@ impl RemoteBundlePull {
         for (opened_resource, result) in opened.iter().zip(pull_results) {
             match result {
                 Ok(Ok(Ok(resource)))
-                    if resource.resource() == opened_resource.resource
-                        && resource.hashes() == opened_resource.hashes =>
+                    if resource.resource() == opened_resource.resource()
+                        && resource.hashes() == opened_resource.hashes() =>
                 {
                     let transferred_bytes = self
                         .target
@@ -236,7 +223,7 @@ impl RemoteBundlePull {
                 Ok(Ok(Ok(_))) => miss = merge_reason(miss, BundleMissReason::Incomplete),
                 Ok(Ok(Err(error))) => {
                     tracing::debug!(
-                        resource = ?opened_resource.resource,
+                        resource = ?opened_resource.resource(),
                         %error,
                         "remote bundle resource pull failed"
                     );
@@ -244,7 +231,7 @@ impl RemoteBundlePull {
                 }
                 Ok(Err(error)) => {
                     tracing::error!(
-                        resource = ?opened_resource.resource,
+                        resource = ?opened_resource.resource(),
                         %error,
                         "detached bundle pull task failed"
                     );
@@ -264,7 +251,11 @@ impl RemoteBundlePull {
         if unix_time_ms() >= self.candidate.lease_expires_at_unix_ms() {
             return Ok(BundlePullOutcome::Miss(BundleMissReason::Expired));
         }
-        let bundle = match StagedBundle::new(lineages, staged) {
+        let staged_lineages = staged
+            .iter()
+            .map(|resource| (resource.resource(), resource.hashes().to_vec()))
+            .collect();
+        let bundle = match StagedBundle::new(staged_lineages, staged) {
             Ok(bundle) => bundle,
             Err(error) => {
                 tracing::debug!(%error, "remote bundle staging was incomplete");
@@ -368,19 +359,12 @@ async fn pull_remote_bundle_with_transfer(
 fn resource_lineages(
     identity: &CacheIdentity,
     advertisement: &super::BundleAdvertisement,
-) -> Result<BTreeMap<LogicalResourceId, Vec<SequenceHash>>> {
+) -> Result<BTreeMap<LogicalResourceId, CompleteG2Lineage>> {
     if advertisement.identity() != identity || !advertisement.key().is_compatible_with(identity) {
         bail!("bundle advertisement is incompatible with the expected identity");
     }
-    let mut lineages = BTreeMap::new();
-    for requirement in identity.resources() {
-        let resource = requirement.resource();
-        let lineage = advertisement
-            .lineage(resource)
-            .ok_or_else(|| anyhow!("bundle advertisement is missing resource {resource:?}"))?;
-        lineages.insert(resource, lineage.hashes().to_vec());
-    }
-    Ok(lineages)
+    let lineages = advertisement.lineages().cloned().collect::<Vec<_>>();
+    CompleteG2Lineage::for_bundle(identity, advertisement.key(), &lineages).map_err(Into::into)
 }
 
 fn merge_reason(

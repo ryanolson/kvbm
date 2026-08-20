@@ -833,8 +833,6 @@ impl BenchInstance {
         // Build OffloadEngine if requested
         let offload_engine = if config.offload {
             let mut engine_builder = OffloadEngine::builder(Arc::new(leader.clone()))
-                .with_registry(Arc::new(registry.clone()))
-                .with_g2_manager(g2_manager.clone())
                 .with_runtime(tokio::runtime::Handle::current());
 
             if let Some(ref g3m) = g3_manager {

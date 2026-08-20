@@ -21,13 +21,13 @@
 //! └─────────────────────────────────────────────────────────────────┘
 //!
 //! Pipeline stages:
-//! ┌─────────────┐    ┌────────────────┐    ┌──────────────────┐
-//! │   Policy    │───▶│     Batch      │───▶│    Transfer      │
-//! │  Evaluator  │    │   Collector    │    │    Executor      │
-//! └─────────────┘    └────────────────┘    └──────────────────┘
-//!       │                   │                      │
-//!       ▼                   ▼                      ▼
-//!   cancel check       cancel check          wait for in-flight
+//! ┌─────────────┐    ┌──────────────┐    ┌────────────────┐    ┌──────────────────┐
+//! │   Policy    │───▶│ Precondition │───▶│     Batch      │───▶│    Transfer      │
+//! │  Evaluator  │    │   Awaiter    │    │   Collector    │    │    Executor      │
+//! └─────────────┘    └──────────────┘    └────────────────┘    └──────────────────┘
+//!       │                   │                     │                      │
+//!       ▼                   ▼                     ▼                      ▼
+//!   cancel check       token select          cancel sweep        claim and drain
 //! ```
 //!
 //! # Features
@@ -36,8 +36,8 @@
 //!   (presence checks, LFU thresholds) before transfer
 //! - **Batched transfers**: Blocks are accumulated into batches for efficient
 //!   bulk transfers
-//! - **Cancellation**: Clean cancellation with confirmation that all blocks
-//!   are released and no outstanding operations remain
+//! - **Cancellation**: Precommit cancellation with ownership confirmation.
+//!   Ambiguous physical completion keeps confirmation pending.
 //! - **Pipeline chaining**: G1→G2 completions can automatically feed G2→G3
 //!
 //! See also: [Developer Guide](../../docs/offload-developer.md) for implementation
@@ -46,14 +46,13 @@
 //! # Example
 //!
 //! ```ignore
-//! use kvbm_engine::tiering::offload::{
-//!     OffloadEngine, PipelineBuilder, PresenceFilter, PresenceAndLFUFilter,
+//! use std::sync::Arc;
+//! use kvbm_engine::{G2, G3};
+//! use kvbm_engine::offload::{
+//!     OffloadEngine, PipelineBuilder, PresenceAndLFUFilter,
 //! };
 //!
-//! // Build engine with pipelines
 //! let engine = OffloadEngine::builder(leader.clone())
-//!     .with_registry(registry.clone())
-//!     .with_g2_manager(g2_manager.clone())
 //!     .with_g3_manager(g3_manager.clone())
 //!     .with_g2_to_g3_pipeline(
 //!         PipelineBuilder::<G2, G3>::new()
@@ -63,17 +62,16 @@
 //!     )
 //!     .build()?;
 //!
-//! // Enqueue blocks for offload
 //! let handle = engine.enqueue_g2_to_g3(blocks)?;
+//! let mut completion = handle.clone();
 //!
-//! // Wait for completion or cancel
 //! tokio::select! {
-//!     result = handle.wait() => {
+//!     result = completion.wait() => {
 //!         println!("Completed: {:?}", result?.completed_blocks);
 //!     }
 //!     _ = shutdown_signal => {
 //!         handle.cancel().wait().await;
-//!         println!("Cancelled");
+//!         println!("Cancellation settled");
 //!     }
 //! }
 //! ```
@@ -94,25 +92,28 @@ macro_rules! nvtx_range {
 
 mod batch;
 mod cancel;
+mod chain_router;
+mod container;
+mod destination;
 mod engine;
 mod handle;
 mod pending;
 mod pipeline;
 mod policy;
 mod queue;
+mod remote_g4;
 mod source;
 
 #[cfg(test)]
 mod cancel_tests;
 
-// Re-export public API
-pub use cancel::{CancelConfirmation, CancelState, CancellationToken};
+// Re-export public API.
+pub use cancel::CancelConfirmation;
 pub use engine::{OffloadEngine, OffloadEngineBuilder};
 pub use handle::{TransferHandle, TransferId, TransferResult, TransferStatus};
-pub use pending::{PendingGuard, PendingTracker};
+pub use pending::PendingTracker;
 pub use pipeline::{
-    ObjectPipeline, ObjectPipelineBuilder, ObjectPipelineConfig, Pipeline, PipelineBuilder,
-    PipelineConfig, ResolvedBatch, ResolvedBlock, upgrade_batch,
+    ObjectPipelineBuilder, ObjectPipelineConfig, PipelineBuilder, PipelineConfig, RegisterObserver,
 };
 pub use policy::{
     AllOfPolicy, AnyOfPolicy, BoxFuture, EvalContext, ObjectLockPresenceFilter,
@@ -120,8 +121,4 @@ pub use policy::{
     PresenceAndLFUFilter, PresenceChecker, PresenceFilter, S3PresenceChecker, async_batch_result,
     async_result, create_policy_from_config, sync_batch_result, sync_result,
 };
-pub use queue::CancellableQueue;
 pub use source::{ExternalBlock, SourceBlock, SourceBlocks};
-
-// Re-export batch config for advanced users
-pub use batch::{BatchConfig, TimingTrace};

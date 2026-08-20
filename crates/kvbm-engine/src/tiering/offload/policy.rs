@@ -930,8 +930,9 @@ impl<T: BlockMetadata> OffloadPolicy<T> for PassAllPolicy<T> {
 /// Returns `PassAllPolicy` if no policies are configured.
 ///
 /// When a `pending_tracker` is provided, it is automatically wired into
-/// `Presence` and `PresenceLfu` policies to enable duplicate prevention
-/// for blocks currently in-flight through the pipeline.
+/// `Presence` and `PresenceLfu` policies as an early in-flight filter.
+/// `PolicyEvaluator` still uses `PendingTracker::try_claim` after policy
+/// evaluation as the atomic duplicate-prevention boundary.
 ///
 /// # Example
 ///

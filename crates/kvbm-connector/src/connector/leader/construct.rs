@@ -438,10 +438,6 @@ pub(super) async fn build_engine_stack(c: &Construction) -> Result<EngineStack> 
             .expect("primary registry")
             .clone(),
     );
-    let g2_manager_for_offload = g2_manager_set
-        .get(primary_resource)
-        .expect("primary G2 manager")
-        .clone();
     let g3_manager_for_offload = g3_manager.clone();
 
     // Snapshot the InstanceLeader workers (transfer clients) + metadata.
@@ -570,10 +566,7 @@ pub(super) async fn build_engine_stack(c: &Construction) -> Result<EngineStack> 
 
     // Step 7: OffloadEngine (core pipelines).
     let offload_config = &runtime.config().offload;
-    let mut engine_builder = OffloadEngine::builder(leader.clone())
-        .with_registry(registry_for_offload.clone())
-        .with_g2_manager(g2_manager_for_offload)
-        .with_runtime(runtime.tokio());
+    let mut engine_builder = OffloadEngine::builder(leader.clone()).with_runtime(runtime.tokio());
 
     if bypass_host {
         let g1_to_g3_config = if offload_config.g1_to_g3.policies.is_empty() {
@@ -722,17 +715,15 @@ pub(super) async fn build_engine_stack(c: &Construction) -> Result<EngineStack> 
                 Some(Arc::clone(&pending)),
             );
             let pipeline = PipelineBuilder::<G1, G2>::new()
+                .resource(resource)
                 .policy(policy)
                 .pending_tracker(pending)
                 .build();
+            let capacity = leader.g2_capacity_for(resource).with_context(|| {
+                format!("G2 capacity for secondary resource {resource:?} is missing")
+            })?;
             let builder = OffloadEngine::builder(leader.clone())
-                .with_registry(Arc::new(registry.clone()))
-                .with_g2_manager(
-                    g2_manager_set
-                        .get(resource)
-                        .expect("G2 manager for every resource")
-                        .clone(),
-                )
+                .with_g2_capacity(capacity)
                 .with_runtime(runtime.tokio())
                 .with_g1_to_g2_pipeline(pipeline);
             offloads.push((resource, Arc::new(builder.build()?)));

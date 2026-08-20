@@ -35,55 +35,58 @@ Offloading moves blocks from a source tier (e.g., GPU memory) to a destination t
 
 ## Container Data Model
 
-The fundamental unit flowing through the pipeline is an **OffloadContainer**:
+`OffloadContainer<T>` is a private pipeline value. It owns one optional payload and one optional `CancellationUnit`.
+The payload owns transfer identity, source data, evaluated blocks, state, and an optional precondition event.
+Evaluated blocks retain their pending guards until they fail or cross the commitment boundary.
+The policy evaluator atomically claims each `SequenceHash` before it creates an evaluated block.
+A failed claim does not create a second evaluated block.
 
 ```rust,ignore
 struct OffloadContainer<T: BlockMetadata> {
-    /// The blocks to offload
-    blocks: Vec<SourceBlock<T>>,
-    /// Precondition event (forward pass completion)
-    precondition: Option<EventHandle>,
-    /// Cancellation token
-    cancel_token: CancellationToken,
+    payload: Option<ContainerPayload<T>>,
+    cancellation: Option<CancellationUnit>,
 }
-```
 
-Containers are grouped into batches for efficient transfer:
-
-```rust,ignore
-struct OffloadBatch<T: BlockMetadata> {
-    /// Multiple containers, each independently cancellable
+struct TransferBatch<T: BlockMetadata> {
     containers: Vec<OffloadContainer<T>>,
+    timing: TimingTrace,
 }
 ```
+
+`TransferBatch` groups complete containers. It does not split a container before commitment.
 
 
 ### P1: Container is the Unit of Cancellation
 
-Individual blocks within a container are not independently cancellable. When a container is cancelled, all its blocks are cancelled together.
+One container owns one precommit cancellation unit. Its blocks do not cancel independently.
+When cancellation wins before commitment, the complete container releases its source and pending guards.
 
 ### P2: Token Travels with Container
 
-Each container carries its own `CancellationToken`, cloned from the `TransferHandle` at enqueue time. The token travels with the container through all pipeline stages until upgrade.
+The handle and container share internal cancellation state. The container owns the sole `CancellationUnit`.
+That unit moves through every stage. The pipeline does not clone or replace it before commitment.
 
 ### P3: Upgrade is the Commitment Boundary
 
-The upgrade step (Weak → Strong) is the point of no return:
+The final claim and weak-to-strong upgrade form the physical commitment boundary.
 
-- **Before upgrade**: Containers can be cancelled via sweep or token check
-- **After upgrade**: We own the blocks; cancellation no longer applies
+- Before commitment, cancellation drops the complete container.
+- After commitment, a request starts drain tracking. It does not cancel physical work.
+- Confirmation waits for every committed route unit to settle.
 
 ### P4: Sweep Before Upgrade
 
-The last cancellation check occurs immediately before upgrade. The `TransferExecutor` calls `batch.sweep_cancelled()` to remove cancelled containers before committing.
+The executor sweeps cancelled containers immediately before upgrade. Each remaining container then claims commitment against cancellation.
 
 ### P5: Flat Map After Upgrade
 
-After upgrade, all blocks from all containers are consolidated into a single `Vec<ImmutableBlock<T>>` for efficient batch transfer. Per-container identity is lost at this point.
+The executor flattens only containers that claim commitment. `ResolvedBatch<T>` retains `ResolvedBlock<T>` values.
+Each resolved block retains transfer identity, source state, and any source or pending guard.
+The container wrapper ends after upgrade. The physical ownership data remains until transfer completion.
 
 ### P6: PreconditionAwaiter Uses Select
 
-The precondition awaiter can be cancelled via `select!` on both the precondition event and the cancellation token. If cancelled while waiting, the container is dropped immediately.
+The precondition awaiter selects the event and effective precommit cancellation. If cancellation wins, it releases the container immediately.
 
 ## Configuration
 
@@ -92,19 +95,19 @@ Pipeline behavior is controlled via `PipelineConfig`:
 | Option | Default | Description |
 |--------|---------|-------------|
 | `resource` | `None` | Logical model resource whose physical tier layouts execute this pipeline; `None` uses the leader primary compatibility route |
-| `batch_config.max_batch_size` | 64 | Maximum blocks per batch |
+| `batch_config.max_batch_size` | 1024 | Maximum blocks per batch |
 | `batch_config.min_batch_size` | 8 | Minimum blocks before flush |
-| `batch_config.flush_interval` | 10ms | Time before flushing partial batch |
+| `batch_config.flush_interval` | 10ms | Time before a partial batch flushes. It must not be zero. |
 | `policy_timeout` | 100ms | Timeout for policy evaluation |
-| `sweep_interval` | 10ms | Interval for cancel sweeper |
+| `sweep_interval` | 10ms | Interval for the cancel sweeper. It must not be zero. |
 | `max_concurrent_transfers` | 1 | Concurrent transfer batches |
 
 ## Usage
 
-### Enqueueing Blocks
+### Enqueue Blocks
 
 ```rust,ignore
-let handle = pipeline.enqueue(source_blocks, precondition_event);
+let mut handle = engine.enqueue_g1_to_g2(blocks)?;
 
 // Track progress
 println!("Status: {:?}", handle.status());
@@ -117,14 +120,11 @@ let result = handle.wait().await?;
 
 ```rust,ignore
 // Request cancellation and wait for confirmation
-handle.cancel().await;
-// All blocks are now released
+handle.cancel().wait().await;
+// All offload-owned source and pending guards are now released.
 ```
 
 ## Related Documentation
 
 - [offload-developer.md](offload-developer.md) - Implementation details and extension rules
-
-
-
 

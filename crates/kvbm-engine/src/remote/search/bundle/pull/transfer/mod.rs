@@ -13,20 +13,14 @@ use kvbm_protocols::control::ControlError;
 use kvbm_protocols::control::client::LeaderControlClient;
 use kvbm_protocols::control::modules::transfer::{
     CloseTransferSessionRequest, FindMode, OpenTransferSessionRequest, OpenTransferSessionResponse,
-    PullFromSessionRequest, SearchMode, TierSelection, TransferSessionCapability,
+    SearchMode, TierSelection,
 };
 
 use crate::leader::InstanceLeader;
 use crate::p2p::StagedPull;
 
 use super::super::BundleMissReason;
-
-#[derive(Clone)]
-pub(super) struct OpenedResource {
-    pub(super) capability: TransferSessionCapability,
-    pub(super) resource: LogicalResourceId,
-    pub(super) hashes: Vec<SequenceHash>,
-}
+use super::lineage::OpenedResource;
 
 pub(super) trait BundleTransfer: Send + Sync {
     fn open(
@@ -59,7 +53,7 @@ pub(super) fn spawn_draining_pull(
     cleanup_timeout: Duration,
 ) -> tokio::task::JoinHandle<Result<StagedPull, BundleTransferError>> {
     tokio::spawn(async move {
-        let session_id = resource.capability.session_id;
+        let session_id = resource.capability().session_id;
         let result = transfer.pull(&resource).await;
         let _ = tokio::time::timeout(
             cleanup_timeout,
@@ -73,7 +67,6 @@ pub(super) fn spawn_draining_pull(
 pub(super) struct LeaderBundleTransfer {
     leader: Arc<InstanceLeader>,
     client: LeaderControlClient,
-    owner: crate::InstanceId,
     registration_epoch: RegistrationEpoch,
 }
 
@@ -86,7 +79,6 @@ impl LeaderBundleTransfer {
         Self {
             client: LeaderControlClient::new(leader.messenger().clone(), owner),
             leader,
-            owner,
             registration_epoch,
         }
     }
@@ -122,23 +114,12 @@ impl BundleTransfer for LeaderBundleTransfer {
         resource: &OpenedResource,
     ) -> BoxFuture<'_, Result<StagedPull, BundleTransferError>> {
         let leader = Arc::clone(&self.leader);
-        let owner = self.owner;
-        let session_id = resource.capability.session_id;
-        let endpoint = resource.capability.endpoint.clone();
-        let resource_id = resource.resource;
-        let hashes = resource.hashes.clone();
+        let resource = resource.clone();
         Box::pin(async move {
             leader
-                .stage_from_session(PullFromSessionRequest {
-                    session_id,
-                    source_instance_id: owner,
-                    endpoint: Some(endpoint),
-                    selector: Some(hashes),
-                    resource: Some(resource_id),
-                    require_payload_integrity: true,
-                })
+                .stage_complete_from_session(&resource)
                 .await
-                .map_err(|error| classify_control_error(resource_id, error))
+                .map_err(|error| classify_control_error(resource.resource(), error))
         })
     }
 
@@ -192,19 +173,16 @@ impl BundleTransferError {
 
 pub(super) async fn close_all(
     transfer: &Arc<dyn BundleTransfer>,
-    opened: &[OpenedResource],
+    session_ids: &[uuid::Uuid],
     reason: &str,
     cleanup_timeout: Duration,
 ) {
-    let closes = opened.iter().map(|resource| {
+    let closes = session_ids.iter().copied().map(|session_id| {
         let transfer = Arc::clone(transfer);
         let reason = reason.to_owned();
         async move {
-            let _ = tokio::time::timeout(
-                cleanup_timeout,
-                transfer.close(resource.capability.session_id, &reason),
-            )
-            .await;
+            let _ =
+                tokio::time::timeout(cleanup_timeout, transfer.close(session_id, &reason)).await;
         }
     });
     join_all(closes).await;

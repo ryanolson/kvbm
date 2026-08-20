@@ -16,20 +16,22 @@
 //! # Solution
 //!
 //! The `PendingTracker` maintains a set of sequence hashes currently in the pipeline.
-//! When blocks pass policy evaluation, a `PendingGuard` is created that:
-//! - Adds the sequence hash to the pending set on creation
-//! - Automatically removes it on drop (RAII pattern)
+//! When blocks pass policy evaluation, `try_claim` atomically creates a `PendingGuard` that:
+//! - Adds a previously absent sequence hash to the pending set
+//! - Returns no guard when another block already owns that hash
+//! - Automatically removes the owned hash on drop (RAII pattern)
 //!
-//! The `PresenceFilter` can then check both the registry (completed transfers)
-//! AND the pending set (in-flight transfers) to avoid duplicates.
+//! The `PresenceFilter` can check both the registry (completed transfers) and
+//! the pending set (in-flight transfers) as early filters. `try_claim` remains
+//! the unique-ownership boundary for every policy configuration.
 //!
 //! # Example
 //!
 //! ```ignore
 //! let tracker = Arc::new(PendingTracker::new());
 //!
-//! // Create guard when block passes policy
-//! let guard = tracker.guard(sequence_hash);
+//! // Claim a hash when a block passes policy.
+//! let guard = tracker.try_claim(sequence_hash)?;
 //!
 //! // Guard travels with block through pipeline stages
 //! queued_block.pending_guard = Some(guard);
@@ -80,18 +82,22 @@ impl PendingTracker {
         self.pending.is_empty()
     }
 
-    /// Create a guard that marks a sequence hash as pending until dropped.
+    /// Atomically claim a sequence hash until the returned guard drops.
     ///
-    /// The guard uses RAII to ensure the hash is removed when:
+    /// Returns `None` if a live guard already owns the hash. The returned guard
+    /// uses RAII to ensure the hash is removed when:
     /// - Transfer completes successfully
     /// - Transfer is cancelled
     /// - Block is evicted from pipeline
     /// - Any error causes the block to be dropped
-    pub fn guard(self: &Arc<Self>, hash: SequenceHash) -> PendingGuard {
-        self.pending.insert(hash);
-        PendingGuard {
-            hash,
-            tracker: Arc::clone(self),
+    pub(crate) fn try_claim(self: &Arc<Self>, hash: SequenceHash) -> Option<PendingGuard> {
+        if self.pending.insert(hash) {
+            Some(PendingGuard {
+                hash,
+                tracker: Arc::clone(self),
+            })
+        } else {
+            None
         }
     }
 }
@@ -115,22 +121,14 @@ impl PendingCheck for Option<Arc<PendingTracker>> {
 /// This guard travels with the block through all pipeline stages and ensures
 /// cleanup happens automatically regardless of how the transfer completes.
 ///
-/// # Clone Behavior
-///
-/// Cloning a `PendingGuard` is cheap (Arc clone) but does NOT create a new
-/// pending entry. The hash is only inserted once when the first guard is
-/// created, and removed when ALL clones are dropped.
-///
-/// However, the current implementation removes on first drop, so cloning
-/// should be avoided unless you understand the implications.
-pub struct PendingGuard {
+pub(crate) struct PendingGuard {
     hash: SequenceHash,
     tracker: Arc<PendingTracker>,
 }
 
 impl PendingGuard {
-    /// Get the sequence hash this guard is tracking.
-    pub fn sequence_hash(&self) -> SequenceHash {
+    #[cfg(test)]
+    pub(crate) fn sequence_hash(&self) -> SequenceHash {
         self.hash
     }
 }
@@ -173,7 +171,7 @@ mod tests {
         assert!(!tracker.is_pending(&hash));
 
         {
-            let _guard = tracker.guard(hash);
+            let _guard = tracker.try_claim(hash).expect("claim a new hash");
             assert!(tracker.is_pending(&hash));
             assert_eq!(tracker.len(), 1);
         }
@@ -190,8 +188,8 @@ mod tests {
         let hash2 = test_hash(222);
         let hash3 = test_hash(333);
 
-        let guard1 = tracker.guard(hash1);
-        let guard2 = tracker.guard(hash2);
+        let guard1 = tracker.try_claim(hash1).expect("claim first hash");
+        let guard2 = tracker.try_claim(hash2).expect("claim second hash");
 
         assert!(tracker.is_pending(&hash1));
         assert!(tracker.is_pending(&hash2));
@@ -212,7 +210,7 @@ mod tests {
         let tracker = Arc::new(PendingTracker::new());
         let hash = test_hash(42);
 
-        let guard = tracker.guard(hash);
+        let guard = tracker.try_claim(hash).expect("claim hash");
         assert_eq!(guard.sequence_hash(), hash);
     }
 
@@ -227,7 +225,7 @@ mod tests {
     fn test_guard_debug() {
         let tracker = Arc::new(PendingTracker::new());
         let hash = test_hash(999);
-        let guard = tracker.guard(hash);
+        let guard = tracker.try_claim(hash).expect("claim hash");
 
         let debug_str = format!("{:?}", guard);
         assert!(debug_str.contains("PendingGuard"));
@@ -235,31 +233,39 @@ mod tests {
     }
 
     #[test]
-    fn test_concurrent_access_to_same_hash() {
-        // Test that the same hash being added twice is handled correctly
+    fn concurrent_claim_has_one_owner_until_drop() {
+        const CLAIMERS: usize = 16;
         let tracker = Arc::new(PendingTracker::new());
         let hash = test_hash(555);
+        let start = Arc::new(std::sync::Barrier::new(CLAIMERS));
+        let claimers: Vec<_> = (0..CLAIMERS)
+            .map(|_| {
+                let tracker = Arc::clone(&tracker);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    tracker.try_claim(hash)
+                })
+            })
+            .collect();
+        let mut winners: Vec<_> = claimers
+            .into_iter()
+            .filter_map(|claimer| claimer.join().expect("claim thread does not panic"))
+            .collect();
 
-        // First guard marks it as pending
-        let guard1 = tracker.guard(hash);
+        assert_eq!(winners.len(), 1);
         assert!(tracker.is_pending(&hash));
         assert_eq!(tracker.len(), 1);
 
-        // Second guard for same hash - DashSet.insert returns false if already present
-        // but our guard() always inserts (doesn't check first)
-        let guard2 = tracker.guard(hash);
+        assert!(tracker.try_claim(hash).is_none());
         assert!(tracker.is_pending(&hash));
-        // DashSet deduplicates, so len is still 1
-        assert_eq!(tracker.len(), 1);
 
-        // Drop first guard - hash removed from set
-        drop(guard1);
-        // DashSet now doesn't have the hash
+        drop(winners.pop().expect("one winner"));
         assert!(!tracker.is_pending(&hash));
 
-        // Second guard still exists but hash was already removed
-        // This is expected behavior - the RAII ensures cleanup on any drop
-        drop(guard2);
+        let reclaim = tracker.try_claim(hash).expect("reclaim after owner drop");
+        assert!(tracker.is_pending(&hash));
+        drop(reclaim);
         assert!(tracker.is_empty());
     }
 }

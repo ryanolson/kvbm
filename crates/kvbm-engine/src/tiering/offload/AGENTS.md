@@ -116,7 +116,7 @@ When modifying this module, specifically verify alignment with:
 | Feature (on-policy) | No change | Add implementation section |
 | Policy change | Update affected policies | Update accordingly |
 | Refactor (on-policy) | No change | Update if relevant |
-| New destination type | No change | Add to TransferDestination section |
+| New destination type | No change | Add to the BlockDestination adapter section |
 | New policy filter | No change | Add to Extension Rules section |
 
 ## Common Scenarios
@@ -164,7 +164,6 @@ If the governance process itself needs updating (this file):
 1. Propose changes to the user explicitly
 2. Explain why current governance is insufficient
 3. Only modify AGENTS.md with explicit approval
-
 
 
 

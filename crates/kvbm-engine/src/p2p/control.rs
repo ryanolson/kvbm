@@ -320,7 +320,6 @@ async fn find_phase(
 /// `LifecycleEvent::Failed` to the puller.
 async fn stage_phase(
     leader: Arc<InstanceLeader>,
-    g2_manager: Arc<BlockManager<G2>>,
     session: Arc<dyn Session>,
     resource: LogicalResourceId,
     require_payload_integrity: bool,
@@ -365,7 +364,12 @@ async fn stage_phase(
         })?;
 
         let holder = BlockHolder::<G3>::new(g3_blocks);
-        let staged = stage_g3_to_g2(&holder, &g2_manager, &*parallel_worker)
+        let g2_capacity = leader.g2_capacity_for(resource).ok_or_else(|| {
+            ControlError::Internal(format!(
+                "logical_resource_not_found: no G2 capacity for resource {resource:?}"
+            ))
+        })?;
+        let staged = stage_g3_to_g2(&holder, g2_capacity, &*parallel_worker)
             .await
             .map_err(|e| ControlError::Internal(format!("stage_g3_to_g2: {e:#}")))?;
 
@@ -546,7 +550,6 @@ pub(crate) async fn open_transfer_session(
     runtime.spawn(async move {
         match stage_phase(
             leader_for_task,
-            g2_manager,
             Arc::clone(&session_for_task),
             resource,
             require_payload_integrity,
@@ -625,6 +628,8 @@ pub(crate) async fn pull_from_session(
 ) -> Result<PullFromSessionResponse, ControlError> {
     let staged = crate::p2p::stage_from_session(leader, req).await?;
     let response = staged.response();
-    let _published = staged.publish();
+    let _published = staged
+        .publish()
+        .map_err(|error| ControlError::Internal(format!("pull: publish G2 blocks: {error}")))?;
     Ok(response)
 }

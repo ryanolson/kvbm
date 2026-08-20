@@ -3,6 +3,9 @@
 
 //! All-resource ownership for a remote bundle before local publication.
 
+#[cfg(test)]
+mod tests;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use kvbm_common::{LogicalResourceId, SequenceHash};
@@ -13,8 +16,7 @@ use crate::p2p::StagedPull;
 
 /// A complete set of unregistered physical pulls and their logical lineages.
 ///
-/// Dropping this value rolls every staged destination back. Publication is a
-/// consuming, infallible transition used only after catalog preflight.
+/// Dropping this value rolls every staged destination back.
 pub(crate) struct StagedBundle {
     lineages: BTreeMap<LogicalResourceId, Vec<SequenceHash>>,
     resources: BTreeMap<LogicalResourceId, StagedPull>,
@@ -59,11 +61,20 @@ impl StagedBundle {
         self.resources.keys().copied()
     }
 
-    pub(crate) fn publish(self) -> BTreeMap<LogicalResourceId, Vec<ImmutableBlock<G2>>> {
-        self.resources
+    pub(crate) fn publish(
+        self,
+    ) -> Result<
+        BTreeMap<LogicalResourceId, Vec<ImmutableBlock<G2>>>,
+        crate::g2_capacity::G2CapacityError,
+    > {
+        let mut published = BTreeMap::new();
+        for (resource, staged) in self.resources {
+            published.insert(resource, staged.publish_reversible()?);
+        }
+        Ok(published
             .into_iter()
-            .map(|(resource, staged)| (resource, staged.publish()))
-            .collect()
+            .map(|(resource, registration)| (resource, registration.commit()))
+            .collect())
     }
 }
 

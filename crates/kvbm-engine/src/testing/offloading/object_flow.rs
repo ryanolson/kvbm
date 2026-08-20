@@ -542,7 +542,7 @@ mod tests {
         let hash = test_hash(12345);
 
         // Mark as pending
-        let _guard = pending_tracker.guard(hash);
+        let _guard = pending_tracker.try_claim(hash).expect("claim pending hash");
 
         let ctx = EvalContext::<G2>::from_weak(BlockId::default(), hash);
 

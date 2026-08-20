@@ -17,6 +17,7 @@ use tokio::task::JoinHandle;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::g2_capacity::{G2AllocationKind, G2Capacity, direct_g2_capacity, reserve_compatibility};
 use crate::leader::BlockHolder;
 use crate::leader::stage_g3_to_g2;
 use crate::leader::{MatchBreakdown, OnboardingStatus};
@@ -105,7 +106,7 @@ impl G4SearchState {
 /// and G4 state — no peer/transport coupling.
 pub struct AsyncSearch {
     session_id: uuid::Uuid,
-    g2_manager: Arc<BlockManager<G2>>,
+    g2_capacity: Arc<dyn G2Capacity>,
     g3_manager: Option<Arc<BlockManager<G3>>>,
     parallel_worker: Option<Arc<dyn ParallelWorkers>>,
     status_tx: watch::Sender<OnboardingStatus>,
@@ -130,7 +131,11 @@ pub struct AsyncSearch {
 }
 
 impl AsyncSearch {
-    /// Create a new async search context.
+    /// Create a compatibility-only async search context from a raw G2 manager.
+    ///
+    /// Use [`Self::new_with_g2_capacity`] for production paths. This
+    /// constructor cannot select an injected capacity policy.
+    #[deprecated(note = "compatibility-only constructor; use new_with_g2_capacity")]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         session_id: uuid::Uuid,
@@ -142,9 +147,33 @@ impl AsyncSearch {
         match_breakdown: Arc<Mutex<MatchBreakdown>>,
         object_client: Option<Arc<dyn ObjectBlockOps>>,
     ) -> Self {
+        Self::new_with_g2_capacity(
+            session_id,
+            direct_g2_capacity(g2_manager),
+            g3_manager,
+            parallel_worker,
+            status_tx,
+            all_g2_blocks,
+            match_breakdown,
+            object_client,
+        )
+    }
+
+    /// Create a new async search context with an injected G2 capacity facade.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_g2_capacity(
+        session_id: uuid::Uuid,
+        g2_capacity: Arc<dyn G2Capacity>,
+        g3_manager: Option<Arc<BlockManager<G3>>>,
+        parallel_worker: Option<Arc<dyn ParallelWorkers>>,
+        status_tx: watch::Sender<OnboardingStatus>,
+        all_g2_blocks: Arc<Mutex<Option<Vec<ImmutableBlock<G2>>>>>,
+        match_breakdown: Arc<Mutex<MatchBreakdown>>,
+        object_client: Option<Arc<dyn ObjectBlockOps>>,
+    ) -> Self {
         Self {
             session_id,
-            g2_manager,
+            g2_capacity,
             g3_manager,
             parallel_worker,
             status_tx,
@@ -172,7 +201,7 @@ impl AsyncSearch {
     /// Search local G2/G3, then G4 if configured. First-responder-wins per hash.
     async fn search_phase(&mut self, sequence_hashes: &[SequenceHash]) -> Result<()> {
         // Local G2 search
-        self.local_g2_blocks = BlockHolder::new(self.g2_manager.match_blocks(sequence_hashes));
+        self.local_g2_blocks = BlockHolder::new(self.g2_capacity.match_blocks(sequence_hashes));
 
         let mut matched_hashes: HashSet<SequenceHash> =
             self.local_g2_blocks.sequence_hashes().into_iter().collect();
@@ -322,8 +351,12 @@ impl AsyncSearch {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("ParallelWorker required for G3→G2 staging"))?;
 
-        let result =
-            stage_g3_to_g2(&self.local_g3_blocks, &self.g2_manager, &**parallel_worker).await?;
+        let result = stage_g3_to_g2(
+            &self.local_g3_blocks,
+            Arc::clone(&self.g2_capacity),
+            &**parallel_worker,
+        )
+        .await?;
 
         let _ = self.local_g3_blocks.take_all();
         self.local_g2_blocks.extend(result.new_g2_blocks);
@@ -434,17 +467,19 @@ impl AsyncSearch {
             self.g4_state.pending_load.insert(*hash);
         }
 
-        let dst_blocks = self
-            .g2_manager
-            .allocate_blocks(won_hashes.len())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Failed to allocate {} G2 blocks for G4 load",
-                    won_hashes.len()
-                )
-            })?;
+        let dst_allocation = reserve_compatibility(
+            self.g2_capacity.as_ref(),
+            G2AllocationKind::RequiredStaging,
+            won_hashes.len(),
+        )
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "Failed to reserve {} G2 blocks for G4 load: {error}",
+                won_hashes.len()
+            )
+        })?;
 
-        let dst_ids: Vec<BlockId> = dst_blocks.iter().map(|b| b.block_id()).collect();
+        let dst_ids = dst_allocation.block_ids();
 
         for (hash, block_id) in won_hashes.iter().zip(dst_ids.iter()) {
             self.g4_state.allocated_blocks.insert(*hash, *block_id);
@@ -453,9 +488,9 @@ impl AsyncSearch {
         let session_id = self.session_id;
         let hashes = won_hashes.clone();
         let parallel_worker = parallel_worker.clone();
-        let g2_manager = self.g2_manager.clone();
+        let g2_capacity = Arc::clone(&self.g2_capacity);
 
-        // Spawn load task. dst_blocks is moved in to keep them alive during download.
+        // Spawn load task. The allocation retains its capacity lease during download.
         tokio::spawn(async move {
             let results = parallel_worker
                 .get_blocks(hashes.clone(), LogicalLayoutHandle::G2, dst_ids.clone())
@@ -463,18 +498,11 @@ impl AsyncSearch {
 
             let mut success = Vec::new();
             let mut failures = Vec::new();
-            let mut blocks = Vec::new();
+            let selected = results.iter().map(Result::is_ok).collect::<Vec<_>>();
 
-            for ((result, dst_block), seq_hash) in
-                results.into_iter().zip(dst_blocks).zip(hashes.iter())
-            {
+            for (result, _seq_hash) in results.into_iter().zip(hashes.iter()) {
                 match result {
                     Ok(hash) => {
-                        let complete = dst_block
-                            .stage(*seq_hash, g2_manager.block_size())
-                            .expect("block size mismatch");
-                        let immutable = g2_manager.register_block(complete);
-                        blocks.push(immutable);
                         success.push(hash);
                     }
                     Err(hash) => {
@@ -482,6 +510,38 @@ impl AsyncSearch {
                     }
                 }
             }
+
+            let blocks = match dst_allocation.stage_selected(
+                &hashes,
+                g2_capacity.block_size(),
+                selected,
+            ) {
+                Ok(staged) => match g2_capacity.register_compatibility(staged) {
+                    Ok(blocks) => blocks,
+                    Err(error) => {
+                        tracing::error!(session_id = %session_id, error = %error, "G4 load registration failed");
+                        failures.extend(
+                            hashes
+                                .iter()
+                                .copied()
+                                .map(|hash| (hash, "Failed to register G4 block".to_string())),
+                        );
+                        success.clear();
+                        Vec::new()
+                    }
+                },
+                Err(error) => {
+                    tracing::error!(session_id = %session_id, error = %error, "G4 load staging failed");
+                    failures.extend(
+                        hashes
+                            .iter()
+                            .copied()
+                            .map(|hash| (hash, "Failed to stage G4 block".to_string())),
+                    );
+                    success.clear();
+                    Vec::new()
+                }
+            };
 
             tracing::debug!(
                 session_id = %session_id,
