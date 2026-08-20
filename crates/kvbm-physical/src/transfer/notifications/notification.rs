@@ -3,17 +3,44 @@
 
 //! Transfer completion notification handle.
 
-use anyhow::Result;
+use anyhow::{Error, Result};
 use futures::future::{Either, Ready, ready};
 use std::{
+    future::Future,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
 };
-use velo::{Event, EventAwaiter, EventManager};
+use velo::{EventAwaiter, EventManager};
+
+/// The drain certainty after a transfer completion receipt resolves.
+///
+/// A failed receipt can still prove that every launched physical operation
+/// drained. Callers that own source memory must retain it only for
+/// [`Self::Unproven`] outcomes.
+#[must_use]
+pub enum TransferDrainOutcome {
+    /// Every physical operation completed successfully.
+    Completed,
+    /// Every launched physical operation drained, but dispatch or a nested
+    /// receipt reported failure.
+    DrainedWithError(Error),
+    /// At least one physical completion did not prove that its work drained.
+    Unproven(Error),
+}
+
+impl TransferDrainOutcome {
+    fn into_result(self) -> Result<()> {
+        match self {
+            Self::Completed => Ok(()),
+            Self::DrainedWithError(error) | Self::Unproven(error) => Err(error),
+        }
+    }
+}
 
 pub enum TransferAwaiter {
     Local(EventAwaiter),
+    Aggregate(Pin<Box<dyn Future<Output = TransferDrainOutcome> + Send>>),
     // Sync(SyncResult),
 }
 
@@ -23,6 +50,10 @@ impl std::future::Future for TransferAwaiter {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.get_mut() {
             Self::Local(waiter) => Pin::new(waiter).poll(cx),
+            Self::Aggregate(waiter) => waiter
+                .as_mut()
+                .poll(cx)
+                .map(TransferDrainOutcome::into_result),
             // Self::Sync(sync) => Pin::new(sync).poll(cx),
         }
     }
@@ -35,8 +66,8 @@ impl std::future::Future for TransferAwaiter {
 /// or processes notification events.
 ///
 /// Uses `futures::Either` to avoid event system overhead for synchronous completions.
-/// Pending transfers use `LocalEventWaiter` which avoids heap allocation and repeated
-/// DashMap lookups when awaiting.
+/// One pending transfer uses `EventAwaiter` without extra aggregate event state.
+/// An aggregate receipt uses an owned future and does not start a background task.
 pub struct TransferCompleteNotification {
     awaiter: Either<Ready<Result<()>>, TransferAwaiter>,
 }
@@ -73,9 +104,28 @@ impl TransferCompleteNotification {
 
     /// Check if the notification can yield the current task.
     ///
-    /// The internal ::Left arm is guaranteed to be ready, while the ::Right arm is not.
+    /// The internal `Left` arm is ready. The `Right` arm can require a wakeup.
     pub fn could_yield(&self) -> bool {
         matches!(self.awaiter, Either::Right(_))
+    }
+
+    /// Await the receipt and preserve whether physical drain was proven.
+    ///
+    /// Ordinary `.await` preserves the legacy `Result<()>` contract. Use this
+    /// method when source ownership depends on the distinction between a
+    /// drained failure and an ambiguous completion failure.
+    pub async fn await_drain(self) -> TransferDrainOutcome {
+        match self.awaiter {
+            Either::Left(awaiter) => match awaiter.await {
+                Ok(()) => TransferDrainOutcome::Completed,
+                Err(error) => TransferDrainOutcome::Unproven(error),
+            },
+            Either::Right(TransferAwaiter::Local(awaiter)) => match awaiter.await {
+                Ok(()) => TransferDrainOutcome::Completed,
+                Err(error) => TransferDrainOutcome::Unproven(error),
+            },
+            Either::Right(TransferAwaiter::Aggregate(awaiter)) => awaiter.await,
+        }
     }
 
     /// Aggregate multiple notifications into one that completes when all are done.
@@ -85,13 +135,13 @@ impl TransferCompleteNotification {
     ///
     /// # Arguments
     /// * `notifications` - The notifications to aggregate
-    /// * `events` - The event system to create the aggregate event
-    /// * `runtime` - The tokio runtime handle to spawn the aggregation task
+    /// * `events` - The event system retained for API compatibility
+    /// * `runtime` - The runtime handle retained for API compatibility
     ///
     /// # Behavior
     /// - If the list is empty, returns an already-completed notification
     /// - If there's only one, returns it directly
-    /// - Otherwise, creates a new event and spawns a task to await all notifications
+    /// - Otherwise, returns a notification that directly owns all child notifications
     pub fn aggregate(
         notifications: Vec<Self>,
         events: &Arc<EventManager>,
@@ -103,13 +153,12 @@ impl TransferCompleteNotification {
     /// Aggregate dispatch results without abandoning transfers that launched
     /// before a later synchronous dispatch error.
     ///
-    /// Every successful notification is drained. Synchronous dispatch errors
-    /// and asynchronous completion errors are combined into one terminal
-    /// failure, delivered only after all launched work has settled.
+    /// The returned receipt owns every successful notification. It polls all
+    /// notifications to completion before it returns a combined failure.
     pub fn aggregate_results(
         results: Vec<Result<Self>>,
-        events: &Arc<EventManager>,
-        runtime: &tokio::runtime::Handle,
+        _events: &Arc<EventManager>,
+        _runtime: &tokio::runtime::Handle,
     ) -> Result<Self> {
         let mut notifications = Vec::with_capacity(results.len());
         let mut dispatch_errors = Vec::new();
@@ -126,49 +175,53 @@ impl TransferCompleteNotification {
             return Ok(notifications.into_iter().next().unwrap());
         }
 
-        // Check if all notifications are already complete (no yielding needed)
-        if notifications.iter().all(|n| !n.could_yield()) {
-            return errors_or_completed(dispatch_errors);
+        // Preserve the allocation-free success path for completed notifications.
+        // Dispatch errors require a receipt, even when all notifications are ready.
+        if dispatch_errors.is_empty() && notifications.iter().all(|n| !n.could_yield()) {
+            return Ok(Self::completed());
         }
 
-        // Create a new event for the aggregate completion
-        let event = events.new_event()?;
-        let awaiter = events.awaiter(event.handle())?;
-
-        // Spawn task that awaits all notifications and triggers/poisons the event
-        runtime.spawn(await_all_notifications(
-            notifications,
-            dispatch_errors,
-            event,
-        ));
-
-        Ok(Self::from_awaiter(awaiter))
+        Ok(Self {
+            awaiter: Either::Right(TransferAwaiter::Aggregate(Box::pin(
+                await_all_notifications(notifications, dispatch_errors),
+            ))),
+        })
     }
 }
 
-/// Awaits all transfer notifications and signals completion via the event.
+/// Awaits all transfer notifications and returns their combined result.
 ///
 /// This function awaits ALL notifications regardless of individual failures,
-/// then triggers the event on success or poisons it with error details on failure.
+/// then combines synchronous dispatch and asynchronous completion errors.
 async fn await_all_notifications(
     notifications: Vec<TransferCompleteNotification>,
-    mut errors: Vec<anyhow::Error>,
-    local_event: Event,
-) {
-    // Await all notifications, collecting results
-    let results: Vec<Result<()>> =
-        futures::future::join_all(notifications.into_iter().map(|n| n.into_future())).await;
+    mut errors: Vec<Error>,
+) -> TransferDrainOutcome {
+    let outcomes = futures::future::join_all(
+        notifications
+            .into_iter()
+            .map(TransferCompleteNotification::await_drain),
+    )
+    .await;
+    let mut unproven = false;
 
-    // Check for any failures
-    errors.extend(results.into_iter().filter_map(|result| result.err()));
+    for outcome in outcomes {
+        match outcome {
+            TransferDrainOutcome::Completed => {}
+            TransferDrainOutcome::DrainedWithError(error) => errors.push(error),
+            TransferDrainOutcome::Unproven(error) => {
+                unproven = true;
+                errors.push(error);
+            }
+        }
+    }
 
     if errors.is_empty() {
-        // Ignore trigger error - if event system is shutdown, nothing to do
-        let _ = local_event.trigger();
+        TransferDrainOutcome::Completed
+    } else if unproven {
+        TransferDrainOutcome::Unproven(anyhow::anyhow!(combined_error_message(&errors)))
     } else {
-        let error_msg = combined_error_message(&errors);
-        // Ignore poison error - if event system is shutdown, nothing to do
-        let _ = local_event.poison(error_msg);
+        TransferDrainOutcome::DrainedWithError(anyhow::anyhow!(combined_error_message(&errors)))
     }
 }
 
@@ -205,23 +258,80 @@ mod tests {
     use anyhow::{Result, anyhow};
     use velo::EventManager;
 
-    use super::TransferCompleteNotification;
+    use super::{TransferCompleteNotification, TransferDrainOutcome};
 
     #[tokio::test]
-    async fn later_dispatch_error_waits_for_earlier_notification_to_drain() -> Result<()> {
+    async fn dispatch_error_after_child_drain_preserves_drain_proof() -> Result<()> {
         let events = Arc::new(EventManager::local());
-        let delayed_event = events.new_event()?;
-        let delayed =
-            TransferCompleteNotification::from_awaiter(events.awaiter(delayed_event.handle())?);
+        let aggregate = TransferCompleteNotification::aggregate_results(
+            vec![
+                Ok(TransferCompleteNotification::completed()),
+                Err(anyhow!("later synchronous dispatch failed")),
+            ],
+            &events,
+            &tokio::runtime::Handle::current(),
+        )?;
+
+        match aggregate.await_drain().await {
+            TransferDrainOutcome::DrainedWithError(error) => {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("later synchronous dispatch failed")
+                );
+            }
+            TransferDrainOutcome::Completed => panic!("dispatch failure must reach the receipt"),
+            TransferDrainOutcome::Unproven(error) => {
+                panic!("all child receipts drained, not unproven: {error:#}")
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn launched_ready_notification_defers_dispatch_error_to_receipt() -> Result<()> {
+        let events = Arc::new(EventManager::local());
+
+        let aggregate = TransferCompleteNotification::aggregate_results(
+            vec![
+                Ok(TransferCompleteNotification::completed()),
+                Err(anyhow!("later synchronous dispatch failed")),
+            ],
+            &events,
+            &tokio::runtime::Handle::current(),
+        )
+        .expect("a launched notification must always produce a completion receipt");
+
+        let failure = aggregate
+            .await
+            .expect_err("the receipt must report the later dispatch error");
+        assert!(
+            failure
+                .to_string()
+                .contains("later synchronous dispatch failed")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unavailable_aggregate_events_cannot_abandon_launched_notification() -> Result<()> {
+        let notification_events = Arc::new(EventManager::local());
+        let delayed_event = notification_events.new_event()?;
+        let delayed = TransferCompleteNotification::from_awaiter(
+            notification_events.awaiter(delayed_event.handle())?,
+        );
+        let unavailable_aggregate_events = Arc::new(EventManager::local());
+        unavailable_aggregate_events.force_shutdown("aggregate events unavailable");
 
         let aggregate = TransferCompleteNotification::aggregate_results(
             vec![
                 Ok(delayed),
                 Err(anyhow!("later synchronous dispatch failed")),
             ],
-            &events,
+            &unavailable_aggregate_events,
             &tokio::runtime::Handle::current(),
-        )?;
+        )
+        .expect("event setup cannot fail after a worker returns a receipt");
         let mut completion = tokio::spawn(aggregate.into_future());
 
         assert!(
@@ -261,6 +371,34 @@ mod tests {
         let message = failure.to_string();
         assert!(message.contains("synchronous dispatch failure"));
         assert!(message.contains("asynchronous completion failure"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn completion_error_keeps_aggregate_drain_unproven() -> Result<()> {
+        let events = Arc::new(EventManager::local());
+        let delayed_event = events.new_event()?;
+        let delayed =
+            TransferCompleteNotification::from_awaiter(events.awaiter(delayed_event.handle())?);
+
+        let aggregate = TransferCompleteNotification::aggregate_results(
+            vec![Ok(delayed), Err(anyhow!("synchronous dispatch failure"))],
+            &events,
+            &tokio::runtime::Handle::current(),
+        )?;
+        delayed_event.poison("asynchronous completion failure")?;
+
+        match aggregate.await_drain().await {
+            TransferDrainOutcome::Unproven(error) => {
+                let message = error.to_string();
+                assert!(message.contains("synchronous dispatch failure"));
+                assert!(message.contains("asynchronous completion failure"));
+            }
+            TransferDrainOutcome::Completed => panic!("completion failure must reach the receipt"),
+            TransferDrainOutcome::DrainedWithError(error) => {
+                panic!("completion failure removes drain proof: {error:#}")
+            }
+        }
         Ok(())
     }
 }

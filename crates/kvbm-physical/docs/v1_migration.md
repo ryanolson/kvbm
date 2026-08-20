@@ -80,7 +80,17 @@ TransferManager::builder()
 
 ### TransferCompleteNotification::aggregate()
 
-Compose multiple transfer notifications into one that completes when all are done. Optimizes away the aggregation when all inputs are already complete.
+Compose multiple transfer notifications into one receipt. The receipt directly
+owns each child notification and resolves after all child notifications resolve.
+It combines all completion errors. The fast path stays allocation-free when all
+inputs already completed.
+
+If a caller owns source memory, use `await_drain()`. A `DrainedWithError`
+result proves that every launched child drained. An `Unproven` result does not
+prove that every launched child drained.
+
+The event and runtime arguments remain in the public API. Aggregation does not
+allocate an event or start a task.
 
 ```rust,ignore
 let combined = TransferCompleteNotification::aggregate(

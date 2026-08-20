@@ -44,7 +44,7 @@ Leaders own block metadata and make placement decisions. Workers execute data tr
 
 - **`leader/`** — `InstanceLeader` coordinates block lookups (`find_matches`), holds blocks via RAII `BlockHolder`, and manages distributed sessions. The `Leader` trait is the core coordination interface.
 - **`worker/`** — `PhysicalWorker` owns a `TransferManager` and layout handles for actual transfers. `CoordinatedWorker` wraps any `Worker` with the leader's coordination state. The `Worker` and `WorkerTransfers` traits define the execution contract.
-- **`worker/group/`** — `SpmdParallelWorkers` broadcasts operations to all workers in parallel (SPMD model) with event aggregation.
+- **`worker/group/`** — `SpmdParallelWorkers` broadcasts operations to all workers in parallel (SPMD model) with owned receipt aggregation.
 - **`worker/velo/`** — RPC layer (`VeloWorkerService`/`VeloWorkerClient`) for remote worker execution via Velo.
 - **`tiering/offload/`** — Multi-stage async pipeline for tier demotion: PolicyEvaluator → PreconditionAwaiter → Batcher → TransferExecutor. Supports per-container cancellation tokens. **See `src/tiering/offload/AGENTS.md` for governance rules before modifying this module.**
 - **`tiering/engine/`** — The seam-facing connector engine: `LocalConnectorEngine` (the `LeaderEngine` impl) plus `WorkerEngine` and pass-plan types (`PassOffload`, `PassOnboard`) consumed by the connector path.

@@ -29,7 +29,7 @@ Abstractions for how KV cache blocks are organized in memory.
 - **`TransferConfig` / builder** — Configures event system, NIXL backends, CUDA device, capabilities, and memory pool before building a `TransferManager`.
 - **`TransferOptions`** — Per-transfer configuration: `layer_range`, `nixl_write_notification`, `bounce_buffer`, caller-provided `cuda_stream`, and src/dst `kv_layout` overrides.
 - **`TransferPreferences`** — Strategy hints via `NativeVsNixlPolicy` (PreferNative / PreferNixl / Automatic).
-- **`TransferCompleteNotification`** — `Either<Ready, EventAwaiter>` implementing `IntoFuture`. Zero-cost for synchronous completions. `aggregate()` composes multiple notifications. `could_yield()` checks if awaiting will suspend.
+- **`TransferCompleteNotification`** — An awaitable receipt with zero-cost synchronous completion. `aggregate()` owns child receipts. `await_drain()` distinguishes drained failures from unproven completion failures. `could_yield()` checks if awaiting can suspend.
 - **`BounceBuffer`** — Staging area for two-hop transfers (e.g., Device &rarr; Host &rarr; Remote).
 - **Checksum utilities** — BLAKE3 block/layer checksums for transfer verification.
 - **Fill utilities** — Constant/sequential patterns for testing and initialization.

@@ -63,7 +63,7 @@ pub use kvbm_memory::StorageKind;
 
 pub use capabilities::TransferCapabilities;
 pub use checksum::{BlockChecksum, compute_block_checksums, compute_layer_checksums};
-pub use context::{TransferCompleteNotification, TransferConfig};
+pub use context::{TransferCompleteNotification, TransferConfig, TransferDrainOutcome};
 pub use fill::{FillPattern, fill_blocks, fill_layers};
 pub use integrity::{PayloadDigest, compute_host_block_digests};
 pub use kvbm_memory::nixl::NixlAgent;

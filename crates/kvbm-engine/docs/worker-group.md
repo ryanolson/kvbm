@@ -33,11 +33,15 @@ Remote handle mappings are stored as `(InstanceId, worker_idx,
 LogicalLayoutHandle) → LayoutHandle`, so `execute_remote_onboard_for_instance`
 can look up the correct remote handle for each worker by rank.
 
-### Event Aggregation
+### Receipt Aggregation
 
 Transfer completion notifications from individual workers are aggregated into
-a single `TransferCompleteNotification` via the event system. The aggregated
-notification fires only when all workers have completed.
+one `TransferCompleteNotification`. The aggregate receipt directly owns all
+worker notifications. It resolves only after all worker notifications resolve.
+It combines dispatch errors with completion errors.
+
+If one worker returns a receipt, aggregation also returns a receipt. Thus, a
+later dispatch error cannot escape synchronously after another worker starts.
 
 ### ObjectBlockOps Aggregation
 
@@ -51,7 +55,7 @@ notification fires only when all workers have completed.
 ```rust,ignore
 let parallel = SpmdParallelWorkers::new(
     workers,        // Vec<Arc<dyn Worker>>, one per rank
-    event_manager,  // Arc<EventManager> for aggregation
-    runtime_handle, // tokio::runtime::Handle for spawning
+    event_manager,  // shared Arc<EventManager>
+    runtime_handle, // shared tokio::runtime::Handle
 );
 ```
