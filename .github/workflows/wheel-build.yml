@@ -81,11 +81,13 @@ jobs:
               set -euo pipefail
               export DEBIAN_FRONTEND=noninteractive
 
-              # Build + python tooling. protobuf-compiler for tonic-build in the
-              # kvbm-client/kvbm-service closure; python3-venv for maturin.
+              # These packages provide the build tools and Python tools.
+              # tonic-build requires protobuf-compiler.
+              # maturin requires python3-venv.
+              # bindgen requires libclang-dev.
               apt-get update -qq
               apt-get install -y -qq \
-                curl git build-essential pkg-config protobuf-compiler \
+                curl git build-essential libclang-dev pkg-config protobuf-compiler \
                 python3 python3-pip python3-venv > /dev/null
 
               # Optional private dynamo git-dep auth.
