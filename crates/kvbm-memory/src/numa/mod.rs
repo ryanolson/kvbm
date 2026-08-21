@@ -448,14 +448,30 @@ pub struct GpuInfo {
 /// `CUDA_VISIBLE_DEVICES`). Used as a last-ditch fallback when neither
 /// sysfs nor NVML succeed.
 fn enumerate_cuda_gpus() -> Vec<GpuInfo> {
-    let count = match cuda_device::get_count() {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
+    // SAFETY: The probe only loads the CUDA driver and checks its symbols.
+    let driver_present = unsafe { cuda_sys::is_culib_present() };
+    enumerate_cuda_gpus_with(
+        driver_present,
+        || cuda_device::get_count().ok(),
+        get_pci_bus_address_from_cuda,
+    )
+}
+
+fn enumerate_cuda_gpus_with(
+    driver_present: bool,
+    device_count: impl FnOnce() -> Option<i32>,
+    pci_address: impl Fn(u32) -> Option<String>,
+) -> Vec<GpuInfo> {
+    if !driver_present {
+        return Vec::new();
+    }
+    let Some(count) = device_count() else {
+        return Vec::new();
     };
 
     (0..count as u32)
         .filter_map(|i| {
-            let pci = get_pci_bus_address_from_cuda(i)?;
+            let pci = pci_address(i)?;
             let numa = read_numa_node_from_sysfs(&pci).map(|n| n.0);
             Some(GpuInfo {
                 pci_address: pci,
@@ -654,6 +670,17 @@ fn compute_cpu_slices_by_pci() -> HashMap<String, Vec<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_cuda_driver_skips_fallback_calls() {
+        let gpus = enumerate_cuda_gpus_with(
+            false,
+            || panic!("CUDA device count must not run"),
+            |_| panic!("CUDA device inspection must not run"),
+        );
+
+        assert!(gpus.is_empty());
+    }
 
     #[test]
     fn test_pci_address_parse_canonical_forms() {

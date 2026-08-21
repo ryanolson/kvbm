@@ -283,19 +283,16 @@ impl Resources {
 
         let all_gpus = numa::enumerate_all_gpus();
 
-        // Best-effort CUDA init so a fresh process (e.g. the inspection
-        // binary) can still see ordinals. Errors are ignored: a CUDA-less
-        // host should still produce a useful sysfs-derived snapshot.
-        let _ = cudarc::driver::result::init();
-
-        let mut cuda_ordinals_by_pci: HashMap<String, u32> = HashMap::new();
-        if let Ok(count) = cudarc::driver::result::device::get_count() {
-            for i in 0..count as u32 {
-                if let Some(pci) = get_pci_bus_address_from_cuda(i) {
-                    cuda_ordinals_by_pci.insert(pci, i);
-                }
-            }
-        }
+        // SAFETY: The probe only loads the CUDA driver and checks its symbols.
+        let driver_present = unsafe { cudarc::driver::sys::is_culib_present() };
+        let cuda_ordinals_by_pci = cuda_ordinals_by_pci(
+            driver_present,
+            || {
+                cudarc::driver::result::init().ok()?;
+                cudarc::driver::result::device::get_count().ok()
+            },
+            get_pci_bus_address_from_cuda,
+        );
 
         let process_allowed_cpus = read_process_allowed_cpus();
         let host_cpus_fallback = available_parallelism_range();
@@ -353,6 +350,27 @@ impl Resources {
             .map(|n| n.total_bytes)
             .try_fold(0u64, |acc, b| b.map(|v| acc + v))
     }
+}
+
+fn cuda_ordinals_by_pci(
+    driver_present: bool,
+    device_count: impl FnOnce() -> Option<i32>,
+    pci_address: impl Fn(u32) -> Option<String>,
+) -> HashMap<String, u32> {
+    let mut ordinals = HashMap::new();
+    if !driver_present {
+        return ordinals;
+    }
+
+    let Some(count) = device_count() else {
+        return ordinals;
+    };
+    for ordinal in 0..count as u32 {
+        if let Some(pci) = pci_address(ordinal) {
+            ordinals.insert(pci, ordinal);
+        }
+    }
+    ordinals
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1242,6 +1260,17 @@ mod tests {
             pci_address: pci.to_string(),
             numa_node: node,
         }
+    }
+
+    #[test]
+    fn missing_cuda_driver_skips_cuda_calls() {
+        let ordinals = cuda_ordinals_by_pci(
+            false,
+            || panic!("CUDA initialization must not run"),
+            |_| panic!("CUDA device inspection must not run"),
+        );
+
+        assert!(ordinals.is_empty());
     }
 
     #[test]
