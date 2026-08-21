@@ -111,27 +111,20 @@ impl BlockRegistrationHandleInner {
 ///   the call keeps the batch path safe even if one does), skipping transfer-created
 ///   handles the same way (see its body).
 ///
-/// Compares the stored `Weak`'s pointer against `identity` (the dying inner):
-/// `Weak::<T>::as_ptr()` for sized `T` returns the same pointer as `&T as *const T`, and
-/// during `drop_in_place` the inner allocation is still live. Only removes when the entry
-/// still points to us; a mismatch means a newer registration replaced the slot between the
-/// strong-count drop and this body, and is left untouched (an unconditional remove would
-/// silently delete the newer registration's entry). Returns `true` iff removed.
+/// The stored `Weak` pointer must match `identity`.
+/// A different pointer identifies a replacement registration.
+/// An absent slot means that another path already removed an entry.
+/// Both cases leave the map unchanged.
 pub(super) fn remove_entry_if_identity(
     map: &DashMap<SequenceHash, Weak<BlockRegistrationHandleInner>>,
     seq_hash: SequenceHash,
     identity: *const BlockRegistrationHandleInner,
 ) -> bool {
-    let should_remove = match map.get(&seq_hash) {
-        Some(weak_ref) => std::ptr::eq(weak_ref.as_ptr(), identity),
-        None => {
-            debug_assert!(
-                false,
-                "registry entry vanished while a strong ref was alive: {seq_hash:?}"
-            );
-            false
-        }
+    let Some(weak_ref) = map.get(&seq_hash) else {
+        return false;
     };
+    let should_remove = std::ptr::eq(weak_ref.as_ptr(), identity);
+    drop(weak_ref);
     if should_remove {
         map.remove(&seq_hash);
     }

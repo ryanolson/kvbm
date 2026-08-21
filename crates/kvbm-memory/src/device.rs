@@ -42,15 +42,24 @@ static CONTEXT_SOURCE: OnceLock<ContextSource> = OnceLock::new();
 /// once and fell back to the default cache. Embedders (e.g. rhino) point
 /// this at their own context registry at startup.
 pub fn set_cuda_context_provider(provider: Box<CudaContextProvider>) -> Result<()> {
-    CONTEXT_SOURCE
-        .set(ContextSource::Provider(provider))
-        .map_err(|_| {
-            StorageError::OperationFailed(
-                "CUDA context source already initialized (a provider was installed earlier, \
+    install_context_provider(&CONTEXT_SOURCE, provider)
+}
+
+fn install_context_provider(
+    source: &OnceLock<ContextSource>,
+    provider: Box<CudaContextProvider>,
+) -> Result<()> {
+    source.set(ContextSource::Provider(provider)).map_err(|_| {
+        StorageError::OperationFailed(
+            "CUDA context source already initialized (a provider was installed earlier, \
                  or a device/pinned allocation already ran and fell back to the default cache)"
-                    .into(),
-            )
-        })
+                .into(),
+        )
+    })
+}
+
+fn context_source(source: &OnceLock<ContextSource>) -> &ContextSource {
+    source.get_or_init(|| ContextSource::Default(Mutex::new(HashMap::new())))
 }
 
 /// Get or create a CUDA context for the given device.
@@ -59,7 +68,7 @@ pub fn set_cuda_context_provider(provider: Box<CudaContextProvider>) -> Result<(
 /// [`set_cuda_context_provider`]; otherwise falls back to the original
 /// create-and-cache-on-demand behavior, unchanged.
 pub(crate) fn cuda_context(device_id: u32) -> Result<Arc<CudaContext>> {
-    match CONTEXT_SOURCE.get_or_init(|| ContextSource::Default(Mutex::new(HashMap::new()))) {
+    match context_source(&CONTEXT_SOURCE) {
         ContextSource::Provider(provider) => provider(device_id),
         ContextSource::Default(cache) => {
             let mut map = cache.lock().unwrap();
@@ -190,5 +199,19 @@ impl super::nixl::NixlCompatible for DeviceStorage {
             nixl_sys::MemType::Vram,
             self.device_id as u64,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_source_blocks_late_provider() {
+        let source = OnceLock::new();
+        let _ = context_source(&source);
+
+        let provider: Box<CudaContextProvider> = Box::new(|_| unreachable!());
+        assert!(install_context_provider(&source, provider).is_err());
     }
 }

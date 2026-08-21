@@ -1,23 +1,21 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! §5.5 regression test: `set_cuda_context_provider` must be rejected after
-//! the *default* cache path has already run once -- not just after a prior
-//! provider install. Both origins share one `OnceLock`.
+#![cfg(feature = "testing-cuda")]
+
+//! This regression test verifies the default CUDA context source.
 //!
-//! Hardware-free: `DeviceStorage::new` claims the `ContextSource` slot with
-//! the default (empty) cache *before* it calls `CudaContext::new`, so this
-//! holds even on a GPU-less box where the allocation itself fails. Runs in
-//! its own process (a separate integration-test binary), isolated from
-//! `CONTEXT_SOURCE`'s use by any other test.
+//! A default device allocation reserves the context source.
+//! A later provider installation must fail.
+//!
+//! The test uses CUDA and runs in its own integration-test process.
 
 use kvbm_memory::{CudaContextProvider, DeviceStorage, set_cuda_context_provider};
 
 #[test]
 fn default_cache_use_occupies_the_slot_too() {
-    // Ignore the result: on a box without device 0, this fails downstream at
-    // `CudaContext::new`, but the `ContextSource` slot is claimed by the
-    // `Default` cache before that call -- which is the property under test.
+    // The allocation reserves the default source before it creates a CUDA context.
+    // The test only checks that a later provider cannot replace that source.
     let _ = DeviceStorage::new(4096, 0);
 
     let unreachable_provider: Box<CudaContextProvider> = Box::new(|_| unreachable!());

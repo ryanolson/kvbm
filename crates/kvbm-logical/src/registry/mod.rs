@@ -305,10 +305,9 @@ impl BlockRegistry {
     /// per-position locks taken when N registration handles drop one at a time. Replaces
     /// those N singular `Drop`-path removals.
     ///
-    /// **Precondition:** every handle must belong to *this* registry. Callers tear down a
-    /// request's own registrations, which are all same-registry; a foreign handle whose
-    /// hash is absent here trips the vanished-entry `debug_assert` in
-    /// [`remove_entry_if_identity`](handle::remove_entry_if_identity).
+    /// **Precondition:** Each handle must belong to this registry.
+    /// Removal still requires an exact pointer match.
+    /// A stale or foreign handle cannot remove a current entry.
     ///
     /// Each handle is consumed by value (`remove_batch` releases the strong references it
     /// is handed). Within each position group, under a single position guard, a handle is
@@ -569,6 +568,17 @@ mod remove_batch_tests {
         drop((a, b));
     }
 
+    #[test]
+    fn identity_check_accepts_an_already_empty_slot() {
+        let registry = BlockRegistry::new();
+        let hash = build_chain(vec![7])[0];
+        let map = registry.prt.prefix(&hash);
+
+        let removed = handle::remove_entry_if_identity(&map, hash, std::ptr::null());
+
+        assert!(!removed, "an empty slot is already removed");
+    }
+
     // (kill-mutation) transfer pairing: `transfer_registration` builds a handle whose inner
     // carries `branch_oracle: None` because it never fired `on_block_registered`. Batch-
     // removing it must NOT fire `on_block_removed` -- an unpaired removal phantom-deletes a
@@ -728,8 +738,8 @@ mod remove_batch_tests {
         assert_eq!(registry.registered_count(), 0);
     }
 
-    // Concurrent singular-register/drop racing batch-remove on the same slots: post-hoc
-    // invariant only (no phantom entry, no vanished-entry debug_assert panic).
+    // A singular drop races with batch removal on the same slots.
+    // The final state must contain no phantom entry.
     #[test]
     fn concurrent_register_and_batch_remove_leave_no_phantom() {
         use std::thread;
@@ -758,8 +768,8 @@ mod remove_batch_tests {
         }
         registrar.join().unwrap();
 
-        // At quiescence every strong ref is gone, so no slot may remain registered and no
-        // debug_assert (phantom removal / vanished entry) may have fired.
+        // Every strong reference is gone at this point.
+        // No slot can remain registered.
         assert_eq!(registry.registered_count(), 0);
     }
 }
