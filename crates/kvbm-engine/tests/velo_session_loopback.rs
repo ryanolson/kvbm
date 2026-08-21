@@ -520,7 +520,8 @@ async fn failed_rdma_terminal_still_acks_and_releases_holder_pin() -> Result<()>
         .await
         .expect_err("worker-less pull must fail at the RDMA dispatch boundary");
     tokio::time::timeout(Duration::from_secs(1), async {
-        while h_session.test_inbound_pulls_count() != 0 {
+        while h_session.test_inbound_pulls_count() != 0 || h_session.test_available_pin_count() != 0
+        {
             tokio::task::yield_now().await;
         }
     })

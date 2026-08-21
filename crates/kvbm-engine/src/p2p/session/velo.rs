@@ -984,6 +984,17 @@ fn fail_pending_pulls(pending: &DashMap<u64, oneshot::Sender<Result<(), String>>
     }
 }
 
+/// Maps a Velo stream error to the session lifecycle contract.
+fn lifecycle_event_for_stream_error(error: &velo::StreamError) -> LifecycleEvent {
+    let reason = format!("stream error: {error}");
+    match error {
+        velo::StreamError::SenderDropped => LifecycleEvent::Detached {
+            reason: Some(reason),
+        },
+        _ => LifecycleEvent::Failed { reason },
+    }
+}
+
 fn spawn_monitor(
     inner: Arc<VeloSessionInner>,
     mut anchor: velo::StreamAnchor<Frame>,
@@ -1032,9 +1043,9 @@ fn spawn_monitor(
                 }
                 Ok(_) => {}
                 Err(err) => {
-                    inner.lifecycle_stream.push(LifecycleEvent::Failed {
-                        reason: format!("stream error: {err}"),
-                    });
+                    inner
+                        .lifecycle_stream
+                        .push(lifecycle_event_for_stream_error(&err));
                     close_reason = format!("stream error: {err}");
                     break;
                 }
@@ -2037,6 +2048,19 @@ mod tests {
                 Some(LifecycleEvent::Detached { .. })
             ));
         });
+    }
+
+    #[test]
+    fn sender_drop_maps_to_detached_lifecycle() {
+        let event = lifecycle_event_for_stream_error(&velo::StreamError::SenderDropped);
+        assert!(matches!(event, LifecycleEvent::Detached { .. }));
+    }
+
+    #[test]
+    fn other_stream_errors_map_to_failed_lifecycle() {
+        let error = velo::StreamError::TransportError("test transport error".to_string());
+        let event = lifecycle_event_for_stream_error(&error);
+        assert!(matches!(event, LifecycleEvent::Failed { .. }));
     }
 
     // Targeted unit test of the pull-drain helper used by `close()` and the
