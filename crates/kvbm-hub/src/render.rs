@@ -688,10 +688,10 @@ mod tests {
         let mut agg = aggregate(vec![descriptor(FeatureKey::Indexer, vec![])]);
         agg.base_config = json!({ "leader": { "tokio": { "worker_threads": 2 } } });
         let mut o = opts();
-        o.kvbm_overrides = vec!["leader.tokio.worker_threads=8".to_string()];
+        o.kvbm_overrides = vec!["leader.tokio.worker_threads=1".to_string()];
         let cli = render_vllm_cli(&agg, "http://hub:1337", &o).unwrap();
         let extra = extract_config(&cli);
-        assert_eq!(extra["leader"]["tokio"]["worker_threads"], json!(8));
+        assert_eq!(extra["leader"]["tokio"]["worker_threads"], json!(1));
     }
 
     #[test]
