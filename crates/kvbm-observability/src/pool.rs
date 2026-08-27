@@ -7,6 +7,7 @@
 //! The [`MetricsAggregator`] reads these atomics at scrape time and builds Prometheus protos.
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::time::Duration;
 
 /// Raw atomic metrics for a single block pool (one per `BlockManager<T>`).
 ///
@@ -27,6 +28,24 @@ pub struct BlockPoolMetrics {
     match_blocks_returned: AtomicU64,
     scan_hashes_requested: AtomicU64,
     scan_blocks_returned: AtomicU64,
+
+    // Inactive-residency accounting. Each terminal outcome of an inactive
+    // tenure contributes the tenure's wall-clock duration to one of these
+    // pairs, so `sum / blocks` is an exact mean for that outcome:
+    //
+    // * evicted — residency that ended in eviction: cache capacity spent on
+    //   a block that was never reused. The mean is the pool's **eviction
+    //   age**; a *falling* eviction age is the capacity-pressure signal.
+    // * reused — residency that ended in a cache hit. The counterpart that
+    //   makes the evicted number readable: without it, a large eviction age
+    //   cannot be told apart from a pool so oversized it barely evicts.
+    //
+    // Together with the block-time currently accrued by resident blocks,
+    // the two pairs partition all inactive residency.
+    inactive_residency_evicted_nanos: AtomicU64,
+    inactive_residency_evicted_blocks: AtomicU64,
+    inactive_residency_reused_nanos: AtomicU64,
+    inactive_residency_reused_blocks: AtomicU64,
 
     // Audit counters for normally-rare branches. These exist primarily
     // so tests can assert "this code path actually fired" rather than
@@ -61,6 +80,10 @@ impl BlockPoolMetrics {
             match_blocks_returned: AtomicU64::new(0),
             scan_hashes_requested: AtomicU64::new(0),
             scan_blocks_returned: AtomicU64::new(0),
+            inactive_residency_evicted_nanos: AtomicU64::new(0),
+            inactive_residency_evicted_blocks: AtomicU64::new(0),
+            inactive_residency_reused_nanos: AtomicU64::new(0),
+            inactive_residency_reused_blocks: AtomicU64::new(0),
             eager_primary_to_inactive_total: AtomicU64::new(0),
             allocate_atomic_rollback_total: AtomicU64::new(0),
             release_primary_noop_total: AtomicU64::new(0),
@@ -134,6 +157,41 @@ impl BlockPoolMetrics {
     #[inline(always)]
     pub fn inc_scan_blocks_returned(&self, n: u64) {
         self.scan_blocks_returned.fetch_add(n, Ordering::Relaxed);
+    }
+
+    // ---- Inactive-residency accounting ----
+
+    /// Record `blocks` inactive tenures that ended in eviction, together
+    /// with their summed residency.
+    ///
+    /// Callers settle a whole batch in one call: the store reads its clock
+    /// once per critical section, so a batched eviction contributes one
+    /// summed duration rather than N separate adds. An empty batch is a
+    /// no-op, so a caller that settles unconditionally pays a predictable
+    /// branch rather than two atomic RMWs on shared lines.
+    #[inline(always)]
+    pub fn add_inactive_residency_evicted(&self, nanos: u64, blocks: u64) {
+        if blocks == 0 {
+            return;
+        }
+        self.inactive_residency_evicted_nanos
+            .fetch_add(nanos, Ordering::Relaxed);
+        self.inactive_residency_evicted_blocks
+            .fetch_add(blocks, Ordering::Relaxed);
+    }
+
+    /// Record `blocks` inactive tenures that ended in a cache hit, together
+    /// with their summed residency. See
+    /// [`Self::add_inactive_residency_evicted`].
+    #[inline(always)]
+    pub fn add_inactive_residency_reused(&self, nanos: u64, blocks: u64) {
+        if blocks == 0 {
+            return;
+        }
+        self.inactive_residency_reused_nanos
+            .fetch_add(nanos, Ordering::Relaxed);
+        self.inactive_residency_reused_blocks
+            .fetch_add(blocks, Ordering::Relaxed);
     }
 
     // ---- Gauge operations ----
@@ -294,6 +352,18 @@ impl BlockPoolMetrics {
             match_blocks_returned: self.match_blocks_returned.load(Ordering::Relaxed),
             scan_hashes_requested: self.scan_hashes_requested.load(Ordering::Relaxed),
             scan_blocks_returned: self.scan_blocks_returned.load(Ordering::Relaxed),
+            inactive_residency_evicted_nanos: self
+                .inactive_residency_evicted_nanos
+                .load(Ordering::Relaxed),
+            inactive_residency_evicted_blocks: self
+                .inactive_residency_evicted_blocks
+                .load(Ordering::Relaxed),
+            inactive_residency_reused_nanos: self
+                .inactive_residency_reused_nanos
+                .load(Ordering::Relaxed),
+            inactive_residency_reused_blocks: self
+                .inactive_residency_reused_blocks
+                .load(Ordering::Relaxed),
             eager_primary_to_inactive_total: self
                 .eager_primary_to_inactive_total
                 .load(Ordering::Relaxed),
@@ -325,6 +395,10 @@ pub struct MetricsSnapshot {
     pub match_blocks_returned: u64,
     pub scan_hashes_requested: u64,
     pub scan_blocks_returned: u64,
+    pub inactive_residency_evicted_nanos: u64,
+    pub inactive_residency_evicted_blocks: u64,
+    pub inactive_residency_reused_nanos: u64,
+    pub inactive_residency_reused_blocks: u64,
     pub eager_primary_to_inactive_total: u64,
     pub allocate_atomic_rollback_total: u64,
     pub release_primary_noop_total: u64,
@@ -334,6 +408,61 @@ pub struct MetricsSnapshot {
     pub held_residency: i64,
     pub reset_pool_size: i64,
     pub inactive_pool_size: i64,
+}
+
+impl MetricsSnapshot {
+    /// Mean inactive residency of the blocks this pool has evicted — the
+    /// pool's **eviction age**.
+    ///
+    /// This is the capacity-pressure signal, and it reads *inversely* to
+    /// intuition: a long eviction age means freed blocks linger, i.e. the
+    /// pool has headroom; a *falling* eviction age means blocks are being
+    /// recycled soon after they are freed, i.e. thrash. Compare it against
+    /// [`Self::mean_reuse_age`] — an eviction age well below the reuse age
+    /// means the pool is discarding blocks before the workload's own reuse
+    /// distance, so more capacity would convert directly into hits.
+    ///
+    /// `None` before the first eviction.
+    ///
+    /// Cumulative since process start. For a live signal, difference two
+    /// snapshots (or use `rate()` over both exported counters) rather than
+    /// reading this directly.
+    pub fn mean_eviction_age(&self) -> Option<Duration> {
+        mean_residency(
+            self.inactive_residency_evicted_nanos,
+            self.inactive_residency_evicted_blocks,
+        )
+    }
+
+    /// Mean inactive residency of the blocks this pool has served as cache
+    /// hits — how long a block typically waits before it is reused.
+    ///
+    /// `None` before the first inactive hit. Same cumulative caveat as
+    /// [`Self::mean_eviction_age`].
+    pub fn mean_reuse_age(&self) -> Option<Duration> {
+        mean_residency(
+            self.inactive_residency_reused_nanos,
+            self.inactive_residency_reused_blocks,
+        )
+    }
+
+    /// Fraction of settled inactive residency that ended in eviction rather
+    /// than reuse, in `[0.0, 1.0]` — the share of cache-residency block-time
+    /// spent on blocks that were never reused.
+    ///
+    /// Unlike the two ages this is dimensionless, so it is comparable across
+    /// pools of different sizes and across tiers. `None` until at least one
+    /// tenure has settled.
+    pub fn wasted_residency_fraction(&self) -> Option<f64> {
+        let evicted = self.inactive_residency_evicted_nanos;
+        let total = evicted.checked_add(self.inactive_residency_reused_nanos)?;
+        (total > 0).then(|| evicted as f64 / total as f64)
+    }
+}
+
+/// Mean residency, or `None` when no tenure has settled into this bucket.
+fn mean_residency(nanos: u64, blocks: u64) -> Option<Duration> {
+    (blocks > 0).then(|| Duration::from_nanos(nanos / blocks))
 }
 
 #[cfg(test)]
@@ -418,6 +547,59 @@ mod tests {
         m.dec_inactive_pool_size();
         let snap = m.snapshot();
         assert_eq!(snap.inactive_pool_size, 52);
+    }
+
+    #[test]
+    fn inactive_residency_means_are_undefined_until_a_tenure_settles() {
+        let m = BlockPoolMetrics::new("G1".to_string());
+        let snap = m.snapshot();
+
+        assert_eq!(snap.mean_eviction_age(), None);
+        assert_eq!(snap.mean_reuse_age(), None);
+        assert_eq!(snap.wasted_residency_fraction(), None);
+    }
+
+    #[test]
+    fn inactive_residency_means_divide_by_their_own_denominator() {
+        let m = BlockPoolMetrics::new("G1".to_string());
+
+        // Two batches into each bucket, mirroring how the store settles:
+        // one summed duration plus its block count per critical section.
+        m.add_inactive_residency_evicted(Duration::from_millis(300).as_nanos() as u64, 2);
+        m.add_inactive_residency_evicted(Duration::from_millis(100).as_nanos() as u64, 2);
+        m.add_inactive_residency_reused(Duration::from_millis(600).as_nanos() as u64, 4);
+
+        let snap = m.snapshot();
+        assert_eq!(snap.inactive_residency_evicted_blocks, 4);
+        assert_eq!(
+            snap.mean_eviction_age(),
+            Some(Duration::from_millis(100)),
+            "400ms over 4 evicted blocks"
+        );
+        assert_eq!(
+            snap.mean_reuse_age(),
+            Some(Duration::from_millis(150)),
+            "600ms over 4 reused blocks"
+        );
+        // 400ms wasted of 1000ms settled.
+        assert_eq!(snap.wasted_residency_fraction(), Some(0.4));
+    }
+
+    /// The eviction age reads *inversely* to intuition, and this pin exists
+    /// so nobody "fixes" the direction: the thrashing pool is the one with
+    /// the SHORTER age, because it recycles freed blocks sooner.
+    #[test]
+    fn a_thrashing_pool_reports_the_shorter_eviction_age() {
+        let roomy = BlockPoolMetrics::new("roomy".to_string());
+        roomy.add_inactive_residency_evicted(Duration::from_secs(30).as_nanos() as u64, 10);
+
+        let thrashing = BlockPoolMetrics::new("thrashing".to_string());
+        thrashing.add_inactive_residency_evicted(Duration::from_millis(200).as_nanos() as u64, 10);
+
+        assert!(
+            thrashing.snapshot().mean_eviction_age() < roomy.snapshot().mean_eviction_age(),
+            "a falling eviction age is the capacity-pressure signal"
+        );
     }
 
     #[test]

@@ -25,6 +25,7 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Weak};
+use std::time::Instant;
 
 // Under `#[cfg(test)]` use `tracing-mutex`'s parking_lot wrapper, which
 // is API-identical to `parking_lot::Mutex` but builds a global
@@ -335,6 +336,17 @@ pub(crate) struct BlockSlot<T: BlockMetadata> {
     /// returns to inactive. It lets exact reclaim reject an inactive →
     /// active → inactive ABA without changing fresh-allocation semantics.
     inactive_epoch: u64,
+    /// Monotonic nanoseconds, relative to [`BlockStore::clock_epoch`], at
+    /// which this slot entered its current inactive residency tenure.
+    ///
+    /// Written by [`BlockStore::enter_inactive_tenure_locked`] and read once
+    /// when the tenure reaches a terminal outcome — eviction or a cache hit
+    /// — to attribute the residency (see
+    /// [`BlockStore::settle_inactive_residency_locked`]). Stale outside an
+    /// `Inactive`/`Held` state, which is why every read is paired with a
+    /// state match. Deliberately *not* visible to `InactiveIndex`: eviction
+    /// policy stays on pool-logical ticks so replay remains deterministic.
+    inactive_since_nanos: u64,
     pub(crate) state: SlotState<T>,
 }
 
@@ -389,6 +401,12 @@ pub(crate) struct BlockStore<T: BlockMetadata> {
     block_size: usize,
     total_blocks: usize,
     metrics: Arc<BlockPoolMetrics>,
+    /// Monotonic base for every `inactive_since_nanos` stamp.
+    ///
+    /// Slots store a `u64` offset from this instant rather than an `Instant`,
+    /// halving the per-slot cost and making the subtraction a plain integer
+    /// op under the store lock.
+    clock_epoch: Instant,
     /// Store-wide default for the per-slot "reset on last drop" override.
     /// When `true`, every primary release bypasses the inactive pool and
     /// goes straight to `Reset` (mirrors `release_duplicate`). Individual
@@ -493,6 +511,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
                 block_size,
                 generation: 0,
                 inactive_epoch: 0,
+                inactive_since_nanos: 0,
                 state: SlotState::Reset,
             });
             free.push_back(i);
@@ -511,6 +530,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
             block_size,
             total_blocks,
             metrics,
+            clock_epoch: Instant::now(),
             default_reset_on_release,
             #[cfg(test)]
             release_primary_gate: Mutex::new(()),
@@ -789,6 +809,23 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         }
 
         // Commit. Past this point we cannot fail.
+        //
+        // Terminal outcome: eviction. Settle before the loop below moves any
+        // slot out of Inactive. The clock read sits inside the lock only
+        // because the rollback branch above may return without evicting
+        // anything, and an unconditional read would tax every failed
+        // allocation attempt.
+        if !evicted_pairs.is_empty() {
+            let now_nanos = self.now_nanos();
+            self.metrics.add_inactive_residency_evicted(
+                Self::settle_inactive_residency_batch_locked(
+                    &inner,
+                    evicted_pairs.iter().map(|(_, block_id)| *block_id),
+                    now_nanos,
+                ),
+                evicted_pairs.len() as u64,
+            );
+        }
         let mut blocks = Vec::with_capacity(count);
         for id in reset_ids {
             let block_size = self.allocate_mutable_slot(&mut inner, id);
@@ -829,6 +866,21 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         let mut inner = self.inner.lock();
         let drained = inner.inactive.allocate_all();
         let count = drained.len();
+        // Terminal outcome: eviction. `reset_inactive_pool` is a bulk
+        // discard rather than organic pressure, but the residency it ends
+        // was still residency that produced no hit, so it belongs in the
+        // evicted bucket for the partition to stay exact.
+        if count > 0 {
+            let now_nanos = self.now_nanos();
+            self.metrics.add_inactive_residency_evicted(
+                Self::settle_inactive_residency_batch_locked(
+                    &inner,
+                    drained.iter().map(|(_, block_id)| *block_id),
+                    now_nanos,
+                ),
+                count as u64,
+            );
+        }
         let mut handles = Vec::with_capacity(count);
         let mut out = Vec::with_capacity(count);
         let mut evicted = Vec::with_capacity(count);
@@ -866,8 +918,9 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         seq_hash: SequenceHash,
         touch: bool,
     ) -> Option<Arc<ImmutableBlockInner<T>>> {
+        let now_nanos = self.now_nanos();
         let mut inner = self.inner.lock();
-        self.acquire_for_hash_locked(&mut inner, seq_hash, touch)
+        self.acquire_for_hash_locked(&mut inner, seq_hash, touch, now_nanos)
     }
 
     /// Locked-form of [`acquire_for_hash`]. Walks one path under the
@@ -883,11 +936,12 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         inner: &mut BlockStoreInner<T>,
         seq_hash: SequenceHash,
         touch: bool,
+        now_nanos: u64,
     ) -> Option<Arc<ImmutableBlockInner<T>>> {
         if inner.held_by_hash.contains_key(&seq_hash) {
             return None;
         }
-        self.acquire_registered_for_hash_locked(inner, seq_hash, touch)
+        self.acquire_registered_for_hash_locked(inner, seq_hash, touch, now_nanos)
     }
 
     /// Registration-side lookup ignores a held ownership fence only to find
@@ -898,8 +952,9 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         inner: &mut BlockStoreInner<T>,
         seq_hash: SequenceHash,
         touch: bool,
+        now_nanos: u64,
     ) -> Option<Arc<ImmutableBlockInner<T>>> {
-        self.acquire_registered_for_hash_locked(inner, seq_hash, touch)
+        self.acquire_registered_for_hash_locked(inner, seq_hash, touch, now_nanos)
     }
 
     /// Active-or-inactive lookup without the held ownership fence.
@@ -908,6 +963,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         inner: &mut BlockStoreInner<T>,
         seq_hash: SequenceHash,
         touch: bool,
+        now_nanos: u64,
     ) -> Option<Arc<ImmutableBlockInner<T>>> {
         // (1) Active path.
         if let Some(&block_id) = inner.active_by_hash.get(&seq_hash) {
@@ -920,7 +976,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
             }
             // (2) Eager Primary → Inactive transition. The original
             // Inner::drop will see slot != Primary and no-op.
-            self.eager_primary_to_inactive_locked(inner, seq_hash, block_id);
+            self.eager_primary_to_inactive_locked(inner, seq_hash, block_id, now_nanos);
             // Fall through to inactive path.
         }
 
@@ -929,6 +985,11 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         // backends) instead of allocating a one-element slice + Vec.
         let block_id = inner.inactive.find_match(seq_hash, touch)?.1;
         self.metrics.dec_inactive_pool_size();
+        // Terminal outcome: reuse. Settle before the slot leaves Inactive.
+        self.metrics.add_inactive_residency_reused(
+            Self::settle_inactive_residency_locked(inner, block_id, now_nanos),
+            1,
+        );
         let handle = take_inactive_handle(&mut inner.slots[block_id], block_id);
         // Resurrection: the per-slot `reset_on_release` atomic carries
         // the previous holder's override across this transition
@@ -969,10 +1030,12 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         self: &Arc<Self>,
         hashes: &[SequenceHash],
     ) -> Vec<Arc<ImmutableBlockInner<T>>> {
+        // One clock read for the whole batch, taken outside the lock.
+        let now_nanos = self.now_nanos();
         let mut inner = self.inner.lock();
         let mut out = Vec::with_capacity(hashes.len());
         for &h in hashes {
-            match self.acquire_for_hash_locked(&mut inner, h, /*touch*/ false) {
+            match self.acquire_for_hash_locked(&mut inner, h, /*touch*/ false, now_nanos) {
                 Some(arc) => out.push(arc),
                 None => break,
             }
@@ -1003,8 +1066,9 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         let mut block = block;
         block.disarm();
 
+        let now_nanos = self.now_nanos();
         let mut inner = self.inner.lock();
-        let existing = self.acquire_for_registration_locked(&mut inner, seq_hash, false);
+        let existing = self.acquire_for_registration_locked(&mut inner, seq_hash, false, now_nanos);
 
         // Whether we added a new presence-bearing slot (Primary or
         // Duplicate). Reject does not, since the slot returns to Reset.
@@ -1144,13 +1208,16 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         let mut results = Vec::with_capacity(blocks.len());
         let mut present_handles = Vec::with_capacity(blocks.len());
 
+        // One clock read for the whole batch, taken outside the lock.
+        let now_nanos = self.now_nanos();
         {
             let mut inner = self.inner.lock();
             for (i, (block, handle)) in blocks.iter().zip(handles.iter()).enumerate() {
                 let block_id = block.block_id();
                 let seq_hash = block.sequence_hash();
 
-                let existing = self.acquire_for_registration_locked(&mut inner, seq_hash, false);
+                let existing =
+                    self.acquire_for_registration_locked(&mut inner, seq_hash, false, now_nanos);
 
                 let inner_arc = if let Some(existing_primary) = existing {
                     assert_ne!(
@@ -1230,6 +1297,56 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         results
     }
 
+    /// Monotonic nanoseconds since this store's [`Self::clock_epoch`].
+    ///
+    /// The invariant is **once per critical section**, threaded into the
+    /// `_locked` helpers from there: the clock read is a vDSO call, and a
+    /// batch that stamps or settles N tenures should pay for it once rather
+    /// than N times. Sharing one stamp across a batch also makes that
+    /// batch's residencies mutually consistent.
+    ///
+    /// Entry paths read it *before* taking the store mutex, since they
+    /// always stamp. Paths that only settle conditionally (`allocate_atomic`
+    /// and the exact-reclaim family, which can bail out before evicting
+    /// anything) read it inside the lock instead, so a failed attempt costs
+    /// nothing. The resulting skew is bounded by the lock hold time — µs
+    /// against residencies measured in ms to s.
+    fn now_nanos(&self) -> u64 {
+        // Saturates at ~584 years of uptime rather than wrapping into
+        // nonsense durations.
+        u64::try_from(self.clock_epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    /// Close out the inactive residency tenure of `block_id` and return its
+    /// duration in nanoseconds.
+    ///
+    /// The caller holds the store lock and must be committing the slot to a
+    /// terminal outcome — eviction or a cache hit. `saturating_sub` guards
+    /// the one case that can invert: a slot read before it ever entered a
+    /// tenure (stamp `0`, never observed on the wired paths, all of which
+    /// match `SlotState::Inactive` first).
+    fn settle_inactive_residency_locked(
+        inner: &BlockStoreInner<T>,
+        block_id: BlockId,
+        now_nanos: u64,
+    ) -> u64 {
+        now_nanos.saturating_sub(inner.slots[block_id].inactive_since_nanos)
+    }
+
+    /// Sum the residency of every tenure in `block_ids`, all settled against
+    /// the same `now_nanos`. Batch counterpart of
+    /// [`Self::settle_inactive_residency_locked`].
+    fn settle_inactive_residency_batch_locked(
+        inner: &BlockStoreInner<T>,
+        block_ids: impl IntoIterator<Item = BlockId>,
+        now_nanos: u64,
+    ) -> u64 {
+        block_ids
+            .into_iter()
+            .map(|block_id| Self::settle_inactive_residency_locked(inner, block_id, now_nanos))
+            .sum()
+    }
+
     /// Transition a slot into a new inactive residency tenure.
     ///
     /// The caller holds the store lock and must clear any active-map entry
@@ -1241,6 +1358,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         block_id: BlockId,
         seq_hash: SequenceHash,
         handle: BlockRegistrationHandle,
+        now_nanos: u64,
     ) {
         let slot = &mut inner.slots[block_id];
         assert_ne!(
@@ -1249,6 +1367,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
             "block slot inactive epoch exhausted"
         );
         slot.inactive_epoch += 1;
+        slot.inactive_since_nanos = now_nanos;
         slot.state = SlotState::Inactive { seq_hash, handle };
         inner.inactive.insert(seq_hash, block_id);
     }
@@ -1262,6 +1381,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         inner: &mut BlockStoreInner<T>,
         seq_hash: SequenceHash,
         block_id: BlockId,
+        now_nanos: u64,
     ) {
         let handle = match &inner.slots[block_id].state {
             SlotState::Primary { handle, .. } => handle.clone(),
@@ -1275,7 +1395,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         // and the eventual `release_primary` read go through this same
         // store mutex, so the value is published reliably regardless of
         // which thread wins the race for the lock.
-        self.enter_inactive_tenure_locked(inner, block_id, seq_hash, handle);
+        self.enter_inactive_tenure_locked(inner, block_id, seq_hash, handle, now_nanos);
         inner.active_by_hash.remove(&seq_hash);
         self.metrics.inc_inactive_pool_size();
         self.metrics.inc_eager_primary_to_inactive();
@@ -1296,6 +1416,8 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         touch: bool,
         scan: bool,
     ) -> Vec<(SequenceHash, Arc<ImmutableBlockInner<T>>)> {
+        // One clock read for the whole batch, taken outside the lock.
+        let now_nanos = self.now_nanos();
         let mut inner = self.inner.lock();
         let matched: Vec<(SequenceHash, BlockId)> = if scan {
             let visible_hashes = hashes
@@ -1331,6 +1453,16 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
             matched
         };
         self.metrics.dec_inactive_pool_size_by(matched.len() as i64);
+        // Terminal outcome: reuse. Settle every matched tenure against the
+        // one batch stamp, before any slot leaves Inactive.
+        self.metrics.add_inactive_residency_reused(
+            Self::settle_inactive_residency_batch_locked(
+                &inner,
+                matched.iter().map(|(_, block_id)| *block_id),
+                now_nanos,
+            ),
+            matched.len() as u64,
+        );
         matched
             .into_iter()
             .map(|(seq_hash, block_id)| {
@@ -1428,6 +1560,8 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         #[cfg(test)]
         let _gate = self.release_primary_gate.lock();
+        // One clock read, outside the critical section.
+        let now_nanos = self.now_nanos();
         let handle_to_mark_absent = {
             let mut inner = self.inner.lock();
             let (seq_hash, handle) = match &inner.slots[block_id].state {
@@ -1461,7 +1595,9 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
                 // The atomic carries the holder's override into the
                 // Inactive period untouched; a future resurrection will
                 // inherit it via the same atomic.
-                self.enter_inactive_tenure_locked(&mut inner, block_id, seq_hash, handle);
+                self.enter_inactive_tenure_locked(
+                    &mut inner, block_id, seq_hash, handle, now_nanos,
+                );
                 inner.active_by_hash.remove(&seq_hash);
                 self.metrics.inc_inactive_pool_size();
                 tracing::trace!(?seq_hash, block_id, "Block stored in inactive pool");
@@ -1589,7 +1725,9 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
             .map(|(i, e)| (e.self_ptr, i))
             .collect();
 
-        // Phase 1 (single lock): process every entry, in input order.
+        // Phase 1 (single lock): process every entry, in input order. One
+        // clock read for the whole batch, taken outside the lock.
+        let now_nanos = self.now_nanos();
         let mut to_drop: Vec<ImmutableBlockInner<T>> = Vec::with_capacity(entries.len());
         let mut deferred: Vec<Arc<ImmutableBlockInner<T>>> = Vec::new();
         let mut pending_mark_absent: Vec<BlockRegistrationHandle> =
@@ -1603,6 +1741,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
                     &target_position,
                     &mut inner,
                     opts,
+                    now_nanos,
                     &mut report,
                     &mut to_drop,
                     &mut deferred,
@@ -1699,6 +1838,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         target_position: &std::collections::HashMap<*const (), usize>,
         inner: &mut BlockStoreInner<T>,
         opts: ReleaseOpts,
+        now_nanos: u64,
         report: &mut ReleaseReport,
         to_drop: &mut Vec<ImmutableBlockInner<T>>,
         deferred: &mut Vec<Arc<ImmutableBlockInner<T>>>,
@@ -1757,7 +1897,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
                     pending_mark_absent.push(handle);
                     report.primary_reset += 1;
                 } else {
-                    self.enter_inactive_tenure_locked(inner, block_id, seq_hash, handle);
+                    self.enter_inactive_tenure_locked(inner, block_id, seq_hash, handle, now_nanos);
                     inner.active_by_hash.remove(&seq_hash);
                     self.metrics.inc_inactive_pool_size();
                     report.primary_inactive += 1;
@@ -1791,6 +1931,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
                                     target_position,
                                     inner,
                                     opts,
+                                    now_nanos,
                                     report,
                                     to_drop,
                                     deferred,

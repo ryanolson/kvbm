@@ -13,6 +13,7 @@ mod exact_inactive_allocation;
 mod exact_reclaim_allocation;
 mod exact_reclaim_by_hash;
 mod inactive_lineage_hold;
+mod inactive_residency;
 mod opaque_exact_reclaim;
 mod registered_presence;
 mod registration_provenance;

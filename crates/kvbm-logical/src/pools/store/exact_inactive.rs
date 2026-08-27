@@ -141,6 +141,19 @@ impl<T: BlockMetadata> BlockStore<T> {
             blocks.push(MutableBlock::from_store(self.clone(), block_id, block_size));
         }
 
+        // Terminal outcome: eviction. Settle every validated victim against
+        // one stamp before the loop moves any slot out of Inactive.
+        if !victims.is_empty() {
+            let now_nanos = self.now_nanos();
+            self.metrics.add_inactive_residency_evicted(
+                Self::settle_inactive_residency_batch_locked(
+                    &inner,
+                    victims.iter().map(|victim| victim.block_id),
+                    now_nanos,
+                ),
+                victims.len() as u64,
+            );
+        }
         let mut evicted = Vec::with_capacity(from_inactive);
         let mut handles = Vec::with_capacity(from_inactive);
         for victim in victims {

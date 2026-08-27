@@ -252,6 +252,19 @@ impl<T: BlockMetadata> BlockStore<T> {
 
         // The backend preflight and all later removals share this store lock.
         // A successful preflight therefore makes every take below infallible.
+        // Terminal outcome: eviction. The preflight above makes every take
+        // below infallible, so settling here cannot over-count.
+        if !victims.is_empty() {
+            let now_nanos = self.now_nanos();
+            self.metrics.add_inactive_residency_evicted(
+                Self::settle_inactive_residency_batch_locked(
+                    &inner,
+                    victims.iter().map(|victim| victim.block_id),
+                    now_nanos,
+                ),
+                victims.len() as u64,
+            );
+        }
         let mut handles = Vec::with_capacity(victims.len());
         let mut evicted = Vec::with_capacity(victims.len());
         for victim in victims {

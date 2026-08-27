@@ -139,9 +139,20 @@ impl<T: BlockMetadata> BlockStore<T> {
     }
 
     fn restore_lineage_hold(&self, source_blocks: Vec<(SequenceHash, BlockId)>) {
+        let now_nanos = self.now_nanos();
         let mut inner = self.inner.lock();
-        let restored =
-            restore_support_blocks(&mut inner, &source_blocks, self.default_reset_on_release);
+        let restored = restore_support_blocks(
+            &mut inner,
+            &source_blocks,
+            self.default_reset_on_release,
+            now_nanos,
+        );
+        // Blocks restored here resume their paused tenure with the stamp
+        // intact; only superseded ones settle.
+        self.metrics.add_inactive_residency_evicted(
+            restored.discarded_residency_nanos,
+            restored.discarded_count,
+        );
         self.metrics
             .inc_inactive_pool_size_by(restored.restored_count as i64);
         self.metrics
@@ -162,13 +173,28 @@ impl<T: BlockMetadata> BlockStore<T> {
         let (victim_hash, victim_id) = source_blocks
             .pop()
             .expect("an inactive lineage hold always contains its leaf");
+        let now_nanos = self.now_nanos();
         let mut inner = self.inner.lock();
 
-        let restored =
-            restore_support_blocks(&mut inner, &source_blocks, self.default_reset_on_release);
+        let restored = restore_support_blocks(
+            &mut inner,
+            &source_blocks,
+            self.default_reset_on_release,
+            now_nanos,
+        );
         // An eviction observer receives only a sequence hash. If a newer
         // copy still owns that hash, it must not receive a false removal.
         let victim_replaced = has_newer_registered_copy(&inner, victim_hash, victim_id);
+        // Terminal outcome: eviction — but only for the leaf. The support
+        // blocks were restored above and resume the *same* tenure they were
+        // holding when the hold paused them, so their residency stays open.
+        // The leaf's residency therefore includes the held interval, which
+        // is the tenure the store itself preserved across the hold.
+        self.metrics.add_inactive_residency_evicted(
+            Self::settle_inactive_residency_locked(&inner, victim_id, now_nanos)
+                + restored.discarded_residency_nanos,
+            1 + restored.discarded_count,
+        );
         let victim_handle = take_exact_held_handle(&inner.slots[victim_id], victim_hash, victim_id);
         assert_eq!(
             inner.held_by_hash.remove(&victim_hash),
@@ -229,16 +255,29 @@ fn current_inactive_lineage<T: BlockMetadata>(
 struct RestoreSupportResult {
     restored_count: usize,
     discarded_handles: Vec<BlockRegistrationHandle>,
+    /// Summed residency of the support tenures that ended here because a
+    /// newer copy had claimed their hash, and the count that produced it.
+    ///
+    /// These tenures are terminal — the slot goes to `Reset` and its cached
+    /// content is gone — and they produced no hit, so they belong in the
+    /// evicted residency bucket. They are deliberately *not* counted in the
+    /// `evictions` event counter: the hash itself survives on the newer
+    /// copy, so no removal is observed.
+    discarded_residency_nanos: u64,
+    discarded_count: u64,
 }
 
 fn restore_support_blocks<T: BlockMetadata>(
     inner: &mut BlockStoreInner<T>,
     source_blocks: &[(SequenceHash, BlockId)],
     default_reset_on_release: bool,
+    now_nanos: u64,
 ) -> RestoreSupportResult {
     let mut result = RestoreSupportResult {
         restored_count: 0,
         discarded_handles: Vec::new(),
+        discarded_residency_nanos: 0,
+        discarded_count: 0,
     };
     for &(seq_hash, block_id) in source_blocks {
         let handle = take_exact_held_handle(&inner.slots[block_id], seq_hash, block_id);
@@ -248,6 +287,9 @@ fn restore_support_blocks<T: BlockMetadata>(
             "inactive lineage hold lost its support ownership fence"
         );
         if has_newer_registered_copy(inner, seq_hash, block_id) {
+            result.discarded_residency_nanos +=
+                BlockStore::<T>::settle_inactive_residency_locked(inner, block_id, now_nanos);
+            result.discarded_count += 1;
             inner.slots[block_id].state = SlotState::Reset;
             inner.reset_on_release[block_id] = default_reset_on_release;
             inner.free.push_back(block_id);

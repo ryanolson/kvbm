@@ -13,6 +13,12 @@ use prometheus::proto::{Gauge, LabelPair, Metric, MetricFamily, MetricType};
 
 use crate::pool::BlockPoolMetrics;
 
+/// Prometheus exports durations in base units, so the nanosecond counters
+/// the pool accumulates are converted at scrape time.
+fn nanos_to_seconds(nanos: u64) -> f64 {
+    nanos as f64 / 1e9
+}
+
 /// Metric definitions: (name, help, type).
 const COUNTER_DEFS: &[(&str, &str)] = &[
     (
@@ -58,6 +64,27 @@ const COUNTER_DEFS: &[(&str, &str)] = &[
     (
         "kvbm_scan_blocks_returned_total",
         "Total blocks returned from scan_matches calls",
+    ),
+    (
+        "kvbm_inactive_residency_evicted_seconds_total",
+        "Summed inactive residency of evicted blocks. Divided by \
+         kvbm_inactive_residency_evicted_blocks_total this is the pool's \
+         eviction age; a falling eviction age is the capacity-pressure signal",
+    ),
+    (
+        "kvbm_inactive_residency_evicted_blocks_total",
+        "Blocks whose inactive residency ended in eviction \
+         (denominator for kvbm_inactive_residency_evicted_seconds_total)",
+    ),
+    (
+        "kvbm_inactive_residency_reused_seconds_total",
+        "Summed inactive residency of blocks reclaimed by a cache hit. \
+         The reuse-side counterpart that makes the evicted number readable",
+    ),
+    (
+        "kvbm_inactive_residency_reused_blocks_total",
+        "Blocks whose inactive residency ended in a cache hit \
+         (denominator for kvbm_inactive_residency_reused_seconds_total)",
     ),
     (
         "kvbm_eager_primary_to_inactive_total",
@@ -207,30 +234,36 @@ impl Collector for MetricsAggregator {
                 base_labels.push(lp);
             }
 
-            // Counter values in order matching COUNTER_DEFS
-            let counter_values: [u64; 15] = [
-                snap.allocations,
-                snap.allocations_from_reset,
-                snap.evictions,
-                snap.registrations,
-                snap.duplicate_blocks,
-                snap.registration_dedup,
-                snap.stagings,
-                snap.match_hashes_requested,
-                snap.match_blocks_returned,
-                snap.scan_hashes_requested,
-                snap.scan_blocks_returned,
-                snap.eager_primary_to_inactive_total,
-                snap.allocate_atomic_rollback_total,
-                snap.release_primary_noop_total,
-                snap.release_duplicate_noop_total,
+            // Counter values in order matching COUNTER_DEFS. `f64` because
+            // the residency counters export as seconds; the plain counts
+            // convert exactly as they always did at `set_value` time.
+            let counter_values: [f64; 19] = [
+                snap.allocations as f64,
+                snap.allocations_from_reset as f64,
+                snap.evictions as f64,
+                snap.registrations as f64,
+                snap.duplicate_blocks as f64,
+                snap.registration_dedup as f64,
+                snap.stagings as f64,
+                snap.match_hashes_requested as f64,
+                snap.match_blocks_returned as f64,
+                snap.scan_hashes_requested as f64,
+                snap.scan_blocks_returned as f64,
+                nanos_to_seconds(snap.inactive_residency_evicted_nanos),
+                snap.inactive_residency_evicted_blocks as f64,
+                nanos_to_seconds(snap.inactive_residency_reused_nanos),
+                snap.inactive_residency_reused_blocks as f64,
+                snap.eager_primary_to_inactive_total as f64,
+                snap.allocate_atomic_rollback_total as f64,
+                snap.release_primary_noop_total as f64,
+                snap.release_duplicate_noop_total as f64,
             ];
 
             for (i, (name, help)) in COUNTER_DEFS.iter().enumerate() {
                 let mut m = Metric::default();
                 m.set_label(base_labels.clone());
                 let mut c = prometheus::proto::Counter::default();
-                c.set_value(counter_values[i] as f64);
+                c.set_value(counter_values[i]);
                 m.set_counter(c);
 
                 let mut mf = MetricFamily::default();

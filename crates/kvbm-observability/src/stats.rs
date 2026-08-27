@@ -42,6 +42,23 @@ pub struct StatsSnapshot {
     pub match_hit_rate: f64,
     /// Ratio of blocks returned to hashes requested in scan_matches.
     pub scan_hit_rate: f64,
+    /// Mean inactive residency, in seconds, of the blocks evicted during
+    /// this window — the pool's windowed **eviction age**.
+    ///
+    /// This is the capacity-pressure signal, and it moves *opposite* to
+    /// intuition: a long eviction age means freed blocks linger, i.e. the
+    /// pool has headroom; a falling eviction age means blocks are recycled
+    /// soon after being freed, i.e. thrash. Read it against
+    /// [`Self::reuse_age_secs`] — an eviction age well below the reuse age
+    /// means the pool discards blocks before the workload's own reuse
+    /// distance, so added capacity would convert directly into hits.
+    ///
+    /// `0.0` in a window with no evictions.
+    pub eviction_age_secs: f64,
+    /// Mean inactive residency, in seconds, of the blocks reclaimed by a
+    /// cache hit during this window — how long a reused block waited.
+    /// `0.0` in a window with no inactive hits.
+    pub reuse_age_secs: f64,
     /// Rate of change of allocation_rate (d(alloc_rate)/dt).
     pub allocation_gradient: f64,
     /// Rate of change of eviction_rate (d(eviction_rate)/dt).
@@ -132,6 +149,21 @@ impl StatsCollector {
                     }
                 };
 
+                // Windowed means: residency settled in this window over the
+                // tenures that settled it. Both counters advance together
+                // under the same store lock, so the pair is always coherent.
+                let eviction_age_secs = windowed_mean_secs(
+                    raw.inactive_residency_evicted_nanos
+                        - prev.raw.inactive_residency_evicted_nanos,
+                    raw.inactive_residency_evicted_blocks
+                        - prev.raw.inactive_residency_evicted_blocks,
+                );
+                let reuse_age_secs = windowed_mean_secs(
+                    raw.inactive_residency_reused_nanos - prev.raw.inactive_residency_reused_nanos,
+                    raw.inactive_residency_reused_blocks
+                        - prev.raw.inactive_residency_reused_blocks,
+                );
+
                 let allocation_gradient = (alloc_rate - prev.stats.allocation_rate) / dt;
                 let eviction_gradient = (eviction_rate - prev.stats.eviction_rate) / dt;
 
@@ -140,6 +172,8 @@ impl StatsCollector {
                     eviction_rate,
                     match_hit_rate,
                     scan_hit_rate,
+                    eviction_age_secs,
+                    reuse_age_secs,
                     allocation_gradient,
                     eviction_gradient,
                     inflight_mutable: raw.inflight_mutable,
@@ -201,12 +235,23 @@ impl StatsCollector {
     }
 }
 
+/// Mean settled residency in seconds over one sample window, or `0.0` when
+/// no tenure settled into this bucket during the window.
+fn windowed_mean_secs(delta_nanos: u64, delta_blocks: u64) -> f64 {
+    if delta_blocks == 0 {
+        return 0.0;
+    }
+    delta_nanos as f64 / delta_blocks as f64 / 1e9
+}
+
 fn zero_stats(raw: &MetricsSnapshot) -> StatsSnapshot {
     StatsSnapshot {
         allocation_rate: 0.0,
         eviction_rate: 0.0,
         match_hit_rate: 0.0,
         scan_hit_rate: 0.0,
+        eviction_age_secs: 0.0,
+        reuse_age_secs: 0.0,
         allocation_gradient: 0.0,
         eviction_gradient: 0.0,
         inflight_mutable: raw.inflight_mutable,
@@ -291,6 +336,33 @@ mod tests {
         stats.sample();
         let snap = stats.latest().unwrap();
         assert!((snap.match_hit_rate - 0.7).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_windowed_residency_ages() {
+        let metrics = Arc::new(BlockPoolMetrics::new("G1".to_string()));
+        let stats = StatsCollector::new(metrics.clone(), StatsConfig::default());
+        stats.set_enabled(true);
+
+        stats.sample(); // baseline
+        std::thread::sleep(Duration::from_millis(10));
+
+        // 2s of evicted residency over 4 blocks, 3s of reused over 2.
+        metrics.add_inactive_residency_evicted(Duration::from_secs(2).as_nanos() as u64, 4);
+        metrics.add_inactive_residency_reused(Duration::from_secs(3).as_nanos() as u64, 2);
+
+        stats.sample();
+        let snap = stats.latest().unwrap();
+        assert!((snap.eviction_age_secs - 0.5).abs() < 1e-9);
+        assert!((snap.reuse_age_secs - 1.5).abs() < 1e-9);
+
+        // A window in which nothing settles reports 0.0 rather than
+        // carrying the previous window's age forward.
+        std::thread::sleep(Duration::from_millis(10));
+        stats.sample();
+        let snap = stats.latest().unwrap();
+        assert_eq!(snap.eviction_age_secs, 0.0);
+        assert_eq!(snap.reuse_age_secs, 0.0);
     }
 
     #[test]
