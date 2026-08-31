@@ -69,7 +69,10 @@ axum = { version = "=0.8.4", features = ["macros", "ws"] }
 blake3 = { version = "1" }
 bytes = { version = "1" }
 clap = { version = "4", features = ["derive", "env"] }
-cudarc = { version = "=0.19.3", features = ["cuda-version-from-build-system", "fallback-latest"] }
+# Keep this requirement open inside 0.19. An exact pin holds every dependent
+# back: cudarc 0.19.3 lists supported CUDA toolkits up to 13.1 and panics on
+# 13.2, and 0.19.9 lists 13.2 and 13.3.
+cudarc = { version = "0.19", features = ["cuda-version-from-build-system", "fallback-latest"] }
 dashmap = { version = "6.1" }
 derive_builder = { version = "0.20" }
 derive-getters = { version = "0.5" }
