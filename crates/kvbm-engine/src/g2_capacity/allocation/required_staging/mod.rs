@@ -14,7 +14,6 @@ use super::{
     G2Allocation, G2ExactAllocation, G2ExactPublishedRequiredStaging, G2ExactStagedAllocation,
     G2StagedAllocation,
 };
-#[cfg(test)]
 use crate::BlockId;
 use crate::G2;
 use crate::g2_capacity::{
@@ -145,6 +144,16 @@ impl RequiredStagingAllocation {
 }
 
 impl RequiredStagingStagedAllocation {
+    pub(crate) fn publish_temporary(mut self) -> Result<Vec<ImmutableBlock<G2>>, G2CapacityError> {
+        match &mut self.inner {
+            StagedRequiredStaging::Compatibility { allocation, .. } => {
+                allocation.set_evict_on_reset(true);
+            }
+            StagedRequiredStaging::Exact(allocation) => allocation.set_evict_on_reset(true),
+        }
+        self.publish()
+    }
+
     /// Bind a compatibility allocation to its original registration owner.
     pub(crate) fn from_compatibility(
         allocation: G2StagedAllocation,
@@ -165,7 +174,6 @@ impl RequiredStagingStagedAllocation {
     }
 
     /// Return staged block identifiers without publishing them.
-    #[cfg(test)]
     pub(crate) fn block_ids(&self) -> Vec<BlockId> {
         match &self.inner {
             StagedRequiredStaging::Compatibility { allocation, .. } => allocation.block_ids(),

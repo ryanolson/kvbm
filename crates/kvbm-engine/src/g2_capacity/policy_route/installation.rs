@@ -41,6 +41,7 @@ pub struct PolicyG1G2Installation {
 pub struct PolicyG1G2ValidatedInstallation<T: PolicyG1SourceMetadata> {
     pub(super) installation: PolicyG1G2Installation,
     pub(super) manager_id: ManagerId,
+    pub(super) block_size: usize,
     pub(super) source_type: PhantomData<fn() -> T>,
 }
 

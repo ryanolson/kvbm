@@ -24,6 +24,8 @@ use crate::testing::managers::TestManagerBuilder;
 use crate::testing::messenger::create_messenger_tcp;
 use crate::{BlockId, G1, G2};
 
+mod session_staging;
+
 #[derive(Default)]
 struct ImmediateTransfer {
     calls: AtomicUsize,

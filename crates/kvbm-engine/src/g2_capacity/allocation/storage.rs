@@ -138,6 +138,12 @@ impl MutableAllocation {
 }
 
 impl StagedAllocation {
+    pub(super) fn set_evict_on_reset(&mut self, value: bool) {
+        for block in &mut self.blocks {
+            block.set_evict_on_reset(value);
+        }
+    }
+
     pub(super) const fn kind(&self) -> G2AllocationKind {
         self.kind
     }

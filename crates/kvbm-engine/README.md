@@ -8,6 +8,16 @@ This crate implements the leader/worker architecture for managing KV cache block
 
 Leaders own block metadata and make placement decisions. Workers execute data transfers (RDMA, NVMe, object storage). Sessions coordinate multi-instance block transfers.
 
+## G1 source staging for sessions
+
+The `PolicyG1G2BoundRoute::stage_for_session` method copies caller-owned G1 pins into temporary G2 blocks and publishes their session availability. The certified route fixes the resource, G1 manager, G2 capacity, and workers. The caller supplies a completion receipt for all source writes and a session for that resource. The caller commits the intended hashes before this method. The method does not change or seal the commit set.
+
+The method checks source manager identity, unique hashes, and equal logical block sizes before dispatch. It reuses G2 matches and reserves only missing blocks through `G2Capacity`. An independent task owns source pins and destination capacity until physical completion. A dropped future cancels publication, not DMA. An uncertain completion or dispatch panic retains the affected memory and capacity.
+
+The method marks new blocks as temporary before registration. A collision does not change the retention of an existing primary. The offload policy can adopt a temporary primary with `ImmutableBlock::set_evict_on_reset(false)`. Otherwise, the last session or external pin release returns it to the free pool. Transport does not evict G1.
+
+Rhino holder-side discovery does not call this method yet. The deliberately unwired integration belongs to Stage 2B in Rhino's `agent-docs/kvbm-transfer-handoff.md`.
+
 ## Feature Flags
 
 

@@ -233,6 +233,10 @@ impl G2ExactAllocation {
 }
 
 impl G2ExactStagedAllocation {
+    pub(crate) fn set_evict_on_reset(&mut self, value: bool) {
+        self.allocation.set_evict_on_reset(value);
+    }
+
     /// Return the allocation policy.
     pub const fn kind(&self) -> G2AllocationKind {
         self.allocation.kind()

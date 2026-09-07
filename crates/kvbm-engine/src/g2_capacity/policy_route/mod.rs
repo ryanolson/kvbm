@@ -4,6 +4,7 @@
 //! Exact G1-to-G2 route ownership for policy actions.
 
 mod installation;
+mod session_staging;
 mod source;
 mod state;
 mod transaction;
@@ -78,6 +79,7 @@ pub struct PolicyG1G2BoundRoute<T: PolicyG1SourceMetadata> {
     core: Arc<PolicyG1G2RouteCore>,
     binding: Arc<RouteBinding>,
     source_manager_id: ManagerId,
+    source_block_size: usize,
     _route_identity: ExactG1G2RouteIdentity,
     _manager_identity: ExactG1G2ManagerIdentity,
     source_type: PhantomData<fn() -> T>,
@@ -275,6 +277,7 @@ impl PolicyG1G2Installation {
         Ok(PolicyG1G2ValidatedInstallation {
             installation: self,
             manager_id: source_manager.id(),
+            block_size: source_manager.block_size(),
             source_type: PhantomData,
         })
     }
@@ -291,6 +294,7 @@ impl<T: PolicyG1SourceMetadata> PolicyG1G2ValidatedInstallation<T> {
             core: route.core,
             binding: Arc::new(RouteBinding),
             source_manager_id: self.manager_id,
+            source_block_size: self.block_size,
             _route_identity: route.identity,
             _manager_identity: manager_identity,
             source_type: PhantomData,
