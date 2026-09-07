@@ -13,10 +13,20 @@ MutableBlock<T> → CompleteBlock<T> → ImmutableBlock<T> ⇄ WeakBlock<T>
 
 - **MutableBlock** — Allocated from the reset pool, writable. Drop returns to the reset pool.
 - **CompleteBlock** — Staged with a `SequenceHash` but not yet registered. Drop returns to the reset pool.
-- **ImmutableBlock** — Registered in the block registry. Strong-ref prevents eviction. Drop moves to the inactive pool for caching.
+- **ImmutableBlock** — A strong reference prevents eviction. The last release caches a primary in the inactive pool by default. A duplicate or reset-on-release primary returns to the free pool.
 - **WeakBlock** — Non-owning reference that does not prevent eviction. Upgradeable back to `ImmutableBlock` via two-phase lookup.
 
 The type parameter `T: BlockMetadata` is a marker for the storage tier (e.g. GPU, CPU, disk).
+
+## Temporary blocks for transfer
+
+`CompleteBlock::set_evict_on_reset(true)` selects the free pool for the staged slot after its last registered owner releases it. The setter does not register the block or change an existing primary with the same hash. The caller must wait for physical writes before registration. The next mutable allocation restores the manager default. `CompleteBlock::reset()` also restores that default.
+
+With `BlockDuplicationPolicy::Reject`, registration can return an existing primary instead of the staged destination. A temporary registration preserves that primary's retention flag. In contrast, `ImmutableBlock::set_evict_on_reset` changes the flag that all owners of the returned primary share.
+
+A retention policy can adopt a temporary primary through `ImmutableBlock::set_evict_on_reset(false)`. Registration alone does not adopt it. The session retains its pins until each authorized physical transfer settles. The final pin release returns an unadopted temporary primary to the free pool, not the inactive pool.
+
+This API supports the planned G1-to-G2 copies for remote sessions. That transfer path remains unwired. Temporary registration does not change the source G1 retention policy or provide isolated session visibility. A registered temporary primary remains matchable while a pin holds it.
 
 ## Usage
 

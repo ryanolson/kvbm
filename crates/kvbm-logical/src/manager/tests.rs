@@ -17,6 +17,7 @@ mod opaque_exact_reclaim;
 mod registered_presence;
 mod registration_provenance;
 mod reset_only_allocation;
+mod temporary_registration;
 
 // Type alias for backward compatibility
 type TestBlockData = TestMeta;

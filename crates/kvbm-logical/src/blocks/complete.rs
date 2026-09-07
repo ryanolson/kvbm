@@ -66,6 +66,10 @@ impl<T: BlockMetadata + Sync> CompleteBlock<T> {
         Arc::ptr_eq(&self.store, store)
     }
 
+    pub fn set_evict_on_reset(&mut self, value: bool) {
+        self.store.store_reset_on_release(self.block_id, value);
+    }
+
     /// Roll back to a [`MutableBlock`].
     pub fn reset(mut self) -> MutableBlock<T> {
         self.store.transition_back_to_mutable(self.block_id);

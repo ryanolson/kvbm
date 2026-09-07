@@ -91,3 +91,14 @@ When modifying code, evaluate and update related documentation so it stays accur
 
 If an `ACTIVE_PLAN.md` exists, load it each session and advance it to completion; update it
 before returning control. If it should be ignored, rename it to `_ACTIVE_PLAN_.md`.
+
+## Rhino-hosted Rust tests
+
+Rhino excludes this Rust workspace. Tests with development dependencies require its own manifest, not `cargo test -p kvbm-logical` from Rhino alone. Rhino enables `static-kernels`, which builds real CUDA kernels and links the shared CUDA runtime without the toolkit's static runtime archives.
+
+Run these commands from the Rhino root, through its canonical uv environment. Use the host's build lock and memory gate where applicable.
+
+```bash
+timeout 300 uv run cargo test --manifest-path 3rdparty/kvbm/crates/Cargo.toml --locked -p kvbm-logical -j 4
+timeout 300 uv run cargo test --manifest-path 3rdparty/kvbm/crates/Cargo.toml --locked -p kvbm-engine --no-default-features --features testing,static-kernels --test velo_session_loopback -j 4
+```

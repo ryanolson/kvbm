@@ -973,3 +973,202 @@ async fn close_drains_inbound_pulls_only_after_terminal_acks() -> Result<()> {
 
     Ok(())
 }
+
+mod temporary_g2 {
+    use super::*;
+
+    fn block(side: &Side, reset_on_release: bool) -> ImmutableBlock<G2> {
+        let tokens = create_token_sequence(1, BLOCK_SIZE, 2000);
+        let mut staged = side
+            .g2_manager
+            .allocate_blocks(1)
+            .expect("destination allocation")
+            .pop()
+            .expect("one destination")
+            .complete(&tokens.blocks()[0])
+            .expect("complete destination");
+        staged.set_evict_on_reset(reset_on_release);
+        side.g2_manager.register_block(staged)
+    }
+
+    fn assert_pool(side: &Side, free: usize, inactive: usize) {
+        let snapshot = side.g2_manager.metrics().snapshot();
+        assert_eq!(snapshot.reset_pool_size, free as i64);
+        assert_eq!(snapshot.inactive_pool_size, inactive as i64);
+    }
+
+    #[tokio::test]
+    async fn last_ack_preserves_the_selected_retention() -> Result<()> {
+        for temporary in [false, true] {
+            let h = build_side().await;
+            let session = h.factory.open_concrete(uuid::Uuid::new_v4())?;
+            let block = block(&h, temporary);
+            let hash = block.sequence_hash();
+            session.commit(vec![hash])?;
+            session.make_available(vec![block])?;
+            session.test_inject_inbound_frame(Frame::Pull {
+                pull_id: 1,
+                hashes: vec![hash],
+            });
+            session.finalize(None);
+            assert_pool(&h, 31, 0);
+
+            session.test_inject_inbound_frame(Frame::PullAck { pull_id: 1 });
+            assert_pool(&h, 31 + usize::from(temporary), usize::from(!temporary));
+            assert_eq!(
+                h.g2_manager.match_blocks(&[hash]).len(),
+                usize::from(!temporary)
+            );
+            session.close(None);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn close_waits_for_overlapping_pulls_and_external_pin() -> Result<()> {
+        let h = build_side().await;
+        let session = h.factory.open_concrete(uuid::Uuid::new_v4())?;
+        let block = block(&h, true);
+        let hash = block.sequence_hash();
+        let pin = block.pin();
+        session.commit(vec![hash])?;
+        session.make_available(vec![block])?;
+        for pull_id in [1, 2] {
+            session.test_inject_inbound_frame(Frame::Pull {
+                pull_id,
+                hashes: vec![hash],
+            });
+        }
+        session.close(None);
+        session.test_inject_inbound_frame(Frame::PullAck { pull_id: 99 });
+        assert_eq!(session.test_inbound_pulls_count(), 2);
+        assert_pool(&h, 31, 0);
+
+        session.test_inject_inbound_frame(Frame::PullAck { pull_id: 1 });
+        assert_eq!(session.test_available_pin_count(), 1);
+        assert_pool(&h, 31, 0);
+        session.test_inject_inbound_frame(Frame::PullAck { pull_id: 2 });
+        assert_eq!(session.test_available_pin_count(), 0);
+        assert_pool(&h, 31, 0);
+        drop(pin);
+        assert_pool(&h, 32, 0);
+        assert!(h.g2_manager.match_blocks(&[hash]).is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn two_sessions_hold_the_same_temporary_block() -> Result<()> {
+        let h = build_side().await;
+        let first = h.factory.open_concrete(uuid::Uuid::new_v4())?;
+        let second = h.factory.open_concrete(uuid::Uuid::new_v4())?;
+        let block = block(&h, true);
+        let hash = block.sequence_hash();
+        for session in [&first, &second] {
+            session.commit(vec![hash])?;
+            session.make_available(vec![block.clone()])?;
+            session.test_inject_inbound_frame(Frame::Pull {
+                pull_id: 1,
+                hashes: vec![hash],
+            });
+        }
+        drop(block);
+        first.test_inject_inbound_frame(Frame::PullAck { pull_id: 1 });
+        first.close(None);
+        assert_pool(&h, 31, 0);
+        second.close(None);
+        assert_pool(&h, 31, 0);
+        second.test_inject_inbound_frame(Frame::PullAck { pull_id: 1 });
+        assert_pool(&h, 32, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn watchdog_returns_unpulled_blocks_to_free() -> Result<()> {
+        let h = build_side().await;
+        let session = h.factory.open_concrete(uuid::Uuid::new_v4())?;
+        let block = block(&h, true);
+        session.commit(vec![block.sequence_hash()])?;
+        session.make_available(vec![block])?;
+        let manager =
+            SessionManager::new(tokio::runtime::Handle::current(), Duration::from_millis(10));
+        manager.register(session.clone());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !manager.is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await?;
+        assert_pool(&h, 32, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejected_availability_returns_blocks_to_free() -> Result<()> {
+        let h = build_side().await;
+        let session = h.factory.open_concrete(uuid::Uuid::new_v4())?;
+        let block = block(&h, true);
+        session.commit(vec![block.sequence_hash()])?;
+        session.finish_availability()?;
+        assert!(session.make_available(vec![block]).is_err());
+        assert_pool(&h, 32, 0);
+        session.close(None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_pull_returns_blocks_to_free_after_ack() -> Result<()> {
+        let (h, p) = paired_sides().await;
+        kvbm_engine::p2p::service::VeloLeaderService::new(h.velo.messenger().clone())
+            .with_export_metadata(Arc::new(|| {
+                Box::pin(async { anyhow::bail!("injected metadata export failure") })
+            }))
+            .register_handlers()?;
+        let id = uuid::Uuid::new_v4();
+        let holder = h.factory.open_concrete(id)?;
+        let puller = p
+            .factory
+            .attach(
+                id,
+                h.velo.instance_id(),
+                holder.endpoint().expect("endpoint"),
+            )
+            .await?;
+        let block = block(&h, true);
+        let hash = block.sequence_hash();
+        holder.commit(vec![hash])?;
+        holder.make_available(vec![block])?;
+        holder.finish_availability()?;
+        let mut availability = puller.availability();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !puller
+                .peer_available()
+                .as_slice()
+                .iter()
+                .any(|b| b.hash == hash)
+            {
+                assert!(availability.next().await.is_some());
+            }
+        })
+        .await?;
+        assert_eq!(holder.test_available_pin_count(), 1);
+        assert_pool(&h, 31, 0);
+        let destination = p.g2_manager.allocate_blocks(1).expect("destination");
+        let error =
+            tokio::time::timeout(Duration::from_secs(5), puller.pull(vec![hash], destination))
+                .await?
+                .expect_err("the pull must fail during RDMA setup");
+        assert_eq!(error.to_string(), "rdma_pull_with_opts");
+        assert!(format!("{error:#}").contains("injected metadata export failure"));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while holder.test_available_pin_count() != 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await?;
+        assert_pool(&h, 32, 0);
+        assert_pool(&p, 32, 0);
+        holder.close(None);
+        puller.close(None);
+        Ok(())
+    }
+}
