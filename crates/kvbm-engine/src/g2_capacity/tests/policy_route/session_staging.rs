@@ -12,6 +12,7 @@ use crate::p2p::session::{MockSession, MockSessionFactory, Session, SessionFacto
 #[cfg(feature = "testing-nixl")]
 mod device;
 mod failures;
+mod source_search;
 
 const RESOURCE: LogicalResourceId = LogicalResourceId(7);
 
@@ -65,7 +66,9 @@ impl Fixture {
         route: &PolicyG1G2BoundRoute<G1>,
         ready: TransferCompleteNotification,
     ) -> BoxFuture<'static, Result<()>> {
-        route.stage_for_session(std::mem::take(&mut self.pins), ready, self.holder.clone())
+        let staged = route.stage_to_g2(std::mem::take(&mut self.pins), ready);
+        let holder = self.holder.clone();
+        Box::pin(async move { holder.make_available(staged.await?) })
     }
 
     fn check_ownership(

@@ -110,12 +110,14 @@ pub struct TierSelection {
 // MatchBreakdown — per-tier hit counts (telemetry)
 // ---------------------------------------------------------------------------
 
-/// Per-tier breakdown of where committed hashes were found on the
-/// holder. Field names match the engine's internal
-/// `leader::types::MatchBreakdown` so the engine-side conversion is
-/// trivial.
+/// Per-tier counts of the holder's committed matches.
+/// Device matches need local G1-to-G2 staging before publication.
+/// Host, disk, and object counts name the other source tiers.
+/// Pull-side responses count copied blocks in the host tier.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct MatchBreakdown {
+    #[serde(default)]
+    pub device_blocks: usize,
     /// G2 (host) matches.
     #[serde(default)]
     pub host_blocks: usize,

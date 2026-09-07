@@ -122,6 +122,7 @@ pub struct InstanceLeader {
 
     /// Destination-side G2 capacity and registry facades by logical resource.
     g2_capacities: Arc<G2CapacitySet>,
+    g1_sources: Arc<crate::p2p::g1_source::G1SourceRegistry>,
 
     /// All model-owned G2 managers keyed by stable logical resource identity.
     g2_managers: Arc<BlockManagerSet<G2>>,
@@ -588,6 +589,7 @@ impl InstanceLeaderBuilder {
                 .ok_or_else(|| anyhow::anyhow!("block registry required"))?,
             g2_manager: resolved_g2.primary,
             g2_capacities,
+            g1_sources: Arc::new(crate::p2p::g1_source::G1SourceRegistry::default()),
             g2_managers: resolved_g2.all,
             primary_g2_resource: self.primary_g2_resource,
             g3_manager: self.g3_manager,
@@ -739,6 +741,20 @@ pub struct ScanBlocksResult {
 }
 
 impl InstanceLeader {
+    pub fn install_g1_sources(
+        &self,
+        sources: &[Arc<crate::p2p::g1_source::G1SessionSource>],
+    ) -> Result<()> {
+        self.g1_sources.install(self, sources)
+    }
+
+    pub(crate) fn g1_source(
+        &self,
+        resource: LogicalResourceId,
+    ) -> Option<Arc<crate::p2p::g1_source::G1SessionSource>> {
+        self.g1_sources.get(resource)
+    }
+
     /// Get a reference to the G2 BlockManager.
     pub(crate) fn g2_manager(&self) -> &Arc<BlockManager<G2>> {
         &self.g2_manager

@@ -16,6 +16,7 @@
 
 pub mod control;
 pub mod dispatch;
+pub mod g1_source;
 mod integrity;
 pub mod parallelism;
 mod pull_transaction;

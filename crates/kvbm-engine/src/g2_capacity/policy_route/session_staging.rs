@@ -13,7 +13,6 @@ use tokio::sync::oneshot;
 use super::{PolicyG1G2BoundRoute, PolicyG1G2RouteCore, PolicyG1SourceMetadata};
 use crate::G2;
 use crate::g2_capacity::{RequiredStagingStagedAllocation, reserve_required_staging};
-use crate::p2p::session::Session;
 
 type StagedBlocks = Vec<ImmutableBlock<G2>>;
 
@@ -25,12 +24,30 @@ struct SessionStagingCopy {
 }
 
 impl<T: PolicyG1SourceMetadata> PolicyG1G2BoundRoute<T> {
-    pub fn stage_for_session(
+    pub fn into_session_source(
+        self,
+        manager: &Arc<kvbm_logical::BlockManager<T>>,
+    ) -> Result<Arc<crate::p2p::g1_source::G1SessionSource>>
+    where
+        T: Send + 'static,
+    {
+        ensure!(
+            manager.id() == self.source_manager_id,
+            "session source belongs to another G1 manager"
+        );
+        Ok(crate::p2p::g1_source::G1SessionSource::new(
+            self.core.resource,
+            self.core.capacity.manager_id(),
+            Arc::downgrade(manager),
+            self,
+        ))
+    }
+
+    pub fn stage_to_g2(
         &self,
         source: Vec<ImmutableBlock<T>>,
         writes_complete: TransferCompleteNotification,
-        session: Arc<dyn Session>,
-    ) -> BoxFuture<'static, Result<()>> {
+    ) -> BoxFuture<'static, Result<Vec<ImmutableBlock<G2>>>> {
         let pins = source.iter().map(ImmutableBlock::pin).collect::<Vec<_>>();
         let validation = (|| {
             ensure!(
@@ -77,13 +94,9 @@ impl<T: PolicyG1SourceMetadata> PolicyG1G2BoundRoute<T> {
             return Box::pin(async { Err(anyhow!("runtime rejected session staging task")) });
         }
         Box::pin(async move {
-            let blocks = receiver
+            receiver
                 .await
-                .context("session staging task ended without a result")??;
-            if !blocks.is_empty() {
-                session.make_available(blocks)?;
-            }
-            Ok(())
+                .context("session staging task ended without a result")?
         })
     }
 }

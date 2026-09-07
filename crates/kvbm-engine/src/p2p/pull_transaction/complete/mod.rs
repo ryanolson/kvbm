@@ -98,6 +98,7 @@ pub(super) async fn stage_attached(
         hashes: target_hashes.clone(),
         allocation: staged,
         breakdown: MatchBreakdown {
+            device_blocks: 0,
             host_blocks: target_hashes.len(),
             disk_blocks: 0,
             object_blocks: 0,

@@ -205,24 +205,99 @@ fn register_search_shim(
 // open_transfer_session — substantive logic
 // ---------------------------------------------------------------------------
 
-/// Result of the populator's `find_phase`. Held only briefly: in Sync
-/// mode we read `g2_committed`, `g3_committed`, and `breakdown` into the
-/// response; in either mode the `*_blocks` are consumed by `stage_phase`.
+/// Result of the populator's `find_phase`, with pinned source blocks.
+/// Sync responses contain the selected hashes and the tier breakdown.
+/// The background `stage_phase` consumes the blocks.
 struct FindOutcome {
     g2_committed: Vec<SequenceHash>,
     g2_blocks: Vec<ImmutableBlock<G2>>,
     g3_committed: Vec<SequenceHash>,
     g3_blocks: Vec<ImmutableBlock<G3>>,
+    g1_blocks: Option<Box<dyn super::g1_source::PinnedG1Source>>,
     breakdown: MatchBreakdown,
 }
 
 impl FindOutcome {
-    fn committed(&self) -> Vec<SequenceHash> {
-        let mut out = Vec::with_capacity(self.g2_committed.len() + self.g3_committed.len());
-        out.extend(&self.g2_committed);
-        out.extend(&self.g3_committed);
-        out
+    fn committed(&self, requested: &[SequenceHash]) -> Vec<SequenceHash> {
+        let mut found = self
+            .g2_committed
+            .iter()
+            .chain(&self.g3_committed)
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        if let Some(source) = &self.g1_blocks {
+            found.extend(source.hashes());
+        }
+        requested
+            .iter()
+            .copied()
+            .filter(|hash| found.remove(hash))
+            .collect()
     }
+}
+
+async fn find_phase(
+    leader: &Arc<InstanceLeader>,
+    g2_manager: &Arc<BlockManager<G2>>,
+    resource: LogicalResourceId,
+    hashes: &[SequenceHash],
+    search_mode: SearchMode,
+    tiers: TierSelection,
+) -> Result<FindOutcome, ControlError> {
+    let Some(source) = leader.g1_source(resource) else {
+        return find_lower_tiers(leader, g2_manager, resource, hashes, search_mode, tiers).await;
+    };
+    let lower_tiers = if search_mode == SearchMode::Prefix {
+        TierSelection::default()
+    } else {
+        tiers
+    };
+    let mut found = find_lower_tiers(
+        leader,
+        g2_manager,
+        resource,
+        hashes,
+        SearchMode::Scatter,
+        lower_tiers,
+    )
+    .await?;
+    let mut selected = found
+        .g2_committed
+        .iter()
+        .chain(&found.g3_committed)
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    let missing = hashes
+        .iter()
+        .copied()
+        .filter(|hash| !selected.contains(hash))
+        .collect::<Vec<_>>();
+    found.g1_blocks = source.pin(&missing);
+    if let Some(pins) = &found.g1_blocks {
+        selected.extend(pins.hashes());
+    }
+    if search_mode == SearchMode::Prefix {
+        selected = hashes
+            .iter()
+            .copied()
+            .take_while(|hash| selected.contains(hash))
+            .collect();
+    }
+    found.g2_committed.retain(|hash| selected.contains(hash));
+    found.g3_committed.retain(|hash| selected.contains(hash));
+    found
+        .g2_blocks
+        .retain(|block| selected.contains(&block.sequence_hash()));
+    found
+        .g3_blocks
+        .retain(|block| selected.contains(&block.sequence_hash()));
+    if let Some(pins) = &mut found.g1_blocks {
+        pins.retain(&selected);
+        found.breakdown.device_blocks = pins.hashes().len();
+    }
+    found.breakdown.host_blocks = found.g2_blocks.len();
+    found.breakdown.disk_blocks = found.g3_blocks.len();
+    Ok(found)
 }
 
 /// Scan local tiers per `search_mode` / `tiers`. Synchronous body — both
@@ -233,7 +308,7 @@ impl FindOutcome {
 /// mode preserves the existing semantic (contiguous G2 prefix); extending
 /// the prefix walk into G3 requires careful gap handling that doesn't
 /// pay for itself yet.
-async fn find_phase(
+async fn find_lower_tiers(
     leader: &Arc<InstanceLeader>,
     g2_manager: &Arc<BlockManager<G2>>,
     resource: LogicalResourceId,
@@ -255,6 +330,7 @@ async fn find_phase(
             let g2_committed: Vec<SequenceHash> =
                 g2_blocks.iter().map(|b| b.sequence_hash()).collect();
             let breakdown = MatchBreakdown {
+                device_blocks: 0,
                 host_blocks: g2_blocks.len(),
                 disk_blocks: 0,
                 object_blocks: 0,
@@ -264,6 +340,7 @@ async fn find_phase(
                 g2_blocks,
                 g3_committed: Vec::new(),
                 g3_blocks: Vec::new(),
+                g1_blocks: None,
                 breakdown,
             })
         }
@@ -295,6 +372,7 @@ async fn find_phase(
             }
 
             let breakdown = MatchBreakdown {
+                device_blocks: 0,
                 host_blocks: g2_blocks.len(),
                 disk_blocks: g3_blocks.len(),
                 object_blocks: 0,
@@ -304,16 +382,17 @@ async fn find_phase(
                 g2_blocks,
                 g3_committed,
                 g3_blocks,
+                g1_blocks: None,
                 breakdown,
             })
         }
     }
 }
 
-/// Drive the disagg session's commit / make_available / finish_*
-/// based on `FindOutcome`. G2 blocks are made available immediately;
-/// G3 hashes are committed up front, then staged G3→G2 in the
-/// background before make_available.
+/// Drive the session's commit, availability, and terminator calls.
+/// G1 sources reach temporary G2 before the first availability batch.
+/// G3 sources use the existing local staging path.
+/// Each checksum uses its position in the full committed set.
 ///
 /// Errors propagate as `ControlError::Internal`; on error the caller
 /// is expected to call `session.close(...)` to surface
@@ -323,40 +402,51 @@ async fn stage_phase(
     session: Arc<dyn Session>,
     resource: LogicalResourceId,
     require_payload_integrity: bool,
+    committed: Vec<SequenceHash>,
     find: FindOutcome,
 ) -> Result<(), ControlError> {
     let FindOutcome {
-        g2_committed,
-        g2_blocks,
-        g3_committed,
+        mut g2_blocks,
         g3_blocks,
+        g1_blocks,
         ..
     } = find;
-
-    let g2_count = g2_committed.len();
-    if !g2_committed.is_empty() {
+    let mut ordinals = std::collections::HashMap::with_capacity(committed.len());
+    for (index, hash) in committed.iter().enumerate() {
+        let ordinal = u32::try_from(index)
+            .map_err(|_| ControlError::Internal("payload ordinal exceeds u32".to_owned()))?;
+        ordinals.insert(*hash, ordinal);
+    }
+    // Commit G3 hashes up front so the puller sees the full
+    // committed set via `commits()` before staging completes.
+    if !committed.is_empty() {
         session
-            .commit(g2_committed)
-            .map_err(|e| ControlError::Internal(format!("commit g2: {e:#}")))?;
+            .commit(committed)
+            .map_err(|error| ControlError::Internal(format!("commit blocks: {error:#}")))?;
+    }
+    if let Some(source) = g1_blocks {
+        g2_blocks.extend(
+            source
+                .stage()
+                .await
+                .map_err(|error| ControlError::Internal(format!("stage G1 blocks: {error:#}")))?,
+        );
+    }
+    g2_blocks.sort_by_key(|block| ordinals.get(&block.sequence_hash()).copied());
+    if !g2_blocks.is_empty() {
         publish_available(
             &leader,
             &session,
             resource,
             g2_blocks,
-            0,
+            &ordinals,
             require_payload_integrity,
         )
         .await
         .map_err(|e| ControlError::Internal(format!("make_available g2: {e:#}")))?;
     }
 
-    if !g3_committed.is_empty() {
-        // Commit G3 hashes up front so the puller sees the full
-        // committed set via `commits()` before staging completes.
-        session
-            .commit(g3_committed)
-            .map_err(|e| ControlError::Internal(format!("commit g3: {e:#}")))?;
-
+    if !g3_blocks.is_empty() {
         let parallel_worker = leader.parallel_worker().ok_or_else(|| {
             ControlError::Internal(
                 "G3 staging requires a parallel_worker; leader was built without workers".into(),
@@ -378,7 +468,7 @@ async fn stage_phase(
             &session,
             resource,
             staged.new_g2_blocks,
-            g2_count,
+            &ordinals,
             require_payload_integrity,
         )
         .await
@@ -399,7 +489,7 @@ async fn publish_available(
     session: &Arc<dyn Session>,
     resource: LogicalResourceId,
     blocks: Vec<ImmutableBlock<G2>>,
-    ordinal_offset: usize,
+    ordinals: &std::collections::HashMap<SequenceHash, u32>,
     require_payload_integrity: bool,
 ) -> Result<()> {
     if !require_payload_integrity {
@@ -407,10 +497,10 @@ async fn publish_available(
     }
     let payload_blocks = blocks
         .iter()
-        .enumerate()
-        .map(|(index, block)| {
-            let ordinal = u32::try_from(ordinal_offset + index)
-                .map_err(|_| anyhow::anyhow!("payload ordinal exceeds u32"))?;
+        .map(|block| {
+            let ordinal = *ordinals
+                .get(&block.sequence_hash())
+                .ok_or_else(|| anyhow::anyhow!("available block has no committed ordinal"))?;
             Ok(PayloadBlock {
                 hash: block.sequence_hash(),
                 block_id: block.block_id(),
@@ -437,7 +527,7 @@ async fn publish_available(
 
 /// Engine-side implementation behind [`InstanceLeader::open_transfer_session`].
 ///
-/// G2 + G3 in v1; G4 in v1.1.
+/// G1 sources stage through G2. G3 remains an optional scatter tier.
 pub(crate) async fn open_transfer_session(
     leader: &Arc<InstanceLeader>,
     req: OpenTransferSessionRequest,
@@ -464,7 +554,7 @@ pub(crate) async fn open_transfer_session(
         req.tiers,
     )
     .await?;
-    let committed = find.committed();
+    let committed = find.committed(&req.sequence_hashes);
     let breakdown = find.breakdown;
 
     // Pre-flight: if find_phase produced G3 matches we cannot stage, fail
@@ -547,12 +637,14 @@ pub(crate) async fn open_transfer_session(
     let session_for_task = Arc::clone(&session);
     let require_payload_integrity = req.require_payload_integrity;
     let find_mode = req.find_mode;
+    let stage_committed = committed.clone();
     runtime.spawn(async move {
         match stage_phase(
             leader_for_task,
             Arc::clone(&session_for_task),
             resource,
             require_payload_integrity,
+            stage_committed,
             find,
         )
         .await
