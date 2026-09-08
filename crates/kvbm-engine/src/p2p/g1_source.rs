@@ -12,6 +12,14 @@ use crate::G2;
 use crate::g2_capacity::{PolicyG1G2BoundRoute, PolicyG1SourceMetadata};
 use crate::leader::InstanceLeader;
 
+/// One holder-side source of G1 (device) blocks for remote search.
+///
+/// The logical manager installs one instance per resource and per lane. A
+/// holder search opens a pin set through `G1SessionSource::pins`, then
+/// stages the pinned blocks into G2 through the certified
+/// [`crate::g2_capacity::PolicyG1G2BoundRoute`].
+/// [`G1SessionSource::set_enabled`] revokes new pins. It does not cancel
+/// a copy that already holds its pins.
 pub struct G1SessionSource {
     resource: LogicalResourceId,
     destination_manager: ManagerId,

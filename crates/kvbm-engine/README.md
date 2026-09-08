@@ -18,7 +18,7 @@ The method marks new blocks as temporary before registration. A collision does n
 
 A caller installs resource-bound `G1SessionSource` handles on the holder. The holder keeps weak references, and the logical manager owns the handles. A source exposes only registered blocks, which must represent completed source writes. The logical owner can disable lookup without canceling copies that already hold pins. A physical resource keeps its original logical binding after source retirement.
 
-Holder search combines G1 and G2 hits in request order. Prefix search stops at the first cross-tier gap. Scatter search can also include G3. The publisher sends one batch per tier as that tier lands: the resident G2 hits first, then the staged device blocks, then the staged disk blocks. The publisher assigns checksums the ordinals from the complete committed set.
+Holder search combines G1 and G2 hits in request order. Prefix search stops at the first cross-tier gap. Scatter search can also include G3. The publisher sends one batch per tier as that tier lands: the resident G2 hits first, then the staged device blocks, then the staged disk blocks. The publisher assigns each checksum the ordinal of its hash in the complete committed set.
 
 Rhino installs these sources independently of proactive mirroring. Hub discovery and GLM fixed-state transport remain separate tasks in Rhino's `agent-docs/kvbm-transfer-handoff.md`.
 

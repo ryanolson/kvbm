@@ -159,8 +159,9 @@ pub(super) async fn pull_from(
             sequence_hashes: target.to_vec(),
             search_mode: SearchMode::Prefix,
             find_mode: FindMode::Sync,
-            // This caller pulls whatever the holder commits, so a device
-            // hit is worth the holder's local copy.
+            // Setting `g1: true` makes this caller accept a committed hash
+            // that is resident in G1 or G2. A G1 hit costs the holder a
+            // local copy into a temporary G2 block before the pull.
             tiers: TierSelection {
                 g1: true,
                 ..Default::default()
@@ -181,7 +182,7 @@ pub(super) async fn pull_from(
         } => (capability, committed),
         OpenTransferSessionResponse::NoBlocksFound => {
             // DECLINE REASON (holder side): the candidate holds none of the
-            // target hashes in its G2 — puller moves to the next candidate.
+            // target hashes in G1 or G2. The puller moves to the next candidate.
             crate::engine_audit!(
                 "remote_pull_candidate_declined",
                 %candidate,
@@ -214,8 +215,10 @@ pub(super) async fn pull_from(
         return Ok(false);
     }
 
-    // `selector: None` pulls every committed hash — i.e. the holder's
-    // contiguous G2 prefix of `target` (its authoritative deepest match).
+    // `selector: None` pulls every committed hash — the holder's
+    // contiguous G1-or-G2 prefix of `target` (its authoritative deepest
+    // match). A committed G1 hash is staged to a temporary G2 block
+    // before the pull reads it.
     let resource = capability.resource;
     let pull = leader
         .pull_from_session(PullFromSessionRequest {

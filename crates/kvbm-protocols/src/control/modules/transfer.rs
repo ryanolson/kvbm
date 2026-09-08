@@ -63,8 +63,10 @@ pub const SEARCH_SCATTER_HANDLER: &str = "kvbm.leader.control.search_scatter";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchMode {
-    /// Contiguous prefix — stop at the first miss. Maps to
-    /// `BlockManager::match_blocks`. The right choice for LLM
+    /// Contiguous prefix — stop at the first miss. In G2 this maps to
+    /// `BlockManager::match_blocks`. When `tiers.g1` is set, the walk
+    /// continues into G1 from the cursor that G2 reached, using
+    /// `match_prefix` with `touch = false`. The right choice for LLM
     /// prompt-prefix KV reuse.
     #[default]
     Prefix,
@@ -122,6 +124,7 @@ pub struct TierSelection {
 /// Pull-side responses count copied blocks in the host tier.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct MatchBreakdown {
+    /// G1 (device) matches.
     #[serde(default)]
     pub device_blocks: usize,
     /// G2 (host) matches.

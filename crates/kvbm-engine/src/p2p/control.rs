@@ -641,6 +641,7 @@ pub(crate) async fn open_transfer_session(
         find_mode = ?req.find_mode,
         search_mode = ?req.search_mode,
         committed = committed.len(),
+        g1_hits = breakdown.device_blocks,
         g2_hits = breakdown.host_blocks,
         g3_hits = breakdown.disk_blocks
     );

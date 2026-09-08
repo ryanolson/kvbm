@@ -157,7 +157,7 @@ All emitted on the `kvbm_audit` tracing target.
 | Event | Fields |
 |---|---|
 | `transfer_session_no_matches` | `requested`, `search_mode` |
-| `transfer_session_opened` | `session_id`, `find_mode`, `search_mode`, `committed`, `g2_hits`, `g3_hits` |
+| `transfer_session_opened` | `session_id`, `find_mode`, `search_mode`, `committed`, `g1_hits`, `g2_hits`, `g3_hits` |
 | `transfer_populator_complete` | `session_id` |
 | `transfer_populator_failed` | `session_id`, `error` |
 | `transfer_pull_started` | `session_id`, `source`, `selector_present` |

@@ -26,7 +26,7 @@ With `BlockDuplicationPolicy::Reject`, registration can return an existing prima
 
 A retention policy can adopt a temporary primary through `ImmutableBlock::set_evict_on_reset(false)`. Registration alone does not adopt it. The session retains its pins until each authorized physical transfer settles. The final pin release returns an unadopted temporary primary to the free pool, not the inactive pool.
 
-This API supports the planned G1-to-G2 copies for remote sessions. That transfer path remains unwired. Temporary registration does not change the source G1 retention policy or provide isolated session visibility. A registered temporary primary remains matchable while a pin holds it.
+This API supports G1-to-G2 copies for remote sessions. `PolicyG1G2BoundRoute::stage_to_g2` in kvbm-engine is the live consumer. Holder-side session staging in `kvbm-engine/src/p2p/g1_source.rs` also uses it. Temporary registration does not change the source G1 retention policy or provide isolated session visibility. A registered temporary primary remains matchable while a pin holds it.
 
 ## Usage
 
