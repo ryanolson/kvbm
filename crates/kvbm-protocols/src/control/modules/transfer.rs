@@ -18,9 +18,9 @@
 //! - [`CLOSE_SESSION_HANDLER`] — dispatched at the *holder*. Idempotent
 //!   teardown of a session by id.
 //!
-//! Two legacy handlers ([`SEARCH_PREFIX_HANDLER`], [`SEARCH_SCATTER_HANDLER`])
-//! are retained as thin shims for back-compat with the hub's existing HTTP
-//! routes; they delegate to `open_session` with `find_mode = Sync` and the
+//! Two handlers ([`SEARCH_PREFIX_HANDLER`], [`SEARCH_SCATTER_HANDLER`])
+//! serve as thin shims for the hub's existing HTTP query routes. They
+//! delegate to `open_session` with `find_mode = Sync` and the
 //! corresponding [`SearchMode`].
 
 use std::time::Duration;
@@ -45,14 +45,14 @@ pub const PULL_FROM_SESSION_HANDLER: &str = "kvbm.leader.control.pull_from_sessi
 /// Velo handler name for explicit session teardown.
 pub const CLOSE_SESSION_HANDLER: &str = "kvbm.leader.control.close_session";
 
-/// Legacy handler: contiguous-prefix G2 search, kept as a shim over
-/// `open_session` with `find_mode = Sync`, `tiers = default`, and
-/// `search_mode = Prefix`.
+/// Handler for a hub HTTP query route: contiguous-prefix G2 search, kept
+/// as a shim over `open_session` with `find_mode = Sync`, `tiers = default`,
+/// and `search_mode = Prefix`.
 pub const SEARCH_PREFIX_HANDLER: &str = "kvbm.leader.control.search_prefix";
 
-/// Legacy handler: scatter (gather-all) G2 search, kept as a shim over
-/// `open_session` with `find_mode = Sync`, `tiers = default`, and
-/// `search_mode = Scatter`.
+/// Handler for a hub HTTP query route: scatter (gather-all) G2 search,
+/// kept as a shim over `open_session` with `find_mode = Sync`,
+/// `tiers = default`, and `search_mode = Scatter`.
 pub const SEARCH_SCATTER_HANDLER: &str = "kvbm.leader.control.search_scatter";
 
 // ---------------------------------------------------------------------------
@@ -65,7 +65,7 @@ pub const SEARCH_SCATTER_HANDLER: &str = "kvbm.leader.control.search_scatter";
 pub enum SearchMode {
     /// Contiguous prefix — stop at the first miss. In G2 this maps to
     /// `BlockManager::match_blocks`. When `tiers.g1` is set, the walk
-    /// continues into G1 from the cursor that G2 reached, using
+    /// continues into G1 from the cursor that G2 reached. The walk uses
     /// `match_prefix` with `touch = false`. The right choice for LLM
     /// prompt-prefix KV reuse.
     #[default]
@@ -312,7 +312,7 @@ pub struct CloseTransferSessionResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Legacy search request/response (kept for hub back-compat)
+// Search request/response for the hub's HTTP query routes
 // ---------------------------------------------------------------------------
 
 /// Request for [`SEARCH_PREFIX_HANDLER`] / [`SEARCH_SCATTER_HANDLER`].
@@ -321,10 +321,10 @@ pub struct SearchRequest {
     pub sequence_hashes: Vec<SequenceHash>,
 }
 
-/// Response for the legacy search handlers. Either no matches (no
-/// session was opened) or the id of a freshly-opened disagg session
-/// pre-populated with the matched G2 blocks. The endpoint is resolved
-/// out-of-band (e.g. via the hub peer registry).
+/// Response for the search handlers of the hub HTTP query routes. Either no
+/// matches (no session was opened) or the id of a freshly-opened disagg
+/// session pre-populated with the matched G2 blocks. The endpoint is
+/// resolved out-of-band, for example through the hub peer registry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum SearchResponse {
@@ -390,7 +390,7 @@ mod client {
             self.chan.call(CLOSE_SESSION_HANDLER, &req).await
         }
 
-        /// Legacy: contiguous-prefix G2 search. Shim over
+        /// Hub HTTP query route: contiguous-prefix G2 search. Shim over
         /// `open_session(find_mode = Sync, search_mode = Prefix)`.
         pub async fn search_prefix(
             &self,
@@ -399,7 +399,7 @@ mod client {
             self.chan.call(SEARCH_PREFIX_HANDLER, &req).await
         }
 
-        /// Legacy: scatter (gather-all) G2 search. Shim over
+        /// Hub HTTP query route: scatter (gather-all) G2 search. Shim over
         /// `open_session(find_mode = Sync, search_mode = Scatter)`.
         pub async fn search_scatter(
             &self,

@@ -8,8 +8,8 @@
 //! The handlers in this file are thin shims: deserialize the request,
 //! call an `InstanceLeader` method, wrap the result in a [`ControlReply`],
 //! and return. The substantive logic lives below as free functions
-//! invoked by both the `InstanceLeader` methods and the legacy
-//! `search_prefix` / `search_scatter` back-compat shims. Putting the
+//! invoked by both the `InstanceLeader` methods and the `search_prefix`
+//! / `search_scatter` shims for the hub's HTTP query routes. Putting the
 //! work on `InstanceLeader` keeps the public surface discoverable for
 //! in-process callers and avoids forcing every caller through the velo
 //! wire.
@@ -70,7 +70,7 @@ impl ControlModule for TransferModule {
         register_open_session(messenger, &self.leader)?;
         register_pull_from_session(messenger, &self.leader)?;
         register_close_session(messenger, &self.leader)?;
-        // Legacy back-compat handlers, retained as shims over open_session.
+        // Handlers for the hub HTTP query routes, retained as shims over open_session.
         register_search_prefix(messenger, &self.leader)?;
         register_search_scatter(messenger, &self.leader)?;
         Ok(())
@@ -151,8 +151,9 @@ fn register_search_scatter(messenger: &Arc<Messenger>, leader: &Arc<InstanceLead
     )
 }
 
-/// Adapter: legacy `SearchRequest`/`SearchResponse` over the new
-/// `open_session` path with `find_mode = Sync` and `tiers = default`.
+/// Adapter: `SearchRequest`/`SearchResponse` for the hub's HTTP query
+/// routes, over the `open_session` path with `find_mode = Sync` and
+/// `tiers = default`.
 fn register_search_shim(
     messenger: &Arc<Messenger>,
     leader: &Arc<InstanceLeader>,

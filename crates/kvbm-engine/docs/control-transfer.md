@@ -13,8 +13,8 @@ talks to each.
 | `kvbm.leader.control.open_session` | Holder | Search the leader's tiers, open a holder-side disagg session, populate it. Returns the attach triple `(session_id, instance_id, endpoint)`. |
 | `kvbm.leader.control.pull_from_session` | Puller | Attach to a session living on `request.source_instance_id`, drain its commits/availability, pull blocks into the puller's local G2 pool. Long-poll. |
 | `kvbm.leader.control.close_session` | Holder | Idempotent teardown of a parked session. |
-| `kvbm.leader.control.search_prefix` | Holder | Legacy: shim over `open_session(find_mode = Sync, search_mode = Prefix)`. |
-| `kvbm.leader.control.search_scatter` | Holder | Legacy: shim over `open_session(find_mode = Sync, search_mode = Scatter)`. |
+| `kvbm.leader.control.search_prefix` | Holder | Hub HTTP query route: shim over `open_session(find_mode = Sync, search_mode = Prefix)`. |
+| `kvbm.leader.control.search_scatter` | Holder | Hub HTTP query route: shim over `open_session(find_mode = Sync, search_mode = Scatter)`. |
 
 Wire types live in
 [`kvbm_protocols::control::modules::transfer`](../../kvbm-protocols/src/control/modules/transfer.rs);

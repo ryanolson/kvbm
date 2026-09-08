@@ -159,7 +159,7 @@ pub(super) async fn pull_from(
             sequence_hashes: target.to_vec(),
             search_mode: SearchMode::Prefix,
             find_mode: FindMode::Sync,
-            // Setting `g1: true` makes this caller accept a committed hash
+            // This caller sets `g1: true`, so it accepts a committed hash
             // that is resident in G1 or G2. A G1 hit costs the holder a
             // local copy into a temporary G2 block before the pull.
             tiers: TierSelection {
@@ -217,8 +217,8 @@ pub(super) async fn pull_from(
 
     // `selector: None` pulls every committed hash — the holder's
     // contiguous G1-or-G2 prefix of `target` (its authoritative deepest
-    // match). A committed G1 hash is staged to a temporary G2 block
-    // before the pull reads it.
+    // match). The holder stages a committed G1 hash to a temporary G2
+    // block before the pull reads it.
     let resource = capability.resource;
     let pull = leader
         .pull_from_session(PullFromSessionRequest {
