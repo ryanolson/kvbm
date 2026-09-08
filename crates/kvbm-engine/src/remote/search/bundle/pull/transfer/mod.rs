@@ -98,7 +98,12 @@ impl BundleTransfer for LeaderBundleTransfer {
                     sequence_hashes: hashes,
                     search_mode: SearchMode::Prefix,
                     find_mode: FindMode::Sync,
-                    tiers: TierSelection::default(),
+                    // The bundle pull follows the open, so a device hit is
+                    // worth the holder's local copy.
+                    tiers: TierSelection {
+                        g1: true,
+                        ..Default::default()
+                    },
                     resource: Some(resource),
                     watchdog_ms: Some(duration_millis(watchdog)),
                     registration_epoch: Some(self.registration_epoch),

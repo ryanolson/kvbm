@@ -432,16 +432,29 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
         self.store.has_any_registered_hashes(hashes)
     }
 
+    /// Linear prefix match that counts every hit as a local use.
+    ///
+    /// [`match_prefix`](Self::match_prefix) with `touch = true`. This is
+    /// the reuse path: a matched prefix is about to feed a local request,
+    /// so the frequency tracker must see it.
+    pub fn match_blocks(&self, seq_hash: &[SequenceHash]) -> Vec<ImmutableBlock<T>> {
+        self.match_prefix(seq_hash, true)
+    }
+
     /// Linear prefix match: walks `seq_hash` left-to-right, stopping on
     /// the first hash that hits neither the active nor the inactive pool.
     ///
     /// The whole active-or-inactive prefix is resolved under a **single**
     /// store-mutex acquisition via [`BlockStore::match_prefix_locked_batch`]
     /// — no per-hash registry radix-tree lookup, no per-hash store lock.
-    /// Frequency-tracker touches are batched and applied *after* the store
-    /// lock is released: every returned block is touched exactly once
-    /// (including inactive resurrections).
-    pub fn match_blocks(&self, seq_hash: &[SequenceHash]) -> Vec<ImmutableBlock<T>> {
+    ///
+    /// `touch` selects the retention policy. With `true` the frequency
+    /// tracker sees every returned block exactly once (including inactive
+    /// resurrections), batched *after* the store lock is released. With
+    /// `false` the prefix is read without any retention effect, which is
+    /// what a search on behalf of a remote peer needs: a block another
+    /// node wants must not outrank a block this node still reads.
+    pub fn match_prefix(&self, seq_hash: &[SequenceHash], touch: bool) -> Vec<ImmutableBlock<T>> {
         self.metrics
             .inc_match_hashes_requested(seq_hash.len() as u64);
 
@@ -453,11 +466,7 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
         // ONE store-lock acquisition for the whole active+inactive prefix.
         let inners = self.store.match_prefix_locked_batch(seq_hash);
 
-        // Frequency-tracker touches, batched, AFTER the store lock is
-        // released. Touches every returned hit exactly once — including
-        // inactive resurrections, which the old `find_inactive_primaries`
-        // path never touched.
-        if self.block_registry.has_frequency_tracking() {
+        if touch && self.block_registry.has_frequency_tracking() {
             for inner in &inners {
                 self.block_registry.touch(inner.sequence_hash());
             }
@@ -470,7 +479,7 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
         tracing::debug!(
             num_hashes = seq_hash.len(),
             total_matched = matched.len(),
-            "match_blocks result"
+            "match_prefix result"
         );
         tracing::trace!(matched = ?matched, "matched blocks");
         matched

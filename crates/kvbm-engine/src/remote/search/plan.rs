@@ -159,7 +159,12 @@ pub(super) async fn pull_from(
             sequence_hashes: target.to_vec(),
             search_mode: SearchMode::Prefix,
             find_mode: FindMode::Sync,
-            tiers: TierSelection::default(),
+            // This caller pulls whatever the holder commits, so a device
+            // hit is worth the holder's local copy.
+            tiers: TierSelection {
+                g1: true,
+                ..Default::default()
+            },
             resource: None,
             watchdog_ms: None,
             registration_epoch: None,

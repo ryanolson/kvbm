@@ -29,15 +29,32 @@ can skip the velo round-trip:
 
 ## Search modes
 
-| Mode | G2 lookup | G3 lookup (v1) | Intended use |
-|---|---|---|---|
-| `Prefix` | `BlockManager::match_blocks` (contiguous prefix; stop at first miss) | Not consulted in v1 | LLM prompt-prefix KV reuse |
-| `Scatter` | `BlockManager::scan_matches` with `touch=false` | `scan_matches` for hashes that missed in G2 (only if `tiers.g3 = true`) | Arbitrary-subset reuse, cross-session sharing |
+| Mode | G2 lookup | G1 lookup (only if `tiers.g1 = true`) | G3 lookup (only if `tiers.g3 = true`) | Intended use |
+|---|---|---|---|---|
+| `Prefix` | `BlockManager::match_blocks` (contiguous prefix; stop at first miss) | `match_prefix` with `touch=false`, from the cursor G2 reached | Not consulted in v1 | LLM prompt-prefix KV reuse |
+| `Scatter` | `BlockManager::scan_matches` with `touch=false` | `scan_matches` for hashes that missed in G2 | `scan_matches` for hashes that missed in G2 **and** in G1 | Arbitrary-subset reuse, cross-session sharing |
 
-`Scatter` uses `touch=false` so an RPC search does not perturb the G2
-LRU. `Prefix` deliberately does not extend into G3 in v1 — the
-contiguous-prefix walk would need gap handling that doesn't pay for
-itself yet.
+Every tier beyond G2 is opt-in, and `TierSelection` defaults to all
+tiers off. A holder that gains a G1 source therefore serves the same
+results as before until a caller asks for the device tier. The two
+`open_session` callers that pull set `tiers.g1 = true`; the query-only
+`search_prefix` / `search_scatter` shims keep the default, because they
+read the matched set and never pull.
+
+Tier order is device before disk. A G1 hit costs one local DMA, a G3 hit
+costs a disk read *and* the same DMA, so G3 sees only the hashes G1
+cannot supply. G2 needs no copy and wins over both.
+
+`Scatter` and the G1 walk use `touch=false` so an RPC search does not
+perturb the local LRU: a block a peer wants must not outrank a block
+this node still reads. `Prefix` deliberately does not extend into G3 in
+v1 — the contiguous-prefix walk would need gap handling that does not
+pay for itself yet.
+
+In `Prefix` mode G2 and G1 extend one shared cursor in turn, so a run G2
+serves and a run G1 serves join into one contiguous prefix. The walk
+ends when neither tier advances the cursor. Each run costs one store
+lock, and the pinned G1 set never reaches past the committed prefix.
 
 ## Find modes
 
@@ -53,23 +70,27 @@ scan, not the stage; that keeps the response fast even with
 ## Populator: find_phase + stage_phase
 
 ```text
-find_phase                   stage_phase  (always background)
-─────────                    ───────────
-G2: match_blocks/scan_matches
-  └─ ImmutableBlock<G2>      ┌─ commit(g2_committed)
-                             └─ make_available(g2_blocks)
-(if tiers.g3)
-G3: scan_matches             ┌─ commit(g3_committed)
-  └─ ImmutableBlock<G3>      ├─ stage_g3_to_g2 → new G2 blocks
-                             └─ make_available(new_g2_blocks)
-                             └─ finish_commits / finish_availability
+find_phase                        stage_phase  (always background)
+─────────                         ───────────
+G2: match_blocks/scan_matches     commit(committed)
+  └─ ImmutableBlock<G2>             │
+(if tiers.g1)                       ├─ stage_to_g2 → temporary G2 blocks
+G1: match_prefix/scan_matches       ├─ make_available(g2_blocks + staged)
+  └─ pinned ImmutableBlock<G1>      │
+(if tiers.g3, Scatter only)         ├─ stage_g3_to_g2 → new G2 blocks
+G3: scan_matches                    ├─ make_available(new_g2_blocks)
+  └─ ImmutableBlock<G3>             └─ finish_commits / finish_availability
 ```
 
-`find_phase` is synchronous in body for G2/G3 (in-memory hashmap
-lookups). It is `async fn` for forward-compat with G4 scans in v1.1.
+`find_phase` computes `committed` once, in request order, and every
+per-tier block vector holds a disjoint subset of it in the same order.
+The commit therefore names every selected hash before any copy starts.
 
-`stage_phase` is `async fn` because `stage_g3_to_g2` awaits the
-parallel-worker's local-transfer notification.
+`find_phase` is synchronous in body for G1/G2/G3 (in-memory lookups). It
+is `async fn` for forward-compat with G4 scans in v1.1.
+
+`stage_phase` is `async fn` because `stage_to_g2` and `stage_g3_to_g2`
+await their transfer notifications.
 
 Failures in `stage_phase` call `Session::close(reason)`, which
 propagates `LifecycleEvent::Failed` to any attached puller. The
@@ -154,8 +175,8 @@ All emitted on the `kvbm_audit` tracing target.
   the hub peer registry is v1.1.
 - **G4 not yet wired** through the populator; `tiers.g4 = true` is
   currently a no-op.
-- **`Prefix` mode is G2-only.** G3 is consulted only in `Scatter` mode
-  in v1.
+- **`Prefix` mode reaches G2 and G1 only.** G3 is consulted only in
+  `Scatter` mode in v1.
 
 See `~/.claude/plans/control-transfer-v1.md` for the full design and
 phased build trace.

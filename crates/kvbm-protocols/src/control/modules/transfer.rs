@@ -95,6 +95,12 @@ pub enum FindMode {
 /// Tiers eligible for matching beyond G2 (G2 is always on).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct TierSelection {
+    /// Match in G1 (device); staged G1→G2 in the background before
+    /// `make_available`. Off by default like every tier beyond G2: a
+    /// holder that gains a G1 source must not start copying device
+    /// blocks for a caller that only queries and never pulls.
+    #[serde(default)]
+    pub g1: bool,
     /// Match in G3; staged G3→G2 in the background before
     /// `make_available`. v1 ships this off by default to preserve
     /// existing G2-only behavior — callers opt in.
@@ -420,8 +426,33 @@ mod tests {
     #[test]
     fn tier_selection_defaults_to_g2_only() {
         let t: TierSelection = Default::default();
+        assert!(!t.g1);
         assert!(!t.g3);
         assert!(!t.g4);
+    }
+
+    #[test]
+    fn old_open_request_selects_no_tier_beyond_g2() {
+        let wire = serde_json::json!({
+            "sequence_hashes": [],
+            "tiers": { "g3": true }
+        });
+        let decoded: OpenTransferSessionRequest = serde_json::from_value(wire).unwrap();
+        assert!(!decoded.tiers.g1);
+        assert!(decoded.tiers.g3);
+    }
+
+    #[test]
+    fn tier_selection_ignores_a_tier_key_it_does_not_know() {
+        // `g99` stands for the `g1` key at a holder built before this
+        // field existed. No side of the wire denies unknown fields, so
+        // that holder decodes the request and searches the tiers it does
+        // know instead of failing the open.
+        let wire = serde_json::json!({ "g1": true, "g3": true, "g99": true });
+        let decoded: TierSelection = serde_json::from_value(wire).unwrap();
+        assert!(decoded.g1);
+        assert!(decoded.g3);
+        assert!(!decoded.g4);
     }
 
     #[test]

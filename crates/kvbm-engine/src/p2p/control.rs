@@ -168,6 +168,9 @@ fn register_search_shim(
                 sequence_hashes: req.sequence_hashes,
                 search_mode: mode,
                 find_mode: FindMode::Sync,
+                // Query-only route: the caller reads the matched set and
+                // never pulls, so selecting a tier that must copy before
+                // it can serve would spend a DMA on nothing.
                 tiers: TierSelection::default(),
                 resource: None,
                 watchdog_ms: None,
@@ -209,33 +212,39 @@ fn register_search_shim(
 /// Sync responses contain the selected hashes and the tier breakdown.
 /// The background `stage_phase` consumes the blocks.
 struct FindOutcome {
-    g2_committed: Vec<SequenceHash>,
+    /// Selected hashes in request order. Each tier vector below holds a
+    /// disjoint subset of these hashes, also in request order.
+    committed: Vec<SequenceHash>,
     g2_blocks: Vec<ImmutableBlock<G2>>,
-    g3_committed: Vec<SequenceHash>,
     g3_blocks: Vec<ImmutableBlock<G3>>,
     g1_blocks: Option<Box<dyn super::g1_source::PinnedG1Source>>,
     breakdown: MatchBreakdown,
 }
 
-impl FindOutcome {
-    fn committed(&self, requested: &[SequenceHash]) -> Vec<SequenceHash> {
-        let mut found = self
-            .g2_committed
-            .iter()
-            .chain(&self.g3_committed)
-            .copied()
-            .collect::<std::collections::HashSet<_>>();
-        if let Some(source) = &self.g1_blocks {
-            found.extend(source.hashes());
-        }
-        requested
-            .iter()
-            .copied()
-            .filter(|hash| found.remove(hash))
-            .collect()
-    }
+/// Blocks one tier walk selected, before the G1 pins join them.
+struct TierBlocks {
+    committed: Vec<SequenceHash>,
+    g2_blocks: Vec<ImmutableBlock<G2>>,
+    g3_blocks: Vec<ImmutableBlock<G3>>,
 }
 
+/// Search the holder's tiers for `hashes` and pin what it can serve.
+///
+/// Lookup order is G2, then G1 (`tiers.g1`), then G3 (`tiers.g3`,
+/// `Scatter` only), and a hash goes to the first tier that holds it.
+/// G2 needs no copy at all. A G1 hit costs one local DMA, a G3 hit
+/// costs a disk read *and* the same DMA, so G1 wins wherever both hold a
+/// hash.
+///
+/// `Prefix` walks the request left to right and stops at the first hash
+/// that no selected tier holds. G2 and G1 extend one shared cursor in
+/// turn, so a run G2 serves and a run G1 serves join into one contiguous
+/// prefix; the walk ends when neither tier advances the cursor. G3 stays
+/// out of the prefix walk: a disk gap needs handling that does not pay
+/// for itself yet.
+///
+/// Synchronous body — every tier read is an in-memory lookup. `async fn`
+/// for forward-compat with G4 (object-store) scans in v1.1.
 async fn find_phase(
     leader: &Arc<InstanceLeader>,
     g2_manager: &Arc<BlockManager<G2>>,
@@ -244,149 +253,142 @@ async fn find_phase(
     search_mode: SearchMode,
     tiers: TierSelection,
 ) -> Result<FindOutcome, ControlError> {
-    let Some(source) = leader.g1_source(resource) else {
-        return find_lower_tiers(leader, g2_manager, resource, hashes, search_mode, tiers).await;
-    };
-    let lower_tiers = if search_mode == SearchMode::Prefix {
-        TierSelection::default()
+    let mut pins = if tiers.g1 {
+        leader.g1_source(resource).and_then(|source| source.pins())
     } else {
-        tiers
+        None
     };
-    let mut found = find_lower_tiers(
-        leader,
-        g2_manager,
-        resource,
-        hashes,
-        SearchMode::Scatter,
-        lower_tiers,
-    )
-    .await?;
-    let mut selected = found
-        .g2_committed
-        .iter()
-        .chain(&found.g3_committed)
-        .copied()
-        .collect::<std::collections::HashSet<_>>();
-    let missing = hashes
-        .iter()
-        .copied()
-        .filter(|hash| !selected.contains(hash))
-        .collect::<Vec<_>>();
-    found.g1_blocks = source.pin(&missing);
-    if let Some(pins) = &found.g1_blocks {
-        selected.extend(pins.hashes());
-    }
-    if search_mode == SearchMode::Prefix {
-        selected = hashes
-            .iter()
-            .copied()
-            .take_while(|hash| selected.contains(hash))
-            .collect();
-    }
-    found.g2_committed.retain(|hash| selected.contains(hash));
-    found.g3_committed.retain(|hash| selected.contains(hash));
-    found
-        .g2_blocks
-        .retain(|block| selected.contains(&block.sequence_hash()));
-    found
-        .g3_blocks
-        .retain(|block| selected.contains(&block.sequence_hash()));
-    if let Some(pins) = &mut found.g1_blocks {
-        pins.retain(&selected);
-        found.breakdown.device_blocks = pins.hashes().len();
-    }
-    found.breakdown.host_blocks = found.g2_blocks.len();
-    found.breakdown.disk_blocks = found.g3_blocks.len();
-    Ok(found)
+    let TierBlocks {
+        committed,
+        g2_blocks,
+        g3_blocks,
+    } = match search_mode {
+        SearchMode::Prefix => find_prefix(g2_manager, hashes, &mut pins),
+        SearchMode::Scatter => {
+            find_scatter(leader, g2_manager, resource, hashes, tiers, &mut pins)?
+        }
+    };
+    // Only served blocks are pinned, so a set that stayed empty carries
+    // no copy and no capacity reservation.
+    let g1_blocks = pins.filter(|pins| pins.len() > 0);
+    let breakdown = MatchBreakdown {
+        device_blocks: g1_blocks.as_ref().map_or(0, |pins| pins.len()),
+        host_blocks: g2_blocks.len(),
+        disk_blocks: g3_blocks.len(),
+        object_blocks: 0,
+    };
+    Ok(FindOutcome {
+        committed,
+        g2_blocks,
+        g3_blocks,
+        g1_blocks,
+        breakdown,
+    })
 }
 
-/// Scan local tiers per `search_mode` / `tiers`. Synchronous body — both
-/// G2 and G3 scans are in-memory hashmap lookups. `async fn` for
-/// forward-compat with G4 (object-store) scans in v1.1.
+/// Contiguous prefix across G2 and G1, from one cursor.
 ///
-/// In v1, **G3 is only consulted in `SearchMode::Scatter`**. The Prefix
-/// mode preserves the existing semantic (contiguous G2 prefix); extending
-/// the prefix walk into G3 requires careful gap handling that doesn't
-/// pay for itself yet.
-async fn find_lower_tiers(
+/// Each tier resolves its run under a single store lock, so a request of
+/// N hashes costs one lock per run rather than one per hash. G2 keeps its
+/// LRU touch: a prefix it serves is a prefix the puller reads.
+fn find_prefix(
+    g2_manager: &Arc<BlockManager<G2>>,
+    hashes: &[SequenceHash],
+    pins: &mut Option<Box<dyn super::g1_source::PinnedG1Source>>,
+) -> TierBlocks {
+    let mut g2_blocks: Vec<ImmutableBlock<G2>> = Vec::new();
+    let mut cursor = 0;
+    loop {
+        let run = g2_manager.match_blocks(&hashes[cursor..]);
+        let g2_run = run.len();
+        cursor += g2_run;
+        g2_blocks.extend(run);
+        let g1_run = pins
+            .as_mut()
+            .map_or(0, |pins| pins.pin_prefix(&hashes[cursor..]));
+        cursor += g1_run;
+        if g2_run + g1_run == 0 {
+            break;
+        }
+    }
+    TierBlocks {
+        committed: hashes[..cursor].to_vec(),
+        g2_blocks,
+        g3_blocks: Vec::new(),
+    }
+}
+
+/// Every hash any selected tier holds, gaps included.
+fn find_scatter(
     leader: &Arc<InstanceLeader>,
     g2_manager: &Arc<BlockManager<G2>>,
     resource: LogicalResourceId,
     hashes: &[SequenceHash],
-    search_mode: SearchMode,
     tiers: TierSelection,
-) -> Result<FindOutcome, ControlError> {
-    if search_mode == SearchMode::Scatter && tiers.g3 && resource != leader.primary_g2_resource() {
+    pins: &mut Option<Box<dyn super::g1_source::PinnedG1Source>>,
+) -> Result<TierBlocks, ControlError> {
+    if tiers.g3 && resource != leader.primary_g2_resource() {
         return Err(ControlError::Internal(format!(
             "resource_g3_unsupported: logical resource {resource:?} requested G3, but G3 is only configured for primary resource {:?}",
             leader.primary_g2_resource()
         )));
     }
 
-    match search_mode {
-        SearchMode::Prefix => {
-            // Contiguous prefix in G2 only. G3/G4 not searched.
-            let g2_blocks = g2_manager.match_blocks(hashes);
-            let g2_committed: Vec<SequenceHash> =
-                g2_blocks.iter().map(|b| b.sequence_hash()).collect();
-            let breakdown = MatchBreakdown {
-                device_blocks: 0,
-                host_blocks: g2_blocks.len(),
-                disk_blocks: 0,
-                object_blocks: 0,
-            };
-            Ok(FindOutcome {
-                g2_committed,
-                g2_blocks,
-                g3_committed: Vec::new(),
-                g3_blocks: Vec::new(),
-                g1_blocks: None,
-                breakdown,
-            })
-        }
-        SearchMode::Scatter => {
-            let g2_map = g2_manager.scan_matches(hashes, /* touch */ false);
-            let g2_committed: Vec<SequenceHash> = g2_map.keys().copied().collect();
-            let g2_blocks: Vec<ImmutableBlock<G2>> = g2_map.into_values().collect();
+    // touch = false: an RPC search must not perturb the local G2 LRU.
+    let mut g2_map = g2_manager.scan_matches(hashes, /* touch */ false);
+    let missing: Vec<SequenceHash> = hashes
+        .iter()
+        .copied()
+        .filter(|hash| !g2_map.contains_key(hash))
+        .collect();
+    if let Some(pins) = pins.as_mut() {
+        pins.pin(&missing);
+    }
+    let mut g1_hashes: std::collections::HashSet<SequenceHash> = pins
+        .as_ref()
+        .map(|pins| pins.hashes().into_iter().collect())
+        .unwrap_or_default();
 
-            let mut g3_committed: Vec<SequenceHash> = Vec::new();
-            let mut g3_blocks: Vec<ImmutableBlock<G3>> = Vec::new();
-
-            if tiers.g3
-                && let Some(g3_manager) = leader.g3_manager()
-            {
-                let g2_set: std::collections::HashSet<SequenceHash> =
-                    g2_committed.iter().copied().collect();
-                let remaining: Vec<SequenceHash> = hashes
-                    .iter()
-                    .filter(|h| !g2_set.contains(h))
-                    .copied()
-                    .collect();
-                if !remaining.is_empty() {
-                    let g3_map = g3_manager.scan_matches(&remaining, false);
-                    for (h, b) in g3_map {
-                        g3_committed.push(h);
-                        g3_blocks.push(b);
-                    }
-                }
-            }
-
-            let breakdown = MatchBreakdown {
-                device_blocks: 0,
-                host_blocks: g2_blocks.len(),
-                disk_blocks: g3_blocks.len(),
-                object_blocks: 0,
-            };
-            Ok(FindOutcome {
-                g2_committed,
-                g2_blocks,
-                g3_committed,
-                g3_blocks,
-                g1_blocks: None,
-                breakdown,
-            })
+    let mut g3_map = std::collections::HashMap::new();
+    if tiers.g3
+        && let Some(g3_manager) = leader.g3_manager()
+    {
+        // A device copy beats a disk read, so the disk tier only sees the
+        // hashes G1 could not supply.
+        let remaining: Vec<SequenceHash> = missing
+            .iter()
+            .copied()
+            .filter(|hash| !g1_hashes.contains(hash))
+            .collect();
+        if !remaining.is_empty() {
+            g3_map = g3_manager.scan_matches(&remaining, false);
         }
     }
+
+    let mut committed = Vec::new();
+    let mut g2_blocks = Vec::new();
+    let mut g3_blocks = Vec::new();
+    for hash in hashes {
+        let served = if let Some(block) = g2_map.remove(hash) {
+            g2_blocks.push(block);
+            true
+        } else if g1_hashes.remove(hash) {
+            true
+        } else if let Some(block) = g3_map.remove(hash) {
+            g3_blocks.push(block);
+            true
+        } else {
+            false
+        };
+        if served {
+            committed.push(*hash);
+        }
+    }
+    Ok(TierBlocks {
+        committed,
+        g2_blocks,
+        g3_blocks,
+    })
 }
 
 /// Drive the session's commit, availability, and terminator calls.
@@ -402,10 +404,10 @@ async fn stage_phase(
     session: Arc<dyn Session>,
     resource: LogicalResourceId,
     require_payload_integrity: bool,
-    committed: Vec<SequenceHash>,
     find: FindOutcome,
 ) -> Result<(), ControlError> {
     let FindOutcome {
+        committed,
         mut g2_blocks,
         g3_blocks,
         g1_blocks,
@@ -417,8 +419,9 @@ async fn stage_phase(
             .map_err(|_| ControlError::Internal("payload ordinal exceeds u32".to_owned()))?;
         ordinals.insert(*hash, ordinal);
     }
-    // Commit G3 hashes up front so the puller sees the full
-    // committed set via `commits()` before staging completes.
+    // Commit every selected hash up front, whichever tier holds it, so
+    // an attached puller reads the full set from `commits()` while the
+    // G1 and G3 copies still run.
     if !committed.is_empty() {
         session
             .commit(committed)
@@ -554,7 +557,7 @@ pub(crate) async fn open_transfer_session(
         req.tiers,
     )
     .await?;
-    let committed = find.committed(&req.sequence_hashes);
+    let committed = find.committed.clone();
     let breakdown = find.breakdown;
 
     // Pre-flight: if find_phase produced G3 matches we cannot stage, fail
@@ -637,14 +640,12 @@ pub(crate) async fn open_transfer_session(
     let session_for_task = Arc::clone(&session);
     let require_payload_integrity = req.require_payload_integrity;
     let find_mode = req.find_mode;
-    let stage_committed = committed.clone();
     runtime.spawn(async move {
         match stage_phase(
             leader_for_task,
             Arc::clone(&session_for_task),
             resource,
             require_payload_integrity,
-            stage_committed,
             find,
         )
         .await

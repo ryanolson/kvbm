@@ -1,33 +1,63 @@
 use super::*;
+use crate::G3;
 use crate::p2p::g1_source::G1SessionSource;
 use kvbm_protocols::control::modules::transfer::{
-    FindMode, OpenTransferSessionRequest, OpenTransferSessionResponse, SearchMode,
+    FindMode, OpenTransferSessionRequest, OpenTransferSessionResponse, SearchMode, TierSelection,
 };
 
 struct Holder {
     fixture: Fixture,
     leader: Arc<InstanceLeader>,
     source: Arc<G1SessionSource>,
-    transfer: Arc<ImmediateTransfer>,
     sessions: Arc<MockSessionFactory>,
+}
+
+/// Select the device tier. Every tier beyond G2 is opt-in, so a holder
+/// search reaches G1 only for a caller that intends to pull.
+fn device_tier() -> TierSelection {
+    TierSelection {
+        g1: true,
+        ..Default::default()
+    }
 }
 
 impl Holder {
     async fn new(count: usize) -> Result<Self> {
+        Self::with_transfer(count, Arc::new(ImmediateTransfer::default())).await
+    }
+
+    async fn with_transfer(
+        count: usize,
+        transfer: Arc<dyn PolicyG1G2TransferExecutor>,
+    ) -> Result<Self> {
+        Self::build(count, transfer, None).await
+    }
+
+    async fn with_disk(
+        count: usize,
+        transfer: Arc<dyn PolicyG1G2TransferExecutor>,
+        g3: Arc<BlockManager<G3>>,
+    ) -> Result<Self> {
+        Self::build(count, transfer, Some(g3)).await
+    }
+
+    async fn build(
+        count: usize,
+        transfer: Arc<dyn PolicyG1G2TransferExecutor>,
+        g3: Option<Arc<BlockManager<G3>>>,
+    ) -> Result<Self> {
         let fixture = Fixture::new(count, count + 2)?;
-        let transfer = Arc::new(ImmediateTransfer::default());
-        let source = fixture
-            .route(transfer.clone())
-            .into_session_source(&fixture.g1)?;
+        let source = fixture.route(transfer).into_session_source(&fixture.g1)?;
         let mut managers = BlockManagerSet::new();
         managers.insert(RESOURCE, fixture.g2.clone())?;
-        let leader = Arc::new(
-            InstanceLeader::builder()
-                .messenger(create_messenger_tcp().await?)
-                .registry(BlockRegistry::new())
-                .g2_manager_set(Arc::new(managers), RESOURCE)
-                .build()?,
-        );
+        let mut builder = InstanceLeader::builder()
+            .messenger(create_messenger_tcp().await?)
+            .registry(BlockRegistry::new())
+            .g2_manager_set(Arc::new(managers), RESOURCE);
+        if let Some(g3) = g3 {
+            builder = builder.g3_manager(g3);
+        }
+        let leader = Arc::new(builder.build()?);
         let sessions = MockSessionFactory::new();
         ensure!(leader.set_session_factory(sessions.clone()));
         leader.install_g1_sources(std::slice::from_ref(&source))?;
@@ -35,29 +65,36 @@ impl Holder {
             fixture,
             leader,
             source,
-            transfer,
             sessions,
         })
     }
 
-    async fn open(&self, mode: SearchMode) -> Result<Vec<SequenceHash>> {
-        match self
-            .leader
-            .open_transfer_session(OpenTransferSessionRequest {
-                sequence_hashes: self.fixture.hashes.clone(),
-                resource: Some(RESOURCE),
-                find_mode: FindMode::Sync,
-                search_mode: mode,
-                ..Default::default()
-            })
-            .await?
-        {
+    async fn open(&self, mode: SearchMode, tiers: TierSelection) -> Result<Vec<SequenceHash>> {
+        match self.response(mode, tiers).await? {
             OpenTransferSessionResponse::Sync { committed, .. } => Ok(committed),
             OpenTransferSessionResponse::NoBlocksFound => Ok(Vec::new()),
             OpenTransferSessionResponse::Async { .. } => {
                 anyhow::bail!("unexpected asynchronous result")
             }
         }
+    }
+
+    async fn response(
+        &self,
+        mode: SearchMode,
+        tiers: TierSelection,
+    ) -> Result<OpenTransferSessionResponse> {
+        Ok(self
+            .leader
+            .open_transfer_session(OpenTransferSessionRequest {
+                sequence_hashes: self.fixture.hashes.clone(),
+                resource: Some(RESOURCE),
+                find_mode: FindMode::Sync,
+                search_mode: mode,
+                tiers,
+                ..Default::default()
+            })
+            .await?)
     }
 
     async fn available(&self) -> Result<Arc<MockSession>> {
@@ -71,8 +108,9 @@ impl Holder {
 }
 
 #[tokio::test]
-async fn holder_finds_g1_only_blocks_and_stages_temporary_g2() -> Result<()> {
-    let holder = Holder::new(3).await?;
+async fn default_tiers_keep_the_holder_g2_only() -> Result<()> {
+    let transfer = Arc::new(ImmediateTransfer::default());
+    let holder = Holder::with_transfer(3, transfer.clone()).await?;
     ensure!(
         holder
             .fixture
@@ -80,23 +118,175 @@ async fn holder_finds_g1_only_blocks_and_stages_temporary_g2() -> Result<()> {
             .match_blocks(&holder.fixture.hashes)
             .is_empty()
     );
-    ensure!(holder.open(SearchMode::Prefix).await? == holder.fixture.hashes);
+    ensure!(
+        holder
+            .open(SearchMode::Prefix, TierSelection::default())
+            .await?
+            .is_empty(),
+        "a caller that does not select G1 must see the G2-only result"
+    );
+    ensure!(
+        transfer.calls() == 0,
+        "an unselected tier must not start a device copy"
+    );
+    ensure!(holder.open(SearchMode::Prefix, device_tier()).await? == holder.fixture.hashes);
+    Ok(())
+}
+
+#[tokio::test]
+async fn prefix_search_keeps_the_single_lock_g2_walk() -> Result<()> {
+    let holder = Holder::new(3).await?;
+    let hashes = holder.fixture.hashes.clone();
+    drop(retained(&holder.fixture.g2, &[hashes[0]])?);
+    let before = holder.fixture.g2.metrics().snapshot();
+    ensure!(holder.open(SearchMode::Prefix, device_tier()).await? == hashes);
+    holder.available().await?;
+    let after = holder.fixture.g2.metrics().snapshot();
+    ensure!(
+        after.match_hashes_requested == before.match_hashes_requested + 3,
+        "the prefix walk must reach G2 through one match_prefix per run"
+    );
+    // Staging dedups its two pinned G1 hashes against G2 with one scatter
+    // scan. The search itself must add none.
+    ensure!(
+        after.scan_hashes_requested == before.scan_hashes_requested + 2,
+        "a Prefix search must not scatter-scan G2"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn prefix_search_pins_only_the_served_prefix() -> Result<()> {
+    let mut holder = Holder::new(4).await?;
+    let absent = holder.fixture.pins.remove(1);
+    absent.set_evict_on_reset(true);
+    drop(absent);
+    // Leave the blocks past the gap registered but inactive.
+    holder.fixture.pins.truncate(1);
+    let hashes = holder.fixture.hashes.clone();
+    let before = holder.fixture.g1.metrics().snapshot();
+    ensure!(holder.open(SearchMode::Prefix, device_tier()).await? == vec![hashes[0]]);
+    let after = holder.fixture.g1.metrics().snapshot();
+    ensure!(
+        after.scan_hashes_requested == before.scan_hashes_requested,
+        "a Prefix search must not scatter-scan G1"
+    );
+    ensure!(
+        after.inactive_pool_size == before.inactive_pool_size,
+        "the walk must not promote a block past the prefix gap"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn scatter_prefers_a_device_hit_over_a_disk_hit() -> Result<()> {
+    let transfer = Arc::new(ImmediateTransfer::default());
+    let g3 = Arc::new(
+        TestManagerBuilder::<G3>::new()
+            .block_count(2)
+            .block_size(4)
+            .build(),
+    );
+    let holder = Holder::with_disk(1, transfer.clone(), Arc::clone(&g3)).await?;
+    let hashes = holder.fixture.hashes.clone();
+    drop(retained(&g3, &hashes)?);
+
+    // Control: the disk tier holds the hash and the scatter walk reaches
+    // it. This holder has no parallel worker, so a G3 selection fails the
+    // open before any session exists.
+    let disk_only = holder
+        .response(
+            SearchMode::Scatter,
+            TierSelection {
+                g3: true,
+                ..Default::default()
+            },
+        )
+        .await;
+    let error = format!(
+        "{:#}",
+        disk_only
+            .err()
+            .context("a G3 hit without a parallel worker must fail the open")?
+    );
+    ensure!(error.contains("g3_requires_parallel_worker"), "{error}");
+
+    let before = g3.metrics().snapshot();
+    match holder
+        .response(
+            SearchMode::Scatter,
+            TierSelection {
+                g1: true,
+                g3: true,
+                g4: false,
+            },
+        )
+        .await?
+    {
+        OpenTransferSessionResponse::Sync {
+            committed,
+            breakdown,
+            ..
+        } => {
+            ensure!(committed == hashes);
+            ensure!(breakdown.device_blocks == 1);
+            ensure!(breakdown.disk_blocks == 0);
+            ensure!(breakdown.host_blocks == 0);
+        }
+        _ => anyhow::bail!("a device hit must open a synchronous session"),
+    }
+    ensure!(
+        g3.metrics().snapshot().scan_hashes_requested == before.scan_hashes_requested,
+        "G1 supplied every miss, so the disk tier must stay unread"
+    );
+    let session = holder.available().await?;
+    ensure!(session.make_available_calls() == vec![hashes]);
+    ensure!(transfer.records()[0].src == LogicalLayoutHandle::G1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn disabling_the_source_mid_copy_does_not_cancel_it() -> Result<()> {
+    let transfer = gated_transfer();
+    let holder = Holder::with_transfer(1, transfer.clone()).await?;
+    ensure!(holder.open(SearchMode::Prefix, device_tier()).await? == holder.fixture.hashes);
+    transfer.started.wait().await;
+    holder.source.set_enabled(false);
+    transfer.release.wait().await;
     let session = holder.available().await?;
     ensure!(session.make_available_calls() == vec![holder.fixture.hashes.clone()]);
-    ensure!(holder.transfer.records()[0].src_blocks.len() == 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn holder_finds_g1_only_blocks_and_stages_temporary_g2() -> Result<()> {
+    let transfer = Arc::new(ImmediateTransfer::default());
+    let holder = Holder::with_transfer(3, transfer.clone()).await?;
+    ensure!(
+        holder
+            .fixture
+            .g2
+            .match_blocks(&holder.fixture.hashes)
+            .is_empty()
+    );
+    ensure!(holder.open(SearchMode::Prefix, device_tier()).await? == holder.fixture.hashes);
+    let session = holder.available().await?;
+    ensure!(session.make_available_calls() == vec![holder.fixture.hashes.clone()]);
+    ensure!(transfer.records()[0].src_blocks.len() == 3);
     ensure!(holder.fixture.g1.match_blocks(&holder.fixture.hashes).len() == 3);
     Ok(())
 }
 
 #[tokio::test]
 async fn mixed_g1_g2_prefix_keeps_request_order_and_copies_only_misses() -> Result<()> {
-    let holder = Holder::new(3).await?;
+    let transfer = Arc::new(ImmediateTransfer::default());
+    let holder = Holder::with_transfer(3, transfer.clone()).await?;
     let hashes = &holder.fixture.hashes;
     drop(retained(&holder.fixture.g2, &[hashes[0], hashes[2]])?);
-    ensure!(holder.open(SearchMode::Prefix).await? == *hashes);
+    ensure!(holder.open(SearchMode::Prefix, device_tier()).await? == *hashes);
     let session = holder.available().await?;
     ensure!(session.make_available_calls() == vec![hashes.clone()]);
-    let records = holder.transfer.records();
+    let records = transfer.records();
     ensure!(records.len() == 1);
     ensure!(records[0].src_blocks == vec![holder.fixture.pins[1].block_id()]);
     Ok(())
@@ -110,8 +300,8 @@ async fn prefix_stops_at_a_cross_tier_hole_but_scatter_keeps_later_hits() -> Res
     drop(absent);
     let hashes = &holder.fixture.hashes;
     drop(retained(&holder.fixture.g2, &[hashes[0]])?);
-    ensure!(holder.open(SearchMode::Prefix).await? == vec![hashes[0]]);
-    ensure!(holder.open(SearchMode::Scatter).await? == vec![hashes[0], hashes[2]]);
+    ensure!(holder.open(SearchMode::Prefix, device_tier()).await? == vec![hashes[0]]);
+    ensure!(holder.open(SearchMode::Scatter, device_tier()).await? == vec![hashes[0], hashes[2]]);
     Ok(())
 }
 
@@ -130,6 +320,7 @@ async fn dropping_source_authority_removes_it_from_holder_search() -> Result<()>
             sequence_hashes: fixture.hashes.clone(),
             resource: Some(RESOURCE),
             find_mode: FindMode::Sync,
+            tiers: device_tier(),
             ..Default::default()
         })
         .await?;
@@ -148,7 +339,7 @@ async fn source_installation_rejects_another_destination_manager() -> Result<()>
         .route(Arc::new(ImmediateTransfer::default()))
         .into_session_source(&foreign.g1)?;
     ensure!(holder.leader.install_g1_sources(&[source]).is_err());
-    ensure!(holder.open(SearchMode::Prefix).await? == holder.fixture.hashes);
+    ensure!(holder.open(SearchMode::Prefix, device_tier()).await? == holder.fixture.hashes);
     Ok(())
 }
 

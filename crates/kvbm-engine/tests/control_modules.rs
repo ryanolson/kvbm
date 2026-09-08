@@ -973,6 +973,7 @@ async fn open_transfer_session_g3_without_parallel_worker_errors() {
             search_mode: SearchMode::Scatter,
             find_mode: FindMode::Sync,
             tiers: TierSelection {
+                g1: false,
                 g3: false,
                 g4: false,
             },
@@ -994,6 +995,7 @@ async fn open_transfer_session_g3_without_parallel_worker_errors() {
             search_mode: SearchMode::Scatter,
             find_mode: FindMode::Sync,
             tiers: TierSelection {
+                g1: false,
                 g3: true,
                 g4: false,
             },
@@ -1058,6 +1060,7 @@ async fn open_transfer_session_g3_ignored_in_prefix_mode() {
             search_mode: SearchMode::Prefix,
             find_mode: FindMode::Sync,
             tiers: TierSelection {
+                g1: false,
                 g3: true,
                 g4: false,
             },
