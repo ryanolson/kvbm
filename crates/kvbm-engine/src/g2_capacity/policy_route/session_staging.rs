@@ -49,7 +49,7 @@ impl<T: PolicyG1SourceMetadata> PolicyG1G2BoundRoute<T> {
     /// caller cannot fail to satisfy, and the parameter would hide the real
     /// rule at the registration seam. The Rhino half of the same rule lives on
     /// `KvRuntime::register_request_blocks`.
-    pub fn stage_to_g2(
+    pub(crate) fn stage_to_g2(
         &self,
         source: Vec<ImmutableBlock<T>>,
     ) -> BoxFuture<'static, Result<Vec<ImmutableBlock<G2>>>> {
@@ -91,8 +91,8 @@ impl<T: PolicyG1SourceMetadata> PolicyG1G2BoundRoute<T> {
             undrained: false,
         };
         let spawned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            runtime.spawn_blocking(move || {
-                let result = copy.execute(&sender);
+            runtime.spawn(async move {
+                let result = copy.execute(&sender).await;
                 drop(copy);
                 let _ = sender.send(result);
             })
@@ -109,7 +109,10 @@ impl<T: PolicyG1SourceMetadata> PolicyG1G2BoundRoute<T> {
 }
 
 impl SessionStagingCopy {
-    fn execute(&mut self, sender: &oneshot::Sender<Result<StagedBlocks>>) -> Result<StagedBlocks> {
+    async fn execute(
+        &mut self,
+        sender: &oneshot::Sender<Result<StagedBlocks>>,
+    ) -> Result<StagedBlocks> {
         ensure!(
             !sender.is_closed(),
             "session staging was canceled before dispatch"
@@ -156,7 +159,7 @@ impl SessionStagingCopy {
                     return Err(error.context("session staging dispatch failed"));
                 }
             };
-            self.settle(receipt.drain())?;
+            self.settle(receipt.into_completion().await)?;
             self.source.clear();
             ensure!(
                 !sender.is_closed(),
@@ -225,6 +228,10 @@ impl SessionStagingCopy {
 /// `Arc` joins the leak because it keeps the transfer executor alive: the
 /// leader, the workers, and the registered layouts must outlive a copy that
 /// can still run. The forgotten allocation already holds its slot owner.
+///
+/// A runtime shutdown drops the staging task at its await point, which
+/// reaches this path with `undrained` set. The copy is then exactly as
+/// unproven as a panic or an uncertain drain, so it gets the same answer.
 impl Drop for SessionStagingCopy {
     fn drop(&mut self) {
         if self.undrained {

@@ -73,13 +73,14 @@ scan, not the stage; that keeps the response fast even with
 find_phase                        stage_phase  (always background)
 ─────────                         ───────────
 G2: match_blocks/scan_matches     commit(committed)
-  └─ ImmutableBlock<G2>             │
-(if tiers.g1)                       ├─ stage_to_g2 → temporary G2 blocks
-G1: match_prefix/scan_matches       ├─ make_available(g2_blocks + staged)
-  └─ pinned ImmutableBlock<G1>      │
-(if tiers.g3, Scatter only)         ├─ stage_g3_to_g2 → new G2 blocks
-G3: scan_matches                    ├─ make_available(new_g2_blocks)
-  └─ ImmutableBlock<G3>             └─ finish_commits / finish_availability
+  └─ ImmutableBlock<G2>             ├─ make_available(g2_blocks)
+(if tiers.g1)                       │
+G1: match_prefix/scan_matches       ├─ stage_to_g2 → temporary G2 blocks
+  └─ pinned ImmutableBlock<G1>      ├─ make_available(staged)
+(if tiers.g3, Scatter only)         │
+G3: scan_matches                    ├─ stage_g3_to_g2 → new G2 blocks
+  └─ ImmutableBlock<G3>             ├─ make_available(new_g2_blocks)
+                                    └─ finish_commits / finish_availability
 ```
 
 `find_phase` computes `committed` once, in request order, and every
@@ -91,6 +92,10 @@ is `async fn` for forward-compat with G4 scans in v1.1.
 
 `stage_phase` is `async fn` because `stage_to_g2` and `stage_g3_to_g2`
 await their transfer notifications.
+
+Publication is tiered. The resident G2 batch goes out before the device
+copy starts, so an attached puller reads the hits that need no copy
+while the copy runs. Each tier publishes its own batch in request order.
 
 Failures in `stage_phase` call `Session::close(reason)`, which
 propagates `LifecycleEvent::Failed` to any attached puller. The

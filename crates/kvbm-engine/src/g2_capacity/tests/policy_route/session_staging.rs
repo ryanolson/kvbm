@@ -224,6 +224,45 @@ async fn delayed_copy_keeps_sources_destinations_and_exact_owner_until_drain() -
     Ok(())
 }
 
+/// A parked copy must leave the blocking pool free.
+///
+/// The pool is the only place `spawn_blocking` can run. A stager that
+/// parks there starves every offload supervisor and every other blocking
+/// task the runtime owns for the whole length of one PCIe copy.
+#[test]
+fn staging_does_not_occupy_the_blocking_pool() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()?;
+    let handle = runtime.handle().clone();
+    runtime.block_on(async move {
+        let mut f = Fixture::new(1, 1)?;
+        let transfer = gated_transfer();
+        let route = bound_route_with_runtime(
+            f.capacity.clone(),
+            RESOURCE,
+            transfer.clone(),
+            &f.g1,
+            handle,
+        );
+        let completion = f.submit(&route);
+        transfer.started.wait().await;
+        let free = tokio::time::timeout(
+            Duration::from_millis(500),
+            tokio::task::spawn_blocking(|| ()),
+        )
+        .await
+        .is_ok();
+        // Release the copy before the assertion. A parked blocking task
+        // holds the runtime open at drop and turns a failure into a hang.
+        transfer.release.wait().await;
+        completion.await?;
+        ensure!(free, "the parked stager occupied the only blocking thread");
+        Ok(())
+    })
+}
+
 async fn interrupted_copy(timeout: bool) -> Result<()> {
     let mut f = Fixture::new(1, 1)?;
     let transfer = gated_transfer();

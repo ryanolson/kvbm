@@ -97,12 +97,17 @@ impl Holder {
             .await?)
     }
 
+    fn session(&self) -> Result<Arc<MockSession>> {
+        self.sessions.last_opened().context("opened holder session")
+    }
+
+    /// Wait for the populator to finish every availability batch.
+    ///
+    /// Publication is tiered, so a wait on the first batch would read a
+    /// partial set and race the batches that follow it.
     async fn available(&self) -> Result<Arc<MockSession>> {
-        let session = self
-            .sessions
-            .last_opened()
-            .context("opened holder session")?;
-        wait_for(|| !session.make_available_calls().is_empty()).await?;
+        let session = self.session()?;
+        wait_for(|| session.finish_availability_called()).await?;
         Ok(session)
     }
 }
@@ -283,12 +288,75 @@ async fn mixed_g1_g2_prefix_keeps_request_order_and_copies_only_misses() -> Resu
     let holder = Holder::with_transfer(3, transfer.clone()).await?;
     let hashes = &holder.fixture.hashes;
     drop(retained(&holder.fixture.g2, &[hashes[0], hashes[2]])?);
-    ensure!(holder.open(SearchMode::Prefix, device_tier()).await? == *hashes);
+    let hashes = hashes.clone();
+    ensure!(holder.open(SearchMode::Prefix, device_tier()).await? == hashes);
     let session = holder.available().await?;
-    ensure!(session.make_available_calls() == vec![hashes.clone()]);
+    // The resident G2 prefix publishes first. The device batch follows it
+    // and carries the retained G2 copy of the last hash, which staging
+    // reuses instead of copying.
+    ensure!(session.make_available_calls() == vec![vec![hashes[0]], vec![hashes[1], hashes[2]]]);
     let records = transfer.records();
     ensure!(records.len() == 1);
     ensure!(records[0].src_blocks == vec![holder.fixture.pins[1].block_id()]);
+    Ok(())
+}
+
+/// Resident G2 hits reach the puller before the device copy lands.
+///
+/// One batch for the whole session would charge every hit the latency of
+/// the slowest tier the search touched.
+#[tokio::test]
+async fn resident_g2_hits_publish_before_the_g1_copy_lands() -> Result<()> {
+    let transfer = gated_transfer();
+    let holder = Holder::with_transfer(2, transfer.clone()).await?;
+    let hashes = holder.fixture.hashes.clone();
+    let primary = retained(&holder.fixture.g2, &hashes[..1])?;
+    ensure!(holder.open(SearchMode::Prefix, device_tier()).await? == hashes);
+    transfer.started.wait().await;
+    let published_during_the_copy = holder.session()?.make_available_calls();
+    // Release the copy before the assertions. A parked gate outlives a
+    // failed test and blocks the runtime drop instead of failing it.
+    transfer.release.wait().await;
+    let session = holder.available().await?;
+    ensure!(
+        published_during_the_copy == vec![vec![hashes[0]]],
+        "the resident G2 hit must publish while the copy runs"
+    );
+    ensure!(session.make_available_calls() == vec![vec![hashes[0]], vec![hashes[1]]]);
+    drop(primary);
+    Ok(())
+}
+
+/// A failed device copy closes the session and names the staging step.
+///
+/// The batch the holder already published stays published, and the copy
+/// releases its G1 pins and its G2 reservation.
+#[tokio::test]
+async fn g1_staging_failure_closes_the_session_with_the_stage_error() -> Result<()> {
+    let transfer = Arc::new(OutcomeTransfer {
+        outcome: Mutex::new(Some(TransferDrainOutcome::DrainedWithError(
+            anyhow::anyhow!("injected staging failure"),
+        ))),
+    });
+    let holder = Holder::with_transfer(2, transfer).await?;
+    let hashes = holder.fixture.hashes.clone();
+    let primary = retained(&holder.fixture.g2, &hashes[..1])?;
+    ensure!(holder.open(SearchMode::Prefix, device_tier()).await? == hashes);
+    let session = holder.session()?;
+    wait_for(|| session.closed_reason().is_some()).await?;
+    ensure!(
+        session
+            .closed_reason()
+            .flatten()
+            .is_some_and(|reason| reason.contains("stage G1 blocks")),
+        "the close reason must name the staging step"
+    );
+    ensure!(session.make_available_calls() == vec![vec![hashes[0]]]);
+    // Four G2 blocks, one held by the retained primary. The drained
+    // failure returned the staging destination to the pool.
+    ensure!(holder.fixture.g2.available_blocks() == 3);
+    ensure!(holder.fixture.g1.match_blocks(&hashes).len() == 2);
+    drop(primary);
     Ok(())
 }
 

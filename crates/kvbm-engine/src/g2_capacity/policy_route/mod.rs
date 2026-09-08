@@ -439,8 +439,15 @@ impl PolicyG1G2TransferReceipt {
         Self { completion }
     }
 
+    /// Hand the drain future to a caller that already runs on the runtime.
+    fn into_completion(self) -> TransferFuture {
+        self.completion
+    }
+
+    /// Drain from a blocking thread. The offload supervisor already owns
+    /// one, so it keeps the same completion primitive as the stager.
     fn drain(self) -> TransferDrainOutcome {
-        futures::executor::block_on(self.completion)
+        futures::executor::block_on(self.into_completion())
     }
 }
 

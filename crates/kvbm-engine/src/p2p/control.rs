@@ -392,8 +392,9 @@ fn find_scatter(
 }
 
 /// Drive the session's commit, availability, and terminator calls.
-/// G1 sources reach temporary G2 before the first availability batch.
-/// G3 sources use the existing local staging path.
+/// Each tier publishes its own availability batch as it lands: the
+/// resident G2 hits, then the G1 sources that staged into temporary G2,
+/// then the G3 sources that staged through the local path.
 /// Each checksum uses its position in the full committed set.
 ///
 /// Errors propagate as `ControlError::Internal`; on error the caller
@@ -408,7 +409,7 @@ async fn stage_phase(
 ) -> Result<(), ControlError> {
     let FindOutcome {
         committed,
-        mut g2_blocks,
+        g2_blocks,
         g3_blocks,
         g1_blocks,
         ..
@@ -427,15 +428,9 @@ async fn stage_phase(
             .commit(committed)
             .map_err(|error| ControlError::Internal(format!("commit blocks: {error:#}")))?;
     }
-    if let Some(source) = g1_blocks {
-        g2_blocks.extend(
-            source
-                .stage()
-                .await
-                .map_err(|error| ControlError::Internal(format!("stage G1 blocks: {error:#}")))?,
-        );
-    }
-    g2_blocks.sort_by_key(|block| ordinals.get(&block.sequence_hash()).copied());
+    // Publish each tier as it lands. The resident G2 hits need no copy, so
+    // holding them back would charge every hit the latency of the slowest
+    // tier the search touched. Each batch already arrives in request order.
     if !g2_blocks.is_empty() {
         publish_available(
             &leader,
@@ -447,6 +442,25 @@ async fn stage_phase(
         )
         .await
         .map_err(|e| ControlError::Internal(format!("make_available g2: {e:#}")))?;
+    }
+
+    if let Some(source) = g1_blocks {
+        let staged = source
+            .stage()
+            .await
+            .map_err(|error| ControlError::Internal(format!("stage G1 blocks: {error:#}")))?;
+        if !staged.is_empty() {
+            publish_available(
+                &leader,
+                &session,
+                resource,
+                staged,
+                &ordinals,
+                require_payload_integrity,
+            )
+            .await
+            .map_err(|e| ControlError::Internal(format!("make_available staged g1: {e:#}")))?;
+        }
     }
 
     if !g3_blocks.is_empty() {
