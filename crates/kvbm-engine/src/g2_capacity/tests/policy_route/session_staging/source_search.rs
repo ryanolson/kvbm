@@ -574,6 +574,8 @@ async fn prefix_walk_resumes_g2_after_a_g1_run() -> Result<()> {
     let absent0 = holder.fixture.pins.remove(0);
     absent0.set_evict_on_reset(true);
     drop(absent0);
+    let registry = holder.fixture.g2.block_registry();
+    let counts_before: Vec<u32> = hashes.iter().map(|hash| registry.count(*hash)).collect();
     match holder.response(SearchMode::Prefix, device_tier()).await? {
         OpenTransferSessionResponse::Sync {
             committed,
@@ -586,6 +588,12 @@ async fn prefix_walk_resumes_g2_after_a_g1_run() -> Result<()> {
         }
         _ => anyhow::bail!("a mixed G2/G1 prefix must open a synchronous session"),
     }
+    let counts_after: Vec<u32> = hashes.iter().map(|hash| registry.count(*hash)).collect();
+    ensure!(
+        counts_after == counts_before,
+        "a remote prefix walk must not touch the G2 frequency sketch on the resumed \
+         run after a G1 hit, the same as the run before it"
+    );
     let session = holder.available().await?;
     ensure!(
         session.make_available_calls() == vec![vec![hashes[0], hashes[2]], vec![hashes[1]]],
