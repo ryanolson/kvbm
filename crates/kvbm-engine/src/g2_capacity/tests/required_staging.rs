@@ -331,6 +331,49 @@ fn compatibility_publication_uses_the_capacity_bound_at_reservation() {
     assert!(foreign_manager.match_blocks(&[hash]).is_empty());
 }
 
+/// F31: a compatibility rollback must reset only the slot it staged. Under
+/// `Reject`, `register_compatibility` hands back the pre-existing retained
+/// primary instead of the newly staged block, so an unconditional
+/// `set_evict_on_reset(true)` sweep over the returned blocks flags a slot
+/// this allocation never staged and never owned.
+#[test]
+fn compatibility_rollback_keeps_a_collided_retained_primary() {
+    let manager = Arc::new(
+        BlockManager::<G2>::builder()
+            .block_count(2)
+            .block_size(4)
+            .registry(kvbm_logical::BlockRegistry::new())
+            .with_lru_backend()
+            .duplication_policy(kvbm_logical::blocks::BlockDuplicationPolicy::Reject)
+            .build()
+            .expect("build a Reject-policy manager"),
+    );
+    let hash = SequenceHash::new(1, None, 0);
+    let retained_slot = manager
+        .allocate_blocks(1)
+        .expect("free slot for the retained primary")
+        .pop()
+        .expect("one allocated block")
+        .stage(hash, manager.block_size())
+        .expect("stage the retained primary");
+    let retained = manager.register_block(retained_slot);
+
+    let capacity = Arc::new(DirectG2Capacity::new(Arc::clone(&manager)));
+    let published = reserve_required_staging(capacity.clone(), 1)
+        .expect("compatibility reservation")
+        .stage_all(&[hash], capacity.block_size())
+        .expect("stage the colliding block")
+        .publish_reversible()
+        .expect("register the collision through the compatibility route");
+
+    // Roll back the unregistered transaction, then release the retained
+    // primary. A correct rollback never touches the retained slot's flag.
+    drop(published);
+    drop(retained);
+
+    assert_eq!(manager.match_blocks(&[hash]).len(), 1);
+}
+
 #[test]
 fn required_staging_rejects_a_partial_hash_set_and_rolls_back_every_slot() {
     let manager = Arc::new(
