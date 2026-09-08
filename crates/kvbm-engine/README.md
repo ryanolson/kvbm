@@ -16,7 +16,7 @@ The method checks source manager identity, unique hashes, and equal logical bloc
 
 The method marks new blocks as temporary before registration. A collision does not change the retention of an existing primary. The offload policy can adopt a temporary primary with `ImmutableBlock::set_evict_on_reset(false)`. Otherwise, the last session or external pin release returns it to the free pool. Transport does not evict G1.
 
-A caller installs resource-bound `G1SessionSource` handles on the holder. The holder keeps weak references, and the logical manager owns the handles. A source exposes only registered blocks, which must represent completed source writes. The logical owner can disable lookup without canceling copies that already hold pins. A physical resource keeps its original logical binding after source retirement.
+A caller installs resource-bound `G1SessionSource` handles on the holder. The holder keeps weak references, and the logical manager owns the handles. A source exposes only registered blocks, which must represent completed source writes. The logical owner can disable lookup and does not cancel a copy that already holds pins. A physical resource keeps its original logical binding after source retirement.
 
 Holder search combines G1 and G2 hits in request order. Prefix search stops at the first cross-tier gap. Scatter search can also include G3. The publisher sends one batch per tier as that tier lands. The resident G2 hits publish first, then the staged device blocks, then the staged disk blocks. The publisher assigns each checksum the ordinal of its hash in the complete committed set.
 

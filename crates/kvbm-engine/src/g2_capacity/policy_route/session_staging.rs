@@ -45,9 +45,10 @@ impl<T: PolicyG1SourceMetadata> PolicyG1G2BoundRoute<T> {
     ///
     /// The copy carries no source-write fence. Every pin names a registered
     /// block, and the installer's contract states that a registered block
-    /// holds completed writes. A fence here would wait on a receipt that the
-    /// caller cannot fail to satisfy, and the parameter would hide the real
-    /// rule at the registration seam. The Rhino half of the same rule lives on
+    /// holds completed writes. If the copy carried a fence, the fence waits
+    /// on a receipt that the caller cannot fail to satisfy. The fence
+    /// parameter then hides the real rule at the registration seam. The
+    /// Rhino half of the same rule lives on
     /// `KvRuntime::register_request_blocks`.
     pub(crate) fn stage_to_g2(
         &self,

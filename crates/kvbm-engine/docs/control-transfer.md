@@ -99,8 +99,12 @@ while the copy runs. Each tier publishes its own batch in request order.
 The commit stream closes before the first batch publishes, so the
 puller's `drain_committed` step finishes before any copy lands.
 
-Failures in `stage_phase` call `Session::close(reason)`, which
-propagates `LifecycleEvent::Failed` to any attached puller. The
+Failures in `stage_phase` call `Session::close(reason)`. That call
+pushes `LifecycleEvent::Detached { reason }` on the lifecycle stream,
+plus `CommitDelta::Closed` and `AvailabilityDelta::Drained` on the
+other streams, to any attached puller. `LifecycleEvent::Failed` does
+not come from this path. It comes from an inbound `Frame::Error`, an
+attach failure, or a velo stream error other than `SenderDropped`. The
 `SessionManager` watchdog evicts the entry.
 
 ### Fail-fast: G3 without a parallel_worker
@@ -146,8 +150,8 @@ the puller's `g2_manager`.
 A session opened by `open_session` is registered in the leader's
 `SessionManager`. It is evicted when:
 
-- The session's lifecycle stream emits `Detached` or `Failed` (peer
-  detach, populator failure).
+- The session's lifecycle stream emits `Detached` (peer detach or
+  populator failure) or `Failed` (protocol, attach, or stream error).
 - The `SessionManager` watchdog timeout elapses (default 30s) without
   the peer attaching or any lifecycle event.
 - An explicit `close_session` removes it.

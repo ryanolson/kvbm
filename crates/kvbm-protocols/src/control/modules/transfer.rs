@@ -97,10 +97,11 @@ pub enum FindMode {
 /// Tiers eligible for matching beyond G2 (G2 is always on).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct TierSelection {
-    /// Match in G1 (device); staged G1→G2 in the background before
-    /// `make_available`. Off by default like every tier beyond G2: a
-    /// holder that gains a G1 source must not start copying device
-    /// blocks for a caller that only queries and never pulls.
+    /// Match in G1 (device). Staging runs G1→G2 in the background
+    /// before `make_available`. This tier is off by default, like
+    /// every tier beyond G2. A holder that gains a G1 source must not
+    /// copy device blocks for a caller that only queries and never
+    /// pulls.
     #[serde(default)]
     pub g1: bool,
     /// Match in G3; staged G3→G2 in the background before

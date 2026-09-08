@@ -170,8 +170,8 @@ fn register_search_shim(
                 search_mode: mode,
                 find_mode: FindMode::Sync,
                 // Query-only route: the caller reads the matched set and
-                // never pulls, so selecting a tier that must copy before
-                // it can serve would spend a DMA on nothing.
+                // never pulls. Selecting a tier that must copy before it
+                // can serve spends a DMA on nothing.
                 tiers: TierSelection::default(),
                 resource: None,
                 watchdog_ms: None,
@@ -240,7 +240,7 @@ struct TierBlocks {
 /// `Prefix` walks the request left to right and stops at the first hash
 /// that no selected tier holds. G2 and G1 extend one shared cursor in
 /// turn, so a run G2 serves and a run G1 serves join into one contiguous
-/// prefix; the walk ends when neither tier advances the cursor. G3 stays
+/// prefix. The walk ends when neither tier advances the cursor. G3 stays
 /// out of the prefix walk: a disk gap needs handling that does not pay
 /// for itself yet.
 ///
@@ -306,8 +306,8 @@ fn find_prefix(
         // G2 stopped at this cursor, so a G1 run of zero ends the walk
         // here, and G1 stopped at the cursor the next G2 call receives,
         // so a G2 run of zero ends it too. Asking a tier again at a
-        // cursor where it already declared a miss would take a store
-        // lock only to re-learn that same miss.
+        // cursor where it already declared a miss takes a store lock
+        // only to re-learn that same miss.
         let g1_run = pins
             .as_mut()
             .map_or(0, |pins| pins.pin_prefix(&hashes[cursor..]));
@@ -365,7 +365,7 @@ fn find_scatter(
         && let Some(g3_manager) = leader.g3_manager()
     {
         // A device copy beats a disk read, so the disk tier only sees the
-        // hashes G1 could not supply.
+        // hashes G1 does not hold.
         let remaining: Vec<SequenceHash> = missing
             .iter()
             .copied()
@@ -408,9 +408,13 @@ fn find_scatter(
 /// then the G3 sources that staged through the local path.
 /// Each checksum uses its position in the full committed set.
 ///
-/// Errors propagate as `ControlError::Internal`; on error the caller
-/// is expected to call `session.close(...)` to surface
-/// `LifecycleEvent::Failed` to the puller.
+/// Errors propagate as `ControlError::Internal`. On error the caller
+/// must call `session.close(reason)`. That call pushes
+/// `LifecycleEvent::Detached { reason }` on the lifecycle stream, plus
+/// `CommitDelta::Closed` and `AvailabilityDelta::Drained` on the other
+/// streams, to the attached puller. `LifecycleEvent::Failed` does not
+/// come from this path. It comes from an inbound `Frame::Error`, an
+/// attach failure, or a velo stream error other than `SenderDropped`.
 async fn stage_phase(
     leader: Arc<InstanceLeader>,
     session: Arc<dyn Session>,
@@ -445,7 +449,7 @@ async fn stage_phase(
         .finish_commits()
         .map_err(|e| ControlError::Internal(format!("finish_commits: {e:#}")))?;
     // Publish each tier as it lands. The resident G2 hits need no copy, so
-    // holding them back would charge every hit the latency of the slowest
+    // holding them back charges every hit the latency of the slowest
     // tier the search touched. Each batch already arrives in request order.
     if !g2_blocks.is_empty() {
         publish_available(

@@ -121,8 +121,8 @@ impl<T: PolicyG1SourceMetadata + Send + 'static> PinnedG1Source for TypedPins<T>
             return 0;
         };
         // touch = false: a remote request must not count as a local hit.
-        // Counting it would hold a block this node no longer reads ahead
-        // of one its own requests still need.
+        // If the walk counted it, the block this node no longer reads
+        // stays ahead of one its own requests still need.
         let run = manager.match_prefix(hashes, false);
         let pinned = run.len();
         self.blocks.extend(run);
