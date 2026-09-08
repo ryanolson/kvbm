@@ -1,6 +1,12 @@
 use super::*;
 use crate::G3;
+use crate::object::ObjectBlockOps;
 use crate::p2p::g1_source::G1SessionSource;
+use crate::worker::group::ParallelWorkers;
+use crate::worker::{
+    ConnectRemoteResponse, ImportMetadataResponse, InstanceId, RemoteDescriptor, SerializedLayout,
+    SerializedLayoutResponse, TransferCompleteNotification, Worker, WorkerTransfers,
+};
 use kvbm_protocols::control::modules::transfer::{
     FindMode, OpenTransferSessionRequest, OpenTransferSessionResponse, SearchMode, TierSelection,
 };
@@ -30,7 +36,7 @@ impl Holder {
         count: usize,
         transfer: Arc<dyn PolicyG1G2TransferExecutor>,
     ) -> Result<Self> {
-        Self::build(count, transfer, None).await
+        Self::build(count, transfer, None, None).await
     }
 
     async fn with_disk(
@@ -38,13 +44,26 @@ impl Holder {
         transfer: Arc<dyn PolicyG1G2TransferExecutor>,
         g3: Arc<BlockManager<G3>>,
     ) -> Result<Self> {
-        Self::build(count, transfer, Some(g3)).await
+        Self::build(count, transfer, Some(g3), None).await
+    }
+
+    /// Like [`Self::with_disk`], with a working `ParallelWorkers` so a
+    /// genuine G3 hit stages all the way to a registered G2 block instead of
+    /// tripping the leader's missing-worker fail-fast.
+    async fn with_disk_and_worker(
+        count: usize,
+        transfer: Arc<dyn PolicyG1G2TransferExecutor>,
+        g3: Arc<BlockManager<G3>>,
+        parallel_worker: Arc<dyn ParallelWorkers>,
+    ) -> Result<Self> {
+        Self::build(count, transfer, Some(g3), Some(parallel_worker)).await
     }
 
     async fn build(
         count: usize,
         transfer: Arc<dyn PolicyG1G2TransferExecutor>,
         g3: Option<Arc<BlockManager<G3>>>,
+        parallel_worker: Option<Arc<dyn ParallelWorkers>>,
     ) -> Result<Self> {
         let fixture = Fixture::new(count, count + 2)?;
         let source = fixture.route(transfer).into_session_source(&fixture.g1)?;
@@ -56,6 +75,9 @@ impl Holder {
             .g2_manager_set(Arc::new(managers), RESOURCE);
         if let Some(g3) = g3 {
             builder = builder.g3_manager(g3);
+        }
+        if let Some(parallel_worker) = parallel_worker {
+            builder = builder.parallel_worker(parallel_worker);
         }
         let leader = Arc::new(builder.build()?);
         let sessions = MockSessionFactory::new();
@@ -109,6 +131,119 @@ impl Holder {
         let session = self.session()?;
         wait_for(|| session.finish_availability_called()).await?;
         Ok(session)
+    }
+}
+
+/// Local-only `ParallelWorkers`. `execute_local_transfer` always reports
+/// success, so `stage_g3_to_g2` can register a real G2 block for a genuine
+/// G3 hit without a live worker. No search fixture that needs this stub
+/// drives a remote or object-store path, so those methods bail or report
+/// absence.
+#[derive(Default)]
+struct StubParallelWorkers;
+
+impl WorkerTransfers for StubParallelWorkers {
+    fn execute_local_transfer(
+        &self,
+        _src: LogicalLayoutHandle,
+        _dst: LogicalLayoutHandle,
+        _src_block_ids: Arc<[BlockId]>,
+        _dst_block_ids: Arc<[BlockId]>,
+        _options: TransferOptions,
+    ) -> Result<TransferCompleteNotification> {
+        Ok(TransferCompleteNotification::completed())
+    }
+
+    fn execute_remote_onboard(
+        &self,
+        _src: RemoteDescriptor,
+        _dst: LogicalLayoutHandle,
+        _dst_block_ids: Arc<[BlockId]>,
+        _options: TransferOptions,
+    ) -> Result<TransferCompleteNotification> {
+        anyhow::bail!("stub: execute_remote_onboard not implemented")
+    }
+
+    fn execute_remote_offload(
+        &self,
+        _src: LogicalLayoutHandle,
+        _src_block_ids: Arc<[BlockId]>,
+        _dst: RemoteDescriptor,
+        _options: TransferOptions,
+    ) -> Result<TransferCompleteNotification> {
+        anyhow::bail!("stub: execute_remote_offload not implemented")
+    }
+
+    fn connect_remote(
+        &self,
+        _instance_id: InstanceId,
+        _metadata: Vec<SerializedLayout>,
+    ) -> Result<ConnectRemoteResponse> {
+        Ok(ConnectRemoteResponse::ready())
+    }
+
+    fn has_remote_metadata(&self, _instance_id: InstanceId) -> bool {
+        false
+    }
+
+    fn execute_remote_onboard_for_instance(
+        &self,
+        _instance_id: InstanceId,
+        _remote_logical_type: LogicalLayoutHandle,
+        _src_block_ids: Vec<BlockId>,
+        _dst: LogicalLayoutHandle,
+        _dst_block_ids: Arc<[BlockId]>,
+        _options: TransferOptions,
+    ) -> Result<TransferCompleteNotification> {
+        anyhow::bail!("stub: execute_remote_onboard_for_instance not implemented")
+    }
+}
+
+impl ObjectBlockOps for StubParallelWorkers {
+    fn has_blocks(
+        &self,
+        keys: Vec<SequenceHash>,
+    ) -> BoxFuture<'static, Vec<(SequenceHash, Option<usize>)>> {
+        Box::pin(async move { keys.into_iter().map(|k| (k, None)).collect() })
+    }
+
+    fn put_blocks(
+        &self,
+        keys: Vec<SequenceHash>,
+        _layout: LogicalLayoutHandle,
+        _block_ids: Vec<BlockId>,
+    ) -> BoxFuture<'static, Vec<Result<SequenceHash, SequenceHash>>> {
+        Box::pin(async move { keys.into_iter().map(Err).collect() })
+    }
+
+    fn get_blocks(
+        &self,
+        keys: Vec<SequenceHash>,
+        _layout: LogicalLayoutHandle,
+        _block_ids: Vec<BlockId>,
+    ) -> BoxFuture<'static, Vec<Result<SequenceHash, SequenceHash>>> {
+        Box::pin(async move { keys.into_iter().map(Err).collect() })
+    }
+}
+
+impl ParallelWorkers for StubParallelWorkers {
+    fn export_metadata(&self) -> Result<Vec<SerializedLayoutResponse>> {
+        Ok(Vec::new())
+    }
+
+    fn import_metadata(
+        &self,
+        _metadata: Vec<SerializedLayout>,
+    ) -> Result<Vec<ImportMetadataResponse>> {
+        Ok(Vec::new())
+    }
+
+    fn worker_count(&self) -> usize {
+        0
+    }
+
+    fn workers(&self) -> &[Arc<dyn Worker>] {
+        &[]
     }
 }
 
@@ -419,6 +554,46 @@ async fn prefix_walk_asks_each_tier_once_per_cursor() -> Result<()> {
     Ok(())
 }
 
+/// A G1 run that ends mid-request must not end the walk: G2 can hold the
+/// hash right after it, and the walk must resume there and join the two
+/// runs into one committed prefix.
+///
+/// G2 holds hashes[0] and hashes[2], not hashes[1]. G1 holds hashes[1]
+/// only. The walk's first G2 call serves hashes[0] and stops at hashes[1];
+/// G1 then serves hashes[1] and stops at hashes[2]; the walk must ask G2
+/// again at that cursor and pick up hashes[2] instead of stopping where G1
+/// did.
+#[tokio::test]
+async fn prefix_walk_resumes_g2_after_a_g1_run() -> Result<()> {
+    let mut holder = Holder::new(3).await?;
+    let hashes = holder.fixture.hashes.clone();
+    drop(retained(&holder.fixture.g2, &[hashes[0], hashes[2]])?);
+    let absent2 = holder.fixture.pins.remove(2);
+    absent2.set_evict_on_reset(true);
+    drop(absent2);
+    let absent0 = holder.fixture.pins.remove(0);
+    absent0.set_evict_on_reset(true);
+    drop(absent0);
+    match holder.response(SearchMode::Prefix, device_tier()).await? {
+        OpenTransferSessionResponse::Sync {
+            committed,
+            breakdown,
+            ..
+        } => {
+            ensure!(committed == hashes);
+            ensure!(breakdown.host_blocks == 2);
+            ensure!(breakdown.device_blocks == 1);
+        }
+        _ => anyhow::bail!("a mixed G2/G1 prefix must open a synchronous session"),
+    }
+    let session = holder.available().await?;
+    ensure!(
+        session.make_available_calls() == vec![vec![hashes[0], hashes[2]], vec![hashes[1]]],
+        "stage_phase must publish one batch per tier, not one per prefix run"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn prefix_stops_at_a_cross_tier_hole_but_scatter_keeps_later_hits() -> Result<()> {
     let mut holder = Holder::new(3).await?;
@@ -428,7 +603,81 @@ async fn prefix_stops_at_a_cross_tier_hole_but_scatter_keeps_later_hits() -> Res
     let hashes = &holder.fixture.hashes;
     drop(retained(&holder.fixture.g2, &[hashes[0]])?);
     ensure!(holder.open(SearchMode::Prefix, device_tier()).await? == vec![hashes[0]]);
-    ensure!(holder.open(SearchMode::Scatter, device_tier()).await? == vec![hashes[0], hashes[2]]);
+    match holder.response(SearchMode::Scatter, device_tier()).await? {
+        OpenTransferSessionResponse::Sync {
+            committed,
+            breakdown,
+            ..
+        } => {
+            ensure!(committed == vec![hashes[0], hashes[2]]);
+            ensure!(breakdown.host_blocks == 1);
+            ensure!(breakdown.device_blocks == 1);
+        }
+        _ => anyhow::bail!("a mixed G2/G1 scatter must open a synchronous session"),
+    }
+    Ok(())
+}
+
+/// G3 is a bottom tier: it must see only the hashes G1 could not also
+/// supply, not the whole G2-miss set. Handing it the whole miss set would
+/// waste a disk lookup on a hash the device tier already serves.
+///
+/// G2 holds hashes[0], G1 holds hashes[1] only, G3 holds hashes[2].
+#[tokio::test]
+async fn scatter_hands_g3_only_the_hashes_g1_lacks() -> Result<()> {
+    let transfer = Arc::new(ImmediateTransfer::default());
+    let g3 = Arc::new(
+        TestManagerBuilder::<G3>::new()
+            .block_count(2)
+            .block_size(4)
+            .build(),
+    );
+    let mut holder = Holder::with_disk_and_worker(
+        3,
+        transfer.clone(),
+        Arc::clone(&g3),
+        Arc::new(StubParallelWorkers),
+    )
+    .await?;
+    let hashes = holder.fixture.hashes.clone();
+    drop(retained(&holder.fixture.g2, &[hashes[0]])?);
+    let absent2 = holder.fixture.pins.remove(2);
+    absent2.set_evict_on_reset(true);
+    drop(absent2);
+    let absent0 = holder.fixture.pins.remove(0);
+    absent0.set_evict_on_reset(true);
+    drop(absent0);
+    drop(retained(&g3, &[hashes[2]])?);
+
+    let before = g3.metrics().snapshot();
+    match holder
+        .response(
+            SearchMode::Scatter,
+            TierSelection {
+                g1: true,
+                g3: true,
+                g4: false,
+            },
+        )
+        .await?
+    {
+        OpenTransferSessionResponse::Sync {
+            committed,
+            breakdown,
+            ..
+        } => {
+            ensure!(committed == hashes);
+            ensure!(breakdown.host_blocks == 1);
+            ensure!(breakdown.device_blocks == 1);
+            ensure!(breakdown.disk_blocks == 1);
+        }
+        _ => anyhow::bail!("a G1+G3 scatter must open a synchronous session"),
+    }
+    ensure!(
+        g3.metrics().snapshot().scan_hashes_requested == before.scan_hashes_requested + 1,
+        "G3 must scan only the hash G1 could not also supply"
+    );
+    holder.available().await?;
     Ok(())
 }
 
@@ -466,6 +715,30 @@ async fn source_installation_rejects_another_destination_manager() -> Result<()>
         .route(Arc::new(ImmediateTransfer::default()))
         .into_session_source(&foreign.g1)?;
     ensure!(holder.leader.install_g1_sources(&[source]).is_err());
+    ensure!(holder.open(SearchMode::Prefix, device_tier()).await? == holder.fixture.hashes);
+    Ok(())
+}
+
+/// Two sources for the same resource inside one `install_g1_sources` call
+/// must be rejected before either reaches the registry, even though each
+/// one alone would bind cleanly. The registry's per-call `HashSet` only
+/// catches this when both land in the same slice: two separate calls with
+/// the same `Arc` instead hit the ptr-equality re-install path, which is
+/// covered elsewhere.
+#[tokio::test]
+async fn installing_one_resource_twice_in_one_call_is_rejected() -> Result<()> {
+    let holder = Holder::new(1).await?;
+    let error = match holder
+        .leader
+        .install_g1_sources(&[holder.source.clone(), holder.source.clone()])
+    {
+        Ok(()) => anyhow::bail!("a repeated resource in one call must be rejected"),
+        Err(error) => error,
+    };
+    ensure!(
+        format!("{error:#}").contains("duplicate G1 source resource"),
+        "{error:#}"
+    );
     ensure!(holder.open(SearchMode::Prefix, device_tier()).await? == holder.fixture.hashes);
     Ok(())
 }
