@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, ensure};
 use futures::future::BoxFuture;
 use kvbm_common::{LogicalLayoutHandle, SequenceHash};
 use kvbm_logical::{ImmutableBlock, LifecyclePinRef};
@@ -90,16 +90,16 @@ impl<T: PolicyG1SourceMetadata> PolicyG1G2BoundRoute<T> {
             // task that ends early releases its pins and its capacity.
             undrained: false,
         };
-        let spawned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            runtime.spawn(async move {
-                let result = copy.execute(&sender).await;
-                drop(copy);
-                let _ = sender.send(result);
-            })
-        }));
-        if spawned.is_err() {
-            return Box::pin(async { Err(anyhow!("runtime rejected session staging task")) });
-        }
+        // tokio 1.48.0 Handle::spawn has no panic path: it reaches
+        // spawn_named -> Inner::spawn, and the only spawn-time panic in this
+        // tokio version is spawn_blocking's SpawnError::NoThreads
+        // (tokio/src/runtime/blocking/pool.rs:324), which this call never
+        // takes.
+        runtime.spawn(async move {
+            let result = copy.execute(&sender).await;
+            drop(copy);
+            let _ = sender.send(result);
+        });
         Box::pin(async move {
             receiver
                 .await
