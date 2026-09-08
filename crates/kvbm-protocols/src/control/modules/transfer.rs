@@ -63,11 +63,11 @@ pub const SEARCH_SCATTER_HANDLER: &str = "kvbm.leader.control.search_scatter";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchMode {
-    /// Contiguous prefix — stop at the first miss. In G2 this maps to
-    /// `BlockManager::match_blocks`. When `tiers.g1` is set, the walk
-    /// continues into G1 from the cursor that G2 reached. The walk uses
-    /// `match_prefix` with `touch = false`. The right choice for LLM
-    /// prompt-prefix KV reuse.
+    /// Contiguous prefix — stop at the first miss. When `tiers.g1` is
+    /// set, the walk continues into G1 from the cursor that G2 reached.
+    /// The G2 leg keeps its LRU touch through `match_blocks`. In G1 the
+    /// walk uses `match_prefix` with `touch = false`. The right choice
+    /// for LLM prompt-prefix KV reuse.
     #[default]
     Prefix,
     /// Gather every hash present, ignoring gaps. Maps to
@@ -184,8 +184,8 @@ pub struct OpenTransferSessionRequest {
     pub watchdog_ms: Option<u64>,
 
     /// Registration lifecycle expected of the holder. Complete-bundle pulls
-    /// always set this from their directory hit; ordinary legacy transfer
-    /// callers may omit it.
+    /// always set this from their directory hit. Ordinary transfer
+    /// callers can omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registration_epoch: Option<RegistrationEpoch>,
 
@@ -265,8 +265,8 @@ pub struct PullFromSessionRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selector: Option<Vec<SequenceHash>>,
     /// Logical resource served by the holder and receiving blocks locally.
-    /// Callers should copy this from [`TransferSessionCapability::resource`].
-    /// `None` selects the puller's primary resource for legacy callers.
+    /// Callers copy this value from [`TransferSessionCapability::resource`].
+    /// `None` selects the puller's primary resource.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource: Option<LogicalResourceId>,
 

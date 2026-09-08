@@ -254,8 +254,8 @@ fn staging_does_not_occupy_the_blocking_pool() -> Result<()> {
         )
         .await
         .is_ok();
-        // Release the copy before the assertion. A parked blocking task
-        // holds the runtime open at drop and turns a failure into a hang.
+        // Release the gate before the assertions so the copy drains and a
+        // failed assertion leaves no parked stager behind.
         transfer.release.wait().await;
         completion.await?;
         ensure!(free, "the parked stager occupied the only blocking thread");

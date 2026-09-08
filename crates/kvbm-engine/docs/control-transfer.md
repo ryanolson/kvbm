@@ -37,7 +37,7 @@ can skip the velo round-trip:
 Every tier beyond G2 is opt-in, and `TierSelection` defaults to all
 tiers off. A holder that gains a G1 source therefore serves the same
 results as before until a caller asks for the device tier. The two
-`open_session` callers that pull set `tiers.g1 = true`; the query-only
+`open_session` callers that pull set `tiers.g1 = true`. The query-only
 `search_prefix` / `search_scatter` shims keep the default, because they
 read the matched set and never pull.
 
@@ -48,7 +48,7 @@ cannot supply. G2 needs no copy and wins over both.
 `Scatter` and the G1 walk use `touch=false` so an RPC search does not
 perturb the local LRU: a block a peer wants must not outrank a block
 this node still reads. `Prefix` deliberately does not extend into G3 in
-v1 — the contiguous-prefix walk would need gap handling that does not
+v1. The contiguous-prefix walk needs gap handling that does not
 pay for itself yet.
 
 In `Prefix` mode G2 and G1 extend one shared cursor in turn, so a run G2
@@ -63,9 +63,9 @@ lock, and the pinned G1 set never reaches past the committed prefix.
 | `Async` (default) | Returns as soon as the session is opened and the populator is spawned. Caller learns matched hashes via the disagg `commits()` stream after attach. | Lowest-latency open + immediate-attach. |
 | `Sync` | Awaits the find phase across `tiers`. Response carries `committed` + `breakdown` inline. Staging still runs in background. | Orchestrators that fan out opens across several holders and compare matched sets before committing to a puller. |
 
-Staging (G3→G2) is always background. `Sync` only awaits the local
-scan, not the stage; that keeps the response fast even with
-`tiers.g3 = true`.
+Staging (G1→G2 and G3→G2) is always background. `Sync` awaits only
+the local scan, not the stage. The response stays fast with
+`tiers.g1 = true` or `tiers.g3 = true`.
 
 ## Populator: find_phase + stage_phase
 

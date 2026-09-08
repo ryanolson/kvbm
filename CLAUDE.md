@@ -94,7 +94,7 @@ before returning control. If it should be ignored, rename it to `_ACTIVE_PLAN_.m
 
 ## Rhino-hosted Rust tests
 
-Rhino excludes this Rust workspace. Tests with development dependencies require the KVBM workspace manifest, not `cargo test -p kvbm-logical` from Rhino alone. Rhino enables `static-kernels`, which builds real CUDA kernels and links the shared CUDA runtime without the toolkit's static runtime archives.
+Rhino excludes this Rust workspace. Tests with development dependencies require the KVBM workspace manifest, not `cargo test -p kvbm-logical` from Rhino alone. Rhino enables `static-kernels`. This feature selects how the compiled `kvbm_kernels` object links. The object links as a static archive, or as an nvcc-built shared library. Real-versus-stub kernel selection depends only on nvcc availability in `kvbm-kernels/build.rs`. `KVBM_REQUIRE_CUDA` makes a missing nvcc fatal under Rhino.
 
 Run these commands from the Rhino root, through its canonical uv environment. Use the host's build lock and memory gate where applicable.
 

@@ -449,8 +449,8 @@ async fn resident_g2_hits_publish_before_the_g1_copy_lands() -> Result<()> {
     ensure!(holder.open(SearchMode::Prefix, device_tier()).await? == hashes);
     transfer.started.wait().await;
     let published_during_the_copy = holder.session()?.make_available_calls();
-    // Release the copy before the assertions. A parked gate outlives a
-    // failed test and blocks the runtime drop instead of failing it.
+    // Release the gate before the assertions so the copy drains and a
+    // failed assertion leaves no parked stager behind.
     transfer.release.wait().await;
     let session = holder.available().await?;
     ensure!(
@@ -476,8 +476,8 @@ async fn commit_stream_closes_before_the_g1_copy_lands() -> Result<()> {
     ensure!(holder.open(SearchMode::Prefix, device_tier()).await? == hashes);
     transfer.started.wait().await;
     let closed_during_the_copy = holder.session()?.finish_commits_called();
-    // Release the copy before the assertions. A parked gate outlives a
-    // failed test and blocks the runtime drop instead of failing it.
+    // Release the gate before the assertions so the copy drains and a
+    // failed assertion leaves no parked stager behind.
     transfer.release.wait().await;
     ensure!(
         closed_during_the_copy,

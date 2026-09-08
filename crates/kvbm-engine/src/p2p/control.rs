@@ -739,7 +739,7 @@ pub(crate) async fn close_transfer_session(
 
 /// Engine-side implementation behind [`InstanceLeader::pull_from_session`].
 ///
-/// The legacy one-resource endpoint publishes immediately after the shared
+/// The one-resource endpoint publishes immediately after the shared
 /// staging transaction succeeds. Complete-bundle callers use
 /// [`crate::p2p::stage_from_session`] directly and defer publication until all
 /// resources have staged.
