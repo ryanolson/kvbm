@@ -360,6 +360,39 @@ async fn g1_staging_failure_closes_the_session_with_the_stage_error() -> Result<
     Ok(())
 }
 
+/// A cross-tier hole must cost one store lock per tier, not one per tier
+/// per cursor visit.
+///
+/// G2 holds only hashes[0] and G1 holds hashes[0] and hashes[2], not
+/// hashes[1]. The walk asks G2 once over the full request (a hit run of
+/// one, stopping at hashes[1]), then asks G1 at that same cursor. G1 also
+/// stops at hashes[1], so the walk must end there without a second round
+/// that re-asks either tier at a cursor it has already declared a miss.
+#[tokio::test]
+async fn prefix_walk_asks_each_tier_once_per_cursor() -> Result<()> {
+    let mut holder = Holder::new(3).await?;
+    let absent = holder.fixture.pins.remove(1);
+    absent.set_evict_on_reset(true);
+    drop(absent);
+    let hashes = holder.fixture.hashes.clone();
+    drop(retained(&holder.fixture.g2, &[hashes[0]])?);
+    let g2_before = holder.fixture.g2.metrics().snapshot();
+    let g1_before = holder.fixture.g1.metrics().snapshot();
+    ensure!(holder.open(SearchMode::Prefix, device_tier()).await? == vec![hashes[0]]);
+    holder.available().await?;
+    let g2_after = holder.fixture.g2.metrics().snapshot();
+    let g1_after = holder.fixture.g1.metrics().snapshot();
+    ensure!(
+        g2_after.match_hashes_requested == g2_before.match_hashes_requested + 3,
+        "the walk must ask G2 only at a cursor it has not already stopped at"
+    );
+    ensure!(
+        g1_after.match_hashes_requested == g1_before.match_hashes_requested + 2,
+        "the walk must ask G1 only at a cursor it has not already stopped at"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn prefix_stops_at_a_cross_tier_hole_but_scatter_keeps_later_hits() -> Result<()> {
     let mut holder = Holder::new(3).await?;

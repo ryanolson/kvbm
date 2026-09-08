@@ -298,18 +298,28 @@ fn find_prefix(
 ) -> TierBlocks {
     let mut g2_blocks: Vec<ImmutableBlock<G2>> = Vec::new();
     let mut cursor = 0;
+    let run = g2_manager.match_blocks(hashes);
+    cursor += run.len();
+    g2_blocks.extend(run);
     loop {
-        let run = g2_manager.match_blocks(&hashes[cursor..]);
-        let g2_run = run.len();
-        cursor += g2_run;
-        g2_blocks.extend(run);
+        // G2 stopped at this cursor, so a G1 run of zero ends the walk
+        // here, and G1 stopped at the cursor the next G2 call receives,
+        // so a G2 run of zero ends it too. Asking a tier again at a
+        // cursor where it already declared a miss would take a store
+        // lock only to re-learn that same miss.
         let g1_run = pins
             .as_mut()
             .map_or(0, |pins| pins.pin_prefix(&hashes[cursor..]));
-        cursor += g1_run;
-        if g2_run + g1_run == 0 {
+        if g1_run == 0 {
             break;
         }
+        cursor += g1_run;
+        let run = g2_manager.match_blocks(&hashes[cursor..]);
+        if run.is_empty() {
+            break;
+        }
+        cursor += run.len();
+        g2_blocks.extend(run);
     }
     TierBlocks {
         committed: hashes[..cursor].to_vec(),
