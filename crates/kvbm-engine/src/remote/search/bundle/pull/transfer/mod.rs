@@ -84,6 +84,31 @@ impl LeaderBundleTransfer {
     }
 }
 
+/// Build the `open_session` request for a bundle pull.
+///
+/// The bundle pull follows the open, so a device hit is worth the holder's
+/// local copy.
+fn bundle_open_request(
+    resource: LogicalResourceId,
+    hashes: Vec<SequenceHash>,
+    watchdog: Duration,
+    registration_epoch: RegistrationEpoch,
+) -> OpenTransferSessionRequest {
+    OpenTransferSessionRequest {
+        sequence_hashes: hashes,
+        search_mode: SearchMode::Prefix,
+        find_mode: FindMode::Sync,
+        tiers: TierSelection {
+            g1: true,
+            ..Default::default()
+        },
+        resource: Some(resource),
+        watchdog_ms: Some(duration_millis(watchdog)),
+        registration_epoch: Some(registration_epoch),
+        require_payload_integrity: true,
+    }
+}
+
 impl BundleTransfer for LeaderBundleTransfer {
     fn open(
         &self,
@@ -94,21 +119,12 @@ impl BundleTransfer for LeaderBundleTransfer {
         Box::pin(async move {
             self.client
                 .transfer()
-                .open_session(OpenTransferSessionRequest {
-                    sequence_hashes: hashes,
-                    search_mode: SearchMode::Prefix,
-                    find_mode: FindMode::Sync,
-                    // The bundle pull follows the open, so a device hit is
-                    // worth the holder's local copy.
-                    tiers: TierSelection {
-                        g1: true,
-                        ..Default::default()
-                    },
-                    resource: Some(resource),
-                    watchdog_ms: Some(duration_millis(watchdog)),
-                    registration_epoch: Some(self.registration_epoch),
-                    require_payload_integrity: true,
-                })
+                .open_session(bundle_open_request(
+                    resource,
+                    hashes,
+                    watchdog,
+                    self.registration_epoch,
+                ))
                 .await
                 .map_err(|error| classify_control_error(resource, error))
         })
@@ -215,4 +231,32 @@ fn classify_control_error(resource: LogicalResourceId, error: ControlError) -> B
 
 fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().clamp(1, u128::from(u64::MAX)) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundle_open_request_selects_the_device_tier() {
+        let resource = LogicalResourceId(7);
+        let hashes = vec![SequenceHash::new(0, None, 0), SequenceHash::new(1, None, 1)];
+        let watchdog = Duration::from_secs(5);
+        let epoch = RegistrationEpoch::new();
+
+        let req = bundle_open_request(resource, hashes, watchdog, epoch);
+
+        assert_eq!(
+            req.tiers,
+            TierSelection {
+                g1: true,
+                ..Default::default()
+            }
+        );
+        assert_eq!(req.search_mode, SearchMode::Prefix);
+        assert_eq!(req.resource, Some(resource));
+        assert_eq!(req.registration_epoch, Some(epoch));
+        assert_eq!(req.watchdog_ms, Some(duration_millis(watchdog)));
+        assert!(req.require_payload_integrity);
+    }
 }

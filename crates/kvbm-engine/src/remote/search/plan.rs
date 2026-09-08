@@ -135,6 +135,27 @@ impl DiscoveryPlan {
     }
 }
 
+/// Build the `open_session` request for a remote pull.
+///
+/// This caller sets `g1: true`, so it accepts a committed hash that is
+/// resident in G1 or G2. A G1 hit costs the holder a local copy into a
+/// temporary G2 block before the pull.
+fn open_request(target: &[SequenceHash]) -> OpenTransferSessionRequest {
+    OpenTransferSessionRequest {
+        sequence_hashes: target.to_vec(),
+        search_mode: SearchMode::Prefix,
+        find_mode: FindMode::Sync,
+        tiers: TierSelection {
+            g1: true,
+            ..Default::default()
+        },
+        resource: None,
+        watchdog_ms: None,
+        registration_epoch: None,
+        require_payload_integrity: false,
+    }
+}
+
 /// Open a session on `candidate`, pull its committed prefix into local G2,
 /// and close the session.
 ///
@@ -155,22 +176,7 @@ pub(super) async fn pull_from(
 
     let open = client
         .transfer()
-        .open_session(OpenTransferSessionRequest {
-            sequence_hashes: target.to_vec(),
-            search_mode: SearchMode::Prefix,
-            find_mode: FindMode::Sync,
-            // This caller sets `g1: true`, so it accepts a committed hash
-            // that is resident in G1 or G2. A G1 hit costs the holder a
-            // local copy into a temporary G2 block before the pull.
-            tiers: TierSelection {
-                g1: true,
-                ..Default::default()
-            },
-            resource: None,
-            watchdog_ms: None,
-            registration_epoch: None,
-            require_payload_integrity: false,
-        })
+        .open_session(open_request(target))
         .await
         .map_err(|e| anyhow!("open_session on {candidate}: {e}"))?;
 
@@ -397,5 +403,22 @@ mod tests {
         // current_prefix = 8 (past remaining_start 4) → pin = 8..11.
         let pin = plan.resolve_pin_target(s[10], 8).expect("pin range");
         assert_eq!(pin, 8..11);
+    }
+
+    #[test]
+    fn remote_pull_open_request_selects_the_device_tier() {
+        let target = seq(3);
+        let req = open_request(&target);
+        assert_eq!(
+            req.tiers,
+            TierSelection {
+                g1: true,
+                ..Default::default()
+            }
+        );
+        assert_eq!(req.search_mode, SearchMode::Prefix);
+        assert_eq!(req.find_mode, FindMode::Sync);
+        assert_eq!(req.resource, None);
+        assert!(!req.require_payload_integrity);
     }
 }
