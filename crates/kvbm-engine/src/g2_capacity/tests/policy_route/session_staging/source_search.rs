@@ -327,6 +327,32 @@ async fn resident_g2_hits_publish_before_the_g1_copy_lands() -> Result<()> {
     Ok(())
 }
 
+/// The commit stream must close before the G1 copy lands.
+///
+/// The holder commits the full set up front, so no later commit exists to
+/// wait for. A puller attached to `drain_committed` must not pay the device
+/// copy latency for a set the holder already knows in full.
+#[tokio::test]
+async fn commit_stream_closes_before_the_g1_copy_lands() -> Result<()> {
+    let transfer = gated_transfer();
+    let holder = Holder::with_transfer(2, transfer.clone()).await?;
+    let hashes = holder.fixture.hashes.clone();
+    let primary = retained(&holder.fixture.g2, &hashes[..1])?;
+    ensure!(holder.open(SearchMode::Prefix, device_tier()).await? == hashes);
+    transfer.started.wait().await;
+    let closed_during_the_copy = holder.session()?.finish_commits_called();
+    // Release the copy before the assertions. A parked gate outlives a
+    // failed test and blocks the runtime drop instead of failing it.
+    transfer.release.wait().await;
+    ensure!(
+        closed_during_the_copy,
+        "the commit stream must close before the device copy lands"
+    );
+    holder.available().await?;
+    drop(primary);
+    Ok(())
+}
+
 /// A failed device copy closes the session and names the staging step.
 ///
 /// The batch the holder already published stays published, and the copy

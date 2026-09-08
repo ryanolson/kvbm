@@ -72,7 +72,7 @@ scan, not the stage; that keeps the response fast even with
 ```text
 find_phase                        stage_phase  (always background)
 ─────────                         ───────────
-G2: match_blocks/scan_matches     commit(committed)
+G2: match_blocks/scan_matches     commit(committed) → finish_commits
   └─ ImmutableBlock<G2>             ├─ make_available(g2_blocks)
 (if tiers.g1)                       │
 G1: match_prefix/scan_matches       ├─ stage_to_g2 → temporary G2 blocks
@@ -80,7 +80,7 @@ G1: match_prefix/scan_matches       ├─ stage_to_g2 → temporary G2 blocks
 (if tiers.g3, Scatter only)         │
 G3: scan_matches                    ├─ stage_g3_to_g2 → new G2 blocks
   └─ ImmutableBlock<G3>             ├─ make_available(new_g2_blocks)
-                                    └─ finish_commits / finish_availability
+                                    └─ finish_availability
 ```
 
 `find_phase` computes `committed` once, in request order, and every
@@ -96,6 +96,8 @@ await their transfer notifications.
 Publication is tiered. The resident G2 batch goes out before the device
 copy starts, so an attached puller reads the hits that need no copy
 while the copy runs. Each tier publishes its own batch in request order.
+The commit stream closes before the first batch publishes, so the
+puller's `drain_committed` step finishes before any copy lands.
 
 Failures in `stage_phase` call `Session::close(reason)`, which
 propagates `LifecycleEvent::Failed` to any attached puller. The

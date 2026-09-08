@@ -431,14 +431,19 @@ async fn stage_phase(
             .map_err(|_| ControlError::Internal("payload ordinal exceeds u32".to_owned()))?;
         ordinals.insert(*hash, ordinal);
     }
-    // Commit every selected hash up front, whichever tier holds it, so
-    // an attached puller reads the full set from `commits()` while the
-    // G1 and G3 copies still run.
+    // Commit every selected hash up front, whichever tier holds it. Then
+    // seal the commit stream before any tier publishes. find_phase already
+    // computes the full committed set, so no later commit exists to wait
+    // for. An attached puller passes `drain_committed` here, before the
+    // G1 and G3 copies run.
     if !committed.is_empty() {
         session
             .commit(committed)
             .map_err(|error| ControlError::Internal(format!("commit blocks: {error:#}")))?;
     }
+    session
+        .finish_commits()
+        .map_err(|e| ControlError::Internal(format!("finish_commits: {e:#}")))?;
     // Publish each tier as it lands. The resident G2 hits need no copy, so
     // holding them back would charge every hit the latency of the slowest
     // tier the search touched. Each batch already arrives in request order.
@@ -503,9 +508,6 @@ async fn stage_phase(
         .map_err(|e| ControlError::Internal(format!("make_available staged: {e:#}")))?;
     }
 
-    session
-        .finish_commits()
-        .map_err(|e| ControlError::Internal(format!("finish_commits: {e:#}")))?;
     session
         .finish_availability()
         .map_err(|e| ControlError::Internal(format!("finish_availability: {e:#}")))?;
