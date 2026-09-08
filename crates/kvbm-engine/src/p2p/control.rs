@@ -301,7 +301,10 @@ fn find_prefix(
     let mut cursor = 0;
     // touch = false: the holder answers a remote peer here, the same as
     // find_scatter and the G1 source. A block another node wants must not
-    // outrank a block this node still reads.
+    // outrank a block this node still reads. The `touch` flag gates only
+    // the frequency-sketch write. The store-side inactive-pool
+    // resurrection happens regardless, because every backend's lookup
+    // ignores its `_touch` parameter.
     let run = g2_manager.match_prefix(&hashes[cursor..], false);
     cursor += run.len();
     g2_blocks.extend(run);
@@ -349,6 +352,9 @@ fn find_scatter(
     }
 
     // touch = false: an RPC search must not perturb the local G2 LRU.
+    // The `touch` flag gates only the frequency-sketch write. The
+    // store-side inactive-pool resurrection happens regardless, because
+    // every backend's lookup ignores its `_touch` parameter.
     let mut g2_map = g2_manager.scan_matches(hashes, /* touch */ false);
     let missing: Vec<SequenceHash> = hashes
         .iter()
