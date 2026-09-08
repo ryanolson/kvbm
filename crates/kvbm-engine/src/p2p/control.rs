@@ -410,11 +410,17 @@ fn find_scatter(
 ///
 /// Errors propagate as `ControlError::Internal`. On error the caller
 /// must call `session.close(reason)`. That call pushes
-/// `LifecycleEvent::Detached { reason }` on the lifecycle stream, plus
-/// `CommitDelta::Closed` and `AvailabilityDelta::Drained` on the other
-/// streams, to the attached puller. `LifecycleEvent::Failed` does not
-/// come from this path. It comes from an inbound `Frame::Error`, an
-/// attach failure, or a velo stream error other than `SenderDropped`.
+/// `LifecycleEvent::Detached { reason: Some(reason) }` on the lifecycle
+/// stream of the holder. The `SessionManager` watcher of the holder
+/// consumes it and evicts the entry. The same call also enqueues
+/// `Frame::CommitsClosed` and `Frame::Drained` on the wire. The puller
+/// observes these as `CommitDelta::Closed` and `AvailabilityDelta::Drained`.
+/// The puller sees `LifecycleEvent::Detached { reason: None }` only when
+/// the Finalized sentinel lands. Finalization waits for the last inbound
+/// `PullAck` while pulls are in flight. The reason string never reaches
+/// the puller. `LifecycleEvent::Failed` does not come from this path.
+/// It comes from an inbound `Frame::Error`, an attach failure, or a
+/// velo stream error other than `SenderDropped`.
 async fn stage_phase(
     leader: Arc<InstanceLeader>,
     session: Arc<dyn Session>,

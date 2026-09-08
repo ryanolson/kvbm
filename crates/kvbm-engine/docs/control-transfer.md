@@ -100,12 +100,17 @@ The commit stream closes before the first batch publishes, so the
 puller's `drain_committed` step finishes before any copy lands.
 
 Failures in `stage_phase` call `Session::close(reason)`. That call
-pushes `LifecycleEvent::Detached { reason }` on the lifecycle stream,
-plus `CommitDelta::Closed` and `AvailabilityDelta::Drained` on the
-other streams, to any attached puller. `LifecycleEvent::Failed` does
+pushes `LifecycleEvent::Detached { reason: Some(reason) }` on the
+lifecycle stream of the holder. The `SessionManager` watcher of the
+holder consumes it and evicts the entry. The same call also enqueues
+`Frame::CommitsClosed` and `Frame::Drained` on the wire. Any attached
+puller observes these as `CommitDelta::Closed` and
+`AvailabilityDelta::Drained`. The puller sees `LifecycleEvent::Detached
+{ reason: None }` only when the Finalized sentinel lands. Finalization
+waits for the last inbound `PullAck` while pulls are in flight. The
+reason string never reaches the puller. `LifecycleEvent::Failed` does
 not come from this path. It comes from an inbound `Frame::Error`, an
-attach failure, or a velo stream error other than `SenderDropped`. The
-`SessionManager` watchdog evicts the entry.
+attach failure, or a velo stream error other than `SenderDropped`.
 
 ### Fail-fast: G3 without a parallel_worker
 
