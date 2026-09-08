@@ -138,9 +138,7 @@ async fn session_staging_device_exact_bytes_use_the_bound_resource() -> Result<(
         g2.match_blocks(&hashes).is_empty(),
         "G1-only source must have no mirrored G2 blocks"
     );
-    let staged = route
-        .stage_to_g2(pins, TransferCompleteNotification::completed())
-        .await?;
+    let staged = route.stage_to_g2(pins).await?;
     holder.make_available(staged)?;
     let blocks = g2.match_blocks(&hashes);
     ensure!(blocks.len() == 2);

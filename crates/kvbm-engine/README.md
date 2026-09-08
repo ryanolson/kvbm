@@ -10,7 +10,7 @@ Leaders own block metadata and make placement decisions. Workers execute data tr
 
 ## G1 source staging for sessions
 
-The `PolicyG1G2BoundRoute::stage_to_g2` method copies caller-owned G1 pins into temporary G2 blocks and returns their registered pins. The certified route fixes the resource, G1 manager, G2 capacity, and workers. The caller supplies a completion receipt for all source writes. The session publisher owns commitments, checksums, and availability.
+The `PolicyG1G2BoundRoute::stage_to_g2` method copies caller-owned G1 pins into temporary G2 blocks and returns their registered pins. The certified route fixes the resource, G1 manager, G2 capacity, and workers. The session publisher owns commitments, checksums, and availability.
 
 The method checks source manager identity, unique hashes, and equal logical block sizes before dispatch. It reuses G2 matches and reserves only missing blocks through `G2Capacity`. An independent task owns source pins and destination capacity until physical completion. A dropped future cancels publication, not DMA. An uncertain completion or dispatch panic retains the affected memory and capacity.
 

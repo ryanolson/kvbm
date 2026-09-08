@@ -5,9 +5,7 @@ use anyhow::{Context, Result, anyhow, ensure};
 use futures::future::BoxFuture;
 use kvbm_common::{LogicalLayoutHandle, SequenceHash};
 use kvbm_logical::{ImmutableBlock, LifecyclePinRef};
-use kvbm_physical::transfer::{
-    TransferCompleteNotification, TransferDrainOutcome, TransferOptions,
-};
+use kvbm_physical::transfer::{TransferDrainOutcome, TransferOptions};
 use tokio::sync::oneshot;
 
 use super::{PolicyG1G2BoundRoute, PolicyG1G2RouteCore, PolicyG1SourceMetadata};
@@ -43,10 +41,17 @@ impl<T: PolicyG1SourceMetadata> PolicyG1G2BoundRoute<T> {
         ))
     }
 
+    /// Copy the registered G1 blocks of `source` into temporary G2 blocks.
+    ///
+    /// The copy carries no source-write fence. Every pin names a registered
+    /// block, and the installer's contract states that a registered block
+    /// holds completed writes. A fence here would wait on a receipt that the
+    /// caller cannot fail to satisfy, and the parameter would hide the real
+    /// rule at the registration seam. The Rhino half of the same rule lives on
+    /// `KvRuntime::register_request_blocks`.
     pub fn stage_to_g2(
         &self,
         source: Vec<ImmutableBlock<T>>,
-        writes_complete: TransferCompleteNotification,
     ) -> BoxFuture<'static, Result<Vec<ImmutableBlock<G2>>>> {
         let pins = source.iter().map(ImmutableBlock::pin).collect::<Vec<_>>();
         let validation = (|| {
@@ -81,11 +86,13 @@ impl<T: PolicyG1SourceMetadata> PolicyG1G2BoundRoute<T> {
             route: Arc::clone(&self.core),
             source: pins,
             destination: None,
-            undrained: true,
+            // No DMA runs before the dispatch site re-arms this flag, so a
+            // task that ends early releases its pins and its capacity.
+            undrained: false,
         };
         let spawned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             runtime.spawn_blocking(move || {
-                let result = copy.execute(writes_complete, &sender);
+                let result = copy.execute(&sender);
                 drop(copy);
                 let _ = sender.send(result);
             })
@@ -102,12 +109,7 @@ impl<T: PolicyG1SourceMetadata> PolicyG1G2BoundRoute<T> {
 }
 
 impl SessionStagingCopy {
-    fn execute(
-        &mut self,
-        writes_complete: TransferCompleteNotification,
-        sender: &oneshot::Sender<Result<StagedBlocks>>,
-    ) -> Result<StagedBlocks> {
-        self.settle(futures::executor::block_on(writes_complete.await_drain()))?;
+    fn execute(&mut self, sender: &oneshot::Sender<Result<StagedBlocks>>) -> Result<StagedBlocks> {
         ensure!(
             !sender.is_closed(),
             "session staging was canceled before dispatch"
@@ -214,6 +216,15 @@ impl SessionStagingCopy {
     }
 }
 
+/// Leak the pins, the destination allocation, and the route on an unproven
+/// drain.
+///
+/// The leak is the fail-closed answer to a DMA that can still be live. A
+/// release returns the G1 pages and the G2 slot to the free pool while the
+/// engine can still write them, which corrupts another request. The route
+/// `Arc` joins the leak because it keeps the transfer executor alive: the
+/// leader, the workers, and the registered layouts must outlive a copy that
+/// can still run. The forgotten allocation already holds its slot owner.
 impl Drop for SessionStagingCopy {
     fn drop(&mut self) {
         if self.undrained {

@@ -6,7 +6,6 @@ use anyhow::{Result, ensure};
 use futures::future::BoxFuture;
 use kvbm_common::{LogicalResourceId, SequenceHash};
 use kvbm_logical::{BlockManager, ImmutableBlock, ManagerId};
-use kvbm_physical::transfer::TransferCompleteNotification;
 use parking_lot::RwLock;
 
 use crate::G2;
@@ -106,8 +105,7 @@ impl<T: PolicyG1SourceMetadata + Send + 'static> PinnedG1Source for TypedPins<T>
     }
 
     fn stage(self: Box<Self>) -> BoxFuture<'static, Result<Vec<ImmutableBlock<G2>>>> {
-        self.route
-            .stage_to_g2(self.blocks, TransferCompleteNotification::completed())
+        self.route.stage_to_g2(self.blocks)
     }
 }
 

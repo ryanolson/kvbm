@@ -51,11 +51,7 @@ async fn failed_registration_preserves_hits_and_publishes_no_batch() -> Result<(
         transfer.clone(),
         &f.g1,
     );
-    ensure!(
-        f.submit(&route, TransferCompleteNotification::completed())
-            .await
-            .is_err()
-    );
+    ensure!(f.submit(&route).await.is_err());
     ensure!(transfer.records()[0].src_blocks.len() == 1);
     ensure!(f.holder.make_available_calls().is_empty());
     ensure!(f.g2.available_blocks() == 2);
@@ -72,46 +68,31 @@ async fn copy_dispatch_failure_releases_capacity_without_publication() -> Result
     f.check_ownership(1, 1, 1)
 }
 
+/// A staging task that ends before dispatch releases its source pins.
+///
+/// No DMA ran, so the fail-closed leak of the `Drop` path would strand the G1
+/// pages and the exact permit for the life of the process. This test is the
+/// only control on the initial value of the drain flag.
+#[tokio::test]
+async fn pre_dispatch_failure_releases_source_pins_and_capacity() -> Result<()> {
+    let mut f = Fixture::new(2, 1)?;
+    let primary = retained(&f.g2, &f.hashes[..1])?;
+    let transfer = Arc::new(ImmediateTransfer::default());
+    ensure!(f.stage(transfer.clone()).await.is_err());
+    ensure!(transfer.calls() == 0);
+    ensure!(f.holder.make_available_calls().is_empty());
+    f.check_ownership(2, 0, 0)?;
+    ensure!(f.g1.match_blocks(&f.hashes).len() == 2);
+    drop(primary);
+    Ok(())
+}
+
 #[tokio::test]
 async fn dispatch_panic_retains_source_and_destination_without_publication() -> Result<()> {
     let mut f = Fixture::new(1, 1)?;
     ensure!(f.stage(Arc::new(PanickingTransfer)).await.is_err());
     ensure!(f.holder.make_available_calls().is_empty());
     f.check_ownership(0, 0, 0)
-}
-
-#[tokio::test]
-async fn canceled_source_fence_retains_g1_until_writes_finish() -> Result<()> {
-    let mut f = Fixture::new(1, 1)?;
-    let transfer = Arc::new(ImmediateTransfer::default());
-    let events = velo::EventManager::local();
-    let written = events.new_event()?;
-    let ready = TransferCompleteNotification::from_awaiter(events.awaiter(written.handle())?);
-    drop(f.submit(&f.route(transfer.clone()), ready));
-    f.check_ownership(0, 1, 0)?;
-    ensure!(f.capacity.requests().is_empty());
-    written.trigger()?;
-    wait_for(|| f.g1.available_blocks() == 1).await?;
-    ensure!(transfer.calls() == 0);
-    ensure!(f.holder.make_available_calls().is_empty());
-    Ok(())
-}
-
-#[tokio::test]
-async fn unproven_source_fence_retains_g1_without_copy_or_allocation() -> Result<()> {
-    let mut f = Fixture::new(1, 1)?;
-    let transfer = Arc::new(ImmediateTransfer::default());
-    let events = velo::EventManager::local();
-    let written = events.new_event()?;
-    let ready = TransferCompleteNotification::from_awaiter(events.awaiter(written.handle())?);
-    let completion = f.submit(&f.route(transfer.clone()), ready);
-    written.poison("source writes did not prove completion")?;
-    ensure!(completion.await.is_err());
-    f.check_ownership(0, 1, 0)?;
-    ensure!(f.capacity.requests().is_empty());
-    ensure!(transfer.calls() == 0);
-    ensure!(f.holder.make_available_calls().is_empty());
-    Ok(())
 }
 
 #[tokio::test]

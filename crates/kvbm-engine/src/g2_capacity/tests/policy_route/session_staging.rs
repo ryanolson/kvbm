@@ -3,7 +3,6 @@ use std::time::Duration;
 use anyhow::{Context, ensure};
 use futures::future::BoxFuture;
 use kvbm_logical::ImmutableBlock;
-use kvbm_physical::transfer::TransferCompleteNotification;
 
 use super::*;
 use crate::g2_capacity::test_support::RecordingG2Capacity;
@@ -55,18 +54,11 @@ impl Fixture {
         &mut self,
         transfer: Arc<dyn PolicyG1G2TransferExecutor>,
     ) -> BoxFuture<'static, Result<()>> {
-        self.submit(
-            &self.route(transfer),
-            TransferCompleteNotification::completed(),
-        )
+        self.submit(&self.route(transfer))
     }
 
-    fn submit(
-        &mut self,
-        route: &PolicyG1G2BoundRoute<G1>,
-        ready: TransferCompleteNotification,
-    ) -> BoxFuture<'static, Result<()>> {
-        let staged = route.stage_to_g2(std::mem::take(&mut self.pins), ready);
+    fn submit(&mut self, route: &PolicyG1G2BoundRoute<G1>) -> BoxFuture<'static, Result<()>> {
+        let staged = route.stage_to_g2(std::mem::take(&mut self.pins));
         let holder = self.holder.clone();
         Box::pin(async move { holder.make_available(staged.await?) })
     }
@@ -250,6 +242,9 @@ async fn interrupted_copy(timeout: bool) -> Result<()> {
     transfer.release.wait().await;
     wait_for(|| f.capacity.exact_permit_drop_count() == 1 && f.g2.available_blocks() == 1).await?;
     f.check_ownership(1, 1, 1)?;
+    // A drained copy returns its source pins to the inactive pool. The Drop
+    // leak path would forget them and leave no G1 match.
+    ensure!(f.g1.match_blocks(&f.hashes).len() == 1);
     ensure!(f.g2.match_blocks(&f.hashes).is_empty());
     ensure!(f.holder.make_available_calls().is_empty());
     Ok(())
@@ -263,28 +258,6 @@ async fn dropped_future_does_not_release_live_copy_or_publish_later() -> Result<
 #[tokio::test]
 async fn timeout_does_not_release_live_copy_or_publish_later() -> Result<()> {
     interrupted_copy(true).await
-}
-
-#[tokio::test]
-async fn source_writes_finish_before_copy_dispatch() -> Result<()> {
-    let mut f = Fixture::new(1, 1)?;
-    let transfer = Arc::new(ImmediateTransfer::default());
-    let events = velo::EventManager::local();
-    let written = events.new_event()?;
-    let ready = TransferCompleteNotification::from_awaiter(events.awaiter(written.handle())?);
-    let mut completion = f.submit(&f.route(transfer.clone()), ready);
-    ensure!(
-        tokio::time::timeout(Duration::from_millis(20), &mut completion)
-            .await
-            .is_err()
-    );
-    ensure!(transfer.calls() == 0);
-    f.check_ownership(0, 1, 0)?;
-    ensure!(f.holder.make_available_calls().is_empty());
-    written.trigger()?;
-    completion.await?;
-    ensure!(transfer.calls() == 1);
-    Ok(())
 }
 
 #[tokio::test]
@@ -395,8 +368,7 @@ async fn compatibility_capacity_keeps_its_lease_and_resets_temporary_blocks() ->
         Arc::new(ImmediateTransfer::default()),
         &f.g1,
     );
-    f.submit(&route, TransferCompleteNotification::completed())
-        .await?;
+    f.submit(&route).await?;
     ensure!(capacity.allocation_kinds() == vec![G2AllocationKind::RequiredStaging]);
     ensure!(capacity.registrations_with_live_lease() == 1);
     ensure!(capacity.lease_drop_count() == 1);
