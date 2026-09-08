@@ -299,7 +299,10 @@ fn find_prefix(
 ) -> TierBlocks {
     let mut g2_blocks: Vec<ImmutableBlock<G2>> = Vec::new();
     let mut cursor = 0;
-    let run = g2_manager.match_blocks(hashes);
+    // touch = false: the holder answers a remote peer here, the same as
+    // find_scatter and the G1 source. A block another node wants must not
+    // outrank a block this node still reads.
+    let run = g2_manager.match_prefix(&hashes[cursor..], false);
     cursor += run.len();
     g2_blocks.extend(run);
     loop {
@@ -315,7 +318,7 @@ fn find_prefix(
             break;
         }
         cursor += g1_run;
-        let run = g2_manager.match_blocks(&hashes[cursor..]);
+        let run = g2_manager.match_prefix(&hashes[cursor..], false);
         if run.is_empty() {
             break;
         }
@@ -763,4 +766,95 @@ pub(crate) async fn pull_from_session(
         .publish()
         .map_err(|error| ControlError::Internal(format!("pull: publish G2 blocks: {error}")))?;
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kvbm_logical::manager::FrequencyTrackingCapacity;
+
+    /// `InstanceLeader` around `g2_manager`, with no G1 source, no G3
+    /// manager, and no workers. `find_phase` never reaches any of those
+    /// when `tiers` selects G2 alone, so the search under test needs none.
+    async fn leader_for_search(g2_manager: Arc<BlockManager<G2>>) -> Arc<InstanceLeader> {
+        let messenger = crate::testing::messenger::create_messenger_tcp()
+            .await
+            .expect("test messenger");
+        Arc::new(
+            InstanceLeader::builder()
+                .messenger(messenger)
+                .registry(kvbm_logical::blocks::BlockRegistry::new())
+                .g2_manager(g2_manager)
+                .workers(vec![])
+                .build()
+                .expect("test leader"),
+        )
+    }
+
+    /// Three-block prefix in a frequency-tracked G2 manager, with the
+    /// registry count of every hash after population.
+    fn tracked_prefix() -> (Arc<BlockManager<G2>>, Vec<SequenceHash>, Vec<u32>) {
+        let g2_manager = Arc::new(
+            crate::testing::managers::TestManagerBuilder::<G2>::new()
+                .block_count(8)
+                .block_size(4)
+                .frequency_tracking(FrequencyTrackingCapacity::Small)
+                .build(),
+        );
+        let token_sequence = crate::testing::token_blocks::create_token_sequence(3, 4, 0);
+        let hashes = crate::testing::managers::populate_manager_with_blocks(
+            &g2_manager,
+            token_sequence.blocks(),
+        )
+        .expect("populate three-block prefix");
+        assert_eq!(hashes.len(), 3);
+        let registry = g2_manager.block_registry();
+        let before = hashes.iter().map(|hash| registry.count(*hash)).collect();
+        (g2_manager, hashes, before)
+    }
+
+    /// Registry counts before and after one `find_phase` in `mode` over
+    /// the whole prefix, with G2 as the only selected tier.
+    async fn counts_around_search(mode: SearchMode) -> (Vec<u32>, Vec<u32>) {
+        let (g2_manager, hashes, before) = tracked_prefix();
+        let leader = leader_for_search(g2_manager.clone()).await;
+        let found = find_phase(
+            &leader,
+            &g2_manager,
+            LogicalResourceId::default(),
+            &hashes,
+            mode,
+            TierSelection::default(),
+        )
+        .await
+        .expect("search");
+        assert_eq!(found.committed, hashes);
+        let registry = g2_manager.block_registry();
+        let after = hashes.iter().map(|hash| registry.count(*hash)).collect();
+        (before, after)
+    }
+
+    /// A remote search must not touch the frequency tracker: a block
+    /// another node wants must not outrank a block this node still reads.
+    /// `find_prefix` must pass `touch = false`, the same as `find_scatter`
+    /// and the G1 source.
+    #[tokio::test]
+    async fn remote_prefix_search_does_not_touch_frequency() {
+        let (before, after) = counts_around_search(SearchMode::Prefix).await;
+        assert_eq!(
+            before, after,
+            "SearchMode::Prefix must not touch the frequency tracker"
+        );
+    }
+
+    /// Control: `find_scatter` passes `touch = false`, so the same prefix
+    /// through `SearchMode::Scatter` leaves every count unchanged.
+    #[tokio::test]
+    async fn remote_scatter_search_does_not_touch_frequency() {
+        let (before, after) = counts_around_search(SearchMode::Scatter).await;
+        assert_eq!(
+            before, after,
+            "SearchMode::Scatter must not touch the frequency tracker"
+        );
+    }
 }

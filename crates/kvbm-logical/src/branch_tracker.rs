@@ -69,6 +69,21 @@
 //! registers, `P` never fires the `on_block_removed(P)` that would reclaim it; the record
 //! is pinned until then. Callers driving the oracle outside the prefix-ordered
 //! registration path must preserve the parent-before-child discipline to keep the bound.
+//!
+//! A `Scatter` onboard names one concrete path into this case. `find_scatter`
+//! (`kvbm-engine/src/p2p/control.rs`) returns every hash that any selected tier holds, gaps
+//! included. A remote pull lands its committed hashes in local `G2`
+//! (`kvbm-engine/src/remote/search/plan.rs`, `pull_from`). Under `SearchMode::Scatter`, that
+//! pull can register a child block whose parent this instance never fetched. Prefix order is
+//! a property of `Prefix` search, not of `Scatter` search.
+//!
+//! The path is dormant today. A registry has an oracle only if its builder receives one
+//! through `.branch_oracle(...)`. Today the one production consumer installs the oracle on
+//! `G1` registries only. Every production requester sends `SearchMode::Prefix`
+//! (`kvbm-engine/src/remote/search/plan.rs:146` and
+//! `kvbm-engine/src/remote/search/bundle/pull/transfer/mod.rs:99`), never `Scatter`. The
+//! orphan path opens when a registration path that observes `G2` landings also feeds this
+//! oracle.
 
 use std::collections::HashMap;
 

@@ -12,6 +12,7 @@
 //! hub so the hub's `on_unregister` sweep reclaims this instance's entries.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -32,10 +33,12 @@ const ZMQ_LINGER_MS: i32 = 0;
 /// The [`Publisher`] contract is synchronous (`publish` returns immediately),
 /// but the tmq socket send is async. A bounded mpsc channel bridges the two: a
 /// background task owns the socket and drains the channel. Backpressure drops
-/// the oldest pending batch rather than blocking the event pipeline — KV index
-/// freshness is advisory.
+/// the newest batch, the one that `publish` hands off, and never blocks the
+/// event pipeline, because KV index freshness is advisory. The channel keeps
+/// what it already queued.
 pub struct ZmqHubPublisher {
     tx: mpsc::Sender<Bytes>,
+    dropped_batches: AtomicU64,
 }
 
 impl ZmqHubPublisher {
@@ -58,7 +61,17 @@ impl ZmqHubPublisher {
             tracing::info!("indexer PUB send task stopped");
         });
 
-        Ok(Self { tx })
+        Ok(Self {
+            tx,
+            dropped_batches: AtomicU64::new(0),
+        })
+    }
+
+    /// Cumulative count of batches dropped because `publish` found the
+    /// channel full. The index is advisory, so the publisher does not
+    /// repair the loss. The counter only makes the loss visible.
+    pub fn dropped_batches(&self) -> u64 {
+        self.dropped_batches.load(Ordering::Relaxed)
     }
 }
 
@@ -75,7 +88,8 @@ impl Publisher for ZmqHubPublisher {
         match self.tx.try_send(payload) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => {
-                tracing::warn!("indexer publish channel full; dropping batch");
+                let dropped = self.dropped_batches.fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::warn!(dropped, "indexer publish channel full; dropping batch");
                 Ok(())
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -86,5 +100,59 @@ impl Publisher for ZmqHubPublisher {
 
     fn flush(&self) -> BoxFuture<'static, Result<()>> {
         Box::pin(async { Ok(()) })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    impl ZmqHubPublisher {
+        /// Publisher over a caller-held channel, with no drain task and no
+        /// ZMQ socket. Exercises the backpressure path of `publish` directly.
+        /// The test holds the receiver, so a full channel is reachable
+        /// without a slow or absent hub on a real socket.
+        fn for_channel(capacity: usize) -> (Self, mpsc::Receiver<Bytes>) {
+            let (tx, rx) = mpsc::channel(capacity);
+            (
+                Self {
+                    tx,
+                    dropped_batches: AtomicU64::new(0),
+                },
+                rx,
+            )
+        }
+    }
+
+    #[test]
+    fn a_full_publish_channel_drops_the_newest_batch_and_counts_it() {
+        let (publisher, mut rx) = ZmqHubPublisher::for_channel(1024);
+
+        for i in 0..1025u32 {
+            let payload = Bytes::from(i.to_be_bytes().to_vec());
+            publisher
+                .publish(SUBJECT, payload)
+                .expect("publish must not error on a full channel");
+        }
+
+        assert_eq!(publisher.dropped_batches(), 1);
+
+        let mut received = Vec::new();
+        while let Ok(payload) = rx.try_recv() {
+            received.push(payload);
+        }
+        assert_eq!(
+            received.len(),
+            1024,
+            "the channel still holds the first 1024 batches"
+        );
+        assert_eq!(
+            received.first(),
+            Some(&Bytes::from(0u32.to_be_bytes().to_vec()))
+        );
+        assert_eq!(
+            received.last(),
+            Some(&Bytes::from(1023u32.to_be_bytes().to_vec()))
+        );
     }
 }
