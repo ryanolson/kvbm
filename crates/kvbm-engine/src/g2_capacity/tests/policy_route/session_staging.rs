@@ -110,11 +110,26 @@ fn source(count: usize) -> Result<Source> {
             .block_size(4)
             .build(),
     );
-    let hashes = (0..count)
-        .map(|index| SequenceHash::new(index as u64 + 80, None, index as u64))
-        .collect::<Vec<_>>();
-    let pins = retained(&manager, &hashes)?;
+    let pins = retained(&manager, &chain(count, 80))?;
     Ok(Source { manager, pins })
+}
+
+/// Build one root-to-leaf lineage.
+///
+/// A production source always holds a chained prefix. Unrelated roots let a
+/// fixture pass a destination rule that only a real lineage can reach.
+fn chain(len: usize, seed: u64) -> Vec<SequenceHash> {
+    let mut hashes = Vec::with_capacity(len);
+    if len == 0 {
+        return hashes;
+    }
+    let mut hash = SequenceHash::root(seed);
+    hashes.push(hash);
+    for offset in 1..len {
+        hash = hash.extend(seed + offset as u64);
+        hashes.push(hash);
+    }
+    hashes
 }
 
 fn retained<T: kvbm_logical::blocks::BlockMetadata + Sync>(
