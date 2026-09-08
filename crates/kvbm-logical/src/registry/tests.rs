@@ -608,3 +608,239 @@ fn drop_does_not_remove_entry_when_replaced_by_newer_registration() {
     drop(inner_b);
     assert!(!registry.is_registered(seq_hash));
 }
+
+// --- Event order across a racing re-registration ---------------------------
+//
+// `Drop` publishes a registration's `Remove`, and `register_sequence_hash`
+// publishes the replacement's `Create` under the entry's position guard. The
+// hub index keeps one holder set per hash and applies `Remove` unconditionally
+// (`kvbm-hub/src/features/indexer/index.rs`), so a `Remove` that reaches the
+// stream after a later `Create` deletes a block the instance still holds. The
+// tests below pin the two orders that the position guard must cover.
+
+use crate::branch_tracker::BranchOracle;
+use crate::events::{EventsManager, KvCacheEvent};
+use futures::{FutureExt, Stream, StreamExt};
+use parking_lot::Mutex;
+use std::pin::Pin;
+
+/// Subscriber handed to a test. Boxing gives one concrete `Unpin` type that a
+/// probe can hold behind a mutex.
+pub(super) type EventStream = Pin<Box<dyn Stream<Item = KvCacheEvent> + Send>>;
+
+/// Collect every event the subscriber already holds. Publication is
+/// synchronous on the operation's own thread, so an operation that has
+/// returned has already queued its events.
+pub(super) fn drain_events(stream: &mut EventStream) -> Vec<KvCacheEvent> {
+    let mut events = Vec::new();
+    while let Some(Some(event)) = stream.next().now_or_never() {
+        events.push(event);
+    }
+    events
+}
+
+/// Oracle that drains the subscriber at each `on_block_removed` call. The
+/// singular removal path fires that call under the entry's position guard, and
+/// the batched path fires it after the guard but before the handles drop, so
+/// what this records is what the stream carried inside the critical section.
+pub(super) struct GuardProbe {
+    stream: Mutex<EventStream>,
+    seen: Mutex<Vec<KvCacheEvent>>,
+}
+
+impl GuardProbe {
+    pub(super) fn new(stream: EventStream) -> Self {
+        Self {
+            stream: Mutex::new(stream),
+            seen: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub(super) fn seen(&self) -> Vec<KvCacheEvent> {
+        self.seen.lock().clone()
+    }
+}
+
+impl BranchOracle for GuardProbe {
+    fn on_block_registered(&self, _hash: SequenceHash) {}
+
+    fn on_block_removed(&self, _hash: SequenceHash) {
+        let drained = drain_events(&mut self.stream.lock());
+        self.seen.lock().extend(drained);
+    }
+
+    fn max_fanout(&self, _hash: SequenceHash) -> Option<u32> {
+        None
+    }
+}
+
+fn events_and_registry() -> (Arc<EventsManager>, BlockRegistry) {
+    let events = Arc::new(EventsManager::builder().channel_capacity(65_536).build());
+    let registry = BlockRegistry::builder()
+        .event_manager(events.clone())
+        .build();
+    (events, registry)
+}
+
+/// Two threads churn one hash. Every `Remove` must reach the stream while the
+/// hub still believes the instance holds the hash. A `Remove` that arrives
+/// when the model already forgot the hash proves the opposite: the `Create`
+/// before it belongs to a registration that was still live, so that
+/// registration's block became undiscoverable.
+#[test]
+fn concurrent_churn_never_publishes_a_remove_for_a_live_registration() {
+    const ITERATIONS: usize = 5_000;
+
+    let (events, registry) = events_and_registry();
+    let mut stream: EventStream = Box::pin(events.subscribe());
+    let seq_hash = create_test_token_block(&[1, 2, 3, 4]).kvbm_sequence_hash();
+
+    std::thread::scope(|scope| {
+        for _ in 0..2 {
+            let registry = &registry;
+            scope.spawn(move || {
+                for _ in 0..ITERATIONS {
+                    drop(registry.register_sequence_hash(seq_hash));
+                }
+            });
+        }
+    });
+
+    let observed = drain_events(&mut stream);
+    assert_eq!(
+        events.lagged_events(),
+        0,
+        "the subscriber lost events, so the order below is not observable"
+    );
+    assert!(!observed.is_empty(), "the churn published no event");
+
+    let mut held = false;
+    for (index, event) in observed.iter().enumerate() {
+        match event {
+            KvCacheEvent::Create(hash) => {
+                assert_eq!(*hash, seq_hash);
+                held = true;
+            }
+            KvCacheEvent::Remove(hash) => {
+                assert_eq!(*hash, seq_hash);
+                let window = &observed[index.saturating_sub(3)..observed.len().min(index + 2)];
+                assert!(
+                    held,
+                    "event {index} removes a hash the hub already forgot; \
+                     the Create before it belongs to a registration that was still live: {window:?}"
+                );
+                held = false;
+            }
+        }
+    }
+    assert!(!held, "the churn ended with the hub still holding the hash");
+}
+
+/// Control for the two-thread test: one thread over the same loop publishes a
+/// strict `Create`, `Remove` alternation.
+#[test]
+fn single_thread_churn_alternates_create_and_remove() {
+    const ITERATIONS: usize = 2_000;
+
+    let (events, registry) = events_and_registry();
+    let mut stream: EventStream = Box::pin(events.subscribe());
+    let seq_hash = create_test_token_block(&[1, 2, 3, 4]).kvbm_sequence_hash();
+
+    for _ in 0..ITERATIONS {
+        drop(registry.register_sequence_hash(seq_hash));
+    }
+
+    let observed = drain_events(&mut stream);
+    assert_eq!(observed.len(), ITERATIONS * 2);
+    for (index, event) in observed.iter().enumerate() {
+        let expected = if index.is_multiple_of(2) {
+            KvCacheEvent::Create(seq_hash)
+        } else {
+            KvCacheEvent::Remove(seq_hash)
+        };
+        assert_eq!(*event, expected, "event {index} breaks the alternation");
+    }
+}
+
+/// The `Remove` must leave inside the position guard that removed the entry.
+/// `on_block_removed` is the one observation point inside that guard, and the
+/// event goes out before it, so a panicking oracle cannot push the `Remove`
+/// out of the critical section.
+#[test]
+fn drop_publishes_remove_inside_the_position_guard() {
+    let events = Arc::new(EventsManager::builder().channel_capacity(1_024).build());
+    let probe = Arc::new(GuardProbe::new(Box::pin(events.subscribe())));
+    let registry = BlockRegistry::builder()
+        .event_manager(events.clone())
+        .branch_oracle(probe.clone() as Arc<dyn BranchOracle>)
+        .build();
+    let seq_hash = create_test_token_block(&[1, 2, 3, 4]).kvbm_sequence_hash();
+
+    drop(registry.register_sequence_hash(seq_hash));
+
+    assert_eq!(
+        probe.seen(),
+        vec![
+            KvCacheEvent::Create(seq_hash),
+            KvCacheEvent::Remove(seq_hash)
+        ],
+        "the Remove reached the stream after the position guard was released"
+    );
+}
+
+/// The mirror of `drop_does_not_remove_entry_when_replaced_by_newer_registration`
+/// on the event stream. `Weak::upgrade` fails as soon as the strong count
+/// reaches zero, so a racing registration can win the position guard before the
+/// old inner's `Drop` body runs. That old inner must publish no `Remove`: the
+/// new inner published the `Create` that owns the hash, and its own drop
+/// publishes the matching `Remove`.
+#[test]
+fn a_superseded_registration_publishes_no_remove() {
+    use super::handle::BlockRegistrationHandleInner;
+
+    let (events, registry) = events_and_registry();
+    let mut stream: EventStream = Box::pin(events.subscribe());
+    let seq_hash = create_test_token_block(&[1, 2, 3, 4]).kvbm_sequence_hash();
+
+    let handle_a = registry.register_sequence_hash(seq_hash);
+    let inner_a: Arc<BlockRegistrationHandleInner> = handle_a.inner.clone();
+    drop(handle_a);
+    assert_eq!(
+        drain_events(&mut stream),
+        vec![KvCacheEvent::Create(seq_hash)]
+    );
+
+    // The racing registration: a new inner takes the slot and publishes its own
+    // Create, exactly as `register_sequence_hash` does under the position guard.
+    let inner_b = Arc::new(BlockRegistrationHandleInner::new(
+        seq_hash,
+        Arc::downgrade(&registry.prt),
+        None,
+    ));
+    let handle_b = BlockRegistrationHandle::from_inner(inner_b.clone());
+    events.on_block_registered(&handle_b);
+    {
+        let map = registry.prt.prefix(&seq_hash);
+        let mut weak = map.get_mut(&seq_hash).expect("entry present");
+        *weak = Arc::downgrade(&inner_b);
+    }
+    assert_eq!(
+        drain_events(&mut stream),
+        vec![KvCacheEvent::Create(seq_hash)]
+    );
+
+    drop(inner_a);
+
+    assert!(
+        drain_events(&mut stream).is_empty(),
+        "the superseded registration published a Remove for a hash the live one holds"
+    );
+
+    // Control: the live registration still publishes its own Remove.
+    drop(handle_b);
+    drop(inner_b);
+    assert_eq!(
+        drain_events(&mut stream),
+        vec![KvCacheEvent::Remove(seq_hash)]
+    );
+}

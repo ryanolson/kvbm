@@ -82,7 +82,7 @@ async fn test_full_event_pipeline() {
         .iter()
         .map(|&hash| {
             let handle = registry.register_sequence_hash(hash);
-            manager.on_block_registered(&handle).unwrap();
+            manager.on_block_registered(&handle);
             handle
         })
         .collect();
@@ -155,7 +155,7 @@ async fn test_type_switch_flushes_batch() {
     // Register block (Create event)
     let hash1 = create_seq_hash_at_position(10);
     let handle1 = registry.register_sequence_hash(hash1);
-    manager.on_block_registered(&handle1).unwrap();
+    manager.on_block_registered(&handle1);
 
     // Drop block (Remove event) - should flush pending Create first
     drop(handle1);
@@ -163,7 +163,7 @@ async fn test_type_switch_flushes_batch() {
     // Register another block (Create event) - should flush pending Remove
     let hash2 = create_seq_hash_at_position(20);
     let handle2 = registry.register_sequence_hash(hash2);
-    manager.on_block_registered(&handle2).unwrap();
+    manager.on_block_registered(&handle2);
 
     // Give time for events to propagate
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -217,7 +217,7 @@ async fn test_max_batch_size_flush() {
         .map(|i| {
             let hash = create_seq_hash_at_position(i);
             let handle = registry.register_sequence_hash(hash);
-            manager.on_block_registered(&handle).unwrap();
+            manager.on_block_registered(&handle);
             handle
         })
         .collect();
@@ -255,7 +255,7 @@ async fn test_multiple_subscribers() {
     let registry = BlockRegistry::new();
     let hash = create_seq_hash_at_position(42);
     let handle = registry.register_sequence_hash(hash);
-    manager.on_block_registered(&handle).unwrap();
+    manager.on_block_registered(&handle);
 
     // Both streams should receive the Create event
     let event1 = tokio::time::timeout(Duration::from_millis(100), stream1.next())

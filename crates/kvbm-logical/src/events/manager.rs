@@ -10,7 +10,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::Result;
 use derive_builder::Builder;
 use futures::Stream;
 use tokio::sync::broadcast;
@@ -84,7 +83,7 @@ impl EventsManagerSettings {
 /// The EventsManager is responsible for:
 /// - Filtering block registrations based on a policy
 /// - Emitting Create events when blocks are registered
-/// - Attaching RAII handles that emit Remove events when blocks are dropped
+/// - Giving each registration the RAII handle that emits its Remove event
 /// - Broadcasting events to multiple subscribers via [`subscribe()`](Self::subscribe)
 ///
 /// Note: Instance context is applied at the publisher level via
@@ -189,19 +188,20 @@ impl EventsManager {
     /// This method:
     /// 1. Checks the policy to determine if an event should be emitted
     /// 2. Broadcasts a Create event if the policy allows
-    /// 3. Attaches an EventReleaseHandle to the registration handle for cleanup
+    /// 3. Gives the registration handle the RAII publisher of its Remove event
+    ///
+    /// `register_sequence_hash` calls this under the entry's position guard, so
+    /// both steps happen inside the critical section that orders this `Create`
+    /// against the `Remove` of the registration it replaces.
     ///
     /// # Arguments
     /// * `handle` - The block registration handle
-    ///
-    /// # Returns
-    /// Ok(()) if successful, or an error if attachment fails
-    pub fn on_block_registered(&self, handle: &BlockRegistrationHandle) -> Result<()> {
+    pub fn on_block_registered(&self, handle: &BlockRegistrationHandle) {
         let seq_hash = handle.seq_hash();
 
         // Check policy - only emit events for filtered blocks
         if !self.policy.should_emit(seq_hash) {
-            return Ok(());
+            return;
         }
 
         // Emit Create event
@@ -210,13 +210,7 @@ impl EventsManager {
         // Broadcast send only fails if there are no receivers, which is fine
         let _ = self.event_tx.send(create_event);
 
-        // Attach RAII handle for Remove event
-        let release_handle = EventReleaseHandle::new(seq_hash, self.event_tx.clone());
-
-        // Attach as Arc<dyn Any> to the registration handle
-        handle.attach_unique(Arc::new(release_handle))?;
-
-        Ok(())
+        handle.attach_event_release(EventReleaseHandle::new(seq_hash, self.event_tx.clone()));
     }
 }
 
@@ -249,7 +243,7 @@ mod tests {
         let handle = registry.register_sequence_hash(seq_hash);
 
         // Register the block
-        manager.on_block_registered(&handle).unwrap();
+        manager.on_block_registered(&handle);
 
         // Should receive Create event
         let event = tokio::time::timeout(std::time::Duration::from_millis(100), stream.next())
@@ -271,7 +265,7 @@ mod tests {
         let handle = registry.register_sequence_hash(seq_hash);
 
         // Register the block
-        manager.on_block_registered(&handle).unwrap();
+        manager.on_block_registered(&handle);
 
         // Should NOT receive any event (will timeout)
         let result =
@@ -294,7 +288,7 @@ mod tests {
 
         {
             let handle = registry.register_sequence_hash(seq_hash);
-            manager.on_block_registered(&handle).unwrap();
+            manager.on_block_registered(&handle);
 
             // Consume Create event
             let event = tokio::time::timeout(std::time::Duration::from_millis(100), stream.next())
@@ -327,7 +321,7 @@ mod tests {
         let seq_hash = create_seq_hash_at_position(64); // Power of 2
         let handle = registry.register_sequence_hash(seq_hash);
 
-        manager.on_block_registered(&handle).unwrap();
+        manager.on_block_registered(&handle);
 
         // Both streams should receive the same event
         let event1 = tokio::time::timeout(std::time::Duration::from_millis(100), stream1.next())
@@ -358,7 +352,7 @@ mod tests {
 
         // With AllEventsPolicy, all blocks should emit events
         // (this would fail with PowerOfTwoPolicy for position 17)
-        manager.on_block_registered(&handle).unwrap();
+        manager.on_block_registered(&handle);
     }
 
     #[tokio::test]

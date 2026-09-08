@@ -8,6 +8,7 @@ use super::{BlockRegistry, PositionalRadixTree};
 
 use crate::blocks::{BlockMetadata, SequenceHash};
 use crate::branch_tracker::BranchOracle;
+use crate::events::protocol::EventReleaseHandle;
 
 use dashmap::DashMap;
 
@@ -94,6 +95,16 @@ impl BlockRegistrationHandleInner {
     pub(super) fn mark_removed_via_batch(&self) {
         self.removed_via_batch.store(true, Ordering::Release);
     }
+
+    /// Take the publisher of this registration's `Remove` event out of the
+    /// attachment store. Both removal paths call this under the entry's
+    /// position guard: dropping the returned handle there publishes the
+    /// `Remove` inside the critical section, and
+    /// [`EventReleaseHandle::disarm`] there suppresses the `Remove` of a
+    /// registration that a newer one replaced.
+    pub(super) fn take_event_release(&self) -> Option<EventReleaseHandle> {
+        self.attachments.lock().event_release.take()
+    }
 }
 
 /// Identity-checked removal of a single registry entry, performed under an already-held
@@ -139,6 +150,8 @@ impl Drop for BlockRegistrationHandleInner {
         // return is what lets `remove_batch` collapse N locks to P, and it keeps
         // `on_block_removed` firing exactly once per removed hash.
         if self.removed_via_batch.load(Ordering::Acquire) {
+            // `remove_batch` released this registration's `Remove` under its own
+            // position guard, so nothing is left to publish here.
             return;
         }
         let Some(registry) = self.registry.upgrade() else {
@@ -150,12 +163,24 @@ impl Drop for BlockRegistrationHandleInner {
         // the identity check performed by `remove_entry_if_identity`.
         let map = registry.prefix(&self.seq_hash);
         if remove_entry_if_identity(&map, self.seq_hash, self as *const Self) {
+            // Publish the `Remove` while `map` is held. A racing
+            // `register_sequence_hash` publishes its `Create` under this same guard,
+            // and the hub keeps one holder set per hash, so a `Remove` released after
+            // that `Create` deletes a block this instance still holds. The event goes
+            // out before the oracle call, so a panicking oracle cannot push it past
+            // the guard.
+            drop(self.take_event_release());
             // Fire the *handle's own* oracle (a transfer-created inner has `None` here and
             // so fires nothing — the pairing invariant). Held under `map`; `BranchOracle`
             // impls must not re-enter the registry (documented on the trait).
             if let Some(oracle) = &self.branch_oracle {
                 oracle.on_block_removed(self.seq_hash);
             }
+        } else if let Some(release) = self.take_event_release() {
+            // A newer registration owns this slot, or already removed it. Its `Create`
+            // is the authoritative one and its own drop publishes the `Remove`, so this
+            // registration must publish nothing.
+            release.disarm();
         }
     }
 }
@@ -175,6 +200,14 @@ impl BlockRegistrationHandle {
             .upgrade()
             .map(|reg| Arc::ptr_eq(&reg, &registry.prt))
             .unwrap_or(false)
+    }
+
+    /// Store the publisher of this registration's `Remove` event.
+    /// [`EventsManager::on_block_registered`](crate::events::EventsManager::on_block_registered)
+    /// calls this right after it publishes the `Create`, under the position
+    /// guard that `register_sequence_hash` holds.
+    pub(crate) fn attach_event_release(&self, release: EventReleaseHandle) {
+        self.inner.attachments.lock().event_release = Some(release);
     }
 
     /// Increment the physical-residency marker for tier `T`. Each

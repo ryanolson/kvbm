@@ -4,6 +4,7 @@
 //! Attachment system for storing arbitrary typed data on registration handles.
 
 use super::handle::BlockRegistrationHandle;
+use crate::events::protocol::EventReleaseHandle;
 
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
@@ -57,6 +58,12 @@ pub(crate) struct AttachmentStore {
     pub(super) multiple_attachments: HashMap<TypeId, Vec<Box<dyn Any + Send + Sync>>>,
     /// Track which types are registered and how
     pub(super) type_registry: HashMap<TypeId, AttachmentMode>,
+    /// Publisher of this registration's `Remove` event, present while an
+    /// [`EventsManager`](crate::events::EventsManager) is attached to the
+    /// registry. Both removal paths take it out under the entry's position
+    /// guard, so the `Remove` cannot be reordered behind the `Create` of the
+    /// registration that replaces this entry.
+    pub(super) event_release: Option<EventReleaseHandle>,
     /// Refcounted physical-residency tracking for registered slots.
     /// Each `Primary`, `Duplicate`, `Inactive`, or `Held` slot for this hash
     /// and tier `T` contributes one count. `has_block::<T>` returns
@@ -71,6 +78,7 @@ impl AttachmentStore {
             unique_attachments: HashMap::new(),
             multiple_attachments: HashMap::new(),
             type_registry: HashMap::new(),
+            event_release: None,
             presence_markers: HashMap::new(),
         }
     }

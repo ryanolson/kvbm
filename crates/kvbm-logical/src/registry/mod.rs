@@ -267,10 +267,8 @@ impl BlockRegistry {
         *weak = Arc::downgrade(&inner);
         let handle = BlockRegistrationHandle::from_inner(inner);
 
-        if let Some(event_manager) = &self.event_manager
-            && let Err(e) = event_manager.on_block_registered(&handle)
-        {
-            tracing::warn!("Failed to register block with event manager: {}", e);
+        if let Some(event_manager) = &self.event_manager {
+            event_manager.on_block_registered(&handle);
         }
         self.touch(seq_hash);
         if let Some(oracle) = &self.branch_oracle {
@@ -358,6 +356,11 @@ impl BlockRegistry {
                     && handle::remove_entry_if_identity(&map, handle.seq_hash(), Arc::as_ptr(inner))
                 {
                     inner.mark_removed_via_batch();
+                    // Publish the `Remove` under this position's guard, for the reason
+                    // the singular `Drop` path does: a racing `register_sequence_hash`
+                    // publishes its `Create` under this same guard, and a `Remove`
+                    // released after that `Create` deletes a block this instance holds.
+                    drop(inner.take_event_release());
                     if inner.branch_oracle.is_some() {
                         to_notify.push(handle.seq_hash());
                     }
@@ -771,5 +774,40 @@ mod remove_batch_tests {
         // Every strong reference is gone at this point.
         // No slot can remain registered.
         assert_eq!(registry.registered_count(), 0);
+    }
+
+    /// The batched path must publish each `Remove` under the position guard
+    /// that removed the entry, for the reason the singular path does: a racing
+    /// `register_sequence_hash` publishes its `Create` under that same guard,
+    /// and the hub keeps one holder set per hash. `on_block_removed` fires
+    /// after phase 1 and before the handles drop, so every `Remove` is already
+    /// on the stream when the first notification runs.
+    #[test]
+    fn batch_publishes_remove_before_the_deferred_notification() {
+        use super::tests::GuardProbe;
+        use crate::events::{EventsManager, KvCacheEvent};
+
+        let events = Arc::new(EventsManager::builder().channel_capacity(1_024).build());
+        let probe = Arc::new(GuardProbe::new(Box::pin(events.subscribe())));
+        let registry = BlockRegistry::builder()
+            .event_manager(events.clone())
+            .branch_oracle(probe.clone() as Arc<dyn BranchOracle>)
+            .build();
+
+        let hashes = build_chain(vec![1, 2, 3]);
+        let handles: Vec<_> = hashes
+            .iter()
+            .map(|&hash| registry.register_sequence_hash(hash))
+            .collect();
+
+        registry.remove_batch(handles);
+
+        let seen = probe.seen();
+        for hash in &hashes {
+            assert!(
+                seen.contains(&KvCacheEvent::Remove(*hash)),
+                "the batch published the Remove for {hash:?} after the position guard: {seen:?}"
+            );
+        }
     }
 }
