@@ -20,6 +20,14 @@ placement decisions. The engine holds these two worlds together.
 
 ---
 
+## Accepted local prefixes
+
+A caller can accept a block-aligned prefix of a local search result. The accepted count cannot exceed the matched count. This permits a hybrid model to stop reuse at its fixed-state checkpoint.
+
+The engine limits G2 sources, G1 destinations, failure block IDs, and the in-flight window to that accepted prefix. It rejects an invalid count before it consumes the search handle. A zero count completes without a transfer. An allocation that lacks accepted destinations fails without a partial success.
+
+A dispatched remote continuation still requires its complete promised count. Its local and remote pieces share one committed continuation span.
+
 ## The Worker
 
 A worker is the physical side of the logical-physical dichotomy. The core

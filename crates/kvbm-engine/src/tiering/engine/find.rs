@@ -61,8 +61,7 @@
 //! ## `onboard_blocks` routing
 //!
 //! Kind-routed off the opaque handle: a Search-kind handle onboards the
-//! matched local span (with a log-level committed-vs-promised token check the
-//! connector never had); a Prefill-kind handle with stored external work
+//! accepted prefix of the matched local span; a Prefill-kind handle with stored external work
 //! validates the committed count against the engine's stored promise
 //! ([`LeaderEngineError::ExternalTokensMismatch`]) and runs the USAA kick; a
 //! zero-stored prefill delegates to its internally-bound local search. One
@@ -72,10 +71,10 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use kvbm_protocols::connector::{BlockId, RequestId, SequenceHash};
+use kvbm_protocols::connector::{BlockId, SequenceHash};
 use kvbm_protocols::connector::{
     FindBlocksHandle, FindBlocksOutcome, FindBlocksRequest, LeaderEngine, LeaderEngineError,
-    OnboardHandle, SearchId,
+    OnboardHandle,
 };
 use kvbm_protocols::disagg::RemotePrefillParams;
 
@@ -425,12 +424,8 @@ impl LocalConnectorEngine {
         dest: &[BlockId],
         num_external_tokens: usize,
     ) -> Result<OnboardHandle, LeaderEngineError> {
-        // LOCAL arm: the committed-vs-promised check the connector never had,
-        // log-level (the local promise is engine-derived, so a divergence is
-        // diagnostic — the slice math below keys off the engine's own state).
         if let Some(search_id) = handle.search_id() {
-            self.warn_on_promise_divergence(search_id, handle.request_id(), num_external_tokens);
-            return Arc::clone(self).local_onboard(search_id, dest);
+            return Arc::clone(self).local_onboard(search_id, dest, num_external_tokens);
         }
 
         // PREFILL arm.
@@ -457,8 +452,7 @@ impl LocalConnectorEngine {
             let Some(sid) = state.local_search_id() else {
                 return Err(LeaderEngineError::SearchNotMatched);
             };
-            self.warn_on_promise_divergence(sid, request_id, num_external_tokens);
-            return Arc::clone(self).local_onboard(sid, dest);
+            return Arc::clone(self).local_onboard(sid, dest, num_external_tokens);
         }
         // vLLM commits exactly what `find_blocks` promised; the promise is the
         // engine-stored cell this same generation refreshes. A divergence means
@@ -470,33 +464,6 @@ impl LocalConnectorEngine {
             });
         }
         Arc::clone(self).prefill_onboard_by_id(request_id, accept_id, dest)
-    }
-
-    /// Log-level committed-vs-promised divergence check, shared by both
-    /// local-onboard entry points (the Search-kind arm and the zero-stored
-    /// prefill delegation): the local promise is engine-derived, so a
-    /// divergence is diagnostic — the onboard slice math keys off the
-    /// engine's own state, never the committed count.
-    fn warn_on_promise_divergence(
-        &self,
-        search_id: SearchId,
-        request_id: &RequestId,
-        num_external_tokens: usize,
-    ) {
-        if let Some(entry) = self.searches.get(&search_id)
-            && let MatchStatus::Matched { hit_blocks } =
-                *entry.status.lock().expect("search-status mutex poisoned")
-        {
-            let promised = hit_blocks as usize * self.block_size;
-            if promised != num_external_tokens {
-                tracing::warn!(
-                    %request_id,
-                    promised,
-                    committed = num_external_tokens,
-                    "onboard_blocks: committed external tokens diverge from the matched promise"
-                );
-            }
-        }
     }
 }
 

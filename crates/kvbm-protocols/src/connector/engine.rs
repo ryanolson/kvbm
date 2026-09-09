@@ -114,8 +114,9 @@ pub trait LeaderEngine: Send + Sync + 'static {
     /// sources; an accepted prefill copies the pulled external suffix; a
     /// zero-stored prefill delegates to its internally-bound local search.
     /// `dest` is the FULL vLLM allocation `[computed prefix… | external…]`; the
-    /// engine slices. Validates `num_external_tokens` against the engine's
-    /// stored promise ([`LeaderEngineError::ExternalTokensMismatch`]).
+    /// engine slices. A local hit accepts a block-aligned prefix of its promise.
+    /// A dispatched prefill requires the complete promised count.
+    /// Invalid counts return [`LeaderEngineError::ExternalTokensMismatch`].
     fn onboard_blocks(
         self: Arc<Self>,
         handle: &FindBlocksHandle,

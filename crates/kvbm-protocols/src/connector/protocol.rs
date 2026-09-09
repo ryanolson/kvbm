@@ -353,9 +353,8 @@ pub enum LeaderEngineError {
     /// The engine and connector disagree about who holds the RAII release.
     #[error("find_blocks desync: latched lifecycle with no caller handle")]
     FindBlocksDesync,
-    /// `onboard_blocks`'s committed external count diverges from the engine's
-    /// stored promise.
-    #[error("external tokens mismatch: vLLM committed {got}, engine stored {expected}")]
+    /// The external token count violates the stored promise or block alignment.
+    #[error("external tokens mismatch: caller committed {got}, engine stored {expected}")]
     ExternalTokensMismatch { expected: usize, got: usize },
     /// A second onboard was driven against a lifecycle whose onboard is already
     /// in flight.

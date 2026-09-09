@@ -56,22 +56,21 @@ pub(super) fn select_onboard_block_ids(
     dest[start..end].to_vec()
 }
 
-/// Collect the G2 blocks destined for onboarding from every shard, honoring the
-/// `[effective_start .. final_end)` span (first-hole contiguous match).
-///
-/// Mirrors the legacy `collect_g2_blocks_from_shards`: walk shards in order
-/// taking their G2 blocks, drop the leading `effective_start -
-/// shards[0].start_block` mask, then truncate to `final_end - effective_start`.
+/// Collect the accepted prefix of the contiguous matched G2 span.
+/// A hybrid checkpoint can end before the available block history ends.
 fn collect_g2_blocks(
     state: &mut OnboardingState,
     block_size: usize,
+    desired_blocks: usize,
 ) -> Result<Vec<ImmutableBlock<G2>>> {
     debug_assert!(!state.shards.is_empty());
     debug_assert!(state.all_shards_terminal());
 
     let (effective_start, final_end) = state.matched_span(block_size);
     debug_assert!(effective_start <= final_end);
-    let desired_blocks = final_end - effective_start;
+    if desired_blocks > final_end - effective_start {
+        bail!("accepted onboard span exceeds the matched G2 prefix");
+    }
     let leading_skip = effective_start - state.shards[0].start_block;
 
     let mut collected: Vec<ImmutableBlock<G2>> = Vec::new();
@@ -124,7 +123,16 @@ pub(super) async fn run_onboard(
     g1_block_ids: Vec<BlockId>,
     staging_futs: Vec<StagingCompletion>,
     block_size: usize,
+    accepted_blocks: usize,
 ) -> ActionStatus {
+    if g1_block_ids.len() != accepted_blocks {
+        tracing::error!(
+            accepted = accepted_blocks,
+            destinations = g1_block_ids.len(),
+            "onboard allocation does not cover the accepted prefix"
+        );
+        return ActionStatus::Failed(ActionFailure::AllBlocks);
+    }
     // Nothing external to move (e.g. a `Matched { hit_blocks: 0 }` onboard):
     // immediately terminal, no transfer issued.
     if g1_block_ids.is_empty() {
@@ -140,7 +148,7 @@ pub(super) async fn run_onboard(
     }
 
     // Pull the matched G2 sources (held alive until the transfer completes).
-    let g2_blocks = match collect_g2_blocks(onboarding, block_size) {
+    let g2_blocks = match collect_g2_blocks(onboarding, block_size, accepted_blocks) {
         Ok(blocks) => blocks,
         Err(e) => {
             tracing::error!(error = %e, "onboard G2 collect failed");
