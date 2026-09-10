@@ -35,6 +35,10 @@ impl G2Capacity for RejectRegistration {
         self.0.match_inactive_blocks(hashes)
     }
 
+    fn has_any_registered_hashes(&self, hashes: &[SequenceHash]) -> bool {
+        self.0.has_any_registered_hashes(hashes)
+    }
+
     fn scan_matches(
         &self,
         hashes: &[SequenceHash],

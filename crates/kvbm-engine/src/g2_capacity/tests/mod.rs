@@ -208,6 +208,10 @@ impl G2Capacity for ExactRegistrationCapacity {
         self.manager.match_inactive_blocks(hashes)
     }
 
+    fn has_any_registered_hashes(&self, hashes: &[SequenceHash]) -> bool {
+        self.manager.has_any_registered_hashes(hashes)
+    }
+
     fn scan_matches(
         &self,
         hashes: &[SequenceHash],

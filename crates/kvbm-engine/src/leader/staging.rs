@@ -140,6 +140,10 @@ mod tests {
             self.direct.match_inactive_blocks(hashes)
         }
 
+        fn has_any_registered_hashes(&self, hashes: &[crate::SequenceHash]) -> bool {
+            self.direct.has_any_registered_hashes(hashes)
+        }
+
         fn scan_matches(
             &self,
             hashes: &[crate::SequenceHash],

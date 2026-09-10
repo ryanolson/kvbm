@@ -28,7 +28,7 @@ pub use capacity::{
 pub use policy_route::{
     PolicyCancelDisposition, PolicyG1G2BoundRoute, PolicyG1G2CancelHandle, PolicyG1G2Completion,
     PolicyG1G2Execution, PolicyG1G2ExecutionError, PolicyG1G2Installation, PolicyG1G2Reservation,
-    PolicyG1G2Route, PolicyG1G2SourceSettlement, PolicyG1G2SubmitError,
+    PolicyG1G2ReserveError, PolicyG1G2Route, PolicyG1G2SourceSettlement, PolicyG1G2SubmitError,
     PolicyG1G2ValidatedInstallation, PolicyG1SourceMetadata, PolicyPhysicalCompletion,
     PolicyPhysicalTerminal,
 };

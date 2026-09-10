@@ -62,6 +62,10 @@ impl G2Capacity for PendingGrantCapacity {
         self.inner.match_inactive_blocks(hashes)
     }
 
+    fn has_any_registered_hashes(&self, hashes: &[SequenceHash]) -> bool {
+        self.inner.has_any_registered_hashes(hashes)
+    }
+
     fn scan_matches(
         &self,
         hashes: &[SequenceHash],
@@ -106,6 +110,10 @@ impl G2Capacity for RepeatedPendingCapacity {
 
     fn match_inactive_blocks(&self, hashes: &[SequenceHash]) -> Vec<ImmutableBlock<G2>> {
         self.manager.match_inactive_blocks(hashes)
+    }
+
+    fn has_any_registered_hashes(&self, hashes: &[SequenceHash]) -> bool {
+        self.manager.has_any_registered_hashes(hashes)
     }
 
     fn scan_matches(
@@ -157,6 +165,10 @@ impl G2Capacity for FaultyExactCapacity {
         self.inner.match_inactive_blocks(hashes)
     }
 
+    fn has_any_registered_hashes(&self, hashes: &[SequenceHash]) -> bool {
+        self.inner.has_any_registered_hashes(hashes)
+    }
+
     fn scan_matches(
         &self,
         hashes: &[SequenceHash],
@@ -202,6 +214,10 @@ impl G2Capacity for FaultyCompatibilityCapacity {
 
     fn match_inactive_blocks(&self, hashes: &[SequenceHash]) -> Vec<ImmutableBlock<G2>> {
         self.manager.match_inactive_blocks(hashes)
+    }
+
+    fn has_any_registered_hashes(&self, hashes: &[SequenceHash]) -> bool {
+        self.manager.has_any_registered_hashes(hashes)
     }
 
     fn scan_matches(

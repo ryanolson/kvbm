@@ -106,6 +106,10 @@ impl G2Capacity for ExactTestCapacity {
         self.manager.match_inactive_blocks(hashes)
     }
 
+    fn has_any_registered_hashes(&self, hashes: &[SequenceHash]) -> bool {
+        self.manager.has_any_registered_hashes(hashes)
+    }
+
     fn scan_matches(
         &self,
         hashes: &[SequenceHash],
@@ -145,6 +149,10 @@ impl G2Capacity for RejectRegistrationCapacity {
 
     fn match_inactive_blocks(&self, hashes: &[SequenceHash]) -> Vec<ImmutableBlock<G2>> {
         self.manager.match_inactive_blocks(hashes)
+    }
+
+    fn has_any_registered_hashes(&self, hashes: &[SequenceHash]) -> bool {
+        self.manager.has_any_registered_hashes(hashes)
     }
 
     fn scan_matches(

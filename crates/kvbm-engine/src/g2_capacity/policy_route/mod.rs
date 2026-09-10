@@ -39,8 +39,9 @@ pub use installation::{
 
 pub use state::{
     PolicyCancelDisposition, PolicyG1G2CancelHandle, PolicyG1G2Completion, PolicyG1G2Execution,
-    PolicyG1G2ExecutionError, PolicyG1G2Reservation, PolicyG1G2SourceSettlement,
-    PolicyG1G2SubmitError, PolicyPhysicalCompletion, PolicyPhysicalTerminal,
+    PolicyG1G2ExecutionError, PolicyG1G2Reservation, PolicyG1G2ReserveError,
+    PolicyG1G2SourceSettlement, PolicyG1G2SubmitError, PolicyPhysicalCompletion,
+    PolicyPhysicalTerminal,
 };
 
 type TransferFuture = Pin<Box<dyn Future<Output = TransferDrainOutcome> + Send>>;
@@ -317,15 +318,20 @@ impl<T: PolicyG1SourceMetadata> PolicyG1G2BoundRoute<T> {
     }
 
     /// Pin retained G2 data or reserve exact capacity before source mutation.
+    ///
+    /// After a complete-match miss, exact capacity preserves the relief path.
+    /// A registered overlap then declines this attempt and drops the allocation.
+    /// The snapshot does not pin G2. A later attempt checks it again.
     pub fn reserve(
         &self,
         hashes: &[SequenceHash],
-    ) -> Result<PolicyG1G2Reservation, G2CapacityError> {
+    ) -> Result<PolicyG1G2Reservation, PolicyG1G2ReserveError> {
         let count = hashes.len();
         if count == 0 {
             return Err(G2CapacityError::Rejected(
                 "an exact G1-to-G2 transfer needs at least one block".to_string(),
-            ));
+            )
+            .into());
         }
         let retained = self.core.capacity.match_inactive_blocks(hashes);
         if retained.len() == count
@@ -348,18 +354,25 @@ impl<T: PolicyG1SourceMetadata> PolicyG1G2BoundRoute<T> {
                 return Err(G2CapacityError::RequirementMismatch {
                     expected: G2CapacityRequirement::ExactReclaim,
                     actual: G2CapacityRequirement::Compatibility,
-                });
+                }
+                .into());
             }
             G2CapacityDecision::PendingReclaim(pending) => {
                 return Err(G2CapacityError::PendingReclaim {
                     target_count: pending.plan().target_count(),
-                });
+                }
+                .into());
             }
         };
         if allocation.kind() != G2AllocationKind::CacheExtension {
             return Err(G2CapacityError::Rejected(
                 "the exact route received a different allocation kind".to_string(),
-            ));
+            )
+            .into());
+        }
+        // Preserve capacity relief before a snapshot can decline cache retention.
+        if self.core.capacity.has_any_registered_hashes(hashes) {
+            return Err(PolicyG1G2ReserveError::G2Overlap);
         }
         Ok(PolicyG1G2Reservation::new(
             PolicyG1G2Destination::Allocated(allocation),

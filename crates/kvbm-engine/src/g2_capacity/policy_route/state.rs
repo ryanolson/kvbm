@@ -13,7 +13,16 @@ use tokio::sync::oneshot;
 
 use super::RouteBinding;
 use crate::G2;
-use crate::g2_capacity::G2ExactAllocation;
+use crate::g2_capacity::{G2CapacityError, G2ExactAllocation};
+
+/// A reservation rejection before source mutation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PolicyG1G2ReserveError {
+    /// Registered G2 data prevents a complete new copy of this lineage.
+    G2Overlap,
+    /// The destination rejected its capacity request.
+    Capacity(G2CapacityError),
+}
 
 /// One opaque exact reservation from a bound policy route.
 #[must_use = "submit this reservation through its bound route or drop it"]
@@ -295,6 +304,23 @@ impl PolicyPhysicalCompletion {
             terminal: PolicyPhysicalTerminal::Failed,
             failure: Some(failure.into()),
         }
+    }
+}
+
+impl std::fmt::Display for PolicyG1G2ReserveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::G2Overlap => formatter.write_str("the exact route overlaps registered G2 data"),
+            Self::Capacity(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for PolicyG1G2ReserveError {}
+
+impl From<G2CapacityError> for PolicyG1G2ReserveError {
+    fn from(error: G2CapacityError) -> Self {
+        Self::Capacity(error)
     }
 }
 
