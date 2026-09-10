@@ -441,6 +441,20 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
         self.match_prefix(seq_hash, true)
     }
 
+    /// Pin a complete inactive set, without an access-frequency update.
+    ///
+    /// Each returned block already survived its last owner's release. Active
+    /// and pressure-held blocks prevent the complete match. A miss or repeated
+    /// hash leaves inactive tenure and eviction order intact. This excludes
+    /// temporary registrations and registrations whose owner can still roll back.
+    pub fn match_inactive_blocks(&self, hashes: &[SequenceHash]) -> Vec<ImmutableBlock<T>> {
+        self.store
+            .match_inactive_primaries(hashes)
+            .into_iter()
+            .map(|(_, inner)| ImmutableBlock::from_inner(inner))
+            .collect()
+    }
+
     /// Linear prefix match: walks `seq_hash` left-to-right, stopping on
     /// the first hash that hits neither the active nor the inactive pool.
     ///

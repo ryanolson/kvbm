@@ -215,7 +215,9 @@ async fn dedicated_exact_capacity_preserves_leader_compatibility_capacity() {
         .validate(resource, &source.manager)
         .unwrap_or_else(|_| panic!("bind the dedicated exact route"))
         .bind();
-    let reservation = route.reserve(1).expect("reserve dedicated exact capacity");
+    let reservation = route
+        .reserve(&source.hashes())
+        .expect("reserve dedicated exact capacity");
 
     assert_eq!(
         exact.requests(),
@@ -306,7 +308,9 @@ async fn completed_move_derives_source_ids_and_commits_inside_the_engine() {
         Arc::clone(&transfer) as Arc<dyn PolicyG1G2TransferExecutor>,
         &source.manager,
     );
-    let reservation = route.reserve(2).expect("reserve exact G2 capacity");
+    let reservation = route
+        .reserve(&source.hashes())
+        .expect("reserve exact G2 capacity");
     let owned = source.take();
 
     let completion = route
@@ -358,7 +362,9 @@ async fn completed_mirror_restores_the_full_source_lineage() {
         Arc::new(ImmediateTransfer::default()),
         &source.manager,
     );
-    let reservation = route.reserve(2).expect("reserve exact G2 capacity");
+    let reservation = route
+        .reserve(&source.hashes())
+        .expect("reserve exact G2 capacity");
 
     let completion = route
         .submit(reservation, source.take(), OffloadMode::Mirror)
@@ -386,7 +392,9 @@ async fn cancellation_before_commit_restores_source_without_dispatch() {
         Arc::clone(&transfer) as Arc<dyn PolicyG1G2TransferExecutor>,
         &source.manager,
     );
-    let reservation = route.reserve(1).expect("reserve exact G2 capacity");
+    let reservation = route
+        .reserve(&source.hashes())
+        .expect("reserve exact G2 capacity");
     let cancellation = reservation.cancellation();
     assert_eq!(
         cancellation.cancel(),
@@ -424,7 +432,9 @@ async fn synchronous_dispatch_error_restores_source_and_releases_capacity() {
         Arc::new(DispatchErrorTransfer),
         &source.manager,
     );
-    let reservation = route.reserve(1).expect("reserve exact G2 capacity");
+    let reservation = route
+        .reserve(&source.hashes())
+        .expect("reserve exact G2 capacity");
 
     let completion = route
         .submit(reservation, source.take(), OffloadMode::Move)
@@ -466,7 +476,9 @@ async fn foreign_route_reservation_fails_before_dispatch_and_restores_source() {
         Arc::clone(&second_transfer) as Arc<dyn PolicyG1G2TransferExecutor>,
         &source.manager,
     );
-    let reservation = first.reserve(1).expect("reserve on the first route");
+    let reservation = first
+        .reserve(&source.hashes())
+        .expect("reserve on the first route");
 
     let completion = second
         .submit(reservation, source.take(), OffloadMode::Move)
@@ -505,7 +517,9 @@ async fn drained_error_releases_destination_before_terminal_publication() {
         }),
         &source.manager,
     );
-    let reservation = route.reserve(1).expect("reserve exact G2 capacity");
+    let reservation = route
+        .reserve(&source.hashes())
+        .expect("reserve exact G2 capacity");
     let cancellation = reservation.cancellation();
     let state_during_release = Arc::new(Mutex::new(None));
     capacity.observe_exact_permit_drop(Arc::new({
@@ -555,7 +569,9 @@ async fn unproven_receipt_retains_source_lease_destination_pins_and_cancellation
         }),
         &source.manager,
     );
-    let reservation = route.reserve(1).expect("reserve exact G2 capacity");
+    let reservation = route
+        .reserve(&source.hashes())
+        .expect("reserve exact G2 capacity");
     let cancellation = reservation.cancellation();
     let execution = route
         .submit(reservation, source.take(), OffloadMode::Move)
@@ -581,7 +597,9 @@ async fn committed_panic_retains_source_and_destination_pins() {
         Arc::new(PanickingTransfer),
         &source.manager,
     );
-    let reservation = route.reserve(1).expect("reserve exact G2 capacity");
+    let reservation = route
+        .reserve(&source.hashes())
+        .expect("reserve exact G2 capacity");
     let cancellation = reservation.cancellation();
 
     assert!(
@@ -616,7 +634,9 @@ async fn dropping_execution_does_not_end_source_before_proven_drain() {
         }),
         &source.manager,
     );
-    let reservation = route.reserve(1).expect("reserve exact G2 capacity");
+    let reservation = route
+        .reserve(&source.hashes())
+        .expect("reserve exact G2 capacity");
     let cancellation = reservation.cancellation();
     let execution = route
         .submit(reservation, source.take(), OffloadMode::Mirror)
@@ -648,7 +668,9 @@ fn a_foreign_source_manager_is_rejected_before_dispatch() {
         Arc::clone(&transfer) as Arc<dyn PolicyG1G2TransferExecutor>,
         &expected_source.manager,
     );
-    let reservation = route.reserve(1).expect("reserve exact G2 capacity");
+    let reservation = route
+        .reserve(&expected_source.hashes())
+        .expect("reserve exact G2 capacity");
     let cancellation = reservation.cancellation();
 
     let error = match route.submit(reservation, foreign_source.take(), OffloadMode::Move) {
@@ -678,7 +700,9 @@ async fn abandoned_task_owner_publishes_a_restored_terminal() {
         Arc::clone(&transfer) as Arc<dyn PolicyG1G2TransferExecutor>,
         &source.manager,
     );
-    let reservation = route.reserve(1).expect("reserve exact G2 capacity");
+    let reservation = route
+        .reserve(&source.hashes())
+        .expect("reserve exact G2 capacity");
     let cancellation = reservation.cancellation();
 
     let execution = route
@@ -722,7 +746,9 @@ fn tokio_no_threads_spawn_panic_restores_the_pre_start_transaction() {
         &source.manager,
         runtime.handle().clone(),
     );
-    let reservation = route.reserve(1).expect("reserve exact G2 capacity");
+    let reservation = route
+        .reserve(&source.hashes())
+        .expect("reserve exact G2 capacity");
     let cancellation = reservation.cancellation();
 
     let execution = route
@@ -764,7 +790,9 @@ fn no_runtime_restores_source_before_the_reservation_becomes_terminal() {
         Arc::new(ImmediateTransfer::default()),
         &source.manager,
     );
-    let reservation = route.reserve(1).expect("reserve exact G2 capacity");
+    let reservation = route
+        .reserve(&source.hashes())
+        .expect("reserve exact G2 capacity");
     let cancellation = reservation.cancellation();
 
     let result = route.submit(reservation, source.take(), OffloadMode::Move);

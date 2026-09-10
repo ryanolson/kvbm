@@ -136,6 +136,10 @@ mod tests {
             self.direct.match_blocks(hashes)
         }
 
+        fn match_inactive_blocks(&self, hashes: &[crate::SequenceHash]) -> Vec<ImmutableBlock<G2>> {
+            self.direct.match_inactive_blocks(hashes)
+        }
+
         fn scan_matches(
             &self,
             hashes: &[crate::SequenceHash],

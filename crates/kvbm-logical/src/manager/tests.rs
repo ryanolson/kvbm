@@ -17,6 +17,7 @@ mod opaque_exact_reclaim;
 mod registered_presence;
 mod registration_provenance;
 mod reset_only_allocation;
+mod retained_race;
 mod temporary_registration;
 
 // Type alias for backward compatibility
@@ -2913,6 +2914,79 @@ mod audit_counter_tests {
              tracker exactly once; got {} (likely a registry+backend \
              double-touch regression)",
             metered.touches()
+        );
+    }
+
+    #[test]
+    fn match_inactive_blocks_excludes_active_without_frequency_updates() {
+        let (manager, metered) = build_manager_with_metered_multi_lru(4);
+        let token = create_test_token_block_from_iota(40_050);
+        let hash = token.kvbm_sequence_hash();
+        let block = manager.allocate_blocks(1).unwrap().pop().unwrap();
+        let active = manager.register_block(block.complete(&token).unwrap());
+        metered.reset();
+        assert!(manager.match_inactive_blocks(&[hash]).is_empty());
+        assert_eq!(metered.touches(), 0);
+        drop(active);
+        metered.reset();
+        let cached = manager.match_inactive_blocks(&[hash]);
+        assert_eq!(cached.len(), 1);
+        assert_eq!(metered.touches(), 0);
+        drop(cached);
+        assert_eq!(manager.inactive_len(), 1);
+        assert_eq!(metered.touches(), 0);
+    }
+
+    #[rstest]
+    #[case(false, false)]
+    #[case(true, false)]
+    #[case(false, true)]
+    #[case(true, true)]
+    fn incomplete_inactive_probe_preserves_tenure_and_order(
+        #[case] lineage: bool,
+        #[case] duplicate: bool,
+    ) {
+        let builder = BlockManager::<TestBlockData>::builder()
+            .block_count(3)
+            .block_size(4)
+            .registry(BlockRegistry::new());
+        let manager = if lineage {
+            builder.with_lineage_backend()
+        } else {
+            builder.with_lru_backend()
+        }
+        .build()
+        .expect("build the inactive probe fixture");
+        let root = SequenceHash::root(81_000);
+        let unrelated = SequenceHash::root(82_000);
+        for hash in [root, unrelated] {
+            let block = manager
+                .allocate_blocks(1)
+                .expect("one source")
+                .pop()
+                .expect("one source");
+            drop(manager.register_block(block.stage(hash, 4).expect("stage source")));
+        }
+        let before = manager.inactive_candidates(3);
+        let tail = if duplicate { root } else { root.extend(81_001) };
+        let matched = manager.match_inactive_blocks(&[root, tail]);
+        let returned_owners = matched.len();
+        drop(matched);
+        let after = manager.inactive_candidates(3);
+        assert_eq!(
+            after, before,
+            "a partial probe must not change inactive tenure or victim order, lineage={lineage}, returned_owners={returned_owners}"
+        );
+        let allocated = manager
+            .allocate_blocks(2)
+            .expect("reset slot and oldest cached root");
+        assert!(
+            allocated.iter().any(|block| block.block_id() == 0),
+            "a partial probe must preserve the oldest eviction victim"
+        );
+        assert_eq!(
+            returned_owners, 0,
+            "a partial probe must return no immutable owner"
         );
     }
 

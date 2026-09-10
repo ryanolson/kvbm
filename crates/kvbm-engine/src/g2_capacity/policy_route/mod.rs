@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use anyhow::Result;
-use kvbm_common::{LogicalLayoutHandle, LogicalResourceId};
+use kvbm_common::{LogicalLayoutHandle, LogicalResourceId, SequenceHash};
 use kvbm_logical::{BlockManager, InactiveLineageHold, ManagerId};
 use kvbm_physical::transfer::{TransferDrainOutcome, TransferOptions};
 use kvbm_protocols::connector::OffloadMode;
@@ -30,6 +30,7 @@ use crate::BlockId;
 use crate::leader::InstanceLeader;
 use installation::{ExactG1G2ManagerIdentity, ExactG1G2RouteIdentity, new_identity_pair};
 use source::PolicyG1G2Source;
+use state::PolicyG1G2Destination;
 use transaction::{PolicyG1G2Transaction, PolicyG1G2TransactionOwner, TransactionRoute};
 
 pub use installation::{
@@ -315,13 +316,31 @@ impl<T: PolicyG1SourceMetadata> PolicyG1G2BoundRoute<T> {
         }
     }
 
-    /// Reserve exact G2 capacity before source mutation.
-    pub fn reserve(&self, count: usize) -> Result<PolicyG1G2Reservation, G2CapacityError> {
+    /// Pin retained G2 data or reserve exact capacity before source mutation.
+    pub fn reserve(
+        &self,
+        hashes: &[SequenceHash],
+    ) -> Result<PolicyG1G2Reservation, G2CapacityError> {
+        let count = hashes.len();
         if count == 0 {
             return Err(G2CapacityError::Rejected(
                 "an exact G1-to-G2 transfer needs at least one block".to_string(),
             ));
         }
+        let retained = self.core.capacity.match_inactive_blocks(hashes);
+        if retained.len() == count
+            && retained.iter().zip(hashes).all(|(block, hash)| {
+                block.sequence_hash() == *hash
+                    && block.pin().manager_id() == self.core.capacity.manager_id()
+            })
+        {
+            return Ok(PolicyG1G2Reservation::new(
+                PolicyG1G2Destination::Retained(retained),
+                hashes.to_vec(),
+                Arc::clone(&self.binding),
+            ));
+        }
+        drop(retained);
         let request = G2CapacityRequest::exact_reclaim(G2AllocationKind::CacheExtension, count);
         let allocation = match self.core.capacity.reserve(request)? {
             G2CapacityDecision::ExactGranted(allocation) => allocation,
@@ -343,7 +362,8 @@ impl<T: PolicyG1SourceMetadata> PolicyG1G2BoundRoute<T> {
             ));
         }
         Ok(PolicyG1G2Reservation::new(
-            allocation,
+            PolicyG1G2Destination::Allocated(allocation),
+            hashes.to_vec(),
             Arc::clone(&self.binding),
         ))
     }

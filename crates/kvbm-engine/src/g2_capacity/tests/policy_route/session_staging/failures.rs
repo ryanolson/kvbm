@@ -31,6 +31,10 @@ impl G2Capacity for RejectRegistration {
         self.0.match_blocks(hashes)
     }
 
+    fn match_inactive_blocks(&self, hashes: &[SequenceHash]) -> Vec<ImmutableBlock<G2>> {
+        self.0.match_inactive_blocks(hashes)
+    }
+
     fn scan_matches(
         &self,
         hashes: &[SequenceHash],

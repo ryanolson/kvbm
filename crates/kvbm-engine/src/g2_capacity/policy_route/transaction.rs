@@ -12,7 +12,10 @@ use kvbm_physical::transfer::{TransferDrainOutcome, TransferOptions};
 use tokio::sync::oneshot;
 
 use super::source::PolicyG1G2Source;
-use super::state::{PolicyG1G2Completion, PolicyG1G2Reservation, PolicyPhysicalCompletion};
+use super::state::{
+    PolicyG1G2Completion, PolicyG1G2Destination, PolicyG1G2Reservation, PolicyG1G2SourceSettlement,
+    PolicyPhysicalCompletion,
+};
 use super::{PolicyG1G2RouteCore, RouteBinding};
 
 pub(super) struct PolicyG1G2Transaction<T: BlockMetadata> {
@@ -76,6 +79,7 @@ impl<T: BlockMetadata> PolicyG1G2Transaction<T> {
             .take()
             .expect("the abandoned transaction restores its logical source");
         let settlement = source.settle(physical.terminal());
+        drop(self.reservation.destination.take());
         cancellation.mark_terminal();
         drop(self);
         PolicyG1G2Completion::new(physical, settlement)
@@ -88,7 +92,7 @@ impl<T: BlockMetadata> PolicyG1G2Transaction<T> {
                     .uncommitted_failure("the exact G2 reservation belongs to another bound route"),
             );
         }
-        let Some(allocation) = self.reservation.allocation.as_ref() else {
+        let Some(destination) = self.reservation.destination.as_ref() else {
             return Some(
                 self.reservation
                     .uncommitted_failure("the exact G2 reservation is empty"),
@@ -99,17 +103,32 @@ impl<T: BlockMetadata> PolicyG1G2Transaction<T> {
             .as_ref()
             .expect("the transaction owns its logical source")
             .source_blocks();
-        if source_blocks.len() != allocation.len() {
+        if source_blocks.len() != self.reservation.len() {
             return Some(self.reservation.uncommitted_failure(format!(
                 "the owned source has {} blocks for a {}-block G2 reservation",
                 source_blocks.len(),
-                allocation.len()
+                self.reservation.len()
             )));
         }
+        if !source_blocks
+            .iter()
+            .map(|(hash, _)| hash)
+            .eq(self.reservation.source_hashes.iter())
+        {
+            return Some(
+                self.reservation
+                    .uncommitted_failure("the owned source hashes differ from the G2 reservation"),
+            );
+        }
         if !self.reservation.cancellation.claim_commit() {
-            drop(self.reservation.allocation.take());
             return Some(PolicyPhysicalCompletion::cancelled());
         }
+        let PolicyG1G2Destination::Allocated(allocation) = destination else {
+            // These pins already passed through the inactive G2 cache. Keep
+            // them through source settlement, without DMA or registration.
+            self.phase = PolicyTransactionPhase::PhysicallyDrained;
+            return Some(PolicyPhysicalCompletion::destination_committed());
+        };
         self.phase = PolicyTransactionPhase::CommittedUndrained;
 
         let hashes = source_blocks
@@ -167,11 +186,16 @@ impl<T: BlockMetadata> PolicyG1G2Transaction<T> {
         }
         self.phase = PolicyTransactionPhase::PhysicallyDrained;
 
-        let allocation = self
+        let destination = self
             .reservation
-            .allocation
+            .destination
             .take()
             .expect("the exact allocation remains pinned through physical drain");
+        let PolicyG1G2Destination::Allocated(allocation) = destination else {
+            return Some(PolicyPhysicalCompletion::failed(
+                "the allocated G2 destination changed before registration",
+            ));
+        };
         let staged = match allocation.stage_all(&hashes, self.route.core.capacity.block_size()) {
             Ok(staged) => staged,
             Err(error) => {
@@ -195,12 +219,25 @@ impl<T: BlockMetadata> PolicyG1G2Transaction<T> {
     fn into_completion(mut self, physical: PolicyPhysicalCompletion) -> PolicyG1G2Completion {
         debug_assert_ne!(self.phase, PolicyTransactionPhase::CommittedUndrained);
         let cancellation = self.reservation.cancellation();
-        drop(self.reservation.allocation.take());
         let source = self
             .source
             .take()
             .expect("the proven transaction settles its logical source");
         let settlement = source.settle(physical.terminal());
+        if matches!(settlement, PolicyG1G2SourceSettlement::Committed { .. })
+            && matches!(
+                self.reservation.destination,
+                Some(PolicyG1G2Destination::Retained(_))
+            )
+        {
+            tracing::info!(
+                resource = ?self.route.core.resource,
+                sequence_hash = ?self.reservation.source_hashes.last(),
+                lineage_blocks = self.reservation.source_hashes.len(),
+                "exact G1 release reused retained G2 without DMA"
+            );
+        }
+        drop(self.reservation.destination.take());
         cancellation.mark_terminal();
         drop(self);
         PolicyG1G2Completion::new(physical, settlement)

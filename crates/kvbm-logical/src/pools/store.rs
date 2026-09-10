@@ -859,6 +859,14 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         self.promote_inactive(hashes, touch, /*scan*/ true)
     }
 
+    /// Pin the complete inactive set without an access-frequency update.
+    pub(crate) fn match_inactive_primaries(
+        self: &Arc<Self>,
+        hashes: &[SequenceHash],
+    ) -> Vec<(SequenceHash, Arc<ImmutableBlockInner<T>>)> {
+        self.promote_inactive(hashes, false, /*scan*/ false)
+    }
+
     /// Atomic active-or-inactive lookup by sequence hash. Replaces the
     /// previous `upgrade_or_resurrect` two-lock dance.
     pub(crate) fn acquire_for_hash(
@@ -1297,6 +1305,22 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         scan: bool,
     ) -> Vec<(SequenceHash, Arc<ImmutableBlockInner<T>>)> {
         let mut inner = self.inner.lock();
+        if !scan {
+            // Backend matching removes entries. A failed retention probe
+            // must leave their order and inactive tenure intact.
+            if hashes
+                .iter()
+                .any(|hash| inner.held_by_hash.contains_key(hash) || !inner.inactive.has(*hash))
+            {
+                return Vec::new();
+            }
+            if hashes.len() > 1 {
+                let mut unique = SeqHashMap::default();
+                if hashes.iter().any(|hash| unique.insert(*hash, ()).is_some()) {
+                    return Vec::new();
+                }
+            }
+        }
         let matched: Vec<(SequenceHash, BlockId)> = if scan {
             let visible_hashes = hashes
                 .iter()

@@ -11,8 +11,8 @@ use super::state::{PolicyG1G2SourceSettlement, PolicyPhysicalTerminal};
 
 /// One real inactive-lineage hold and its source disposition.
 ///
-/// The exact route derives physical source IDs from this value. It never
-/// accepts caller-supplied source hashes or block IDs.
+/// The exact route derives physical source IDs from this value. Reservation
+/// hashes constrain this source but do not establish source authority.
 #[must_use = "submit this owned source through its paired bound route"]
 pub(super) struct PolicyG1G2Source<T: BlockMetadata> {
     hold: Option<InactiveLineageHold<T>>,
