@@ -31,12 +31,16 @@ fn bs_event(
         token_ids: tokens,
         block_size,
         lora_name,
+        cache_namespace: None,
         medium: None,
         block_mm_infos: None,
         is_eagle: None,
         group_idx: None,
         kv_cache_spec_kind: None,
         kv_cache_spec_sliding_window: None,
+        locality: None,
+        ownership: None,
+        session_id: None,
     }
 }
 
@@ -177,7 +181,12 @@ async fn zmq_multipart_parsing() {
             .expect("send 1-frame");
 
         // 4-frame (bad).
-        let good_payload = TestBatch(0.0, vec![RawKvEvent::AllBlocksCleared], None).encode();
+        let good_payload = TestBatch(
+            0.0,
+            vec![RawKvEvent::AllBlocksCleared { ownership: None }],
+            None,
+        )
+        .encode();
         pub_handle
             .send_frames(vec![vec![], vec![0u8; 8], good_payload.clone(), vec![0u8]])
             .await

@@ -42,9 +42,146 @@ fn create_test_manager(block_count: usize) -> BlockManager<TestBlockData> {
     testing::create_test_manager(block_count)
 }
 
+#[test]
+fn adjustable_capacity_grows_slot_metadata_and_inactive_index() {
+    let manager = BlockManager::<TestMeta>::builder()
+        .block_count(1)
+        .maximum_block_count(3)
+        .block_size(4)
+        .registry(BlockRegistry::new())
+        .with_lru_backend()
+        .build()
+        .unwrap();
+    assert_eq!(manager.total_blocks(), 1);
+    manager.set_capacity(3).unwrap();
+    let blocks = manager.allocate_blocks(3).unwrap();
+    let cached: Vec<_> = blocks
+        .into_iter()
+        .enumerate()
+        .map(|(index, block)| {
+            manager.register_block(
+                block
+                    .complete(&create_test_token_block_from_iota(index as u32 * 4))
+                    .unwrap(),
+            )
+        })
+        .collect();
+    drop(cached);
+    assert_eq!(manager.available_blocks(), 3);
+    assert_eq!(manager.occupied_high_water(), 3);
+    assert_eq!(manager.occupied_blocks(), 3);
+    manager.reset_inactive_pool().unwrap();
+    manager.set_capacity(1).unwrap();
+    manager.set_capacity(3).unwrap();
+    assert_eq!(manager.allocate_blocks(3).unwrap().len(), 3);
+}
+
+#[test]
+fn adjustable_capacity_protects_live_and_cached_tail_blocks() {
+    let manager = create_test_manager(3);
+    let mut blocks = manager.allocate_blocks(3).unwrap();
+    let tail = blocks.pop().unwrap();
+    drop(blocks.remove(0));
+    assert_eq!(manager.occupied_high_water(), 3);
+    assert!(manager.set_capacity(2).is_err());
+    assert_eq!(manager.total_blocks(), 3);
+    let first = manager.allocate_blocks(1).unwrap();
+    assert_eq!(first[0].block_id(), 0);
+    let staged = tail
+        .complete(&create_test_token_block_from_iota(0))
+        .unwrap();
+    assert!(manager.validate_capacity(2).is_err());
+    let immutable = manager.register_block(staged);
+    let pin = immutable.clone();
+    drop(immutable);
+    assert!(manager.set_capacity(2).is_err());
+    drop(pin);
+    assert!(manager.set_capacity(2).is_err());
+    assert_eq!(manager.occupied_blocks(), 3);
+    drop(first);
+    drop(blocks);
+    manager.reset_inactive_pool().unwrap();
+    manager.set_capacity(0).unwrap();
+    assert_eq!(manager.occupied_high_water(), 0);
+    assert_eq!(manager.occupied_blocks(), 0);
+    assert!(manager.allocate_blocks(1).is_none());
+    manager.set_capacity(2).unwrap();
+    assert_eq!(manager.available_blocks(), 2);
+    assert_eq!(manager.metrics().snapshot().reset_pool_size, 2);
+    assert_eq!(manager.maximum_blocks(), 3);
+    assert!(manager.set_capacity(4).is_err());
+}
+
 // ============================================================================
 // BUILDER PATTERN TESTS
 // ============================================================================
+
+#[test]
+fn inactive_tail_release_preserves_low_cache_and_notifies_evictions() {
+    let manager = create_test_manager(4);
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = observed.clone();
+    let observer: Arc<dyn BlockEvictionObserver> = Arc::new(move |hashes: &[SequenceHash]| {
+        sink.lock().unwrap().extend_from_slice(hashes);
+    });
+    manager.observe_evictions(&observer);
+    let tokens: Vec<_> = (0..4)
+        .map(|index| create_test_token_block_from_iota(90000 + index * 4))
+        .collect();
+    let hashes: Vec<_> = tokens
+        .iter()
+        .map(|token| token.kvbm_sequence_hash())
+        .collect();
+    let cached = manager.register_blocks(
+        manager
+            .allocate_blocks(4)
+            .unwrap()
+            .into_iter()
+            .zip(&tokens)
+            .map(|(block, token)| block.complete(token).unwrap())
+            .collect(),
+    );
+    drop(cached);
+    assert_eq!(manager.release_inactive_tail(2), 2);
+    assert_eq!(*observed.lock().unwrap(), hashes[2..]);
+    assert_eq!(manager.occupied_high_water(), 2);
+    assert_eq!(manager.metrics().snapshot().inactive_pool_size, 2);
+    assert_eq!(manager.metrics().snapshot().reset_pool_size, 2);
+    for (index, (_, present)) in manager
+        .block_registry()
+        .check_presence::<TestMeta>(&hashes)
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(*present, index < 2);
+    }
+    assert_eq!(manager.match_blocks(&hashes[..2]).len(), 2);
+    manager.set_capacity(2).unwrap();
+}
+
+#[test]
+fn inactive_tail_release_preserves_staged_transfer_and_shared_prefix_pins() {
+    let manager = create_test_manager(4);
+    let mut blocks = manager.allocate_blocks(4).unwrap();
+    let high = blocks.pop().unwrap();
+    drop(blocks);
+    assert_eq!(manager.release_inactive_tail(0), 4);
+    let staged = high
+        .complete(&create_test_token_block_from_iota(91000))
+        .unwrap();
+    assert_eq!(manager.release_inactive_tail(0), 4);
+    let shared = manager.register_block(staged);
+    let prefix_pin = shared.clone();
+    let transfer_pin = shared.pin();
+    drop(shared);
+    assert_eq!(manager.release_inactive_tail(0), 4);
+    drop(prefix_pin);
+    assert_eq!(manager.release_inactive_tail(0), 4);
+    assert!(manager.set_capacity(3).is_err());
+    drop(transfer_pin);
+    assert_eq!(manager.release_inactive_tail(0), 0);
+    manager.set_capacity(0).unwrap();
+}
 
 mod builder_tests {
     use super::*;
@@ -3241,7 +3378,7 @@ mod audit_counter_tests {
             reported_len: 2, // lie: claims 2, allocate() returns 0
         };
         let store: Arc<BlockStore<TestBlockData>> =
-            BlockStore::new(4, 4, Box::new(backend), metrics.clone(), false);
+            BlockStore::new(4, 4, 4, Box::new(backend), metrics.clone(), false);
 
         // free.len() is 4 (all reset). Asking for 5 forces from_inactive=1
         // which trips into the allocate path → backend lies → rollback.
@@ -3402,7 +3539,7 @@ mod audit_counter_tests {
         // backend.allocate(3) returns 2 → rollback fires and reinserts
         // those 2 partial pairs into the inactive index.
         let store: Arc<BlockStore<TestBlockData>> =
-            BlockStore::new(4, 4, Box::new(backend), metrics.clone(), false);
+            BlockStore::new(4, 4, 4, Box::new(backend), metrics.clone(), false);
 
         let result = store.allocate_atomic(7);
         assert!(result.is_none(), "rollback returns None");

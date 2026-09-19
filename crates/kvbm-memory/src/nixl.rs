@@ -20,6 +20,25 @@ pub use nixl_sys::{
 };
 pub use serde::{Deserialize, Serialize};
 
+/// Owns registration and mapped memory until a transfer completes.
+pub trait MappedRegistrationGuard: Send + Sync + fmt::Debug {}
+impl<T: Send + Sync + fmt::Debug> MappedRegistrationGuard for T {}
+
+/// Registered intervals and their lifetime owner for one requested range.
+#[derive(Debug)]
+pub struct MappedRegistrationLease {
+    /// Ordered, contiguous registered intervals that exactly cover the request.
+    pub ranges: Vec<std::ops::Range<usize>>,
+    /// Keeps every covered registration and physical allocation alive.
+    pub guard: Arc<dyn MappedRegistrationGuard>,
+}
+
+/// Acquires only published mapped ranges. Withdrawal rejects new acquisitions.
+pub trait MappedRegistrationProvider: Send + Sync + fmt::Debug {
+    /// Acquire published intervals and retain them through actual completion.
+    fn acquire(&self, address: usize, bytes: usize) -> anyhow::Result<MappedRegistrationLease>;
+}
+
 /// Trait for storage types that can be registered with NIXL.
 pub trait NixlCompatible {
     /// Get parameters needed for NIXL registration.
@@ -394,6 +413,19 @@ impl<T: MemoryDescriptor + NixlCompatible + Sized> NixlRegisterExt for T {}
 mod tests {
     use super::*;
     use crate::SystemStorage;
+
+    #[cfg(feature = "testing-nixl")]
+    #[test]
+    fn registration_without_a_backend_returns_storage() -> anyhow::Result<()> {
+        let agent = Agent::new("registration-without-backend")?;
+        let storage = SystemStorage::new(1024)?;
+        let address = storage.addr();
+        let error = register_with_nixl(storage, &agent, None)
+            .expect_err("an agent without a backend cannot register memory");
+        assert_eq!(error.storage.addr(), address);
+        assert_eq!(error.storage.size(), 1024);
+        Ok(())
+    }
 
     /// §5.4 regression test: storage that arrives pre-registered (i.e.
     /// `nixl_descriptor()` already returns `Some`) must report

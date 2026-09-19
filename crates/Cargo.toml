@@ -49,13 +49,13 @@ kvbm-protocols = { path = "kvbm-protocols" }
 kvbm-runtime = { path = "kvbm-runtime" }
 kvbm-service = { path = "kvbm-service" }
 
-# dynamo crates (git deps — branch exposes the 4 leaf libs the kvbm tree needs)
+# Dynamo crates
 # NOTE: dynamo-kv-router is intentionally featureless. The `runtime-protocols`
 # feature pulls `dynamo-runtime` (and its dynamo-core closure); kvbm-consolidator
 # only consumes `dynamo_kv_router::zmq_wire`, which is available without features.
-dynamo-tokens = { git = "https://github.com/ai-dynamo/dynamo", branch = "ryan/kvbm-engine-service" }
-dynamo-kv-router = { git = "https://github.com/ai-dynamo/dynamo", branch = "ryan/kvbm-engine-service" }
-dynamo-kv-hashing = { git = "https://github.com/ai-dynamo/dynamo", branch = "ryan/kvbm-engine-service" }
+dynamo-tokens = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "f1fa52254e2785f5072440e0b2077eb820cc548a" }
+dynamo-kv-router = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "f1fa52254e2785f5072440e0b2077eb820cc548a" }
+dynamo-kv-hashing = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "f1fa52254e2785f5072440e0b2077eb820cc548a" }
 
 # velo (registry — 0.4.1 / 0.2.0 are published on crates.io)
 velo     = { version = "0.4.1" }
@@ -83,7 +83,7 @@ hyper-util = { version = "=0.1.17" }
 indexmap = { version = "2" }
 libc = { version = "0.2" }
 libloading = "0.8.9"
-nixl-sys = { version = "=1.0.1" } # the single graph-wide NIXL binding pin (kvbm-memory inherits via workspace = true)
+nixl-sys = { version = "=1.4.1", git = "https://github.com/Aphoh/nixl.git", rev = "9e04f3dcb56c84d5b63feb10250e657822168322" }
 oneshot = { version = "0.1.13", features = ["std", "async"] }
 parking_lot = "0.12.5"
 prometheus = { version = "0.14" }
@@ -96,12 +96,13 @@ reqwest = { version = "0.12.24", default-features = false, features = [
     "rustls-tls",
 ] }
 rmp-serde = { version = "1" }
+rustc-hash = { version = "2" }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1" }
 tempfile = "3"
 thiserror = { version = "2.0.17" }
 tmq = { version = "0.5.0" }
-tokio = { version = "=1.48.0", features = ["full"] }
+tokio = { version = "=1.52.4", features = ["full"] }
 tokio-stream = { version = "0.1" }
 tokio-util = { version = "0.7.17", features = ["codec", "net", "rt", "io-util"] }
 tonic = { version = "0.13" }

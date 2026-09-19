@@ -76,6 +76,14 @@ impl MultiLruBackend {
 }
 
 impl InactiveIndex for MultiLruBackend {
+    fn grow_capacity(&mut self, capacity: usize) {
+        if let Some(capacity) = NonZeroUsize::new(capacity) {
+            for pool in &mut self.priority_pools {
+                pool.resize(capacity);
+            }
+        }
+    }
+
     fn find_matches(
         &mut self,
         hashes: &[SequenceHash],

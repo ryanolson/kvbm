@@ -46,7 +46,7 @@ pub struct BlockManager<T: BlockMetadata> {
     pub(crate) block_registry: BlockRegistry,
     pub(crate) inactive_backend: InactiveBackendConfig,
     pub(crate) duplication_policy: BlockDuplicationPolicy,
-    pub(crate) total_blocks: usize,
+    pub(crate) maximum_blocks: usize,
     pub(crate) block_size: usize,
     pub(crate) metrics: Arc<BlockPoolMetrics>,
     eviction_notifier: EvictionNotifier,
@@ -303,14 +303,23 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
         drop(blocks);
 
         let reset_count = self.store.reset_len();
-        if reset_count != self.total_blocks {
+        if reset_count != self.total_blocks() {
             return Err(BlockManagerResetError::BlockCountMismatch {
-                expected: self.total_blocks,
+                expected: self.total_blocks(),
                 actual: reset_count,
             });
         }
 
         Ok(())
+    }
+
+    /// Release inactive cached tail blocks without moving live blocks.
+    /// The returned bound is a snapshot. Capacity changes still validate live slots.
+    pub fn release_inactive_tail(&self, min_capacity: usize) -> usize {
+        let (blocks, evicted) = self.store.inactive_tail_to_mutable(min_capacity);
+        self.notify_evictions(&evicted);
+        drop(blocks);
+        self.occupied_high_water().max(min_capacity)
     }
 
     fn notify_evictions(&self, hashes: &[SequenceHash]) {
@@ -702,9 +711,35 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
         self.store.reset_len()
     }
 
-    /// Total number of blocks managed (constant after construction).
+    /// Number of blocks available within the published capacity.
     pub fn total_blocks(&self) -> usize {
-        self.total_blocks
+        self.store.total_blocks()
+    }
+
+    /// Maximum capacity from construction. Block IDs index physical pool units.
+    pub fn maximum_blocks(&self) -> usize {
+        self.maximum_blocks
+    }
+
+    /// One past the highest occupied block, including cached blocks and transfer pins.
+    pub fn occupied_high_water(&self) -> usize {
+        self.store.occupied_high_water()
+    }
+
+    /// Count all non-reset blocks, including inactive cached blocks.
+    pub fn occupied_blocks(&self) -> usize {
+        self.store.occupied_blocks()
+    }
+
+    /// Check capacity without mutation. Publication must repeat this check.
+    pub fn validate_capacity(&self, capacity: usize) -> Result<(), String> {
+        self.store.validate_capacity(capacity)
+    }
+
+    /// Publish capacity atomically. The caller must map storage before growth.
+    /// Shrink rejects every occupied tail block, including inactive cached blocks.
+    pub fn set_capacity(&self, capacity: usize) -> Result<(), String> {
+        self.store.set_capacity(capacity)
     }
 
     /// Blocks available for allocation (reset + inactive pools).

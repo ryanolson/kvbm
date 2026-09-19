@@ -177,6 +177,12 @@ pub(crate) fn execute_planner_cuda_transfer(
         src.layout().block_layout(),
         dst.layout().block_layout(),
     )?;
+    let mut guards = super::registration::acquire_blocks(src, src_block_ids, layer_range.as_ref())?;
+    guards.extend(super::registration::acquire_blocks(
+        dst,
+        dst_block_ids,
+        layer_range.as_ref(),
+    )?);
     // PR-7.3: 4 KiB min_inner_bytes — same-layout copies with a small
     // contiguous tail route to SmallStridedCopy (via vectorized_copy)
     // rather than failing with a no-kernel error.
@@ -196,7 +202,7 @@ pub(crate) fn execute_planner_cuda_transfer(
 
     // Acquire a stream (caller-provided or pool-acquired). Direction
     // determines which stream pool we draw from.
-    let caller_manages_sync = cuda_stream.is_some();
+    let caller_manages_sync = cuda_stream.is_some() && guards.is_empty();
     let stream = match &outcome {
         PlanOutcome::Empty => return Ok(TransferCompleteNotification::completed()),
         _ => {
@@ -213,6 +219,7 @@ pub(crate) fn execute_planner_cuda_transfer(
     let completion_admission = (!caller_manages_sync)
         .then(|| ctx.reserve_cuda_event())
         .transpose()?;
+    let mut submission = super::registration::CudaSubmissionGuard::new(stream.clone(), guards);
 
     // PR-7.6: capture telemetry fields from the outcome before dispatch
     // so we can compute bytes/descriptors once without a second projection.
@@ -300,6 +307,7 @@ pub(crate) fn execute_planner_cuda_transfer(
     Ok(ctx.register_cuda_event(
         event,
         completion_admission.expect("planner CUDA transfer reserved completion admission"),
+        submission.take(),
     ))
 }
 
@@ -453,7 +461,6 @@ pub(crate) fn execute_planner_nixl_transfer(
 
     let src_mem_type = src_metadata.mem_type();
     let dst_mem_type = dst_metadata.mem_type();
-    let src_device_id = src_metadata.device_id();
     let dst_device_id = dst_metadata.device_id();
 
     // Build XferDescLists. One descriptor per CopyOp on each side —
@@ -464,18 +471,18 @@ pub(crate) fn execute_planner_nixl_transfer(
     // benchmark target via `CountingDescSink`.
     let mut src_dl = XferDescList::new(src_mem_type)?;
     let mut dst_dl = XferDescList::new(dst_mem_type)?;
-    {
-        use crate::transfer::prepared::{DescSink, NixlDescPairSink};
-        let mut sink = NixlDescPairSink {
-            src: &mut src_dl,
-            dst: &mut dst_dl,
-            src_device_id,
-            dst_device_id,
-        };
-        sink.reserve(ops.len());
-        for op in &ops {
-            sink.push(op.src_addr, op.dst_addr, op.size);
-        }
+    let mut guards = Vec::new();
+    for op in &ops {
+        super::registration::append_pair(
+            src,
+            dst,
+            op.src_addr,
+            op.dst_addr,
+            op.size,
+            &mut src_dl,
+            &mut dst_dl,
+            &mut guards,
+        )?;
     }
 
     // Flipped strategies swap the roles assigned to the descriptor
@@ -506,7 +513,9 @@ pub(crate) fn execute_planner_nixl_transfer(
     let xfer_req = nixl_agent.create_xfer_req(xfer_op, &src_dl, &dst_dl, remote_agent, None)?;
     let tel_ctrl_us = t_ctrl0.elapsed().as_micros() as u64;
     let t_post0 = std::time::Instant::now();
-    let still_pending = nixl_agent.post_xfer_req(&xfer_req, None)?;
+    let still_pending = nixl_agent
+        .post_xfer_req(&xfer_req, None)
+        .inspect_err(|_| std::mem::forget(std::mem::take(&mut guards)))?;
     let tel_post_us = t_post0.elapsed().as_micros() as u64;
     let tel_submitted_at = std::time::Instant::now();
 
@@ -552,7 +561,7 @@ pub(crate) fn execute_planner_nixl_transfer(
     };
 
     if still_pending {
-        Ok(ctx.register_nixl_status(xfer_req, Some(telemetry), registration))
+        Ok(ctx.register_nixl_status(xfer_req, Some(telemetry), registration, guards))
     } else {
         // Synchronous completion never enters the poller — emit inline.
         telemetry.emit_complete(true);
@@ -1492,6 +1501,7 @@ pub(crate) fn dispatch_transform_kernel(
 /// failure), these are hot-path helpers that surface errors to their
 /// caller for graceful handling.
 struct OwnedStagedContext {
+    registrations: super::registration::RegistrationGuards,
     event_system: Arc<velo::EventManager>,
     tx_cuda_event: crate::transfer::context::PollingRegistrationQueue<
         crate::transfer::notifications::CudaEventChecker,
@@ -1515,6 +1525,7 @@ impl OwnedStagedContext {
     fn from_ctx(ctx: &TransferContext) -> Self {
         let nixl_agent = ctx.nixl_agent().clone();
         Self {
+            registrations: Vec::new(),
             event_system: ctx.event_system().clone(),
             tx_cuda_event: ctx.tx_cuda_event_clone(),
             tx_nixl_status: ctx.tx_nixl_status_clone(),
@@ -1531,12 +1542,16 @@ impl OwnedStagedContext {
         cuda_event: cudarc::driver::CudaEvent,
         admission: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<TransferCompleteNotification> {
+        let checker = crate::transfer::notifications::CudaEventChecker::new(
+            cuda_event,
+            self.registrations.clone(),
+        );
         let new_event = self.event_system.new_event()?;
         let handle = new_event.into_handle();
         let awaiter = self.event_system.awaiter(handle)?;
         let notification = crate::transfer::notifications::RegisterPollingNotification {
             uuid: uuid::Uuid::new_v4(),
-            checker: crate::transfer::notifications::CudaEventChecker::new(cuda_event),
+            checker,
             event_handle: handle,
             telemetry: None,
             admission,
@@ -1552,16 +1567,20 @@ impl OwnedStagedContext {
         &self,
         xfer_req: kvbm_memory::nixl::XferRequest,
         admission: tokio::sync::OwnedSemaphorePermit,
+        mut registrations: super::registration::RegistrationGuards,
     ) -> Result<TransferCompleteNotification> {
+        registrations.extend(self.registrations.iter().cloned());
+        let checker = crate::transfer::notifications::NixlStatusChecker::new(
+            self.raw_agent.clone(),
+            xfer_req,
+            registrations,
+        );
         let new_event = self.event_system.new_event()?;
         let handle = new_event.into_handle();
         let awaiter = self.event_system.awaiter(handle)?;
         let notification = crate::transfer::notifications::RegisterPollingNotification {
             uuid: uuid::Uuid::new_v4(),
-            checker: crate::transfer::notifications::NixlStatusChecker::new(
-                self.raw_agent.clone(),
-                xfer_req,
-            ),
+            checker,
             event_handle: handle,
             // Staged NIXL legs (operational↔universal transform) are not part of
             // the uniform remote-search pull path we instrument.
@@ -1638,9 +1657,18 @@ impl OwnedStagedContext {
         let dst_metadata = dst.nixl_metadata();
         let mut src_dl = XferDescList::new(src_metadata.mem_type())?;
         let mut dst_dl = XferDescList::new(dst_metadata.mem_type())?;
+        let mut guards = Vec::new();
         for op in &ops {
-            src_dl.add_desc(op.src_addr, op.size, src_metadata.device_id());
-            dst_dl.add_desc(op.dst_addr, op.size, dst_metadata.device_id());
+            super::registration::append_pair(
+                src,
+                dst,
+                op.src_addr,
+                op.dst_addr,
+                op.size,
+                &mut src_dl,
+                &mut dst_dl,
+                &mut guards,
+            )?;
         }
         if matches!(
             strategy,
@@ -1657,11 +1685,17 @@ impl OwnedStagedContext {
         let xfer_req =
             self.nixl_agent
                 .create_xfer_req(xfer_op, &src_dl, &dst_dl, remote_agent, None)?;
-        let still_pending = self.nixl_agent.post_xfer_req(&xfer_req, None)?;
+        let still_pending = self
+            .nixl_agent
+            .post_xfer_req(&xfer_req, None)
+            .inspect_err(|_| {
+                std::mem::forget(std::mem::take(&mut guards));
+                std::mem::forget(self.registrations.clone());
+            })?;
         if !still_pending {
             return Ok(TransferCompleteNotification::completed());
         }
-        self.register_nixl_status(xfer_req, registration)
+        self.register_nixl_status(xfer_req, registration, guards)
     }
 }
 
@@ -1813,7 +1847,22 @@ fn dispatch_staged_nixl_transform(
     let tel_bytes = n * src.layout().bytes_per_block();
 
     // ──────── Build owned context. ────────
-    let staged = OwnedStagedContext::from_ctx(ctx);
+    let mut staged = OwnedStagedContext::from_ctx(ctx);
+    staged.registrations = super::registration::acquire_blocks(src, &src_block_ids, None)?;
+    staged
+        .registrations
+        .extend(super::registration::acquire_blocks(
+            dst,
+            &dst_block_ids,
+            None,
+        )?);
+    staged
+        .registrations
+        .extend(super::registration::acquire_blocks(
+            bounce_layout,
+            &bounce_block_ids,
+            None,
+        )?);
 
     // ──────── Build stage 1 synchronously. ────────
     let stage1_notification = match xfer_op {
@@ -1836,6 +1885,10 @@ fn dispatch_staged_nixl_transform(
                 bounce_layout,
             )?);
             let completion_admission = staged.tx_cuda_event.reserve()?;
+            let mut submission = super::registration::CudaSubmissionGuard::new(
+                staged.stream.clone(),
+                staged.registrations.clone(),
+            );
             dispatch_transform_kernel(
                 &invocation,
                 src,
@@ -1846,7 +1899,9 @@ fn dispatch_staged_nixl_transform(
                 &stage1_prepared,
             )?;
             let cuda_event = staged.stream.record_event(None)?;
-            staged.register_cuda_event(cuda_event, completion_admission)?
+            let notification = staged.register_cuda_event(cuda_event, completion_admission)?;
+            drop(submission.take());
+            notification
         }
     };
 
@@ -1880,6 +1935,10 @@ fn dispatch_staged_nixl_transform(
                             &dst_owned,
                         )?);
                     let completion_admission = staged.tx_cuda_event.reserve()?;
+                    let mut submission = super::registration::CudaSubmissionGuard::new(
+                        staged.stream.clone(),
+                        staged.registrations.clone(),
+                    );
                     dispatch_transform_kernel(
                         &invocation_owned,
                         &bounce_owned,
@@ -1890,7 +1949,10 @@ fn dispatch_staged_nixl_transform(
                         &stage2_prepared,
                     )?;
                     let cuda_event = staged.stream.record_event(None)?;
-                    staged.register_cuda_event(cuda_event, completion_admission)
+                    let notification =
+                        staged.register_cuda_event(cuda_event, completion_admission)?;
+                    drop(submission.take());
+                    Ok(notification)
                 })();
                 match prep {
                     Ok(notif) => notif.await,

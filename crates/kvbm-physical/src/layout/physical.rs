@@ -37,6 +37,7 @@ pub struct PhysicalLayout {
 
     /// NIXL registration metadata
     nixl_metadata: NixlMetadata,
+    registration_provider: Option<Arc<dyn kvbm_memory::nixl::MappedRegistrationProvider>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +72,21 @@ impl NixlMetadata {
 }
 
 impl PhysicalLayout {
+    /// Attach the owner of dynamically registered mapped ranges.
+    pub fn with_registration_provider(
+        mut self,
+        provider: Arc<dyn kvbm_memory::nixl::MappedRegistrationProvider>,
+    ) -> Self {
+        self.registration_provider = Some(provider);
+        self
+    }
+
+    pub(crate) fn registration_provider(
+        &self,
+    ) -> Option<&Arc<dyn kvbm_memory::nixl::MappedRegistrationProvider>> {
+        self.registration_provider.as_ref()
+    }
+
     /// Create a typed builder that enforces NIXL registration.
     pub fn builder(agent: NixlAgent) -> PhysicalLayoutBuilderDefault {
         PhysicalLayoutBuilder::new(agent)
@@ -90,6 +106,7 @@ impl PhysicalLayout {
             layout,
             location,
             nixl_metadata,
+            registration_provider: None,
         }
     }
 
@@ -277,6 +294,7 @@ impl PhysicalLayout {
             layout,
             location: serialized.location,
             nixl_metadata: serialized.nixl_metadata,
+            registration_provider: None,
         })
     }
 }

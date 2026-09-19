@@ -23,12 +23,16 @@ fn bs(hash: u64, parent: Option<u64>, tokens: Vec<u32>, block_size: usize) -> Ra
         token_ids: tokens,
         block_size,
         lora_name: None,
+        cache_namespace: None,
         medium: None,
         block_mm_infos: None,
         is_eagle: None,
         group_idx: None,
         kv_cache_spec_kind: None,
         kv_cache_spec_sliding_window: None,
+        locality: None,
+        ownership: None,
+        session_id: None,
     }
 }
 
@@ -39,12 +43,16 @@ fn bs_lora(hash: u64, tokens: Vec<u32>, lora_name: String) -> RawKvEvent {
         token_ids: tokens,
         block_size: 4,
         lora_name: Some(lora_name),
+        cache_namespace: None,
         medium: None,
         block_mm_infos: None,
         is_eagle: None,
         group_idx: None,
         kv_cache_spec_kind: None,
         kv_cache_spec_sliding_window: None,
+        locality: None,
+        ownership: None,
+        session_id: None,
     }
 }
 

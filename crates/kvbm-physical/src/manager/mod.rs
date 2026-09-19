@@ -649,7 +649,9 @@ impl TransferManager {
         event: cudarc::driver::CudaEvent,
         admission: tokio::sync::OwnedSemaphorePermit,
     ) -> anyhow::Result<TransferCompleteNotification> {
-        Ok(self.context.register_cuda_event(event, admission))
+        Ok(self
+            .context
+            .register_cuda_event(event, admission, Vec::new()))
     }
 
     /// Get the CUDA memory pool (for testing only).

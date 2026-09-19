@@ -197,7 +197,7 @@ impl PrefillRouterManager {
                 })
             })
             .collect();
-        targets.sort_by(|a, b| a.instance_id.to_string().cmp(&b.instance_id.to_string()));
+        targets.sort_by_key(|target| target.instance_id.to_string());
         TargetsResponse { targets }
     }
 
@@ -216,7 +216,7 @@ impl PrefillRouterManager {
                 }
             })
             .collect();
-        workers.sort_by(|a, b| a.instance_id.to_string().cmp(&b.instance_id.to_string()));
+        workers.sort_by_key(|worker| worker.instance_id.to_string());
         CountersResponse {
             workers,
             available_permits: self.selector.available_permits(),

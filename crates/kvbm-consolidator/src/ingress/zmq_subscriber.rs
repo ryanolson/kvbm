@@ -226,7 +226,7 @@ fn process_event(tracker: &mut Tracker, event: RawKvEvent, engine_source: EventS
             }
         }
 
-        RawKvEvent::AllBlocksCleared => {
+        RawKvEvent::AllBlocksCleared { .. } => {
             tracker.handle_clear_all();
         }
 

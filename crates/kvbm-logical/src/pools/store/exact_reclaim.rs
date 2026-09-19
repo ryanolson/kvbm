@@ -262,7 +262,7 @@ impl<T: BlockMetadata> BlockStore<T> {
             let handle = take_inactive_handle(&mut inner.slots[victim.block_id], victim.block_id);
             inner.slots[victim.block_id].state = SlotState::Reset;
             inner.reset_on_release[victim.block_id] = self.default_reset_on_release;
-            inner.free.push_back(victim.block_id);
+            inner.free.insert(victim.block_id);
             evicted.push(victim.seq_hash);
             handles.push(handle);
         }
@@ -271,7 +271,7 @@ impl<T: BlockMetadata> BlockStore<T> {
         for _ in 0..count {
             let block_id = inner
                 .free
-                .pop_front()
+                .pop_first()
                 .expect("validated exact reclaim capacity was lost under the store lock");
             let block_size = self.allocate_mutable_slot(&mut inner, block_id);
             blocks.push(MutableBlock::from_store(self.clone(), block_id, block_size));

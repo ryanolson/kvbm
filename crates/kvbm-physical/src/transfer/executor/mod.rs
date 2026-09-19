@@ -7,6 +7,7 @@ pub(super) mod cuda;
 mod memcpy;
 mod nixl;
 pub(crate) mod planner;
+pub(crate) mod registration;
 
 use super::strategy::select_strategy;
 use super::strategy::{TransferPlan, TransferStrategy};
@@ -658,6 +659,14 @@ fn execute_two_hop_transfer(params: TwoHopTransferParams) -> Result<TransferComp
         ctx,
     } = params;
 
+    let mut registrations =
+        registration::acquire_blocks(src, src_block_ids, options.layer_range.as_ref())?;
+    registrations.extend(registration::acquire_blocks(
+        dst,
+        dst_block_ids,
+        options.layer_range.as_ref(),
+    )?);
+
     let event = ctx.event_system().new_event()?;
     let handle = event.into_handle();
     let awaiter = ctx.event_system().awaiter(handle)?;
@@ -674,6 +683,7 @@ fn execute_two_hop_transfer(params: TwoHopTransferParams) -> Result<TransferComp
     // let options_clone = options.clone();
 
     ctx.tokio().spawn(async move {
+        let _registrations = registrations;
         let Some(ref bounce_buffer_spec) = options.bounce_buffer else {
             let _ = system.poison(
                 handle,

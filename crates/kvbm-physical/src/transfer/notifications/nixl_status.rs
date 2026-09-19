@@ -12,11 +12,20 @@ use super::CompletionChecker;
 pub struct NixlStatusChecker {
     agent: NixlAgent,
     xfer_req: XferRequest,
+    _registrations: crate::transfer::executor::registration::RegistrationGuards,
 }
 
 impl NixlStatusChecker {
-    pub fn new(agent: NixlAgent, xfer_req: XferRequest) -> Self {
-        Self { agent, xfer_req }
+    pub fn new(
+        agent: NixlAgent,
+        xfer_req: XferRequest,
+        registrations: crate::transfer::executor::registration::RegistrationGuards,
+    ) -> Self {
+        Self {
+            agent,
+            xfer_req,
+            _registrations: registrations,
+        }
     }
 }
 
@@ -28,6 +37,15 @@ impl CompletionChecker for NixlStatusChecker {
         match self.agent.get_xfer_status(&self.xfer_req) {
             Ok(status) => Ok(status.is_success()),
             Err(e) => Err(anyhow!("NIXL transfer status check failed: {}", e)),
+        }
+    }
+}
+
+impl Drop for NixlStatusChecker {
+    fn drop(&mut self) {
+        if !self._registrations.is_empty() && !matches!(self.is_complete(), Ok(true)) {
+            // A failed status query or stopped worker does not prove DMA completion.
+            std::mem::forget(std::mem::take(&mut self._registrations));
         }
     }
 }

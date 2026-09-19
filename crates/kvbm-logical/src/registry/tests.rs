@@ -582,8 +582,8 @@ fn drop_does_not_remove_entry_when_replaced_by_newer_registration() {
         None,
     ));
     {
-        let map = registry.prt.prefix(&seq_hash);
-        let mut weak = map.get_mut(&seq_hash).expect("entry present");
+        let mut map = registry.prt.prefix(&seq_hash);
+        let weak = map.get_mut(&seq_hash).expect("entry present");
         *weak = Arc::downgrade(&inner_b);
     }
 
@@ -820,8 +820,8 @@ fn a_superseded_registration_publishes_no_remove() {
     let handle_b = BlockRegistrationHandle::from_inner(inner_b.clone());
     events.on_block_registered(&handle_b);
     {
-        let map = registry.prt.prefix(&seq_hash);
-        let mut weak = map.get_mut(&seq_hash).expect("entry present");
+        let mut map = registry.prt.prefix(&seq_hash);
+        let weak = map.get_mut(&seq_hash).expect("entry present");
         *weak = Arc::downgrade(&inner_b);
     }
     assert_eq!(

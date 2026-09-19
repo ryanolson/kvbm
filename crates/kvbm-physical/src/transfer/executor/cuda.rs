@@ -46,6 +46,12 @@ pub fn execute_cuda_transfer(
     cuda_stream: Option<Arc<CudaStream>>,
     ctx: &TransferContext,
 ) -> Result<TransferCompleteNotification> {
+    let mut guards = super::registration::acquire_blocks(src, src_block_ids, layer_range.as_ref())?;
+    guards.extend(super::registration::acquire_blocks(
+        dst,
+        dst_block_ids,
+        layer_range.as_ref(),
+    )?);
     // Validate layouts
     let src_layout = src.layout();
     let dst_layout = dst.layout();
@@ -76,7 +82,7 @@ pub fn execute_cuda_transfer(
     let use_whole_block = can_use_whole_block_transfer(src, dst, layer_range.as_ref());
 
     // Track whether caller provided stream (affects event recording)
-    let caller_manages_sync = cuda_stream.is_some();
+    let caller_manages_sync = cuda_stream.is_some() && guards.is_empty();
 
     // Get appropriate CUDA stream - use caller-provided or acquire from pool
     let stream = if let Some(s) = cuda_stream {
@@ -141,6 +147,7 @@ pub fn execute_cuda_transfer(
     let completion_admission = (!caller_manages_sync)
         .then(|| ctx.reserve_cuda_event())
         .transpose()?;
+    let mut submission = super::registration::CudaSubmissionGuard::new(stream.clone(), guards);
 
     match strategy {
         TransferStrategy::CudaAsyncH2D
@@ -216,6 +223,7 @@ pub fn execute_cuda_transfer(
         Ok(ctx.register_cuda_event(
             event,
             completion_admission.expect("async CUDA transfer reserved completion admission"),
+            submission.take(),
         ))
     } else {
         // Blocking transfers are already synchronized

@@ -135,7 +135,7 @@ impl<T: BlockMetadata> BlockStore<T> {
         for _ in 0..from_reset {
             let block_id = inner
                 .free
-                .pop_front()
+                .pop_first()
                 .expect("reset capacity was validated");
             let block_size = self.allocate_mutable_slot(&mut inner, block_id);
             blocks.push(MutableBlock::from_store(self.clone(), block_id, block_size));
