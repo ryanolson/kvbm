@@ -205,24 +205,43 @@ impl<T: BlockMetadata> RequestSequence<T> {
         &mut self,
         manager: &BlockManager<T>,
     ) -> Result<usize, LogicalBlockAssignmentError<T>> {
+        self.match_and_add_prefix_bounded(manager, usize::MAX)
+    }
+
+    /// Like [`match_and_add_prefix`](Self::match_and_add_prefix), but match
+    /// at most the first `max_blocks` blocks.
+    ///
+    /// A caller that restores other state at a block boundary adopts exactly
+    /// the blocks before that boundary. A deeper hit would hand the caller
+    /// shared blocks that its own prefill then writes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the sequence already has assigned blocks.
+    pub fn match_and_add_prefix_bounded(
+        &mut self,
+        manager: &BlockManager<T>,
+        max_blocks: usize,
+    ) -> Result<usize, LogicalBlockAssignmentError<T>> {
         assert!(
             self.assignments.is_empty() && self.detached_assigned.is_empty(),
             "match_and_add_prefix called on sequence with existing assignments"
         );
-        let matched = self.match_prefix(manager);
+        let matched = self.match_prefix(manager, max_blocks);
         if matched.is_empty() {
             return Ok(0);
         }
         self.add_matched_blocks(matched)
     }
 
-    /// Search for prefix cache hits against the manager's pools.
+    /// Search for prefix cache hits against the manager's pools, over at
+    /// most the first `max_blocks` hashes.
     ///
     /// Returns matched [`ImmutableBlock`]s in sequence order. Pass the result
     /// to [`add_matched_blocks`](Self::add_matched_blocks).
-    fn match_prefix(&self, manager: &BlockManager<T>) -> Vec<ImmutableBlock<T>> {
+    fn match_prefix(&self, manager: &BlockManager<T>, max_blocks: usize) -> Vec<ImmutableBlock<T>> {
         let hashes = self.sequence.all_sequence_hashes();
-        manager.match_blocks(&hashes)
+        manager.match_blocks(&hashes[..hashes.len().min(max_blocks)])
     }
 
     /// Add prefix-matched immutable blocks as assigned.
@@ -694,6 +713,42 @@ mod tests {
         let result = build_prefilled(make_tokens(12), 10, BLOCK_SIZE, &manager);
         assert!(result.is_none());
         assert_eq!(manager.available_blocks(), 2);
+    }
+
+    // =========================================================================
+    // Bounded prefix matching
+    // =========================================================================
+
+    /// A caller that restores from a checkpoint at block `n` adopts exactly
+    /// the blocks `0..n`. Blocks past the bound stay unmatched even when the
+    /// registry holds them, so the caller allocates and recomputes them.
+    #[test]
+    fn test_bounded_prefix_match_stops_at_the_bound() {
+        let manager = create_test_manager::<TestMeta>(20);
+        let _holder = build_prefilled(make_tokens(12), 0, BLOCK_SIZE, &manager).unwrap();
+
+        let mut bounded = RequestSequence::<TestMeta>::new(make_tokens(12), 0, BLOCK_SIZE);
+        assert_eq!(
+            bounded.match_and_add_prefix_bounded(&manager, 2).unwrap(),
+            2
+        );
+        assert_eq!(bounded.prefix_matched_blocks(), 2);
+        assert_eq!(bounded.assigned_blocks(), 2);
+
+        let mut unbounded = RequestSequence::<TestMeta>::new(make_tokens(12), 0, BLOCK_SIZE);
+        assert_eq!(unbounded.match_and_add_prefix(&manager).unwrap(), 3);
+
+        let mut past_the_hits = RequestSequence::<TestMeta>::new(make_tokens(12), 0, BLOCK_SIZE);
+        assert_eq!(
+            past_the_hits
+                .match_and_add_prefix_bounded(&manager, 10)
+                .unwrap(),
+            3
+        );
+
+        let mut none = RequestSequence::<TestMeta>::new(make_tokens(12), 0, BLOCK_SIZE);
+        assert_eq!(none.match_and_add_prefix_bounded(&manager, 0).unwrap(), 0);
+        assert_eq!(none.assigned_blocks(), 0);
     }
 
     // =========================================================================
