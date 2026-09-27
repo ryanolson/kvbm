@@ -341,11 +341,13 @@ impl TransferManager {
             dst_kv_layout,
             metric_route,
             use_planner,
+            copy_engine,
         ) = options.dissolve();
 
         let force_planner = selection_slices.is_some();
         let mut builder = TransferOptionsInternal::builder()
             .use_planner(force_planner || use_planner)
+            .copy_engine(copy_engine)
             .handles(src_handle, dst_handle);
         if let Some(slices) = selection_slices {
             builder = builder.axis_slices(slices);

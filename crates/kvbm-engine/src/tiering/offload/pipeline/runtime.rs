@@ -232,6 +232,7 @@ impl<Src: BlockMetadata, Dst: BlockMetadata> Pipeline<Src, Dst> {
             dst_layout,
             skip_transfers: base.skip_transfers,
             max_concurrent_transfers: base.max_concurrent_transfers,
+            copy_engine: base.copy_engine,
             chain_tx,
             register_observers: Arc::clone(&register_observers),
             shutdown: ExecutorShutdown::new(pipeline_runtime.shutdown_receiver()),

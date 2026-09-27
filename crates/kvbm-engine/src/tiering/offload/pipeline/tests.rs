@@ -24,6 +24,17 @@ fn test_pipeline_builder() {
 }
 
 #[test]
+fn pipeline_builder_records_copy_engine() {
+    let config = PipelineBuilder::<(), ()>::new()
+        .copy_engine(kvbm_physical::transfer::CopyEngine::MemcpyBatch)
+        .build();
+    assert_eq!(
+        config.base.copy_engine,
+        kvbm_physical::transfer::CopyEngine::MemcpyBatch
+    );
+}
+
+#[test]
 fn pipeline_builder_records_logical_resource() {
     let resource = kvbm_common::LogicalResourceId(9);
     let config = PipelineBuilder::<(), ()>::new().resource(resource).build();

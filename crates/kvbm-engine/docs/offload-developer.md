@@ -110,6 +110,13 @@ This rule keeps `SequenceHash` values unique in each object transfer batch.
 `PipelineConfig` and `ObjectPipelineConfig` are public type aliases for this shared configuration.
 Their builders use one `SharedPipelineBuilder` implementation.
 
+`SharedPipelineBuilder::copy_engine` selects the CUDA copy primitive the
+block transfer executor passes through `TransferOptions`: `auto` (default)
+keeps the executor's shape-based dispatch, `vectorized-kernel` pins the
+`vectorized_copy` SM kernel, and `memcpy-batch` pins the hardware copy
+engine. `TierOffloadConfig.copy_engine` carries the per-transition setting
+and the connector maps it via `copy_engine_from_config`.
+
 `PipelineRuntime` owns the common stage queues, cancellation watchers, registration gate, and task handles.
 Block and object pipelines add only their destination executor state.
 The runtime uses one internal executor channel with capacity eight.

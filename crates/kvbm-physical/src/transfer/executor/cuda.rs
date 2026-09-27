@@ -7,7 +7,7 @@ use super::TransferContext;
 use super::{PhysicalLayout, TransferStrategy};
 use crate::BlockId;
 use crate::transfer::context::TransferCompleteNotification;
-use crate::transfer::{can_use_whole_block_transfer, validate_layout_compatibility};
+use crate::transfer::{CopyEngine, can_use_whole_block_transfer, validate_layout_compatibility};
 use anyhow::{Result, anyhow};
 use cudarc::driver::{CudaStream, result as cuda_result};
 use cudarc::runtime::sys::cudaStream_t;
@@ -34,6 +34,7 @@ use std::sync::Arc;
 /// * `strategy` - CUDA transfer strategy (H2D, D2H, D2D, async or blocking)
 /// * `cuda_stream` - Optional caller-provided stream. If provided, use this stream
 ///   and skip event recording (caller manages sync). Returns completed() immediately.
+/// * `copy_engine` - CUDA copy primitive selection (see [`CopyEngine`])
 /// * `ctx` - Transfer context with CUDA stream
 #[allow(clippy::too_many_arguments)]
 pub fn execute_cuda_transfer(
@@ -44,6 +45,7 @@ pub fn execute_cuda_transfer(
     layer_range: Option<Range<usize>>,
     strategy: TransferStrategy,
     cuda_stream: Option<Arc<CudaStream>>,
+    copy_engine: CopyEngine,
     ctx: &TransferContext,
 ) -> Result<TransferCompleteNotification> {
     let mut guards = super::registration::acquire_blocks(src, src_block_ids, layer_range.as_ref())?;
@@ -153,51 +155,135 @@ pub fn execute_cuda_transfer(
         TransferStrategy::CudaAsyncH2D
         | TransferStrategy::CudaAsyncD2H
         | TransferStrategy::CudaAsyncD2D => {
-            if use_whole_block {
-                // FC→FC: Use unified whole-block path with batched memcpy
-                // Direction auto-detected by cudaMemcpyDefault
-                tracing::debug!(
-                    strategy = strategy_name,
-                    num_blocks = src_block_ids.len(),
-                    bytes_per_block = src_layout.bytes_per_block(),
-                    "Using whole-block transfer (auto direction)"
-                );
-                execute_whole_block_cuda(src, dst, src_block_ids, dst_block_ids, stream.as_ref())?;
-            } else {
-                match uniform_chunk_bytes {
-                    Some(chunk_size) => {
+            match copy_engine {
+                CopyEngine::Auto => {
+                    if use_whole_block {
+                        // FC→FC: Use unified whole-block path with batched memcpy
+                        // Direction auto-detected by cudaMemcpyDefault
                         tracing::debug!(
                             strategy = strategy_name,
                             num_blocks = src_block_ids.len(),
-                            num_layers = layers.len(),
-                            "Using vectorized_copy for uniform layer-wise transfer"
+                            bytes_per_block = src_layout.bytes_per_block(),
+                            "Using whole-block transfer (auto direction)"
                         );
-                        execute_fc_lw_vectorized(
+                        execute_whole_block_cuda(
                             src,
                             dst,
                             src_block_ids,
                             dst_block_ids,
-                            layers.clone(),
-                            chunk_size,
+                            stream.as_ref(),
+                        )?;
+                    } else {
+                        match uniform_chunk_bytes {
+                            Some(chunk_size) => {
+                                tracing::debug!(
+                                    strategy = strategy_name,
+                                    num_blocks = src_block_ids.len(),
+                                    num_layers = layers.len(),
+                                    "Using vectorized_copy for uniform layer-wise transfer"
+                                );
+                                execute_fc_lw_vectorized(
+                                    src,
+                                    dst,
+                                    src_block_ids,
+                                    dst_block_ids,
+                                    layers.clone(),
+                                    chunk_size,
+                                    stream.as_ref(),
+                                    ctx.cuda_pool(),
+                                )?;
+                            }
+                            None => {
+                                tracing::debug!(
+                                    strategy = strategy_name,
+                                    num_blocks = src_block_ids.len(),
+                                    num_layers = layers.len(),
+                                    "Using segmented CUDA copies for ragged layer-wise transfer"
+                                );
+                                execute_ragged_layer_wise_cuda(
+                                    src,
+                                    dst,
+                                    src_block_ids,
+                                    dst_block_ids,
+                                    layers.clone(),
+                                    stream.as_ref(),
+                                )?;
+                            }
+                        }
+                    }
+                }
+                CopyEngine::MemcpyBatch => {
+                    if use_whole_block {
+                        execute_whole_block_cuda(
+                            src,
+                            dst,
+                            src_block_ids,
+                            dst_block_ids,
+                            stream.as_ref(),
+                        )?;
+                    } else {
+                        match uniform_chunk_bytes {
+                            Some(chunk_size) => {
+                                tracing::debug!(
+                                    strategy = strategy_name,
+                                    num_blocks = src_block_ids.len(),
+                                    num_layers = layers.len(),
+                                    "Using memcpy_batch for uniform layer-wise transfer"
+                                );
+                                execute_fc_lw_memcpy_batch(
+                                    src,
+                                    dst,
+                                    src_block_ids,
+                                    dst_block_ids,
+                                    layers.clone(),
+                                    chunk_size,
+                                    stream.as_ref(),
+                                )?;
+                            }
+                            None => {
+                                execute_ragged_layer_wise_cuda(
+                                    src,
+                                    dst,
+                                    src_block_ids,
+                                    dst_block_ids,
+                                    layers.clone(),
+                                    stream.as_ref(),
+                                )?;
+                            }
+                        }
+                    }
+                }
+                CopyEngine::VectorizedKernel => {
+                    if use_whole_block {
+                        execute_whole_block_vectorized(
+                            src,
+                            dst,
+                            src_block_ids,
+                            dst_block_ids,
                             stream.as_ref(),
                             ctx.cuda_pool(),
                         )?;
-                    }
-                    None => {
-                        tracing::debug!(
-                            strategy = strategy_name,
-                            num_blocks = src_block_ids.len(),
-                            num_layers = layers.len(),
-                            "Using segmented CUDA copies for ragged layer-wise transfer"
-                        );
-                        execute_ragged_layer_wise_cuda(
-                            src,
-                            dst,
-                            src_block_ids,
-                            dst_block_ids,
-                            layers.clone(),
-                            stream.as_ref(),
-                        )?;
+                    } else {
+                        match uniform_chunk_bytes {
+                            Some(chunk_size) => {
+                                execute_fc_lw_vectorized(
+                                    src,
+                                    dst,
+                                    src_block_ids,
+                                    dst_block_ids,
+                                    layers.clone(),
+                                    chunk_size,
+                                    stream.as_ref(),
+                                    ctx.cuda_pool(),
+                                )?;
+                            }
+                            None => {
+                                return Err(anyhow!(
+                                    "CopyEngine::VectorizedKernel requires a uniform chunk size; \
+                                     this layout pair is ragged"
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -293,6 +379,40 @@ fn execute_whole_block_cuda(
     Ok(())
 }
 
+/// Whole-block transfer through `vectorized_copy`: one chunk of
+/// `bytes_per_block` per block — the kernel equivalent of
+/// `execute_whole_block_cuda`.
+fn execute_whole_block_vectorized(
+    src: &PhysicalLayout,
+    dst: &PhysicalLayout,
+    src_block_ids: &[BlockId],
+    dst_block_ids: &[BlockId],
+    stream: &CudaStream,
+    pool: &CudaMemPool,
+) -> Result<()> {
+    // Bind CUDA context to current thread before any CUDA operations.
+    stream.context().bind_to_thread()?;
+
+    let bytes_per_block = src.layout().bytes_per_block();
+    let num_blocks = src_block_ids.len();
+
+    if num_blocks == 0 {
+        return Ok(());
+    }
+
+    let mut src_ptrs: Vec<usize> = Vec::with_capacity(num_blocks);
+    let mut dst_ptrs: Vec<usize> = Vec::with_capacity(num_blocks);
+
+    for (&src_block_id, &dst_block_id) in src_block_ids.iter().zip(dst_block_ids.iter()) {
+        let src_region = src.memory_region(src_block_id, 0, 0)?;
+        let dst_region = dst.memory_region(dst_block_id, 0, 0)?;
+        src_ptrs.push(src_region.addr());
+        dst_ptrs.push(dst_region.addr());
+    }
+
+    launch_vectorized_copy(&src_ptrs, &dst_ptrs, bytes_per_block, stream, pool)
+}
+
 // ============================================================================
 // FC↔LW Transfer using vectorized_copy kernel
 // ============================================================================
@@ -345,6 +465,21 @@ fn execute_fc_lw_vectorized(
         }
     }
 
+    launch_vectorized_copy(&src_ptrs, &dst_ptrs, chunk_size, stream, pool)
+}
+
+/// Upload (src, dst) pointer pairs to the device pool and launch the
+/// `vectorized_copy` kernel over them. Waits for the pointer upload
+/// before returning so the host arrays may drop.
+fn launch_vectorized_copy(
+    src_ptrs: &[usize],
+    dst_ptrs: &[usize],
+    chunk_size: usize,
+    stream: &CudaStream,
+    pool: &CudaMemPool,
+) -> Result<()> {
+    let total_chunks = src_ptrs.len();
+
     // Allocate device memory for pointer arrays
     let src_ptrs_device = pool.alloc_async(total_chunks * std::mem::size_of::<usize>(), stream)?;
     let dst_ptrs_device = pool.alloc_async(total_chunks * std::mem::size_of::<usize>(), stream)?;
@@ -393,10 +528,74 @@ fn execute_fc_lw_vectorized(
     tracing::debug!(
         total_chunks,
         chunk_size,
-        "FC↔LW vectorized_copy transfer completed"
+        "vectorized_copy transfer completed"
     );
 
     pointers_transfered_event.synchronize()?;
+
+    Ok(())
+}
+
+/// Uniform-chunk transfer through the hardware copy engine: the same
+/// (src, dst) chunk pairs as `execute_fc_lw_vectorized`, dispatched to
+/// `kvbm_kernels::memcpy_batch` on host pointer arrays.
+fn execute_fc_lw_memcpy_batch(
+    src: &PhysicalLayout,
+    dst: &PhysicalLayout,
+    src_block_ids: &[BlockId],
+    dst_block_ids: &[BlockId],
+    layers: Range<usize>,
+    chunk_size: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    // Bind CUDA context to current thread before any CUDA operations.
+    stream.context().bind_to_thread()?;
+
+    let src_layout = src.layout();
+    let nl = layers.len();
+    let no = src_layout.outer_dim();
+    let total_chunks = src_block_ids.len() * nl * no;
+
+    if total_chunks == 0 {
+        return Ok(());
+    }
+
+    // Build host pointer arrays - memcpy_batch reads them on the host
+    let mut src_ptrs: Vec<*const c_void> = Vec::with_capacity(total_chunks);
+    let mut dst_ptrs: Vec<*mut c_void> = Vec::with_capacity(total_chunks);
+
+    for (&src_block_id, &dst_block_id) in src_block_ids.iter().zip(dst_block_ids.iter()) {
+        for layer_id in layers.clone() {
+            for outer_id in 0..no {
+                let src_region = src.memory_region(src_block_id, layer_id, outer_id)?;
+                let dst_region = dst.memory_region(dst_block_id, layer_id, outer_id)?;
+                src_ptrs.push(src_region.addr() as *const c_void);
+                dst_ptrs.push(dst_region.addr() as *mut c_void);
+            }
+        }
+    }
+
+    let status = unsafe {
+        kvbm_kernels::memcpy_batch(
+            src_ptrs.as_ptr(),
+            dst_ptrs.as_ptr(),
+            chunk_size,
+            total_chunks,
+            MemcpyBatchMode::BatchedWithFallback,
+            stream.cu_stream() as cudaStream_t,
+        )
+    };
+
+    if status != cudarc::runtime::sys::cudaError::cudaSuccess {
+        return Err(anyhow!("memcpy_batch failed: {:?}", status));
+    }
+
+    tracing::debug!(
+        total_chunks,
+        chunk_size,
+        batch_available = kvbm_kernels::is_memcpy_batch_available(),
+        "FC↔LW memcpy_batch transfer completed"
+    );
 
     Ok(())
 }

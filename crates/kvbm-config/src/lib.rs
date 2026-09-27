@@ -57,7 +57,8 @@ pub use metrics::MetricsConfig;
 pub use nixl::NixlConfig;
 pub use object::{NixlObjectConfig, ObjectClientConfig, ObjectConfig, S3ObjectConfig};
 pub use offload::{
-    OffloadConfig, PolicyType, PresenceFilterConfig, PresenceLfuFilterConfig, TierOffloadConfig,
+    CopyEngine, OffloadConfig, PolicyType, PresenceFilterConfig, PresenceLfuFilterConfig,
+    TierOffloadConfig,
 };
 pub use onboard::{OnboardConfig, OnboardMode};
 pub use rayon::RayonConfig;
