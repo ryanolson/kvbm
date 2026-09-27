@@ -636,7 +636,11 @@ async fn execute_two_hop_transfer_chunk(
         layer_range.clone(),
         first_strategy,
         None, // Two-hop transfers don't support caller-provided streams
-        copy_engine,
+        if first_strategy.is_cuda_family() {
+            copy_engine
+        } else {
+            CopyEngine::Auto
+        },
         false, // Two-hop chunks stay on the legacy path for now
         None,  // bounce_buffer only used by use_planner=true NIXL transforms
         Vec::new(), // axis_slices: two-hop chunks never carry slices (rejected upstream)
@@ -653,7 +657,11 @@ async fn execute_two_hop_transfer_chunk(
         layer_range.clone(),
         second_strategy,
         None, // Two-hop transfers don't support caller-provided streams
-        copy_engine,
+        if second_strategy.is_cuda_family() {
+            copy_engine
+        } else {
+            CopyEngine::Auto
+        },
         false, // Two-hop chunks stay on the legacy path for now
         None,
         Vec::new(), // axis_slices: two-hop chunks never carry slices
