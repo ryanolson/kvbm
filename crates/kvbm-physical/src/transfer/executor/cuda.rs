@@ -481,8 +481,8 @@ fn launch_vectorized_copy(
     let total_chunks = src_ptrs.len();
 
     // Allocate device memory for pointer arrays
-    let src_ptrs_device = pool.alloc_async(total_chunks * std::mem::size_of::<usize>(), stream)?;
-    let dst_ptrs_device = pool.alloc_async(total_chunks * std::mem::size_of::<usize>(), stream)?;
+    let src_ptrs_device = pool.alloc_async(std::mem::size_of_val(src_ptrs), stream)?;
+    let dst_ptrs_device = pool.alloc_async(std::mem::size_of_val(dst_ptrs), stream)?;
 
     // Upload pointer arrays to device
     unsafe {
@@ -490,7 +490,7 @@ fn launch_vectorized_copy(
             src_ptrs_device,
             std::slice::from_raw_parts(
                 src_ptrs.as_ptr() as *const u8,
-                total_chunks * std::mem::size_of::<usize>(),
+                std::mem::size_of_val(src_ptrs),
             ),
             stream.cu_stream(),
         )?;
@@ -498,7 +498,7 @@ fn launch_vectorized_copy(
             dst_ptrs_device,
             std::slice::from_raw_parts(
                 dst_ptrs.as_ptr() as *const u8,
-                total_chunks * std::mem::size_of::<usize>(),
+                std::mem::size_of_val(dst_ptrs),
             ),
             stream.cu_stream(),
         )?;
