@@ -72,16 +72,41 @@ enum MemoryPlan {
 struct MemoryEntry {
     region: Buffer,
     descriptor: Option<NixlDescriptor>,
+    /// The NIXL registration that covers `region`.
+    ///
+    /// This differs from `descriptor` when one allocation is registered once
+    /// and then sliced into several regions. NIXL matches a partial metadata
+    /// export against the registration, not against a slice of it, so the
+    /// export needs this descriptor rather than `descriptor`.
+    registration: Option<NixlDescriptor>,
 }
 
 impl MemoryEntry {
     fn new(region: Buffer, descriptor: Option<NixlDescriptor>) -> Self {
-        Self { region, descriptor }
+        let registration = descriptor.clone();
+        Self {
+            region,
+            descriptor,
+            registration,
+        }
+    }
+
+    fn with_registration(
+        region: Buffer,
+        descriptor: Option<NixlDescriptor>,
+        registration: Option<NixlDescriptor>,
+    ) -> Self {
+        Self {
+            region,
+            descriptor,
+            registration,
+        }
     }
 
     fn ensure_registered(mut self) -> Result<Self> {
         if self.descriptor.is_none() {
             self.descriptor = self.region.nixl_descriptor();
+            self.registration = self.descriptor.clone();
         }
 
         #[cfg(not(test))]
@@ -443,6 +468,7 @@ impl PhysicalLayoutBuilder<HasConfig, HasLayout, HasMemory> {
 
         let required_sizes = compute_allocation_sizes(&config, &layout_kind)?;
         let entries = resolve_memory_plan(&agent, memory_plan, &required_sizes)?;
+        let registrations = collect_registrations(&entries);
 
         validate_memory_sizes(&entries, &required_sizes)?;
         let kind = derive_storage_kind(&entries)?;
@@ -487,8 +513,29 @@ impl PhysicalLayoutBuilder<HasConfig, HasLayout, HasMemory> {
             }
         };
 
-        Ok(PhysicalLayout::new_local(layout, kind, metadata))
+        Ok(PhysicalLayout::new_local(layout, kind, metadata).with_registrations(registrations))
     }
+}
+
+/// The distinct NIXL registrations that back these regions, in address order.
+fn collect_registrations(entries: &[MemoryEntry]) -> Vec<NixlDescriptor> {
+    let mut registrations: Vec<NixlDescriptor> = Vec::new();
+    for entry in entries {
+        let Some(registration) = entry.registration.as_ref() else {
+            continue;
+        };
+        if registrations.iter().any(|held| {
+            held.addr == registration.addr
+                && held.size == registration.size
+                && held.mem_type == registration.mem_type
+                && held.device_id == registration.device_id
+        }) {
+            continue;
+        }
+        registrations.push(registration.clone());
+    }
+    registrations.sort_by_key(|registration| registration.addr);
+    registrations
 }
 
 fn register_existing_regions<S>(agent: &NixlAgent, regions: Vec<S>) -> Result<Vec<MemoryEntry>>
@@ -686,7 +733,11 @@ fn create_offset_entries(
             .map(|descriptor| derive_descriptor(descriptor, offset, size))
             .transpose()?;
 
-        entries.push(MemoryEntry::new(region, descriptor));
+        entries.push(MemoryEntry::with_registration(
+            region,
+            descriptor,
+            base_descriptor.clone(),
+        ));
 
         offset = offset
             .checked_add(size)
@@ -1115,3 +1166,51 @@ mod tests {
 // fn context_device_id(ctx: &TransferContext) -> u32 {
 //     ctx.stream().context().ordinal() as u32
 // }
+
+#[cfg(test)]
+mod registration_tests {
+    use super::*;
+
+    /// One allocation registered once and then sliced must export as one
+    /// registration. NIXL matches a partial metadata export against the
+    /// registration, and it refuses a slice of one with `NIXL_ERR_NOT_FOUND`.
+    #[test]
+    fn sliced_regions_report_the_one_registration_that_backs_them() -> Result<()> {
+        let storage = SystemStorage::new(4096)?;
+        let base_addr = storage.addr() as u64;
+        let base = MemoryEntry::new(
+            create_buffer(storage),
+            Some(NixlDescriptor {
+                addr: base_addr,
+                size: 4096,
+                mem_type: MemType::Dram,
+                device_id: 0,
+            }),
+        );
+
+        let entries = create_offset_entries(base, &[256, 256], 1)?;
+        assert_eq!(entries.len(), 2);
+        assert_ne!(
+            entries[0].descriptor.as_ref().map(|d| d.size),
+            Some(4096),
+            "each region must still describe its own slice"
+        );
+
+        let registrations = collect_registrations(&entries);
+        assert_eq!(registrations.len(), 1);
+        assert_eq!(registrations[0].addr, base_addr);
+        assert_eq!(registrations[0].size, 4096);
+        assert_eq!(registrations[0].mem_type, MemType::Dram);
+        Ok(())
+    }
+
+    /// An unregistered region contributes nothing, so the export never names
+    /// memory that NIXL does not hold.
+    #[test]
+    fn an_unregistered_region_contributes_no_registration() -> Result<()> {
+        let storage = SystemStorage::new(1024)?;
+        let entry = MemoryEntry::new(create_buffer(storage), None);
+        assert!(collect_registrations(&[entry]).is_empty());
+        Ok(())
+    }
+}

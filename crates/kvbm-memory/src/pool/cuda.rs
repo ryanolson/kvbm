@@ -15,12 +15,18 @@
 
 use anyhow::{Result, anyhow};
 use cudarc::driver::sys::{
-    self, CUmemAllocationType, CUmemLocationType, CUmemPool_attribute, CUmemPoolProps,
-    CUmemoryPool, CUresult, CUstream,
+    self, CUmemAllocationType, CUmemLocation, CUmemLocationType, CUmemPool_attribute,
+    CUmemPoolProps, CUmemoryPool, CUresult, CUstream,
 };
 use cudarc::driver::{CudaContext, CudaStream};
 use std::ptr;
 use std::sync::{Arc, Mutex};
+
+#[repr(C)]
+struct CudaMemLocation {
+    type_: CUmemLocationType,
+    id: std::ffi::c_int,
+}
 
 /// Builder for creating a CUDA memory pool with configurable parameters.
 ///
@@ -72,8 +78,12 @@ impl CudaMemPoolBuilder {
         // Initialize pool properties
         let mut props: CUmemPoolProps = unsafe { std::mem::zeroed() };
         props.allocType = CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED;
-        props.location.type_ = CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
-        props.location.id = self.context.cu_device();
+        props.location = unsafe {
+            std::mem::transmute::<CudaMemLocation, CUmemLocation>(CudaMemLocation {
+                type_: CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE,
+                id: self.context.cu_device(),
+            })
+        };
 
         let mut pool: CUmemoryPool = ptr::null_mut();
 

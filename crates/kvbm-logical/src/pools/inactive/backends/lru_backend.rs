@@ -27,6 +27,12 @@ impl LruBackend {
 }
 
 impl InactiveIndex for LruBackend {
+    fn grow_capacity(&mut self, capacity: usize) {
+        if let Some(capacity) = NonZeroUsize::new(capacity) {
+            self.cache.resize(capacity);
+        }
+    }
+
     fn find_matches(
         &mut self,
         hashes: &[SequenceHash],

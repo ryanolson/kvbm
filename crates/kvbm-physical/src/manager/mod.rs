@@ -35,7 +35,7 @@ use anyhow::{Result, anyhow, bail};
 use kvbm_common::KvbmTransferRoute;
 use kvbm_common::LogicalLayoutHandle;
 use kvbm_memory::StorageKind;
-use kvbm_memory::nixl::NixlAgent;
+use kvbm_memory::nixl::{HostAgentMetadata, MemType, NixlAgent, NixlDescriptor};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, RwLock};
@@ -341,11 +341,13 @@ impl TransferManager {
             dst_kv_layout,
             metric_route,
             use_planner,
+            copy_engine,
         ) = options.dissolve();
 
         let force_planner = selection_slices.is_some();
         let mut builder = TransferOptionsInternal::builder()
             .use_planner(force_planner || use_planner)
+            .copy_engine(copy_engine)
             .handles(src_handle, dst_handle);
         if let Some(slices) = selection_slices {
             builder = builder.axis_slices(slices);
@@ -649,7 +651,9 @@ impl TransferManager {
         event: cudarc::driver::CudaEvent,
         admission: tokio::sync::OwnedSemaphorePermit,
     ) -> anyhow::Result<TransferCompleteNotification> {
-        Ok(self.context.register_cuda_event(event, admission))
+        Ok(self
+            .context
+            .register_cuda_event(event, admission, Vec::new()))
     }
 
     /// Get the CUDA memory pool (for testing only).
@@ -745,11 +749,8 @@ impl LayoutRegistry {
     /// # Returns
     /// Packed metadata ready for transmission
     pub(crate) fn export_metadata(&self) -> Result<SerializedLayout> {
-        // Get NIXL metadata from agent
-        let nixl_metadata = self
-            .nixl_agent
-            .get_local_md()
-            .map_err(|e| anyhow!("failed to get NIXL local metadata: {:?}", e))?;
+        // Host registrations only. See `get_nixl_metadata`.
+        let nixl_metadata = self.get_nixl_metadata()?;
 
         // Create worker address
         let worker_address = WorkerAddress::new(self.worker_id, self.nixl_agent.name().to_string());
@@ -836,11 +837,12 @@ impl LayoutRegistry {
             return Ok(handles);
         }
 
-        // Load NIXL metadata
-        let returned_agent_name = self
-            .nixl_agent
-            .load_remote_md(&inner.nixl_metadata)
-            .map_err(|e| anyhow!("failed to load remote NIXL metadata: {:?}", e))?;
+        // Load NIXL metadata. The blob carries the connection info and the host
+        // memory section as an ordered pair; see `get_nixl_metadata`.
+        let (host_metadata, _): (HostAgentMetadata, usize) =
+            bincode::serde::decode_from_slice(&inner.nixl_metadata, bincode::config::standard())
+                .map_err(|e| anyhow!("failed to decode host agent metadata: {}", e))?;
+        let returned_agent_name = self.nixl_agent.load_host_metadata(&host_metadata)?;
 
         // Verify agent name matches
         if returned_agent_name != inner.worker_address.nixl_agent_name {
@@ -900,11 +902,41 @@ impl LayoutRegistry {
         ))
     }
 
-    /// Get the NIXL metadata for this worker.
+    /// Every host registration that this registry made on the NIXL agent.
+    ///
+    /// NIXL matches a partial metadata export against the registration, so
+    /// these are the registered allocations, not the layout memory regions. One
+    /// allocation is often registered once and then sliced into several
+    /// regions.
+    fn host_descriptors(&self) -> Vec<NixlDescriptor> {
+        let mut descriptors = Vec::new();
+        for local_layout in self.local_layouts.values() {
+            for registration in local_layout.layout().registrations() {
+                if registration.mem_type == MemType::Dram {
+                    descriptors.push(registration.clone());
+                }
+            }
+        }
+        descriptors.sort_by_key(|descriptor| descriptor.addr);
+        descriptors
+    }
+
+    /// Get the peer-facing NIXL metadata for this worker.
+    ///
+    /// The blob names the host registrations only. One NIXL agent carries one
+    /// memory section, and a worker can share its agent with a GPU pool, so a
+    /// full-agent export would hand a peer the GPU mappings as well. Every
+    /// remote pull reads the host tier, because the holder stages its G1 and G3
+    /// matches into G2 before it advertises them, and the `connect_remote` call
+    /// site requires G2.
+    ///
+    /// The blob is an encoded [`HostAgentMetadata`]. NIXL cannot put the
+    /// backend connection info and a filtered memory section in one partial
+    /// export, so the pair travels together and the peer loads both.
     pub(crate) fn get_nixl_metadata(&self) -> Result<Vec<u8>> {
-        self.nixl_agent
-            .get_local_md()
-            .map_err(|e| anyhow!("failed to get NIXL local metadata: {:?}", e))
+        let metadata = self.nixl_agent.host_metadata(&self.host_descriptors())?;
+        bincode::serde::encode_to_vec(&metadata, bincode::config::standard())
+            .map_err(|e| anyhow!("failed to encode host agent metadata: {}", e))
     }
 
     /// Get the worker address for this registry.
@@ -1072,6 +1104,57 @@ mod tests {
         assert!(dest_manager.get_remote(handle1).is_some());
         assert!(dest_manager.get_remote(handle2).is_some());
         assert!(dest_manager.get_layout(handle1).is_some());
+    }
+
+    /// The peer-facing export names the host registrations and nothing else.
+    ///
+    /// This registers real host memory on a UCX agent, so it exercises the
+    /// ordered pair of NIXL blobs and the encode and decode of the metadata in
+    /// one path. The plain round-trip test above registers nothing, so it
+    /// cannot see either.
+    #[test]
+    #[ignore] // Requires a UCX backend
+    fn export_over_registered_host_memory_reaches_only_the_host_registrations() {
+        use kvbm_memory::nixl::XferDescList;
+
+        let mut source_agent = NixlAgent::new("host-only-source").expect("create agent");
+        source_agent.add_backend("UCX").expect("UCX backend");
+        let mut source_manager = LayoutRegistry::new(source_agent.clone(), 42);
+        let handle = source_manager
+            .register_local(make_test_layout(&source_agent))
+            .unwrap();
+
+        let hosts = source_manager.host_descriptors();
+        assert!(
+            !hosts.is_empty(),
+            "a registered host layout must produce a host descriptor"
+        );
+        assert!(hosts.iter().all(|host| host.mem_type == MemType::Dram));
+
+        let metadata = source_manager.export_metadata().unwrap();
+        let mut dest_agent = NixlAgent::new("host-only-dest").expect("create agent");
+        dest_agent.add_backend("UCX").expect("UCX backend");
+        let mut dest_manager = LayoutRegistry::new(dest_agent.clone(), 43);
+        let imported = dest_manager.import_metadata(metadata).unwrap();
+        assert!(imported.contains(&handle));
+
+        for host in &hosts {
+            let mut list = XferDescList::new(MemType::Dram).unwrap();
+            list.add_desc(host.addr as usize, host.size, host.device_id);
+            assert!(
+                dest_agent.check_remote_metadata(&source_agent.name(), Some(&list)),
+                "the peer must reach the exported host registration"
+            );
+        }
+
+        // A device address on the same agent stays unreachable. The export
+        // named no VRAM descriptor, so NIXL holds no VRAM section for the peer.
+        let mut vram = XferDescList::new(MemType::Vram).unwrap();
+        vram.add_desc(hosts[0].addr as usize, hosts[0].size, 0);
+        assert!(
+            !dest_agent.check_remote_metadata(&source_agent.name(), Some(&vram)),
+            "the peer must hold no device section for this agent"
+        );
     }
 
     #[test]

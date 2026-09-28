@@ -308,6 +308,48 @@ mod tests {
         }
     }
 
+    struct PinnedCompletion {
+        complete: Arc<AtomicBool>,
+        _guards: crate::transfer::executor::registration::RegistrationGuards,
+    }
+
+    impl CompletionChecker for PinnedCompletion {
+        fn is_complete(&self) -> Result<bool> {
+            Ok(self.complete.load(Ordering::SeqCst))
+        }
+    }
+
+    #[tokio::test]
+    async fn registration_guard_survives_dropped_caller_and_queue_shutdown() -> Result<()> {
+        let system = Arc::new(EventManager::local());
+        let (queue, rx) = crate::transfer::context::PollingRegistrationQueue::new(1);
+        let event = system.new_event()?;
+        let handle = event.into_handle();
+        let caller = system.awaiter(handle)?;
+        let complete = Arc::new(AtomicBool::new(false));
+        let owner = Arc::new(123usize);
+        let weak = Arc::downgrade(&owner);
+        queue.send(RegisterPollingNotification {
+            uuid: Uuid::new_v4(),
+            checker: PinnedCompletion {
+                complete: complete.clone(),
+                _guards: vec![owner],
+            },
+            event_handle: handle,
+            telemetry: None,
+            admission: queue.reserve()?,
+        })?;
+        drop(caller);
+        drop(queue);
+        let worker = tokio::spawn(process_polling_notifications(rx, system));
+        tokio::task::yield_now().await;
+        assert!(weak.upgrade().is_some());
+        complete.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(1), worker).await??;
+        assert!(weak.upgrade().is_none());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn polling_registration_queue_is_lossless_under_burst() -> Result<()> {
         const REGISTRATIONS: usize = 256;

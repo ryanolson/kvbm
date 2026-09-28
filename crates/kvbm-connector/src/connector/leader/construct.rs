@@ -37,7 +37,7 @@ use kvbm_engine::leader::{ConsolidatorParams, InstanceLeader};
 use kvbm_engine::object::{ObjectLockManager, create_lock_manager, create_object_client};
 use kvbm_engine::offload::{
     ObjectPipelineBuilder, ObjectPresenceFilter, OffloadEngine, PendingTracker, PipelineBuilder,
-    S3PresenceChecker, create_policy_from_config,
+    S3PresenceChecker, copy_engine_from_config, create_policy_from_config,
 };
 use kvbm_engine::worker::{LeaderLayoutConfig, Worker};
 use kvbm_hub::HubClient;
@@ -614,6 +614,7 @@ pub(super) async fn build_engine_stack(c: &Construction) -> Result<EngineStack> 
             .policy(g1_to_g2_policy)
             .pending_tracker(g1_to_g2_pending)
             .auto_chain(has_downstream_tier)
+            .copy_engine(copy_engine_from_config(g1_to_g2_config.copy_engine))
             .build();
 
         let g2_to_g3_config = if offload_config.g2_to_g3.policies.is_empty() {
@@ -718,6 +719,7 @@ pub(super) async fn build_engine_stack(c: &Construction) -> Result<EngineStack> 
                 .resource(resource)
                 .policy(policy)
                 .pending_tracker(pending)
+                .copy_engine(copy_engine_from_config(offload_config.copy_engine))
                 .build();
             let capacity = leader.g2_capacity_for(resource).with_context(|| {
                 format!("G2 capacity for secondary resource {resource:?} is missing")

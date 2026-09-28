@@ -37,6 +37,14 @@ pub struct PhysicalLayout {
 
     /// NIXL registration metadata
     nixl_metadata: NixlMetadata,
+    registration_provider: Option<Arc<dyn kvbm_memory::nixl::MappedRegistrationProvider>>,
+
+    /// The NIXL registrations that back this layout, in address order.
+    ///
+    /// One allocation can be registered once and then sliced into several
+    /// regions, so these descriptors are not the same as the layout memory
+    /// regions. A partial metadata export must name the registration.
+    registrations: Vec<NixlDescriptor>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +79,32 @@ impl NixlMetadata {
 }
 
 impl PhysicalLayout {
+    /// Record the NIXL registrations that back this layout.
+    pub(crate) fn with_registrations(mut self, registrations: Vec<NixlDescriptor>) -> Self {
+        self.registrations = registrations;
+        self
+    }
+
+    /// The NIXL registrations that back this layout, in address order.
+    pub(crate) fn registrations(&self) -> &[NixlDescriptor] {
+        &self.registrations
+    }
+
+    /// Attach the owner of dynamically registered mapped ranges.
+    pub fn with_registration_provider(
+        mut self,
+        provider: Arc<dyn kvbm_memory::nixl::MappedRegistrationProvider>,
+    ) -> Self {
+        self.registration_provider = Some(provider);
+        self
+    }
+
+    pub(crate) fn registration_provider(
+        &self,
+    ) -> Option<&Arc<dyn kvbm_memory::nixl::MappedRegistrationProvider>> {
+        self.registration_provider.as_ref()
+    }
+
     /// Create a typed builder that enforces NIXL registration.
     pub fn builder(agent: NixlAgent) -> PhysicalLayoutBuilderDefault {
         PhysicalLayoutBuilder::new(agent)
@@ -90,6 +124,8 @@ impl PhysicalLayout {
             layout,
             location,
             nixl_metadata,
+            registration_provider: None,
+            registrations: Vec::new(),
         }
     }
 
@@ -277,6 +313,9 @@ impl PhysicalLayout {
             layout,
             location: serialized.location,
             nixl_metadata: serialized.nixl_metadata,
+            registration_provider: None,
+            // A remote layout holds no local registration.
+            registrations: Vec::new(),
         })
     }
 }

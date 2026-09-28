@@ -10,6 +10,7 @@ use std::time::Duration;
 use anyhow::ensure;
 use kvbm_common::LogicalResourceId;
 use kvbm_logical::blocks::BlockMetadata;
+use kvbm_physical::transfer::CopyEngine;
 
 use super::super::batch::BatchConfig;
 use super::super::pending::PendingTracker;
@@ -27,6 +28,7 @@ pub(crate) struct PipelineBaseConfig<Src: BlockMetadata> {
     pub(crate) max_concurrent_transfers: usize,
     pub(crate) pending_tracker: Option<Arc<PendingTracker>>,
     pub(crate) max_concurrent_precondition_awaits: usize,
+    pub(crate) copy_engine: CopyEngine,
     source: PhantomData<Src>,
 }
 
@@ -41,6 +43,7 @@ impl<Src: BlockMetadata> Default for PipelineBaseConfig<Src> {
             max_concurrent_transfers: 1,
             pending_tracker: None,
             max_concurrent_precondition_awaits: 8,
+            copy_engine: CopyEngine::Auto,
             source: PhantomData,
         }
     }
@@ -197,6 +200,12 @@ where
     /// Set the tracker that prevents duplicate transfers.
     pub fn pending_tracker(mut self, tracker: Arc<PendingTracker>) -> Self {
         self.config.base.pending_tracker = Some(tracker);
+        self
+    }
+
+    /// Set the CUDA copy primitive the transfer executor uses.
+    pub fn copy_engine(mut self, engine: CopyEngine) -> Self {
+        self.config.base.copy_engine = engine;
         self
     }
 

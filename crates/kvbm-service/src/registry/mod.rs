@@ -547,7 +547,7 @@ fn client_views(clients: &HashMap<RegistrationId, ClientSlot>) -> Vec<ClientView
                 .unwrap_or_default(),
         })
         .collect();
-    entries.sort_by(|a, b| a.registered_at_unix_ms.cmp(&b.registered_at_unix_ms));
+    entries.sort_by_key(|entry| entry.registered_at_unix_ms);
     entries
 }
 

@@ -12,6 +12,18 @@ use kvbm_common::KvbmTransferRoute;
 use std::ops::Range;
 use std::sync::Arc;
 
+/// Which CUDA copy primitive a `CudaAsync*` transfer uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CopyEngine {
+    /// The executor picks per shape (current behavior).
+    #[default]
+    Auto,
+    /// `kvbm_kernels::vectorized_copy` — an SM kernel over uniform chunks.
+    VectorizedKernel,
+    /// `kvbm_kernels::memcpy_batch` / `cudaMemcpyAsync` — the hardware copy engine.
+    MemcpyBatch,
+}
+
 /// Options for configuring transfer operations.
 ///
 /// This structure provides configuration for block and layer transfers,
@@ -98,6 +110,18 @@ pub struct TransferOptions {
     /// the kernel catalog).
     #[builder(default)]
     pub use_planner: bool,
+
+    /// CUDA copy primitive for `CudaAsync*` strategies on the legacy
+    /// (non-planner) executor path.
+    ///
+    /// `Auto` keeps the shape-based dispatch: FC→FC whole-block goes to
+    /// `memcpy_batch`, uniform chunks to `vectorized_copy`, ragged
+    /// layouts to per-region `cudaMemcpyAsync`. `VectorizedKernel` and
+    /// `MemcpyBatch` pin the primitive for the whole-block and uniform-
+    /// chunk cases; ragged layouts always fall back to per-region
+    /// `cudaMemcpyAsync`, and `VectorizedKernel` errors there.
+    #[builder(default)]
+    pub copy_engine: CopyEngine,
 }
 
 impl TransferOptions {
@@ -132,6 +156,7 @@ mod tests {
         assert!(options.layer_range.is_none());
         assert!(options.nixl_write_notification.is_none());
         assert!(options.bounce_buffer.is_none());
+        assert_eq!(options.copy_engine, CopyEngine::Auto);
     }
 
     #[test]

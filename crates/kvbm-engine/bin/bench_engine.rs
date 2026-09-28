@@ -92,7 +92,7 @@ use kvbm_logical::manager::BlockManager;
 use kvbm_physical::layout::{
     BlockDimension, KvBlockLayout, LayoutConfig, PhysicalLayout, TensorDataType,
 };
-use kvbm_physical::transfer::{NixlAgent, TransferManager, TransferOptions};
+use kvbm_physical::transfer::{CopyEngine, NixlAgent, TransferManager, TransferOptions};
 
 /// Block layout selector for G1/G2 layouts in the bench.
 ///
@@ -101,6 +101,31 @@ use kvbm_physical::transfer::{NixlAgent, TransferManager, TransferOptions};
 /// fast path (matching shapes + matching tags) or invokes a transform
 /// kernel (mismatching tags — e.g. operational → universal). LW +
 /// Universal is rejected at builder time, so the enum omits it.
+
+/// CUDA copy primitive for the offload pipeline's G1→G2 transfers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+#[clap(rename_all = "kebab-case")]
+enum BenchCopyEngine {
+    /// The executor picks per shape.
+    #[default]
+    Auto,
+    /// `vectorized_copy` — an SM kernel over uniform chunks.
+    VectorizedKernel,
+    /// `memcpy_batch` / `cudaMemcpyAsync` — the hardware copy engine.
+    MemcpyBatch,
+}
+
+impl From<BenchCopyEngine> for CopyEngine {
+    fn from(engine: BenchCopyEngine) -> Self {
+        match engine {
+            BenchCopyEngine::Auto => CopyEngine::Auto,
+            BenchCopyEngine::VectorizedKernel => CopyEngine::VectorizedKernel,
+            BenchCopyEngine::MemcpyBatch => CopyEngine::MemcpyBatch,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 #[clap(rename_all = "kebab-case")]
@@ -312,6 +337,11 @@ struct Cli {
     #[arg(long, value_delimiter = ',', default_values_t = vec![1, 2, 4])]
     offload_concurrency: Vec<usize>,
 
+    /// CUDA copy primitive for the offload pipeline's G1→G2 transfers.
+    /// Default: `auto` (executor picks per shape).
+    #[arg(long, value_enum, default_value_t = BenchCopyEngine::Auto)]
+    copy_engine: BenchCopyEngine,
+
     /// Base directory for output (default: current directory)
     #[arg(long, short)]
     output: Option<PathBuf>,
@@ -367,6 +397,8 @@ struct BenchConfig {
     offload: bool,
     offload_batch_sizes: Vec<usize>,
     offload_concurrency: Vec<usize>,
+    #[serde(default)]
+    copy_engine: BenchCopyEngine,
     output: Option<PathBuf>,
     #[serde(default)]
     weak_scale: bool,
@@ -404,6 +436,7 @@ impl From<Cli> for BenchConfig {
             offload: cli.offload,
             offload_batch_sizes: cli.offload_batch_sizes,
             offload_concurrency: cli.offload_concurrency,
+            copy_engine: cli.copy_engine,
             output: cli.output,
             weak_scale: cli.weak_scale,
             g1_layout: cli.g1_layout,
@@ -846,6 +879,7 @@ impl BenchInstance {
                 ))))
                 .batch_size(64)
                 .max_concurrent_transfers(4)
+                .copy_engine(config.copy_engine.into())
                 .build();
             engine_builder = engine_builder.with_g1_to_g2_pipeline(g1_to_g2_config);
 

@@ -11,11 +11,18 @@ use super::CompletionChecker;
 /// Completion checker that polls CUDA event status.
 pub struct CudaEventChecker {
     event: CudaEvent,
+    _registrations: crate::transfer::executor::registration::RegistrationGuards,
 }
 
 impl CudaEventChecker {
-    pub fn new(event: CudaEvent) -> Self {
-        Self { event }
+    pub fn new(
+        event: CudaEvent,
+        registrations: crate::transfer::executor::registration::RegistrationGuards,
+    ) -> Self {
+        Self {
+            event,
+            _registrations: registrations,
+        }
     }
 }
 
@@ -29,6 +36,15 @@ impl CompletionChecker for CudaEventChecker {
                 Err(DriverError(CUresult::CUDA_ERROR_NOT_READY)) => Ok(false),
                 Err(e) => Err(anyhow::anyhow!("CUDA event query failed: {:?}", e)),
             }
+        }
+    }
+}
+
+impl Drop for CudaEventChecker {
+    fn drop(&mut self) {
+        if !self._registrations.is_empty() && !matches!(self.is_complete(), Ok(true)) {
+            // Keep mappings if an error or worker shutdown prevents completion proof.
+            std::mem::forget(std::mem::take(&mut self._registrations));
         }
     }
 }

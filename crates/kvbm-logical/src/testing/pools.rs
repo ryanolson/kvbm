@@ -38,6 +38,7 @@ impl TestPoolSetup {
         let metrics = Arc::new(BlockPoolMetrics::new(short_type_name::<T>()));
         BlockStore::new(
             self.block_count,
+            self.block_count,
             self.block_size,
             backend,
             metrics,

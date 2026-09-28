@@ -305,22 +305,18 @@ pub(crate) mod tests {
             assert!(store.has_inactive(hash));
         }
 
-        /// Pins down the exact free-list *position* the "not yet
-        /// visited" cascade branch (`j > idx` in `release_entry_at`) is
-        /// responsible for: an independent, unrelated block released
+        /// Exercises the "not yet visited" cascade branch (`j > idx` in
+        /// `release_entry_at`): an independent, unrelated block released
         /// *between* a duplicate and its own (later, co-batched) primary
-        /// in input order. One-at-a-time drop order is
-        /// [duplicate, independent, primary] → the primary's cascade
-        /// only fires when the *primary's own* drop runs (last), so it
-        /// must land in the free list *after* the independent block, not
-        /// before. (An earlier draft of the fix retried the primary
-        /// immediately upon seeing the duplicate release, landing it
-        /// *before* the independent block instead — this test's
-        /// `assert_eq!` on the exact `free` sequence, not just its
-        /// contents, is what would catch that regression; a set/sorted
-        /// comparison would not.)
+        /// in input order. All three slots must reach the reset pool
+        /// inline, with the primary's cascade counted as a primary reset.
+        ///
+        /// The reset pool is a `BTreeSet<BlockId>` ordered by block id so
+        /// that capacity contraction can withdraw the tail indices. Release
+        /// order is therefore not observable through `free`, and this test
+        /// checks membership and the report counts, not a sequence.
         #[test]
-        fn duplicate_before_independent_before_primary_preserves_fifo_order() {
+        fn duplicate_before_independent_before_primary_resets_all_three() {
             let store = TestPoolSetupBuilder::default()
                 .block_count(3)
                 .block_size(4)
@@ -356,11 +352,11 @@ pub(crate) mod tests {
             assert_eq!(report.primary_reset, 2, "independent + cascaded primary");
 
             let free = &store.debug_snapshot().free;
+            let mut expected = vec![duplicate_id, independent_id, primary_id];
+            expected.sort_unstable();
             assert_eq!(
-                free,
-                &vec![duplicate_id, independent_id, primary_id],
-                "primary's cascade must land after the independent block, matching \
-                 one-at-a-time drop order — not immediately after the duplicate"
+                free, &expected,
+                "duplicate, independent, and cascaded primary must all reach the reset pool"
             );
         }
 

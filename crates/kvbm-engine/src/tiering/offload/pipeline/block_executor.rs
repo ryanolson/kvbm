@@ -9,7 +9,7 @@ use tokio::sync::{Semaphore, mpsc};
 
 use kvbm_common::{LogicalLayoutHandle, LogicalResourceId};
 use kvbm_logical::blocks::{BlockMetadata, ImmutableBlock};
-use kvbm_physical::transfer::TransferOptions;
+use kvbm_physical::transfer::{CopyEngine, TransferOptions};
 
 use crate::leader::InstanceLeader;
 use crate::{BlockId, SequenceHash};
@@ -45,6 +45,8 @@ pub(super) struct BlockTransferExecutor<Src: BlockMetadata, Dst: BlockMetadata> 
     pub(super) skip_transfers: bool,
     /// Maximum concurrent transfers
     pub(super) max_concurrent_transfers: usize,
+    /// CUDA copy primitive for the transfers this executor dispatches
+    pub(super) copy_engine: CopyEngine,
     /// Channel to send registered blocks for chaining to downstream pipeline
     pub(super) chain_tx: Option<mpsc::Sender<ChainOutput<Dst>>>,
     /// Multicast observers invoked after each batch's register step.
@@ -64,6 +66,7 @@ struct SharedBlockExecutorState<Dst: BlockMetadata> {
     src_layout: LogicalLayoutHandle,
     dst_layout: LogicalLayoutHandle,
     skip_transfers: bool,
+    copy_engine: CopyEngine,
     chain_tx: Option<mpsc::Sender<ChainOutput<Dst>>>,
     register_observers: Arc<RegisterObservers<Dst>>,
 }
@@ -85,6 +88,7 @@ impl<Src: BlockMetadata, Dst: BlockMetadata> BlockTransferExecutor<Src, Dst> {
             src_layout: self.src_layout,
             dst_layout: self.dst_layout,
             skip_transfers: self.skip_transfers,
+            copy_engine: self.copy_engine,
             chain_tx: self.chain_tx.take(),
             register_observers: Arc::clone(&self.register_observers),
         });
@@ -237,6 +241,10 @@ impl<Src: BlockMetadata, Dst: BlockMetadata> BlockTransferExecutor<Src, Dst> {
             // dispatch error restores them for normal failure handling.
             let ownership = local_ownership::LocalPhysicalOwnership::new(batch, dst_allocation);
 
+            let transfer_options = TransferOptions::builder()
+                .copy_engine(shared.copy_engine)
+                .build()?;
+
             // Execute transfer via leader
             let start_xfer = Instant::now();
             let dispatch = match shared.resource {
@@ -246,14 +254,14 @@ impl<Src: BlockMetadata, Dst: BlockMetadata> BlockTransferExecutor<Src, Dst> {
                     shared.dst_layout,
                     src_block_ids.clone(),
                     dst_block_ids.clone(),
-                    TransferOptions::default(),
+                    transfer_options,
                 ),
                 None => shared.leader.execute_local_transfer(
                     shared.src_layout,
                     shared.dst_layout,
                     src_block_ids.clone(),
                     dst_block_ids.clone(),
-                    TransferOptions::default(),
+                    transfer_options,
                 ),
             };
             let notification = match dispatch {

@@ -67,7 +67,7 @@ pub use context::{TransferCompleteNotification, TransferConfig, TransferDrainOut
 pub use fill::{FillPattern, fill_blocks, fill_layers};
 pub use integrity::{PayloadDigest, compute_host_block_digests};
 pub use kvbm_memory::nixl::NixlAgent;
-pub use options::{TransferOptions, TransferOptionsBuilder};
+pub use options::{CopyEngine, TransferOptions, TransferOptionsBuilder};
 // AB-1d: TransferSelection is the input shape for sliced cross-leader
 // transfers. Exposed for the cross-parallelism dispatcher (AB-2) which
 // builds selections from intersected LayoutViews, and for the worker

@@ -282,12 +282,10 @@ impl<'a> NixlTransferBuilder<'a, Set, Set, Set, Set, Set> {
         let src_mem_type = src_metadata.mem_type();
         let dst_mem_type = dst_metadata.mem_type();
 
-        let src_device_id = src_metadata.device_id();
-        let dst_device_id = dst_metadata.device_id();
-
         // Build XferDescLists for source and destination
         let mut src_dl = XferDescList::new(src_mem_type)?;
         let mut dst_dl = XferDescList::new(dst_mem_type)?;
+        let mut guards = Vec::new();
 
         // Build descriptor lists - use whole-block or layer-wise depending on layout
         if use_whole_block {
@@ -302,8 +300,16 @@ impl<'a> NixlTransferBuilder<'a, Set, Set, Set, Set, Set> {
                 let src_region = src.memory_region(src_block_id, 0, 0)?;
                 let dst_region = dst.memory_region(dst_block_id, 0, 0)?;
 
-                src_dl.add_desc(src_region.addr(), bytes_per_block, src_device_id);
-                dst_dl.add_desc(dst_region.addr(), bytes_per_block, dst_device_id);
+                super::registration::append_pair(
+                    src,
+                    dst,
+                    src_region.addr(),
+                    dst_region.addr(),
+                    bytes_per_block,
+                    &mut src_dl,
+                    &mut dst_dl,
+                    &mut guards,
+                )?;
             }
         } else {
             tracing::debug!(
@@ -332,8 +338,16 @@ impl<'a> NixlTransferBuilder<'a, Set, Set, Set, Set, Set> {
                             ));
                         }
 
-                        src_dl.add_desc(src_region.addr(), src_region.size(), src_device_id);
-                        dst_dl.add_desc(dst_region.addr(), dst_region.size(), dst_device_id);
+                        super::registration::append_pair(
+                            src,
+                            dst,
+                            src_region.addr(),
+                            dst_region.addr(),
+                            src_region.size(),
+                            &mut src_dl,
+                            &mut dst_dl,
+                            &mut guards,
+                        )?;
                     }
                 }
             }
@@ -372,11 +386,13 @@ impl<'a> NixlTransferBuilder<'a, Set, Set, Set, Set, Set> {
         // NOTE: this legacy NixlTransferBuilder path is NOT the live remote-search
         // pull route (the connector always uses the planner's direct path via
         // execute_planner_nixl_transfer). Per-worker RDMA telemetry lives there.
-        let still_pending = nixl_agent.post_xfer_req(&xfer_req, None)?;
+        let still_pending = nixl_agent
+            .post_xfer_req(&xfer_req, None)
+            .inspect_err(|_| std::mem::forget(std::mem::take(&mut guards)))?;
 
         if still_pending {
             // Register for async completion via status polling
-            Ok(ctx.register_nixl_status(xfer_req, None, registration))
+            Ok(ctx.register_nixl_status(xfer_req, None, registration, guards))
         } else {
             // Transfer completed synchronously
             Ok(TransferCompleteNotification::completed())

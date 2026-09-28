@@ -10,7 +10,7 @@ use crate::blocks::{BlockMetadata, SequenceHash};
 use crate::branch_tracker::BranchOracle;
 use crate::events::protocol::EventReleaseHandle;
 
-use dashmap::DashMap;
+use rustc_hash::FxHashMap;
 
 use std::any::{Any, TypeId};
 use std::marker::PhantomData;
@@ -127,7 +127,7 @@ impl BlockRegistrationHandleInner {
 /// An absent slot means that another path already removed an entry.
 /// Both cases leave the map unchanged.
 pub(super) fn remove_entry_if_identity(
-    map: &DashMap<SequenceHash, Weak<BlockRegistrationHandleInner>>,
+    map: &mut FxHashMap<SequenceHash, Weak<BlockRegistrationHandleInner>>,
     seq_hash: SequenceHash,
     identity: *const BlockRegistrationHandleInner,
 ) -> bool {
@@ -135,7 +135,6 @@ pub(super) fn remove_entry_if_identity(
         return false;
     };
     let should_remove = std::ptr::eq(weak_ref.as_ptr(), identity);
-    drop(weak_ref);
     if should_remove {
         map.remove(&seq_hash);
     }
@@ -161,8 +160,8 @@ impl Drop for BlockRegistrationHandleInner {
         // serializes us against concurrent `register_sequence_hash` and
         // `transfer_registration` on this `seq_hash`, so the stored `Weak` is stable across
         // the identity check performed by `remove_entry_if_identity`.
-        let map = registry.prefix(&self.seq_hash);
-        if remove_entry_if_identity(&map, self.seq_hash, self as *const Self) {
+        let mut map = registry.prefix(&self.seq_hash);
+        if remove_entry_if_identity(&mut map, self.seq_hash, self as *const Self) {
             // Publish the `Remove` while `map` is held. A racing
             // `register_sequence_hash` publishes its `Create` under this same guard,
             // and the hub keeps one holder set per hash, so a `Remove` released after

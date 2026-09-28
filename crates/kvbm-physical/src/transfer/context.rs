@@ -654,7 +654,13 @@ impl TransferContext {
         xfer_req: XferRequest,
         telemetry: Option<notifications::XferTelemetry>,
         admission: OwnedSemaphorePermit,
+        registrations: crate::transfer::executor::registration::RegistrationGuards,
     ) -> TransferCompleteNotification {
+        let checker = notifications::NixlStatusChecker::new(
+            self.nixl_agent.raw_agent().clone(),
+            xfer_req,
+            registrations,
+        );
         let event = self
             .event_system
             .new_event()
@@ -667,10 +673,7 @@ impl TransferContext {
 
         let notification = notifications::RegisterPollingNotification {
             uuid: Uuid::new_v4(),
-            checker: notifications::NixlStatusChecker::new(
-                self.nixl_agent.raw_agent().clone(),
-                xfer_req,
-            ),
+            checker,
             event_handle: handle,
             telemetry,
             admission,
@@ -700,7 +703,9 @@ impl TransferContext {
         &self,
         event: CudaEvent,
         admission: OwnedSemaphorePermit,
+        registrations: crate::transfer::executor::registration::RegistrationGuards,
     ) -> TransferCompleteNotification {
+        let checker = notifications::CudaEventChecker::new(event, registrations);
         let new_event = self
             .event_system
             .new_event()
@@ -713,7 +718,7 @@ impl TransferContext {
 
         let notification = notifications::RegisterPollingNotification {
             uuid: Uuid::new_v4(),
-            checker: notifications::CudaEventChecker::new(event),
+            checker,
             event_handle: handle,
             telemetry: None,
             admission,

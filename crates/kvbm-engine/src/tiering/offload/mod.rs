@@ -119,6 +119,7 @@ pub use policy::{
     AllOfPolicy, AnyOfPolicy, BoxFuture, EvalContext, ObjectLockPresenceFilter,
     ObjectPresenceFilter, OffloadPolicy, PassAllPolicy, PolicyBatchFuture, PolicyFuture,
     PresenceAndLFUFilter, PresenceChecker, PresenceFilter, S3PresenceChecker, async_batch_result,
-    async_result, create_policy_from_config, sync_batch_result, sync_result,
+    async_result, copy_engine_from_config, create_policy_from_config, sync_batch_result,
+    sync_result,
 };
 pub use source::{ExternalBlock, SourceBlock, SourceBlocks};

@@ -30,6 +30,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use futures::future::Either;
 use kvbm_config::{PolicyType, TierOffloadConfig};
+use kvbm_physical::transfer::CopyEngine;
 
 use crate::{BlockId, SequenceHash};
 use kvbm_logical::blocks::{BlockMetadata, BlockRegistry, ImmutableBlock};
@@ -993,6 +994,17 @@ where
         policies.into_iter().next().unwrap()
     } else {
         Arc::new(AllOfPolicy::new(policies))
+    }
+}
+
+/// Map a `TierOffloadConfig` copy-engine setting to the executor's
+/// [`CopyEngine`]. kvbm-config cannot depend on kvbm-physical, so the
+/// enums are separate and matched here.
+pub fn copy_engine_from_config(engine: kvbm_config::CopyEngine) -> CopyEngine {
+    match engine {
+        kvbm_config::CopyEngine::Auto => CopyEngine::Auto,
+        kvbm_config::CopyEngine::VectorizedKernel => CopyEngine::VectorizedKernel,
+        kvbm_config::CopyEngine::MemcpyBatch => CopyEngine::MemcpyBatch,
     }
 }
 

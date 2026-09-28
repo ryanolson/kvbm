@@ -51,6 +51,20 @@ pub enum PolicyType {
     PresenceLfu,
 }
 
+/// CUDA copy primitive for a tier transition; `auto` lets the executor
+/// choose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CopyEngine {
+    /// The executor picks per shape.
+    #[default]
+    Auto,
+    /// `vectorized_copy` — an SM kernel over uniform chunks.
+    VectorizedKernel,
+    /// `memcpy_batch` / `cudaMemcpyAsync` — the hardware copy engine.
+    MemcpyBatch,
+}
+
 /// Configuration for presence filter.
 ///
 /// Currently has no parameters, but the struct exists for future extensibility
@@ -150,6 +164,11 @@ pub struct TierOffloadConfig {
     /// V1 compat: `DYN_KVBM_MAX_TRANSFER_BATCH_SIZE` or `DYN_KVBM_TRANSFER_BATCH_SIZE`
     #[serde(default)]
     pub max_batch_size: Option<usize>,
+
+    /// CUDA copy primitive for this tier transition; `auto` lets the
+    /// executor choose.
+    #[serde(default)]
+    pub copy_engine: CopyEngine,
 }
 
 /// Top-level offload configuration.
@@ -243,6 +262,21 @@ mod tests {
         let config: TierOffloadConfig = serde_json::from_str(json).unwrap();
         // Should use default of 1 (offload on second hit, matching KVBM v1)
         assert_eq!(config.presence_lfu.min_lfu_count, 1);
+    }
+
+    #[test]
+    fn test_copy_engine_serde() {
+        let json = r#"{"copy_engine": "memcpy_batch"}"#;
+        let config: TierOffloadConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.copy_engine, CopyEngine::MemcpyBatch);
+
+        let serialized = serde_json::to_string(&config).unwrap();
+        let roundtrip: TierOffloadConfig = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(roundtrip.copy_engine, CopyEngine::MemcpyBatch);
+
+        // `auto` is the default when the key is absent
+        let empty: TierOffloadConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty.copy_engine, CopyEngine::Auto);
     }
 
     #[test]

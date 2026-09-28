@@ -44,6 +44,7 @@ use crate::{branch_tracker::BranchOracle, events::EventsManager, tinylfu::Freque
 
 use crate::blocks::SequenceHash;
 
+use rustc_hash::FxHashMap;
 use std::sync::{Arc, Weak};
 
 use handle::BlockRegistrationHandleInner;
@@ -256,8 +257,8 @@ impl BlockRegistry {
     // pattern should replace the direct EventsManager call here.
     #[inline]
     pub fn register_sequence_hash(&self, seq_hash: SequenceHash) -> BlockRegistrationHandle {
-        let map = self.prt.prefix(&seq_hash);
-        let mut weak = map.entry(seq_hash).or_default();
+        let mut map = self.prt.prefix(&seq_hash);
+        let weak = map.entry(seq_hash).or_default();
 
         if let Some(inner) = weak.upgrade() {
             return BlockRegistrationHandle::from_inner(inner);
@@ -290,7 +291,7 @@ impl BlockRegistry {
     ) -> dashmap::mapref::one::RefMut<
         '_,
         u64,
-        dashmap::DashMap<SequenceHash, Weak<BlockRegistrationHandleInner>>,
+        FxHashMap<SequenceHash, Weak<BlockRegistrationHandleInner>>,
     > {
         #[cfg(test)]
         self.prefix_lock_count
@@ -349,11 +350,15 @@ impl BlockRegistry {
         let mut to_notify: Vec<SequenceHash> = Vec::new();
         for group in by_position.values() {
             // ONE lock acquisition per position (see `acquire_position`).
-            let map = self.acquire_position(&group[0].seq_hash());
+            let mut map = self.acquire_position(&group[0].seq_hash());
             for handle in group {
                 let inner = &handle.inner;
                 if Arc::strong_count(inner) == 1
-                    && handle::remove_entry_if_identity(&map, handle.seq_hash(), Arc::as_ptr(inner))
+                    && handle::remove_entry_if_identity(
+                        &mut map,
+                        handle.seq_hash(),
+                        Arc::as_ptr(inner),
+                    )
                 {
                     inner.mark_removed_via_batch();
                     // Publish the `Remove` under this position's guard, for the reason
@@ -396,8 +401,8 @@ impl BlockRegistry {
     /// Used when copying blocks between pools where we don't want to count the transfer as a new access.
     #[allow(dead_code)]
     pub(crate) fn transfer_registration(&self, seq_hash: SequenceHash) -> BlockRegistrationHandle {
-        let map = self.prt.prefix(&seq_hash);
-        let mut weak = map.entry(seq_hash).or_default();
+        let mut map = self.prt.prefix(&seq_hash);
+        let weak = map.entry(seq_hash).or_default();
 
         match weak.upgrade() {
             Some(inner) => BlockRegistrationHandle::from_inner(inner),
@@ -559,8 +564,8 @@ mod remove_batch_tests {
         assert!(registry.is_registered(x));
 
         // Under the position guard for X, attempt removal of X but with b's identity.
-        let map = registry.prt.prefix(&x);
-        let removed = handle::remove_entry_if_identity(&map, x, Arc::as_ptr(&b.inner));
+        let mut map = registry.prt.prefix(&x);
+        let removed = handle::remove_entry_if_identity(&mut map, x, Arc::as_ptr(&b.inner));
         drop(map);
 
         assert!(!removed, "mismatched identity must not remove");
@@ -575,9 +580,9 @@ mod remove_batch_tests {
     fn identity_check_accepts_an_already_empty_slot() {
         let registry = BlockRegistry::new();
         let hash = build_chain(vec![7])[0];
-        let map = registry.prt.prefix(&hash);
+        let mut map = registry.prt.prefix(&hash);
 
-        let removed = handle::remove_entry_if_identity(&map, hash, std::ptr::null());
+        let removed = handle::remove_entry_if_identity(&mut map, hash, std::ptr::null());
 
         assert!(!removed, "an empty slot is already removed");
     }

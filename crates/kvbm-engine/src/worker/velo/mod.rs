@@ -71,7 +71,7 @@ use super::DirectWorker;
 use super::*;
 use kvbm_common::KvbmTransferRoute;
 use kvbm_physical::layout::LayoutConfig;
-use kvbm_physical::transfer::TransferOptions;
+use kvbm_physical::transfer::{CopyEngine, TransferOptions};
 
 use ::velo::Messenger;
 use bytes::Bytes;
@@ -108,6 +108,9 @@ impl From<SerializableTransferOptions> for TransferOptions {
             // cross-leader case (Universal↔Universal under c3 semantics
             // → requires_transform = false → auto-promote never fires).
             use_planner: false,
+            // copy_engine is likewise not serialized; the receiver picks
+            // its own CUDA copy primitive.
+            copy_engine: CopyEngine::Auto,
         }
     }
 }

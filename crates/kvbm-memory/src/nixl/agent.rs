@@ -7,13 +7,13 @@
 //! - `NixlAgent`: Wrapper around nixl_sys::Agent that tracks initialized backends
 //! - `NixlBackendConfig`: Configuration for NIXL backends from environment variables
 
-use anyhow::{Context, Result};
-use nixl_sys::{Agent, is_stub};
+use anyhow::{Context, Result, ensure};
+use nixl_sys::{Agent, MemType, RegDescList, is_stub};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::OnceLock;
 
-use crate::nixl::NixlBackendConfig;
+use crate::nixl::{HostAgentMetadata, NixlBackendConfig, NixlDescriptor};
 
 /// Environment variable naming an explicit `libnixl_capi.so` to preload
 /// before the first `nixl_sys::Agent::new` call. See [`NixlAgent::new`].
@@ -59,8 +59,8 @@ impl NixlAgent {
             return Ok(());
         }
         // SAFETY: this loads a NIXL C API shared object and retains the
-        // handle for the process lifetime, matching rhino-nixl-ffi's
-        // `load_packaged_nixl_runtime` guard.
+        // handle for the process lifetime, matching the packaged-runtime guard
+        // that a host application uses for the same purpose.
         let library = unsafe {
             libloading::os::unix::Library::open(Some(path), libc::RTLD_NOW | libc::RTLD_GLOBAL)
         }
@@ -235,6 +235,82 @@ impl NixlAgent {
         &self.available_backends
     }
 
+    /// Export agent metadata that names the given host registrations only.
+    ///
+    /// The peer receives the backend connection info and the memory section
+    /// entries for `hosts`. It receives no entry for any other registration on
+    /// this agent, so it cannot address a GPU mapping through this metadata.
+    ///
+    /// # Errors
+    /// Returns an error if a descriptor is not host memory, or if NIXL refuses
+    /// either export.
+    pub fn host_metadata(&self, hosts: &[NixlDescriptor]) -> Result<HostAgentMetadata> {
+        for host in hosts {
+            ensure!(
+                host.mem_type == MemType::Dram,
+                "host metadata rejects the {:?} registration at {:#x}",
+                host.mem_type,
+                host.addr
+            );
+        }
+
+        // An empty descriptor list selects every backend and emits the
+        // connection info with an empty memory section. See
+        // `nixlAgent::getLocalPartialMD`.
+        let connections_only = RegDescList::new(MemType::Dram)
+            .map_err(|error| anyhow::anyhow!("build NIXL descriptor list: {error:?}"))?;
+        let connections = self
+            .agent
+            .get_local_partial_md(&connections_only, None)
+            .map_err(|error| anyhow::anyhow!("export NIXL connection info: {error:?}"))?;
+
+        if hosts.is_empty() {
+            return Ok(HostAgentMetadata {
+                connections,
+                host_registrations: Vec::new(),
+            });
+        }
+
+        let mut host_list = RegDescList::new(MemType::Dram)
+            .map_err(|error| anyhow::anyhow!("build NIXL descriptor list: {error:?}"))?;
+        for host in hosts {
+            let addr = usize::try_from(host.addr).context("host registration address")?;
+            host_list.add_desc(addr, host.size, host.device_id);
+        }
+        let host_registrations = self
+            .agent
+            .get_local_partial_md(&host_list, None)
+            .map_err(|error| anyhow::anyhow!("export NIXL host registrations: {error:?}"))?;
+
+        Ok(HostAgentMetadata {
+            connections,
+            host_registrations,
+        })
+    }
+
+    /// Load host-only metadata from a peer and return the peer agent name.
+    ///
+    /// The connection info loads first. NIXL refuses a memory section for an
+    /// agent whose connection info it does not hold.
+    pub fn load_host_metadata(&self, metadata: &HostAgentMetadata) -> Result<String> {
+        let name = self
+            .agent
+            .load_remote_md(&metadata.connections)
+            .map_err(|error| anyhow::anyhow!("load NIXL connection info: {error:?}"))?;
+        if metadata.host_registrations.is_empty() {
+            return Ok(name);
+        }
+        let named = self
+            .agent
+            .load_remote_md(&metadata.host_registrations)
+            .map_err(|error| anyhow::anyhow!("load NIXL host registrations: {error:?}"))?;
+        ensure!(
+            named == name,
+            "NIXL host metadata names agent '{named}' after connection info named '{name}'"
+        );
+        Ok(name)
+    }
+
     /// Require a specific backend, returning an error if unavailable.
     ///
     /// Use this at the start of operations that need specific backends.
@@ -258,15 +334,14 @@ impl NixlAgent {
 
 // Delegate common methods to the underlying agent.
 //
-// FORBIDDEN at the pinned nixl-sys `=1.0.1` (see the workspace pin in
-// `crates/Cargo.toml`): do NOT call `Agent::fetch_remote_md` or
-// `Agent::invalidate_remote_md` through this `Deref`. At 1.0.1 the former
-// self-deadlocks (takes `inner.write()` twice on its success path) and the
-// latter passes a non-NUL-terminated string to the C API. Both are fixed at
-// 1.1.0 but the graph-wide pin is held at 1.0.1 to unify with rhino's dynamo
-// stack; rhino-nixl-ffi carries the `invalidate_remote_metadata` workaround for
-// the second bug. kvbm calls neither today (only `get_local_md`/`load_remote_md`
-// are used); lift this note when the pin can rise.
+// The workspace pin in `crates/Cargo.toml` is nixl-sys `=1.4.1`. Two defects
+// that made `Agent::fetch_remote_md` and `Agent::invalidate_remote_md` unusable
+// at `=1.0.1` are fixed at that version. The former self-deadlocked, and the
+// latter passed a string without a NUL terminator to the C API.
+//
+// `Agent::get_local_md` exports every registration on the agent. Use
+// [`NixlAgent::host_metadata`] for a peer export, so a shared agent does not
+// hand its GPU mappings to that peer.
 impl std::ops::Deref for NixlAgent {
     type Target = Agent;
 

@@ -25,6 +25,7 @@ indexmap = { workspace = true }
 lru = "0.16"
 parking_lot = { workspace = true }
 rmp-serde = { workspace = true }
+rustc-hash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

@@ -94,7 +94,6 @@ required-features = ["kvbmctl"]
 [dev-dependencies]
 tokio              = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
 tracing-subscriber = { workspace = true }
-velo-transports    = { version = "0.1.0" }
 # Used by the indexer find_blocks integration test to build real PLHs and seed
 # the index, the same way the in-crate index unit tests do.
 kvbm-logical       = { workspace = true }

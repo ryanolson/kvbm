@@ -7,6 +7,7 @@ pub(super) mod cuda;
 mod memcpy;
 mod nixl;
 pub(crate) mod planner;
+pub(crate) mod registration;
 
 use super::strategy::select_strategy;
 use super::strategy::{TransferPlan, TransferStrategy};
@@ -16,6 +17,7 @@ use crate::BlockId;
 use crate::layout::KvBlockLayout;
 use crate::manager::LayoutHandle;
 use crate::transfer::BounceBufferInternal;
+use crate::transfer::CopyEngine;
 use crate::transfer::{StorageKind, context::TransferCompleteNotification};
 use anyhow::Result;
 use cudarc::driver::CudaStream;
@@ -142,6 +144,10 @@ pub(crate) struct TransferOptionsInternal {
     /// Registry handles for the physical layouts. Present for normal
     /// manager-driven transfers and used as the prepared-plan cache key.
     pub(crate) plan_handles: Option<(LayoutHandle, LayoutHandle)>,
+    /// CUDA copy primitive for `CudaAsync*` strategies on the legacy
+    /// executor path. Non-`Auto` values are rejected by the Memcpy and
+    /// NIXL strategies and by the planner path.
+    pub(crate) copy_engine: CopyEngine,
 }
 
 impl TransferOptionsInternal {
@@ -162,6 +168,7 @@ pub(crate) struct TransferOptionsInternalBuilder {
     use_planner: bool,
     axis_slices: Vec<kvbm_common::AxisIntersection>,
     plan_handles: Option<(LayoutHandle, LayoutHandle)>,
+    copy_engine: CopyEngine,
 }
 
 impl TransferOptionsInternalBuilder {
@@ -240,6 +247,11 @@ impl TransferOptionsInternalBuilder {
         self
     }
 
+    pub(crate) fn copy_engine(mut self, engine: CopyEngine) -> Self {
+        self.copy_engine = engine;
+        self
+    }
+
     pub(crate) fn build(self) -> Result<TransferOptionsInternal> {
         if !self.axis_slices.is_empty() && !self.use_planner {
             anyhow::bail!("TransferOptionsInternal: axis_slices requires use_planner=true");
@@ -255,6 +267,7 @@ impl TransferOptionsInternalBuilder {
             use_planner: self.use_planner,
             axis_slices: self.axis_slices,
             plan_handles: self.plan_handles,
+            copy_engine: self.copy_engine,
         })
     }
 }
@@ -324,6 +337,7 @@ pub(crate) fn execute_transfer(
             options.layer_range,
             strategy,
             options.cuda_stream,
+            options.copy_engine,
             options.use_planner,
             options.bounce_buffer.as_ref(),
             options.axis_slices,
@@ -366,6 +380,7 @@ fn execute_direct_transfer(
     layer_range: Option<Range<usize>>,
     strategy: TransferStrategy,
     cuda_stream: Option<Arc<CudaStream>>,
+    copy_engine: CopyEngine,
     use_planner: bool,
     bounce_buffer: Option<&BounceBufferInternal>,
     axis_slices: Vec<kvbm_common::AxisIntersection>,
@@ -388,6 +403,9 @@ fn execute_direct_transfer(
                 return Err(anyhow::anyhow!(
                     "cuda_stream option is not supported for Memcpy strategy"
                 ));
+            }
+            if copy_engine != CopyEngine::Auto {
+                anyhow::bail!("copy_engine only applies to CUDA strategies");
             }
             memcpy::execute_memcpy_transfer(
                 src,
@@ -413,6 +431,12 @@ fn execute_direct_transfer(
                 // still reject layer_range because plan_copy's Direct
                 // path doesn't slice on Layer — those stay on the
                 // legacy executor until plan_copy grows the support.
+                if copy_engine != CopyEngine::Auto {
+                    return Err(anyhow::anyhow!(
+                        "copy_engine is not honoured by the use_planner path; \
+                         leave it at CopyEngine::Auto or set use_planner=false"
+                    ));
+                }
                 if layer_range.is_some()
                     && !src
                         .layout()
@@ -447,6 +471,7 @@ fn execute_direct_transfer(
                 layer_range,
                 strategy,
                 cuda_stream,
+                copy_engine,
                 ctx,
             )?)
         }
@@ -458,6 +483,9 @@ fn execute_direct_transfer(
                 return Err(anyhow::anyhow!(
                     "cuda_stream option is not supported for NIXL strategies"
                 ));
+            }
+            if copy_engine != CopyEngine::Auto {
+                anyhow::bail!("copy_engine only applies to CUDA strategies");
             }
             if use_planner {
                 // PR-5.6: planner-driven NIXL path. Errors propagate;
@@ -527,6 +555,7 @@ async fn handle_buffered_transfer(
     first_strategy: TransferStrategy,
     second_strategy: TransferStrategy,
     layer_range: &Option<Range<usize>>,
+    copy_engine: CopyEngine,
     ctx: &TransferContext,
 ) -> Result<()> {
     let bounce_groups =
@@ -562,6 +591,7 @@ async fn handle_buffered_transfer(
                 first_strategy,
                 second_strategy,
                 layer_range,
+                copy_engine,
                 ctx,
             )
             .await?;
@@ -593,6 +623,7 @@ async fn execute_two_hop_transfer_chunk(
     first_strategy: TransferStrategy,
     second_strategy: TransferStrategy,
     layer_range: &Option<Range<usize>>,
+    copy_engine: CopyEngine,
     ctx: &TransferContext,
 ) -> Result<()> {
     let bounce_ids_to_use = &bounce_block_ids[..src_block_ids.len()];
@@ -604,7 +635,12 @@ async fn execute_two_hop_transfer_chunk(
         bounce_ids_to_use,
         layer_range.clone(),
         first_strategy,
-        None,       // Two-hop transfers don't support caller-provided streams
+        None, // Two-hop transfers don't support caller-provided streams
+        if first_strategy.is_cuda_family() {
+            copy_engine
+        } else {
+            CopyEngine::Auto
+        },
         false,      // Two-hop chunks stay on the legacy path for now
         None,       // bounce_buffer only used by use_planner=true NIXL transforms
         Vec::new(), // axis_slices: two-hop chunks never carry slices (rejected upstream)
@@ -620,7 +656,12 @@ async fn execute_two_hop_transfer_chunk(
         dst_block_ids,
         layer_range.clone(),
         second_strategy,
-        None,  // Two-hop transfers don't support caller-provided streams
+        None, // Two-hop transfers don't support caller-provided streams
+        if second_strategy.is_cuda_family() {
+            copy_engine
+        } else {
+            CopyEngine::Auto
+        },
         false, // Two-hop chunks stay on the legacy path for now
         None,
         Vec::new(), // axis_slices: two-hop chunks never carry slices
@@ -658,6 +699,14 @@ fn execute_two_hop_transfer(params: TwoHopTransferParams) -> Result<TransferComp
         ctx,
     } = params;
 
+    let mut registrations =
+        registration::acquire_blocks(src, src_block_ids, options.layer_range.as_ref())?;
+    registrations.extend(registration::acquire_blocks(
+        dst,
+        dst_block_ids,
+        options.layer_range.as_ref(),
+    )?);
+
     let event = ctx.event_system().new_event()?;
     let handle = event.into_handle();
     let awaiter = ctx.event_system().awaiter(handle)?;
@@ -671,9 +720,11 @@ fn execute_two_hop_transfer(params: TwoHopTransferParams) -> Result<TransferComp
     let dst_block_ids = dst_block_ids.to_vec();
 
     let ctx_clone = ctx.clone();
+    let copy_engine = options.copy_engine;
     // let options_clone = options.clone();
 
     ctx.tokio().spawn(async move {
+        let _registrations = registrations;
         let Some(ref bounce_buffer_spec) = options.bounce_buffer else {
             let _ = system.poison(
                 handle,
@@ -706,6 +757,7 @@ fn execute_two_hop_transfer(params: TwoHopTransferParams) -> Result<TransferComp
                     first_strategy,
                     second_strategy,
                     &options.layer_range,
+                    copy_engine,
                     &ctx_clone,
                 )
                 .await
@@ -727,6 +779,7 @@ fn execute_two_hop_transfer(params: TwoHopTransferParams) -> Result<TransferComp
                 first_strategy,
                 second_strategy,
                 &options.layer_range,
+                copy_engine,
                 &ctx_clone,
             )
             .await

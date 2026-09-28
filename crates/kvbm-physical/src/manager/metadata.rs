@@ -280,7 +280,11 @@ impl ParallelismDescriptor {
 pub struct RdmaLayoutDescriptors {
     /// Worker identification
     pub worker_address: WorkerAddress,
-    /// Exported NIXL metadata from nixl_sys::Agent::get_local_md()
+    /// Encoded `kvbm_memory::nixl::HostAgentMetadata`.
+    ///
+    /// The pair names the backend connection info and the host registrations of
+    /// the exporting agent. It names no GPU registration, so a peer cannot
+    /// address a GPU mapping through it.
     pub nixl_metadata: Vec<u8>,
     /// Serialized layouts (handle + logical type + layout data)
     pub layouts: Vec<LogicalLayoutDescriptor>,
@@ -349,7 +353,8 @@ impl SerializedLayout {
     ///
     /// # Arguments
     /// * `worker_address` - Worker identification
-    /// * `nixl_metadata` - NIXL metadata blob from get_local_md()
+    /// * `nixl_metadata` - encoded host-only agent metadata from
+    ///   `LayoutRegistry::get_nixl_metadata`
     /// * `layouts` - Vector of layouts with handles and logical types to export
     /// * `parallelism` - Optional [`ParallelismDescriptor`] for cross-parallelism
     ///   planning. `None` is the transitional default until leader-level

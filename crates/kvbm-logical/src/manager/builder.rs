@@ -139,6 +139,7 @@ pub enum BlockManagerResetError {
 pub struct BlockManagerConfigBuilder<T: BlockMetadata> {
     /// Number of blocks in the pool
     block_count: Option<usize>,
+    maximum_block_count: Option<usize>,
 
     /// Size of each block in tokens (must be power of 2, 1-1024)
     /// Default: 16
@@ -176,6 +177,7 @@ impl<T: BlockMetadata> Default for BlockManagerConfigBuilder<T> {
     fn default() -> Self {
         Self {
             block_count: None,
+            maximum_block_count: None,
             block_size: Some(16), // Default to 16 tokens per block
             registry: None,
             inactive_backend: None,
@@ -197,6 +199,12 @@ impl<T: BlockMetadata> BlockManagerConfigBuilder<T> {
     /// Set the number of blocks in the pool.
     pub fn block_count(mut self, count: usize) -> Self {
         self.block_count = Some(count);
+        self
+    }
+
+    /// Set the maximum capacity without allocation of slot metadata for that maximum.
+    pub fn maximum_block_count(mut self, count: usize) -> Self {
+        self.maximum_block_count = Some(count);
         self
     }
 
@@ -453,6 +461,12 @@ impl<T: BlockMetadata> BlockManagerConfigBuilder<T> {
             .map_err(BlockManagerBuilderError::ValidationError)?;
 
         let block_count = self.block_count.unwrap();
+        let maximum_blocks = self.maximum_block_count.unwrap_or(block_count);
+        if maximum_blocks < block_count {
+            return Err(BlockManagerBuilderError::ValidationError(
+                "maximum block count is less than initial block count".to_owned(),
+            ));
+        }
         let block_size = self.block_size.unwrap_or(16);
 
         // Use provided registry
@@ -537,6 +551,7 @@ impl<T: BlockMetadata> BlockManagerConfigBuilder<T> {
         // Construct unified store
         let store = BlockStore::new(
             block_count,
+            maximum_blocks,
             block_size,
             backend,
             metrics.clone(),
@@ -555,7 +570,7 @@ impl<T: BlockMetadata> BlockManagerConfigBuilder<T> {
             duplication_policy: self
                 .duplication_policy
                 .unwrap_or(BlockDuplicationPolicy::Allow),
-            total_blocks: block_count,
+            maximum_blocks,
             block_size,
             metrics,
             eviction_notifier: EvictionNotifier::default(),
