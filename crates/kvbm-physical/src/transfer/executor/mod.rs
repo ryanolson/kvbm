@@ -641,8 +641,8 @@ async fn execute_two_hop_transfer_chunk(
         } else {
             CopyEngine::Auto
         },
-        false, // Two-hop chunks stay on the legacy path for now
-        None,  // bounce_buffer only used by use_planner=true NIXL transforms
+        false,      // Two-hop chunks stay on the legacy path for now
+        None,       // bounce_buffer only used by use_planner=true NIXL transforms
         Vec::new(), // axis_slices: two-hop chunks never carry slices (rejected upstream)
         None,       // two-hop chunks do not map to the original handle pair
         ctx,
@@ -662,7 +662,7 @@ async fn execute_two_hop_transfer_chunk(
         } else {
             CopyEngine::Auto
         },
-        false, // Two-hop chunks stay on the legacy path for now
+        false,      // Two-hop chunks stay on the legacy path for now
         None,
         Vec::new(), // axis_slices: two-hop chunks never carry slices
         None,       // two-hop chunks do not map to the original handle pair
