@@ -377,7 +377,8 @@ pub(super) async fn build_engine_stack(c: &Construction) -> Result<EngineStack> 
     let mut indexer_publisher = None;
     let mut indexer_hub_client = None;
     if indexer_only {
-        if let Some(manifest) = c.cache_manifest.lock().clone() {
+        let registered_manifest = c.cache_manifest.lock().clone();
+        if let Some(manifest) = registered_manifest {
             let h = handshake
                 .as_ref()
                 .expect("indexer_only implies a handshake");
