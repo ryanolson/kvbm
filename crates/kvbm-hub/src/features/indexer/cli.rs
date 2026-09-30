@@ -4,7 +4,7 @@
 //! `kvbmctl` client CLI for the KV indexer feature.
 //!
 //! Surfaces the read-only hub endpoints (`/v1/features/indexer/{config,
-//! hashes/by_position/{pos}, query}`) as `kvbmctl get indexer
+//! manifests/{manifest}/hashes/by_position/{pos}, query}`) as `kvbmctl get indexer
 //! {config,by-pos,query}`. The win over hand-rolled curl is `query`: it takes a
 //! decimal `u128` and packs it into the 16-big-endian-byte wire shape the hub
 //! expects (`SequenceHash` = `PositionalLineageHash`, `serde_bytes_u128`), so
@@ -13,6 +13,7 @@
 use anyhow::{Context, Result};
 use clap::{Arg, ArgMatches, Command};
 use futures::future::BoxFuture;
+use kvbm_protocols::cache_manifest::CacheManifestId;
 use serde_json::json;
 
 use crate::client::HubClient;
@@ -45,7 +46,13 @@ impl FeatureCli for IndexerCli {
             ))
             .subcommand(
                 Command::new("by-pos")
-                    .about("List indexed blocks at a position bucket (GET /hashes/by_position)")
+                    .about("List indexed blocks at a position bucket")
+                    .arg(
+                        Arg::new("manifest")
+                            .long("manifest")
+                            .required(true)
+                            .help("64-character hexadecimal cache manifest id"),
+                    )
                     .arg(
                         Arg::new("pos")
                             .required(true)
@@ -56,6 +63,12 @@ impl FeatureCli for IndexerCli {
             .subcommand(
                 Command::new("query")
                     .about("Resolve which instances hold a block hash (POST /query)")
+                    .arg(
+                        Arg::new("manifest")
+                            .long("manifest")
+                            .required(true)
+                            .help("64-character hexadecimal cache manifest id"),
+                    )
                     .arg(
                         Arg::new("hash")
                             .required(true)
@@ -82,12 +95,24 @@ impl FeatureCli for IndexerCli {
                 }
                 Some(("by-pos", sm)) => {
                     let pos = *sm.get_one::<usize>("pos").expect("pos is required");
+                    let manifest = sm
+                        .get_one::<String>("manifest")
+                        .expect("manifest is required")
+                        .parse::<CacheManifestId>()
+                        .context("--manifest must be 64 hexadecimal characters")?;
                     let r: ByPositionResponse = hub
-                        .get_json(&format!("{base}/hashes/by_position/{pos}"))
+                        .get_json(&format!(
+                            "{base}/manifests/{manifest}/hashes/by_position/{pos}"
+                        ))
                         .await?;
                     Ok(serde_json::to_value(r)?)
                 }
                 Some(("query", sm)) => {
+                    let manifest = sm
+                        .get_one::<String>("manifest")
+                        .expect("manifest is required")
+                        .parse::<CacheManifestId>()
+                        .context("--manifest must be 64 hexadecimal characters")?;
                     let hash_str = sm.get_one::<String>("hash").expect("hash is required");
                     let hash: u128 = hash_str.parse().with_context(|| {
                         format!("--hash must be a decimal u128, got {hash_str:?}")
@@ -95,7 +120,10 @@ impl FeatureCli for IndexerCli {
                     // SequenceHash serializes as the 16 big-endian bytes of the
                     // u128; build that wire shape so the hub's byte-decoder
                     // accepts it (same encoding the kvindex smoke does in Python).
-                    let body = json!({ "hashes": [hash.to_be_bytes().to_vec()] });
+                    let body = json!({
+                        "manifest": manifest,
+                        "hashes": [hash.to_be_bytes().to_vec()]
+                    });
                     let r: QueryResponse = hub.post_json(&format!("{base}/query"), &body).await?;
                     Ok(serde_json::to_value(r)?)
                 }

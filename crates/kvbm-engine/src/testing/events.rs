@@ -17,7 +17,7 @@ use crate::InstanceId;
 use crate::pubsub::{StubBus, Subscriber, Subscription};
 use kvbm_logical::blocks::BlockMetadata;
 use kvbm_logical::events::{
-    BatchingConfig, EventsManager, KvbmCacheEvents, KvbmCacheEventsPublisher,
+    BatchingConfig, CreateKind, EventsManager, KvbmCacheEvents, KvbmCacheEventsPublisher,
 };
 use kvbm_logical::manager::BlockManager;
 
@@ -43,6 +43,7 @@ use super::managers::TestManagerBuilder;
 /// let mut subscription = subscriber.subscribe("kvbm.events").await?;
 /// let _publisher = KvbmCacheEventsPublisher::builder()
 ///     .instance_id(12345)
+///     .create_kind(CreateKind::Block)
 ///     .event_stream(events_manager.subscribe())
 ///     .publisher(publisher)
 ///     .batching_config(BatchingConfig::default().with_window(Duration::from_millis(50)))
@@ -99,6 +100,7 @@ impl EventsPipelineConfigBuilder {
         // Build the publishing pipeline - convert InstanceId to u128
         let publisher = KvbmCacheEventsPublisher::builder()
             .instance_id(instance_id.as_u128())
+            .create_kind(CreateKind::Block)
             .event_stream(events_manager.subscribe())
             .publisher(publisher_arc)
             .batching_config(BatchingConfig::default().with_window(batching_window))
@@ -250,6 +252,7 @@ mod tests {
         // 6. Build the publishing pipeline
         let _events_publisher = KvbmCacheEventsPublisher::builder()
             .instance_id(12345)
+            .create_kind(CreateKind::Block)
             .event_stream(events_manager.subscribe())
             .publisher(publisher)
             .batching_config(BatchingConfig::default().with_window(Duration::from_millis(50)))
@@ -306,6 +309,9 @@ mod tests {
             }
             KvCacheEvents::Remove(_) => panic!("Expected Create events, got Remove"),
             KvCacheEvents::Shutdown => panic!("Expected Create events, got Shutdown"),
+            KvCacheEvents::CarrierCreate(_) | KvCacheEvents::Snapshot { .. } => {
+                panic!("Expected block Create events")
+            }
         }
     }
 
@@ -339,6 +345,7 @@ mod tests {
 
         let _events_publisher = KvbmCacheEventsPublisher::builder()
             .instance_id(12345)
+            .create_kind(CreateKind::Block)
             .event_stream(events_manager.subscribe())
             .publisher(publisher)
             .batching_config(BatchingConfig::default().with_window(Duration::from_millis(50)))
@@ -389,6 +396,9 @@ mod tests {
             }
             KvCacheEvents::Remove(_) => panic!("Expected Create events"),
             KvCacheEvents::Shutdown => panic!("Expected Create events"),
+            KvCacheEvents::CarrierCreate(_) | KvCacheEvents::Snapshot { .. } => {
+                panic!("Expected block Create events")
+            }
         }
     }
 
@@ -421,6 +431,7 @@ mod tests {
 
         let _events_publisher = KvbmCacheEventsPublisher::builder()
             .instance_id(12345)
+            .create_kind(CreateKind::Block)
             .event_stream(events_manager.subscribe())
             .publisher(publisher)
             .batching_config(BatchingConfig::default().with_window(Duration::from_millis(50)))
@@ -496,6 +507,9 @@ mod tests {
                 KvCacheEvents::Create(hashes) => received_creates += hashes.len(),
                 KvCacheEvents::Remove(hashes) => received_removes += hashes.len(),
                 KvCacheEvents::Shutdown => {} // Ignore shutdown events in counting
+                KvCacheEvents::CarrierCreate(_) | KvCacheEvents::Snapshot { .. } => {
+                    panic!("Unexpected non-block event")
+                }
             }
         }
 

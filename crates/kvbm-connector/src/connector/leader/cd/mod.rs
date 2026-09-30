@@ -96,12 +96,29 @@ pub(super) async fn wire_disagg(
         kvbm_config::DisaggregationRole::Prefill => kvbm_hub::ConditionalDisaggRole::Prefill,
         kvbm_config::DisaggregationRole::Decode => kvbm_hub::ConditionalDisaggRole::Decode,
     };
-    let indexer =
-        handshake
-            .has(kvbm_hub::FeatureKey::Indexer)
-            .then(|| kvbm_hub::IndexerFeatureConfig {
-                max_seq_len: runtime.config().max_seq_len,
-            });
+    let registered_manifest = construction.cache_manifest.lock().clone();
+    let manifest_id = registered_manifest.as_ref().map(|manifest| manifest.id());
+    let remote_search_manifest = if runtime.config().remote_search.is_some() {
+        Some(
+            manifest_id
+                .ok_or_else(|| anyhow::anyhow!("remote search requires a registered cache manifest"))?,
+        )
+    } else {
+        None
+    };
+    let indexer = if handshake.has(kvbm_hub::FeatureKey::Indexer) {
+        registered_manifest.map(|manifest| kvbm_hub::IndexerFeatureConfig {
+            max_seq_len: runtime.config().max_seq_len,
+            manifest,
+            create_kind: kvbm_logical::events::CreateKind::Block,
+        })
+    } else {
+        None
+    };
+    let indexer_registered = indexer.is_some();
+    if handshake.has(kvbm_hub::FeatureKey::Indexer) && !indexer_registered {
+        super::construct::warn_missing_registered_cache_manifest();
+    }
     let features = wiring::assemble_features(
         layout_compat,
         cd_role,
@@ -118,7 +135,7 @@ pub(super) async fn wire_disagg(
     // CD-case KV-index publisher: the registration above included
     // `Feature::Indexer` when effective, so the publisher-implies-registration
     // invariant now holds for this path too.
-    if let (Some(endpoint), Some(em)) = (
+    if indexer_registered && let (Some(endpoint), Some(em)) = (
         handshake.indexer_zmq_endpoint.as_ref(),
         stack.events_manager.as_ref(),
     ) && let Some(publisher) = build_indexer_publisher(runtime, endpoint, em)
@@ -160,6 +177,8 @@ pub(super) async fn wire_disagg(
             index,
             Arc::clone(&foundation.peer_resolver)
                 as Arc<dyn kvbm_engine::p2p::session::PeerResolver>,
+            remote_search_manifest
+                .ok_or_else(|| anyhow::anyhow!("remote search requires a registered cache manifest"))?,
         );
         remote = kvbm_engine::RemoteOps::with_search(discovery);
     }

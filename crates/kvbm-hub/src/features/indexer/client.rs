@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use kvbm_logical::SequenceHash;
-use kvbm_protocols::cache_manifest::RegistrationEpoch;
+use kvbm_protocols::cache_manifest::{CacheManifestId, RegistrationEpoch};
 use kvbm_protocols::tier_protocol::TierPlacementSnapshotV1;
 use url::Url;
 use velo::Messenger;
@@ -106,13 +106,18 @@ impl IndexerLookupClient {
     /// Resolve a candidate block sequence to the deepest indexed block and its
     /// holders, over velo.
     ///
-    /// `hashes` are the block-sequence PLHs in position order (low → high). The
-    /// hub walks them and returns the deepest one present — so `[x, y, z]` with
+    /// `hashes` are the block-sequence PLHs in position order (low → high).
+    /// `manifest` scopes the lookup to one cache ABI. The hub walks the hashes
+    /// and returns the deepest one present — so `[x, y, z]` with
     /// `z` missing but `y` indexed yields `Some(hit)` where `hit.matched == y`
     /// and `hit.candidates` are the instances holding `y`. A full miss returns
     /// `Ok(None)`.
-    pub async fn find_blocks(&self, hashes: Vec<SequenceHash>) -> Result<Option<FindBlocksHit>> {
-        let req = QueryRequest { hashes };
+    pub async fn find_blocks(
+        &self,
+        manifest: CacheManifestId,
+        hashes: Vec<SequenceHash>,
+    ) -> Result<Option<FindBlocksHit>> {
+        let req = QueryRequest { manifest, hashes };
         let hit = self
             .messenger
             .typed_unary::<Option<FindBlocksHit>>(QUERY_HANDLER)?

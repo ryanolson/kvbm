@@ -14,7 +14,7 @@ use futures::Stream;
 use futures::StreamExt;
 use tokio::pin;
 
-use super::protocol::{InstanceId, KvCacheEvent, KvCacheEvents, KvbmCacheEvents};
+use super::protocol::{CreateKind, InstanceId, KvCacheEvent, KvCacheEvents, KvbmCacheEvents};
 use crate::SequenceHash;
 
 /// Configuration for event batching.
@@ -61,6 +61,7 @@ impl BatchType {
         match event {
             KvCacheEvent::Create(_) => BatchType::Create,
             KvCacheEvent::Remove(_) => BatchType::Remove,
+            KvCacheEvent::Snapshot(_) => unreachable!("snapshots are handled separately"),
         }
     }
 }
@@ -78,6 +79,7 @@ impl BatchType {
 pub struct EventBatcher {
     config: BatchingConfig,
     instance_id: InstanceId,
+    create_kind: CreateKind,
 }
 
 impl EventBatcher {
@@ -86,10 +88,12 @@ impl EventBatcher {
     /// # Arguments
     /// * `config` - Batching configuration
     /// * `instance_id` - Worker instance ID to include in batched events
-    pub fn new(config: BatchingConfig, instance_id: InstanceId) -> Self {
+    /// * `create_kind` - Kind used for create and snapshot events
+    pub fn new(config: BatchingConfig, instance_id: InstanceId, create_kind: CreateKind) -> Self {
         Self {
             config,
             instance_id,
+            create_kind,
         }
     }
 
@@ -106,6 +110,7 @@ impl EventBatcher {
     {
         let config = self.config;
         let instance_id = self.instance_id;
+        let create_kind = self.create_kind;
 
         stream! {
             pin!(input);
@@ -122,10 +127,31 @@ impl EventBatcher {
 
                     maybe_event = input.next() => {
                         match maybe_event {
+                            Some(KvCacheEvent::Snapshot(mut hashes)) => {
+                                if let Some(batch_type) = current_type.take()
+                                    && !current_batch.is_empty() {
+                                        yield Self::make_batch(
+                                            &mut current_batch,
+                                            batch_type,
+                                            instance_id,
+                                            create_kind,
+                                        );
+                                    }
+                                hashes.sort_by_key(|hash| hash.position());
+                                yield KvbmCacheEvents {
+                                    events: KvCacheEvents::Snapshot {
+                                        kind: create_kind,
+                                        hashes,
+                                    },
+                                    instance_id,
+                                };
+                                deadline = tokio::time::Instant::now() + config.window_duration;
+                            }
                             Some(event) => {
                                 let event_type = BatchType::from_event(&event);
                                 let seq_hash = match &event {
                                     KvCacheEvent::Create(h) | KvCacheEvent::Remove(h) => *h,
+                                    KvCacheEvent::Snapshot(_) => unreachable!("snapshots are handled separately"),
                                 };
 
                                 // Check if we need to flush due to type switch
@@ -136,6 +162,7 @@ impl EventBatcher {
                                             &mut current_batch,
                                             current,
                                             instance_id,
+                                            create_kind,
                                         );
                                         yield batch;
                                         deadline = tokio::time::Instant::now() + config.window_duration;
@@ -150,6 +177,7 @@ impl EventBatcher {
                                         &mut current_batch,
                                         event_type,
                                         instance_id,
+                                        create_kind,
                                     );
                                     yield batch;
                                     current_type = None;
@@ -164,6 +192,7 @@ impl EventBatcher {
                                             &mut current_batch,
                                             batch_type,
                                             instance_id,
+                                            create_kind,
                                         );
                                         yield batch;
                                     }
@@ -180,6 +209,7 @@ impl EventBatcher {
                                     &mut current_batch,
                                     batch_type,
                                     instance_id,
+                                    create_kind,
                                 );
                                 yield batch;
                                 current_type = None;
@@ -195,6 +225,7 @@ impl EventBatcher {
         hashes: &mut Vec<SequenceHash>,
         batch_type: BatchType,
         instance_id: InstanceId,
+        create_kind: CreateKind,
     ) -> KvbmCacheEvents {
         // Sort based on batch type
         match batch_type {
@@ -211,7 +242,10 @@ impl EventBatcher {
         let sorted_hashes = std::mem::take(hashes);
 
         let events = match batch_type {
-            BatchType::Create => KvCacheEvents::Create(sorted_hashes),
+            BatchType::Create => match create_kind {
+                CreateKind::Block => KvCacheEvents::Create(sorted_hashes),
+                CreateKind::Carrier => KvCacheEvents::CarrierCreate(sorted_hashes),
+            },
             BatchType::Remove => KvCacheEvents::Remove(sorted_hashes),
         };
 
@@ -240,7 +274,7 @@ mod tests {
     #[tokio::test]
     async fn test_batcher_batches_creates() {
         let config = BatchingConfig::default().with_window(Duration::from_millis(50));
-        let batcher = EventBatcher::new(config, 12345);
+        let batcher = EventBatcher::new(config, 12345, CreateKind::Block);
 
         let events = vec![
             KvCacheEvent::Create(create_seq_hash_at_position(10)),
@@ -267,7 +301,7 @@ mod tests {
     #[tokio::test]
     async fn test_batcher_batches_removes() {
         let config = BatchingConfig::default().with_window(Duration::from_millis(50));
-        let batcher = EventBatcher::new(config, 12345);
+        let batcher = EventBatcher::new(config, 12345, CreateKind::Block);
 
         let events = vec![
             KvCacheEvent::Remove(create_seq_hash_at_position(10)),
@@ -293,7 +327,7 @@ mod tests {
     #[tokio::test]
     async fn test_batcher_flushes_on_type_switch() {
         let config = BatchingConfig::default().with_window(Duration::from_secs(60)); // Long window
-        let batcher = EventBatcher::new(config, 12345);
+        let batcher = EventBatcher::new(config, 12345, CreateKind::Block);
 
         let events = vec![
             KvCacheEvent::Create(create_seq_hash_at_position(10)),
@@ -323,7 +357,7 @@ mod tests {
         let config = BatchingConfig::default()
             .with_window(Duration::from_secs(60)) // Long window
             .with_max_size(NonZeroUsize::new(3).unwrap());
-        let batcher = EventBatcher::new(config, 12345);
+        let batcher = EventBatcher::new(config, 12345, CreateKind::Block);
 
         let events = vec![
             KvCacheEvent::Create(create_seq_hash_at_position(1)),
@@ -348,7 +382,7 @@ mod tests {
     #[tokio::test]
     async fn test_batcher_flushes_on_timeout() {
         let config = BatchingConfig::default().with_window(Duration::from_millis(50));
-        let batcher = EventBatcher::new(config, 12345);
+        let batcher = EventBatcher::new(config, 12345, CreateKind::Block);
 
         // Create a channel-based stream so we can control timing
         let (tx, rx) = tokio::sync::mpsc::channel(10);
@@ -373,5 +407,51 @@ mod tests {
 
         // Clean up
         drop(tx);
+    }
+
+    #[tokio::test]
+    async fn carrier_batcher_emits_carrier_create() {
+        let config = BatchingConfig::default().with_window(Duration::from_secs(60));
+        let batcher = EventBatcher::new(config, 12345, CreateKind::Carrier);
+        let input = stream::iter(vec![
+            KvCacheEvent::Create(create_seq_hash_at_position(2)),
+            KvCacheEvent::Create(create_seq_hash_at_position(1)),
+        ]);
+        let mut output = Box::pin(batcher.batch(input));
+        let batch = output.next().await.unwrap();
+        assert!(matches!(batch.events, KvCacheEvents::CarrierCreate(ref hashes) if hashes[0].position() == 1 && hashes[1].position() == 2));
+    }
+
+    #[tokio::test]
+    async fn snapshot_preserves_order_and_sorts_hashes() {
+        let config = BatchingConfig::default().with_window(Duration::from_secs(60));
+        let batcher = EventBatcher::new(config, 12345, CreateKind::Block);
+        let input = stream::iter(vec![
+            KvCacheEvent::Create(create_seq_hash_at_position(2)),
+            KvCacheEvent::Create(create_seq_hash_at_position(0)),
+            KvCacheEvent::Snapshot(vec![
+                create_seq_hash_at_position(3),
+                create_seq_hash_at_position(1),
+            ]),
+            KvCacheEvent::Remove(create_seq_hash_at_position(4)),
+        ]);
+        let mut output = Box::pin(batcher.batch(input));
+
+        assert!(matches!(
+            output.next().await.unwrap().events,
+            KvCacheEvents::Create(_)
+        ));
+        let snapshot = output.next().await.unwrap();
+        assert!(matches!(
+            snapshot.events,
+            KvCacheEvents::Snapshot {
+                kind: CreateKind::Block,
+                ref hashes
+            } if hashes[0].position() == 1 && hashes[1].position() == 3
+        ));
+        assert!(matches!(
+            output.next().await.unwrap().events,
+            KvCacheEvents::Remove(_)
+        ));
     }
 }

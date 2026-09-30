@@ -24,8 +24,8 @@ use kvbm_hub::{
     RegistryError, RegistryIncarnation, RegistryRemoval,
 };
 use kvbm_protocols::cache_manifest::{
-    BundleKey, BundleResourceLineage, CacheManifestId, RegistrationEpoch, ResourceRequirement,
-    ResourceRole,
+    BundleKey, BundleResourceLineage, CacheManifest, CacheManifestId, ModelIdentity,
+    RegistrationEpoch, ResourceRequirement, ResourceRole,
 };
 use velo::Transport;
 use velo::discovery::PeerDiscovery;
@@ -1207,7 +1207,24 @@ fn register_request(peer_info: PeerInfo) -> RegisterRequest {
 fn indexer_register_request(peer_info: PeerInfo, block_size: usize) -> RegisterRequest {
     RegisterRequest {
         peer_info,
-        features: vec![Feature::Indexer(IndexerFeatureConfig::default())],
+        features: vec![Feature::Indexer(IndexerFeatureConfig {
+            max_seq_len: None,
+            manifest: CacheManifest::new(
+                ModelIdentity::new("test-architecture", "test-revision", [71; 32]).unwrap(),
+                "test-cache-abi",
+                vec![
+                    ResourceRequirement::new(
+                        LogicalResourceId(1),
+                        ResourceRole::PrefixHistory,
+                        4,
+                    )
+                    .unwrap(),
+                ],
+                std::collections::BTreeMap::new(),
+            )
+            .unwrap(),
+            create_kind: kvbm_logical::events::CreateKind::Block,
+        })],
         runtime: Some(RuntimeConfigSummary {
             block_size: Some(block_size),
             block_layout: None,

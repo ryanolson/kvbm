@@ -26,7 +26,7 @@
 //! `Leader::initialize_async`.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -43,7 +43,7 @@ use kvbm_engine::worker::{LeaderLayoutConfig, Worker};
 use kvbm_hub::HubClient;
 use kvbm_logical::BlockManagerSet;
 use kvbm_logical::blocks::{BlockDuplicationPolicy, BlockRegistry};
-use kvbm_logical::events::{EventsManager, KvbmCacheEventsPublisher};
+use kvbm_logical::events::{CreateKind, EventsManager, KvbmCacheEventsPublisher};
 use kvbm_logical::manager::{BlockManager, FrequencyTrackingCapacity};
 use kvbm_physical::layout::LayoutConfig;
 use kvbm_physical::manager::WorkerDataPlacement;
@@ -59,6 +59,13 @@ mod resources;
 use resources::{
     ResourcePlan, build_collective_bootstrap, logical_tier_block_count, resolve_parallelism,
 };
+
+pub(super) fn warn_missing_registered_cache_manifest() {
+    static WARNED: OnceLock<()> = OnceLock::new();
+    WARNED.get_or_init(|| {
+        tracing::warn!("KV index registration requires a registered cache manifest");
+    });
+}
 
 fn local_transfer_placements(
     resource_parallelism: &BTreeMap<LogicalResourceId, ParallelismMode>,
@@ -106,6 +113,7 @@ pub(super) struct EngineStack {
 async fn register_indexer_only(
     runtime: &Arc<KvbmRuntime>,
     handshake: &HubHandshake,
+    manifest: kvbm_protocols::cache_manifest::CacheManifest,
 ) -> Result<Arc<HubClient>> {
     let velo = runtime
         .velo()
@@ -120,6 +128,8 @@ async fn register_indexer_only(
         velo.peer_info(),
         vec![kvbm_hub::Feature::Indexer(kvbm_hub::IndexerFeatureConfig {
             max_seq_len,
+            manifest,
+            create_kind: CreateKind::Block,
         })],
         handshake.runtime_summary.clone(),
     )
@@ -144,6 +154,7 @@ pub(super) fn build_indexer_publisher(
             let instance_id = runtime.messenger().instance_id().as_u128();
             match KvbmCacheEventsPublisher::builder()
                 .instance_id(instance_id)
+                .create_kind(CreateKind::Block)
                 .event_stream(events_manager.subscribe())
                 .publisher(Arc::new(zmq_pub))
                 .subject(hub_indexer::SUBJECT)
@@ -366,14 +377,18 @@ pub(super) async fn build_engine_stack(c: &Construction) -> Result<EngineStack> 
     let mut indexer_publisher = None;
     let mut indexer_hub_client = None;
     if indexer_only {
-        let h = handshake
-            .as_ref()
-            .expect("indexer_only implies a handshake");
-        // Register first, so the publisher never emits without a live registration.
-        indexer_hub_client = Some(register_indexer_only(runtime, h).await?);
+        if let Some(manifest) = c.cache_manifest.lock().clone() {
+            let h = handshake
+                .as_ref()
+                .expect("indexer_only implies a handshake");
+            // Register first, so the publisher never emits without a live registration.
+            indexer_hub_client = Some(register_indexer_only(runtime, h, manifest).await?);
 
-        if let (Some(endpoint), Some(em)) = (&indexer_endpoint, events_manager.as_ref()) {
-            indexer_publisher = build_indexer_publisher(runtime, endpoint, em);
+            if let (Some(endpoint), Some(em)) = (&indexer_endpoint, events_manager.as_ref()) {
+                indexer_publisher = build_indexer_publisher(runtime, endpoint, em);
+            }
+        } else {
+            warn_missing_registered_cache_manifest();
         }
     }
 

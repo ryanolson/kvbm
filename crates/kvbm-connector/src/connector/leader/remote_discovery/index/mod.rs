@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use futures::future::BoxFuture;
+use kvbm_protocols::cache_manifest::CacheManifestId;
 use kvbm_engine::remote::search::bundle::{
     BundleAdvertisement, BundleDiscoveryOutcome, BundleDiscoveryQuery, BundleInvalidation,
     BundleMissReason, RemoteBundleCandidate,
@@ -17,6 +18,7 @@ use kvbm_logical::SequenceHash;
 pub(super) trait BlockIndex: Send + Sync {
     fn find_blocks(
         &self,
+        manifest: CacheManifestId,
         hashes: Vec<SequenceHash>,
     ) -> BoxFuture<'static, Result<Option<FindBlocksHit>>>;
 
@@ -47,12 +49,13 @@ pub(super) struct HubBlockIndex(pub(super) Arc<IndexerLookupClient>);
 impl BlockIndex for HubBlockIndex {
     fn find_blocks(
         &self,
+        manifest: CacheManifestId,
         hashes: Vec<SequenceHash>,
     ) -> BoxFuture<'static, Result<Option<FindBlocksHit>>> {
         let index = Arc::clone(&self.0);
         Box::pin(async move {
             index
-                .find_blocks(hashes)
+                .find_blocks(manifest, hashes)
                 .await
                 .context("query KVBM hub block index")
         })

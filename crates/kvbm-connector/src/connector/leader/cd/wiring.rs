@@ -280,6 +280,26 @@ mod tests {
     fn indexer() -> IndexerFeatureConfig {
         IndexerFeatureConfig {
             max_seq_len: Some(8192),
+            manifest: kvbm_protocols::cache_manifest::CacheManifest::new(
+                kvbm_protocols::cache_manifest::ModelIdentity::new(
+                    "test-architecture",
+                    "test-revision",
+                    [7; 32],
+                )
+                .unwrap(),
+                "test-cache-abi",
+                vec![
+                    kvbm_protocols::cache_manifest::ResourceRequirement::new(
+                        kvbm_common::LogicalResourceId(1),
+                        kvbm_protocols::cache_manifest::ResourceRole::PrefixHistory,
+                        4,
+                    )
+                    .unwrap(),
+                ],
+                std::collections::BTreeMap::new(),
+            )
+            .unwrap(),
+            create_kind: kvbm_logical::events::CreateKind::Block,
         }
     }
 

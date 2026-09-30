@@ -17,33 +17,34 @@ use velo::Handler;
 use velo_ext::InstanceId;
 
 use super::bundle::BundleDirectory;
-use super::index::PositionalIndex;
+use super::index::ManifestIndexes;
 use super::protocol::{
     BUNDLE_INVALIDATE_HANDLER, BUNDLE_PUBLISH_HANDLER, BUNDLE_QUERY_HANDLER,
     BundleInvalidateRequest, BundlePublishRequest, BundleQueryOutcome, BundleQueryRequest,
     FindBlocksHit, QUERY_HANDLER, QueryRequest,
 };
 
-/// Build the indexer-lookup velo handler over a shared [`PositionalIndex`].
+/// Build the indexer-lookup velo handler over manifest-scoped indexes.
 ///
 /// Resolves the candidate hashes to the deepest indexed block and its holders
-/// via [`PositionalIndex::query_holders`], reconstructing each holder's
+/// via [`ManifestIndexes::query_holders`], reconstructing each holder's
 /// [`InstanceId`] from the raw `u128` the index stores (publishers stamp
 /// `velo_id.as_u128()`). Returns `Ok(None)` on a full miss.
-pub fn create_query_handler(index: Arc<PositionalIndex>) -> Handler {
+pub fn create_query_handler(indexes: Arc<ManifestIndexes>) -> Handler {
     Handler::typed_unary_async::<QueryRequest, Option<FindBlocksHit>, _, _>(
         QUERY_HANDLER,
         move |ctx| {
-            let index = Arc::clone(&index);
+            let indexes = Arc::clone(&indexes);
             async move {
-                Ok(index
-                    .query_holders(&ctx.input.hashes)
-                    .map(|(matched, ids)| FindBlocksHit {
+                Ok(indexes
+                    .query_holders(ctx.input.manifest, &ctx.input.hashes)
+                    .map(|(matched, ids, kind)| FindBlocksHit {
                         matched,
                         candidates: ids
                             .into_iter()
                             .map(|u| InstanceId::from(Uuid::from_u128(u)))
                             .collect(),
+                        kind,
                     }))
             }
         },

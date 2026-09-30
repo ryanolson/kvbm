@@ -245,7 +245,7 @@ impl PyConnectorLeader {
         let identity = manifest.identity();
         let digest = identity.manifest().as_bytes().to_vec();
         self.inner
-            .register_cache_identity(identity.clone())
+            .register_cache_manifest(manifest.clone())
             .map_err(to_pyerr)?;
         *self.manifest.write().expect("manifest lock poisoned") = Some(identity);
         Ok(digest)

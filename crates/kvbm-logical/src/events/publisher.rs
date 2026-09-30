@@ -15,7 +15,7 @@ use futures::StreamExt;
 use tokio::task::JoinHandle;
 
 use super::batcher::{BatchingConfig, EventBatcher};
-use super::protocol::{InstanceId, KvCacheEvent, KvbmCacheEvents};
+use super::protocol::{CreateKind, InstanceId, KvCacheEvent, KvbmCacheEvents};
 use crate::pubsub::Publisher;
 
 /// Builder for constructing a [`KvbmCacheEventsPublisher`].
@@ -25,6 +25,7 @@ use crate::pubsub::Publisher;
 /// ```ignore
 /// let publisher = KvbmCacheEventsPublisher::builder()
 ///     .instance_id(manager.instance_id())
+///     .create_kind(CreateKind::Block)
 ///     .event_stream(manager.subscribe())
 ///     .publisher(nats_publisher)
 ///     .subject("kvbm.events")
@@ -36,6 +37,7 @@ pub struct KvbmCacheEventsPublisherBuilder<S, P> {
     publisher: Option<Arc<P>>,
     batching_config: BatchingConfig,
     subject: String,
+    create_kind: Option<CreateKind>,
 }
 
 impl<S, P> Default for KvbmCacheEventsPublisherBuilder<S, P> {
@@ -46,6 +48,7 @@ impl<S, P> Default for KvbmCacheEventsPublisherBuilder<S, P> {
             publisher: None,
             batching_config: BatchingConfig::default(),
             subject: "kvbm.events".to_string(),
+            create_kind: None,
         }
     }
 }
@@ -90,6 +93,12 @@ where
         self
     }
 
+    /// Sets the create-event kind published by this instance.
+    pub fn create_kind(mut self, create_kind: CreateKind) -> Self {
+        self.create_kind = Some(create_kind);
+        self
+    }
+
     /// Builds and starts the publisher.
     ///
     /// This spawns a background task that consumes events from the stream,
@@ -108,8 +117,11 @@ where
         let publisher = self
             .publisher
             .ok_or_else(|| anyhow!("publisher is required"))?;
+        let create_kind = self
+            .create_kind
+            .ok_or_else(|| anyhow!("create_kind is required"))?;
 
-        let batcher = EventBatcher::new(self.batching_config, instance_id);
+        let batcher = EventBatcher::new(self.batching_config, instance_id, create_kind);
         let batched_stream = batcher.batch(event_stream);
         let subject = self.subject;
 
@@ -272,6 +284,7 @@ mod tests {
 
         let publisher = KvbmCacheEventsPublisher::builder()
             .instance_id(12345)
+            .create_kind(CreateKind::Block)
             .event_stream(event_stream)
             .publisher(mock_publisher.clone())
             .batching_config(config)
@@ -322,12 +335,13 @@ mod tests {
         let event_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
         let mock_publisher = Arc::new(MockPublisher::new());
 
-        // Missing instance_id
+        // Missing create kind.
         let result = KvbmCacheEventsPublisherBuilder::new()
+            .instance_id(12345)
             .event_stream(event_stream)
             .publisher(mock_publisher)
             .build();
-        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().to_string(), "create_kind is required");
     }
 
     #[tokio::test]
@@ -339,6 +353,7 @@ mod tests {
 
         let publisher = KvbmCacheEventsPublisher::builder()
             .instance_id(12345)
+            .create_kind(CreateKind::Block)
             .event_stream(event_stream)
             .publisher(mock_publisher)
             .build()

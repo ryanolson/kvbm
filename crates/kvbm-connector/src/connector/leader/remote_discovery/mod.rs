@@ -16,6 +16,7 @@ use kvbm_engine::remote::search::bundle::{
 };
 use kvbm_hub::IndexerLookupClient;
 use kvbm_logical::SequenceHash;
+use kvbm_protocols::cache_manifest::CacheManifestId;
 
 use index::{BlockIndex, HubBlockIndex};
 
@@ -23,20 +24,34 @@ use index::{BlockIndex, HubBlockIndex};
 pub struct HubRemoteDiscovery {
     index: Arc<dyn BlockIndex>,
     peers: Arc<dyn PeerResolver>,
+    manifest: CacheManifestId,
 }
 
 impl HubRemoteDiscovery {
     /// Build discovery over the hub indexer and the local Velo peer resolver.
-    pub fn new(index: Arc<IndexerLookupClient>, peers: Arc<dyn PeerResolver>) -> Arc<Self> {
+    pub fn new(
+        index: Arc<IndexerLookupClient>,
+        peers: Arc<dyn PeerResolver>,
+        manifest: CacheManifestId,
+    ) -> Arc<Self> {
         Arc::new(Self {
             index: Arc::new(HubBlockIndex(index)),
             peers,
+            manifest,
         })
     }
 
     #[cfg(test)]
-    fn with_backends(index: Arc<dyn BlockIndex>, peers: Arc<dyn PeerResolver>) -> Arc<Self> {
-        Arc::new(Self { index, peers })
+    fn with_backends(
+        index: Arc<dyn BlockIndex>,
+        peers: Arc<dyn PeerResolver>,
+        manifest: CacheManifestId,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            index,
+            peers,
+            manifest,
+        })
     }
 }
 
@@ -47,8 +62,9 @@ impl RemoteBlockDiscovery for HubRemoteDiscovery {
     ) -> BoxFuture<'static, Result<Option<RemoteCandidates>>> {
         let index = Arc::clone(&self.index);
         let peers = Arc::clone(&self.peers);
+        let manifest = self.manifest;
         Box::pin(async move {
-            let Some(hit) = index.find_blocks(hashes).await? else {
+            let Some(hit) = index.find_blocks(manifest, hashes).await? else {
                 return Ok(None);
             };
 
@@ -135,15 +151,21 @@ mod tests {
 
     struct StubIndex {
         hit: Option<FindBlocksHit>,
+        expected_manifest: CacheManifestId,
     }
 
     impl BlockIndex for StubIndex {
         fn find_blocks(
             &self,
+            manifest: CacheManifestId,
             _hashes: Vec<SequenceHash>,
         ) -> BoxFuture<'static, Result<Option<FindBlocksHit>>> {
+            let expected_manifest = self.expected_manifest;
             let hit = self.hit.clone();
-            Box::pin(async move { Ok(hit) })
+            Box::pin(async move {
+                assert_eq!(manifest, expected_manifest);
+                Ok(hit)
+            })
         }
     }
 
@@ -168,6 +190,10 @@ mod tests {
         (1..=position).fold(SequenceHash::root(1), |parent, block| {
             parent.extend(block + 1)
         })
+    }
+
+    fn test_manifest_id() -> CacheManifestId {
+        CacheManifestId::from_bytes([1; 32])
     }
 
     fn bundle_query() -> (BundleDiscoveryQuery, BundleKey) {
@@ -389,9 +415,12 @@ mod tests {
                 hit: Some(FindBlocksHit {
                     matched: hash(7),
                     candidates: vec![unreachable, reachable],
+                    kind: kvbm_logical::events::CreateKind::Carrier,
                 }),
+                expected_manifest: test_manifest_id(),
             }),
             Arc::clone(&peers) as Arc<dyn PeerResolver>,
+            test_manifest_id(),
         );
 
         let found = discovery
@@ -412,8 +441,12 @@ mod tests {
             seen: Mutex::new(Vec::new()),
         });
         let discovery = HubRemoteDiscovery::with_backends(
-            Arc::new(StubIndex { hit: None }),
+            Arc::new(StubIndex {
+                hit: None,
+                expected_manifest: test_manifest_id(),
+            }),
             Arc::clone(&peers) as Arc<dyn PeerResolver>,
+            test_manifest_id(),
         );
 
         assert!(discovery.discover(vec![hash(1)]).await.unwrap().is_none());
@@ -428,12 +461,15 @@ mod tests {
                 hit: Some(FindBlocksHit {
                     matched: hash(1),
                     candidates: vec![unreachable],
+                    kind: kvbm_logical::events::CreateKind::Block,
                 }),
+                expected_manifest: test_manifest_id(),
             }),
             Arc::new(RecordingPeers {
                 failed: HashSet::from([unreachable]),
                 seen: Mutex::new(Vec::new()),
             }),
+            test_manifest_id(),
         );
 
         let error = discovery.discover(vec![hash(1)]).await.unwrap_err();

@@ -5,10 +5,10 @@
 //! an [`kvbm_logical::events::EventsManager`] subscription into the tracker.
 //!
 //! `KvCacheEvent::Create(seq_hash)` → `tracker.handle_kvbm_store(seq_hash, [], 0, None)`.
-//! The bridge has no tokens/block_size/lora_name to forward — the canonical key is the
-//! PLH, and a placeholder Store would be invalid downstream — so the tracker registers
-//! the block without publishing. A subsequent vLLM / TRT-LLM store for the same PLH
-//! publishes with real metadata.
+//! Carrier creates and snapshots are not consumed by this block-only bridge.
+//! The bridge has no tokens/block_size/lora_name to forward — the canonical key
+//! is the PLH, and a placeholder Store would be invalid downstream — so the
+//! tracker registers blocks without publishing.
 //!
 //! `KvCacheEvent::Remove(seq_hash)` → `tracker.handle_kvbm_remove(seq_hash)`.
 //!
@@ -29,8 +29,7 @@ use crate::tracker::Tracker;
 
 /// Emit an audit log for a single KVBM event.
 ///
-/// Called once per event, before the tracker write. `KvCacheEvent` has no `ClearAll`
-/// variant (KVBM only emits Create/Remove), so `num_blocks = 1` for every arm.
+/// Called once per block event, before the tracker write.
 pub fn audit_kvbm_event(event: &KvCacheEvent) {
     match event {
         KvCacheEvent::Create(seq_hash) => {
@@ -50,6 +49,9 @@ pub fn audit_kvbm_event(event: &KvCacheEvent) {
                 seq_hash = format!("{:032x}", seq_hash.as_u128()),
                 num_blocks = 1usize,
             );
+        }
+        KvCacheEvent::Snapshot(_) => {
+            tracing::debug!("consolidator: dropping unsupported KVBM snapshot event");
         }
     }
 }
@@ -80,6 +82,9 @@ where
                     Some(KvCacheEvent::Remove(seq_hash)) => {
                         audit_kvbm_event(&KvCacheEvent::Remove(seq_hash));
                         tracker.write().await.handle_kvbm_remove(seq_hash);
+                    }
+                    Some(event @ KvCacheEvent::Snapshot(_)) => {
+                        tracing::debug!(?event, "consolidator: dropping unsupported KVBM snapshot event");
                     }
                     None => break,
                 },

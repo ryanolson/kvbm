@@ -14,11 +14,10 @@
 //! hub narrow a search without tracking every block. Do not assume either when
 //! reasoning about coverage — read the configured policy.
 //!
-//! This is the *legacy* untiered stream. It carries no tier, resource, lane,
-//! generation, sequence number, or recovery, and it stays byte-compatible for
-//! the consolidator and the hub's legacy indexer. The tiered, sequenced,
-//! recoverable stream is a separate wire schema
-//! (`kvbm_protocols::tier_protocol`) on a separate subject.
+//! This untiered stream carries no tier, resource, lane, generation, or sequence
+//! number. Its snapshot event supports index recovery. The tiered, sequenced
+//! stream is a separate wire schema (`kvbm_protocols::tier_protocol`) on a
+//! separate subject.
 //!
 //! The event types are organized in three layers:
 //! - [`KvCacheEvent`]: Individual events for internal streaming
@@ -35,6 +34,15 @@ use crate::SequenceHash;
 /// Instance identifier for a worker node (u128).
 pub type InstanceId = u128;
 
+/// The kind of indexed create events published by one instance.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum CreateKind {
+    /// Ordinary indexed blocks; these do not identify a hybrid restart point.
+    Block,
+    /// Carrier blocks that can restart the hybrid state of a request.
+    Carrier,
+}
+
 /// Individual event emitted when a block is registered or removed.
 ///
 /// This is the simplified internal event type. Instance and cluster context
@@ -45,6 +53,8 @@ pub enum KvCacheEvent {
     Create(SequenceHash),
     /// A block has been removed from a worker's cache.
     Remove(SequenceHash),
+    /// Replaces this instance's complete indexed set.
+    Snapshot(Vec<SequenceHash>),
 }
 
 /// Batched events with multiple sequence hashes.
@@ -55,12 +65,20 @@ pub enum KvCacheEvent {
 /// (high to low) for efficient radix tree removal.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum KvCacheEvents {
-    /// Multiple blocks have been registered.
+    /// Ordinary blocks have been registered; these do not establish a hybrid
+    /// restart point.
     Create(Vec<SequenceHash>),
     /// Multiple blocks have been removed.
     Remove(Vec<SequenceHash>),
     /// Publisher is shutting down.
     Shutdown,
+    /// A carrier block at this hash can restart the hybrid state of a request.
+    CarrierCreate(Vec<SequenceHash>),
+    /// Replaces the instance's complete indexed set.
+    Snapshot {
+        kind: CreateKind,
+        hashes: Vec<SequenceHash>,
+    },
 }
 
 /// Wire format for publishing batched events.

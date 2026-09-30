@@ -314,6 +314,7 @@ impl FlushGlue {
 struct Construction {
     runtime: Arc<KvbmRuntime>,
     manifest: Mutex<Option<kvbm_protocols::cache_manifest::CacheManifestId>>,
+    cache_manifest: Mutex<Option<kvbm_protocols::cache_manifest::CacheManifest>>,
     cache_identity: Mutex<Option<kvbm_protocols::cache_manifest::CacheIdentity>>,
     // Consumed by the engine-stack build (`InstanceLeader::with_consolidator`).
     consolidator_endpoints: Option<ConsolidatorEndpoints>,
@@ -381,6 +382,7 @@ impl Leader {
             construction: Some(Construction {
                 runtime,
                 manifest: Mutex::new(None),
+                cache_manifest: Mutex::new(None),
                 cache_identity: Mutex::new(None),
                 consolidator_endpoints,
                 workers: Mutex::new(WorkerAccum::default()),
@@ -443,26 +445,34 @@ impl Leader {
         Ok(())
     }
 
-    /// Bind the complete cache identity used to derive resource admission
-    /// defaults while preserving [`Self::register_manifest`] for digest-only
-    /// integrations.
-    pub fn register_cache_identity(
+    /// Bind the complete cache manifest used for hub indexing and resource
+    /// admission defaults.
+    pub fn register_cache_manifest(
         &self,
-        identity: kvbm_protocols::cache_manifest::CacheIdentity,
+        manifest: kvbm_protocols::cache_manifest::CacheManifest,
     ) -> Result<()> {
+        let identity = manifest.identity();
         self.register_manifest(identity.manifest())?;
         let construction = self
             .construction
             .as_ref()
-            .ok_or_else(|| anyhow!("cache identity registration requires deferred construction"))?;
-        let mut installed = construction.cache_identity.lock();
+            .ok_or_else(|| anyhow!("cache manifest registration requires deferred construction"))?;
+        let mut installed_manifest = construction.cache_manifest.lock();
+        let mut installed_identity = construction.cache_identity.lock();
         anyhow::ensure!(
-            installed
+            installed_manifest
+                .as_ref()
+                .is_none_or(|current| current == &manifest),
+            "leader cache manifest is already registered with a different resource contract"
+        );
+        anyhow::ensure!(
+            installed_identity
                 .as_ref()
                 .is_none_or(|current| current == &identity),
             "leader cache identity is already registered with a different resource contract"
         );
-        *installed = Some(identity);
+        *installed_manifest = Some(manifest);
+        *installed_identity = Some(identity);
         Ok(())
     }
 
