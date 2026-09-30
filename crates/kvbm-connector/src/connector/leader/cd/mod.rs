@@ -177,8 +177,9 @@ pub(super) async fn wire_disagg(
             index,
             Arc::clone(&foundation.peer_resolver)
                 as Arc<dyn kvbm_engine::p2p::session::PeerResolver>,
-            remote_search_manifest
-                .ok_or_else(|| anyhow::anyhow!("remote search requires a registered cache manifest"))?,
+            remote_search_manifest.ok_or_else(|| {
+                anyhow::anyhow!("remote search requires a registered cache manifest")
+            })?,
         );
         remote = kvbm_engine::RemoteOps::with_search(discovery);
     }

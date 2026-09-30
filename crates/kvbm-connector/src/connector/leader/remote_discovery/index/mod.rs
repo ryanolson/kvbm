@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use futures::future::BoxFuture;
-use kvbm_protocols::cache_manifest::CacheManifestId;
 use kvbm_engine::remote::search::bundle::{
     BundleAdvertisement, BundleDiscoveryOutcome, BundleDiscoveryQuery, BundleInvalidation,
     BundleMissReason, RemoteBundleCandidate,
@@ -14,6 +13,7 @@ use kvbm_hub::{
     BundleQueryOutcome, BundleQueryRequest, FindBlocksHit, IndexerLookupClient,
 };
 use kvbm_logical::SequenceHash;
+use kvbm_protocols::cache_manifest::CacheManifestId;
 
 pub(super) trait BlockIndex: Send + Sync {
     fn find_blocks(

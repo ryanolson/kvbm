@@ -770,11 +770,7 @@ mod tests {
             indexes.query_holders(manifest_b.id(), &[hash]).unwrap().1,
             vec![20]
         );
-        assert!(
-            indexes
-                .query(manifest(3, false).id(), &[hash])
-                .is_none()
-        );
+        assert!(indexes.query(manifest(3, false).id(), &[hash]).is_none());
     }
 
     #[test]
@@ -794,7 +790,10 @@ mod tests {
             ApplyOutcome::KindMismatch
         );
         assert!(indexes.query(manifest.id(), &[hash]).is_none());
-        assert_eq!(indexes.apply(create(vec![hash], 30)), ApplyOutcome::KindMismatch);
+        assert_eq!(
+            indexes.apply(create(vec![hash], 30)),
+            ApplyOutcome::KindMismatch
+        );
 
         indexes
             .bind(30, &manifest, CreateKind::Block, None)
@@ -816,9 +815,7 @@ mod tests {
         );
 
         let capsule = manifest(6, true);
-        indexes
-            .bind(41, &capsule, CreateKind::Block, None)
-            .unwrap();
+        indexes.bind(41, &capsule, CreateKind::Block, None).unwrap();
         assert!(matches!(
             indexes.bind(42, &capsule, CreateKind::Carrier, None),
             Err(BindError::KindConflict {
@@ -854,11 +851,7 @@ mod tests {
             }),
             ApplyOutcome::KindMismatch
         );
-        assert!(
-            indexes
-                .query(carrier_manifest.id(), &[hash])
-                .is_none()
-        );
+        assert!(indexes.query(carrier_manifest.id(), &[hash]).is_none());
         assert_eq!(
             indexes.apply(KvbmCacheEvents {
                 events: KvCacheEvents::CarrierCreate(vec![hash]),
@@ -901,12 +894,18 @@ mod tests {
         );
         assert!(indexes.query(manifest.id(), &[deep]).is_none());
         assert_eq!(
-            indexes.query(manifest.id(), &[deep, shallow]).unwrap().hash_u128,
+            indexes
+                .query(manifest.id(), &[deep, shallow])
+                .unwrap()
+                .hash_u128,
             shallow.as_u128().to_string()
         );
 
         let new_hash = plhs(4, 1, 45)[0];
-        assert_eq!(indexes.apply(create(vec![new_hash], 50)), ApplyOutcome::Applied);
+        assert_eq!(
+            indexes.apply(create(vec![new_hash], 50)),
+            ApplyOutcome::Applied
+        );
         assert_eq!(
             indexes.apply(create(vec![new_hash], 50)),
             ApplyOutcome::Applied
