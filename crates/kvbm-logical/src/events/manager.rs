@@ -17,9 +17,9 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
-use crate::SequenceHash;
 use super::policy::EventEmissionPolicy;
 use super::protocol::{EventReleaseHandle, KvCacheEvent};
+use crate::SequenceHash;
 use crate::registry::BlockRegistrationHandle;
 
 /// Settings for constructing an [`EventsManager`].
