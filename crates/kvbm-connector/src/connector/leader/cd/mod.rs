@@ -98,14 +98,14 @@ pub(super) async fn wire_disagg(
     };
     let registered_manifest = construction.cache_manifest.lock().clone();
     let manifest_id = registered_manifest.as_ref().map(|manifest| manifest.id());
-    let remote_search_manifest = if runtime.config().remote_search.is_some() {
-        Some(
-            manifest_id
-                .ok_or_else(|| anyhow::anyhow!("remote search requires a registered cache manifest"))?,
-        )
-    } else {
-        None
-    };
+    let remote_search_manifest =
+        if runtime.config().remote_search.is_some() {
+            Some(manifest_id.ok_or_else(|| {
+                anyhow::anyhow!("remote search requires a registered cache manifest")
+            })?)
+        } else {
+            None
+        };
     let indexer = if handshake.has(kvbm_hub::FeatureKey::Indexer) {
         registered_manifest.map(|manifest| kvbm_hub::IndexerFeatureConfig {
             max_seq_len: runtime.config().max_seq_len,
@@ -135,10 +135,12 @@ pub(super) async fn wire_disagg(
     // CD-case KV-index publisher: the registration above included
     // `Feature::Indexer` when effective, so the publisher-implies-registration
     // invariant now holds for this path too.
-    if indexer_registered && let (Some(endpoint), Some(em)) = (
-        handshake.indexer_zmq_endpoint.as_ref(),
-        stack.events_manager.as_ref(),
-    ) && let Some(publisher) = build_indexer_publisher(runtime, endpoint, em)
+    if indexer_registered
+        && let (Some(endpoint), Some(em)) = (
+            handshake.indexer_zmq_endpoint.as_ref(),
+            stack.events_manager.as_ref(),
+        )
+        && let Some(publisher) = build_indexer_publisher(runtime, endpoint, em)
     {
         let _ = leader.indexer_publisher.set(publisher);
     }
