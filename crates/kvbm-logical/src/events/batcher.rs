@@ -419,7 +419,9 @@ mod tests {
         ]);
         let mut output = Box::pin(batcher.batch(input));
         let batch = output.next().await.unwrap();
-        assert!(matches!(batch.events, KvCacheEvents::CarrierCreate(ref hashes) if hashes[0].position() == 1 && hashes[1].position() == 2));
+        assert!(
+            matches!(batch.events, KvCacheEvents::CarrierCreate(ref hashes) if hashes[0].position() == 1 && hashes[1].position() == 2)
+        );
     }
 
     #[tokio::test]

@@ -835,12 +835,8 @@ mod tests {
                 ModelIdentity::new("test-architecture", "test-revision", [3; 32]).unwrap(),
                 "test-cache-abi",
                 vec![
-                    ResourceRequirement::new(
-                        LogicalResourceId(1),
-                        ResourceRole::PrefixHistory,
-                        4,
-                    )
-                    .unwrap(),
+                    ResourceRequirement::new(LogicalResourceId(1), ResourceRole::PrefixHistory, 4)
+                        .unwrap(),
                 ],
                 std::collections::BTreeMap::new(),
             )

@@ -655,12 +655,7 @@ mod tests {
                 &Feature::Indexer(IndexerFeatureConfig {
                     max_seq_len: None,
                     manifest: CacheManifest::new(
-                        ModelIdentity::new(
-                            "test-architecture",
-                            "test-revision",
-                            [1; 32],
-                        )
-                        .unwrap(),
+                        ModelIdentity::new("test-architecture", "test-revision", [1; 32]).unwrap(),
                         "test-cache-abi",
                         vec![
                             ResourceRequirement::new(

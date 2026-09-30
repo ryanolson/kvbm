@@ -1213,12 +1213,8 @@ fn indexer_register_request(peer_info: PeerInfo, block_size: usize) -> RegisterR
                 ModelIdentity::new("test-architecture", "test-revision", [71; 32]).unwrap(),
                 "test-cache-abi",
                 vec![
-                    ResourceRequirement::new(
-                        LogicalResourceId(1),
-                        ResourceRole::PrefixHistory,
-                        4,
-                    )
-                    .unwrap(),
+                    ResourceRequirement::new(LogicalResourceId(1), ResourceRole::PrefixHistory, 4)
+                        .unwrap(),
                 ],
                 std::collections::BTreeMap::new(),
             )

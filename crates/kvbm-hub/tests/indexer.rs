@@ -12,8 +12,7 @@ use std::time::{Duration, Instant};
 use dynamo_tokens::TokenBlockSequence;
 use futures::SinkExt;
 use kvbm_hub::{
-    Feature, FeatureManager, HubServer, IndexerConfigResponse, IndexerFeatureConfig,
-    IndexerManager,
+    Feature, FeatureManager, HubServer, IndexerConfigResponse, IndexerFeatureConfig, IndexerManager,
 };
 use kvbm_logical::events::{KvCacheEvents, KvbmCacheEvents};
 use kvbm_logical::{KvbmSequenceHashProvider, SequenceHash};
@@ -45,13 +44,15 @@ fn test_manifest() -> CacheManifest {
 }
 
 async fn start_hub() -> (HubServer, Arc<IndexerManager>) {
-    let manager = Arc::new(kvbm_hub::IndexerManager::new(
-        MAX_SEQ_LEN,
-        BLOCK_SIZE as usize,
-        Some("tcp://127.0.0.1:0".to_string()),
-        Some("127.0.0.1".to_string()),
-    )
-    .expect("build indexer manager"));
+    let manager = Arc::new(
+        kvbm_hub::IndexerManager::new(
+            MAX_SEQ_LEN,
+            BLOCK_SIZE as usize,
+            Some("tcp://127.0.0.1:0".to_string()),
+            Some("127.0.0.1".to_string()),
+        )
+        .expect("build indexer manager"),
+    );
 
     let server = kvbm_hub::create_server_builder()
         .bind_addr("127.0.0.1".parse().unwrap())
@@ -160,7 +161,13 @@ async fn two_instances_publish_index_and_query() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|binding| binding["instance"].as_str().unwrap().parse::<u128>().unwrap())
+        .map(|binding| {
+            binding["instance"]
+                .as_str()
+                .unwrap()
+                .parse::<u128>()
+                .unwrap()
+        })
         .collect::<Vec<_>>();
     assert!(
         binding_instances.windows(2).all(|pair| pair[0] <= pair[1]),
