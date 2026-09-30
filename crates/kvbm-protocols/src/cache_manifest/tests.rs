@@ -71,6 +71,19 @@ fn manifest_digest_is_canonical_across_input_order() {
 }
 
 #[test]
+fn manifest_id_parses_displayed_hex() {
+    let id = CacheManifestId::from_bytes([0xAB; 32]);
+    assert_eq!(id.to_string().parse::<CacheManifestId>().unwrap(), id);
+    assert_eq!("AB".repeat(32).parse::<CacheManifestId>().unwrap(), id);
+    assert!("ab".parse::<CacheManifestId>().is_err());
+    assert!(
+        format!("{}g", "0".repeat(63))
+            .parse::<CacheManifestId>()
+            .is_err()
+    );
+}
+
+#[test]
 fn canonical_history_is_the_finest_resource_with_a_stable_tie_break() {
     let manifest = manifest(
         vec![

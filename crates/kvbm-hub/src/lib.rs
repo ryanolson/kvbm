@@ -71,10 +71,11 @@ pub use features::disagg::{
     ConditionalDisaggClient, ConditionalDisaggInstancesResponse, ConditionalDisaggManager,
 };
 pub use features::indexer::{
-    BundleAdvertisementRecord, BundleInvalidateRequest, BundleInvalidationRecord,
-    BundlePublishRequest, BundleQueryHit, BundleQueryMissReason, BundleQueryOutcome,
-    BundleQueryRequest, FindBlocksHit, IndexerConfigResponse, IndexerLookupClient, IndexerManager,
-    InstancesResponse, PositionalIndex, QueryRequest, QueryResponse,
+    ApplyOutcome, BindError, BundleAdvertisementRecord, BundleInvalidateRequest,
+    BundleInvalidationRecord, BundlePublishRequest, BundleQueryHit, BundleQueryMissReason,
+    BundleQueryOutcome, BundleQueryRequest, FindBlocksHit, IndexerConfigResponse,
+    IndexerLookupClient, IndexerManager, InstanceBinding, InstancesResponse, ManifestIndexes,
+    QueryRequest, QueryResponse,
 };
 #[cfg(feature = "kvbmctl")]
 pub use features::p2p::cli::{p2p_command, run_p2p};
@@ -94,6 +95,7 @@ pub use handlers::{
     TierSignalAck,
 };
 pub use kvbm_common::BlockLayoutMode;
+pub use kvbm_logical::events::CreateKind;
 pub use protocol::{
     CD_PREFILL_QUEUE, ConditionalDisaggConfig, ConditionalDisaggRole, DEFAULT_CONTROL_PORT,
     DEFAULT_DISCOVERY_PORT, Feature, FeatureDescriptor, FeatureKey, HubConfigResponse,

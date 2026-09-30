@@ -15,5 +15,5 @@ pub use batcher::{BatchingConfig, EventBatcher};
 pub use manager::{EventsManager, EventsManagerBuilder, EventsManagerSettings};
 pub use ordered_batcher::OrderedBatcher;
 pub use policy::{AllEventsPolicy, EventEmissionPolicy, PowerOfTwoPolicy};
-pub use protocol::{InstanceId, KvCacheEvent, KvCacheEvents, KvbmCacheEvents};
+pub use protocol::{CreateKind, InstanceId, KvCacheEvent, KvCacheEvents, KvbmCacheEvents};
 pub use publisher::{KvbmCacheEventsPublisher, KvbmCacheEventsPublisherBuilder};

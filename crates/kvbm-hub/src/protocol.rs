@@ -11,7 +11,8 @@
 //! All request/response bodies are JSON.
 
 use kvbm_common::BlockLayoutMode;
-use kvbm_protocols::cache_manifest::RegistrationEpoch;
+use kvbm_logical::events::CreateKind;
+use kvbm_protocols::cache_manifest::{CacheManifest, RegistrationEpoch};
 use kvbm_protocols::control::MetricsSnapshotResponse;
 pub use kvbm_protocols::control::layout_compat::LayoutCompatPayload;
 /// Remote-prefill request payload carried by the hub's CD queue.
@@ -485,17 +486,22 @@ impl Feature {
 ///
 /// The connector opts into hub-side indexing (the hub records the registration
 /// so it can reclaim the instance's index entries on unregister) and reports
-/// its `max_seq_len` so the hub can **grow** the index capacity to fit it.
+/// its manifest and create kind so the hub can isolate and validate the stream.
+/// `max_seq_len` lets the hub **grow** the index capacity to fit it.
 /// `max_seq_len` is advisory — it never shrinks the index and is not a
 /// must-match field; block-size consistency is enforced via
 /// [`RuntimeConfigSummary`].
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IndexerFeatureConfig {
     /// The connector's max sequence length (from vLLM `max_model_len`), if
     /// known. When larger than the hub's current index capacity, the hub grows
     /// the index to fit it. `None` leaves capacity unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_seq_len: Option<usize>,
+    /// Validated cache ABI used to scope this instance's block index.
+    pub manifest: CacheManifest,
+    /// The event kind this publisher emits.
+    pub create_kind: CreateKind,
 }
 
 /// Configuration payload for the P2P feature. Carries the
@@ -813,6 +819,33 @@ mod tests {
         let json = serde_json::to_string(&f).unwrap();
         let back: Feature = serde_json::from_str(&json).unwrap();
         assert_eq!(back, f);
+    }
+
+    #[test]
+    fn indexer_config_rejects_an_invalid_manifest() {
+        use kvbm_common::LogicalResourceId;
+        use kvbm_logical::events::CreateKind;
+        use kvbm_protocols::cache_manifest::{
+            CacheManifest, ModelIdentity, ResourceRequirement, ResourceRole,
+        };
+
+        let config = IndexerFeatureConfig {
+            max_seq_len: None,
+            manifest: CacheManifest::new(
+                ModelIdentity::new("test-architecture", "test-revision", [3; 32]).unwrap(),
+                "test-cache-abi",
+                vec![
+                    ResourceRequirement::new(LogicalResourceId(1), ResourceRole::PrefixHistory, 4)
+                        .unwrap(),
+                ],
+                std::collections::BTreeMap::new(),
+            )
+            .unwrap(),
+            create_kind: CreateKind::Block,
+        };
+        let mut wire = serde_json::to_value(config).unwrap();
+        wire["manifest"]["model"]["architecture"] = serde_json::json!("");
+        assert!(serde_json::from_value::<IndexerFeatureConfig>(wire).is_err());
     }
 
     #[test]

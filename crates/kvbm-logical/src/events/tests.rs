@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 
 use super::batcher::BatchingConfig;
 use super::manager::EventsManager;
-use super::protocol::{KvCacheEvent, KvCacheEvents, KvbmCacheEvents};
+use super::protocol::{CreateKind, KvCacheEvent, KvCacheEvents, KvbmCacheEvents};
 use super::publisher::KvbmCacheEventsPublisher;
 use crate::pubsub::Publisher;
 use crate::registry::BlockRegistry;
@@ -70,6 +70,7 @@ async fn test_full_event_pipeline() {
     // 3. Build pipeline
     let _publisher = KvbmCacheEventsPublisher::builder()
         .instance_id(12345)
+        .create_kind(CreateKind::Block)
         .event_stream(manager.subscribe())
         .publisher(mock_publisher)
         .batching_config(BatchingConfig::default().with_window(Duration::from_millis(50)))
@@ -146,6 +147,7 @@ async fn test_type_switch_flushes_batch() {
     // Use long window so we know flushes are due to type switch, not timeout
     let _publisher = KvbmCacheEventsPublisher::builder()
         .instance_id(12345)
+        .create_kind(CreateKind::Block)
         .event_stream(manager.subscribe())
         .publisher(mock_publisher)
         .batching_config(BatchingConfig::default().with_window(Duration::from_secs(60)))
@@ -202,6 +204,7 @@ async fn test_max_batch_size_flush() {
 
     let _publisher = KvbmCacheEventsPublisher::builder()
         .instance_id(12345)
+        .create_kind(CreateKind::Block)
         .event_stream(manager.subscribe())
         .publisher(mock_publisher)
         .batching_config(
@@ -414,4 +417,37 @@ fn legacy_frames_do_not_decode_as_tier_batches() {
         rmp_serde::from_slice::<TierPlacementBatchV1>(&legacy_bytes).is_err(),
         "legacy frame silently decoded as a tier-placement batch"
     );
+}
+
+#[test]
+fn carrier_and_snapshot_frames_round_trip_without_cross_decoding() {
+    use kvbm_protocols::tier_protocol::TierPlacementBatchV1;
+
+    let hashes = vec![
+        SequenceHash::new(0x0102_0304_0506_0708, None, 0),
+        SequenceHash::new(0x1112_1314_1516_1718, Some(0x0102_0304_0506_0708), 1),
+    ];
+    let batches = [
+        KvbmCacheEvents {
+            events: KvCacheEvents::CarrierCreate(hashes.clone()),
+            instance_id: 17,
+        },
+        KvbmCacheEvents {
+            events: KvCacheEvents::Snapshot {
+                kind: CreateKind::Carrier,
+                hashes,
+            },
+            instance_id: 17,
+        },
+    ];
+    let tier_bytes = tier_batch_msgpack();
+    for batch in batches {
+        let bytes = rmp_serde::to_vec(&batch).unwrap();
+        assert_eq!(
+            rmp_serde::from_slice::<KvbmCacheEvents>(&bytes).unwrap(),
+            batch
+        );
+        assert!(rmp_serde::from_slice::<TierPlacementBatchV1>(&bytes).is_err());
+        assert!(rmp_serde::from_slice::<KvbmCacheEvents>(&tier_bytes).is_err());
+    }
 }

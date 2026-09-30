@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! ZMQ ingest loop: dispatch published frames by topic, decode them, and apply
-//! them to the [`PositionalIndex`] or the [`TierPlacementProjection`].
+//! them to the [`ManifestIndexes`] or the [`TierPlacementProjection`].
 //!
 //! # Why this dispatches on the topic frame
 //!
@@ -26,7 +26,7 @@ use kvbm_protocols::tier_protocol::{
 use tmq::subscribe::Subscribe;
 use tokio_util::sync::CancellationToken;
 
-use super::index::PositionalIndex;
+use super::index::{ApplyOutcome, ManifestIndexes};
 use super::tier_placement::TierPlacementProjection;
 
 /// ZMQ topic frame the legacy KV index stream publishes under. Matches
@@ -44,6 +44,10 @@ pub const LEGACY_INDEX_SUBJECT: &str = "kvbm.kv_index";
 pub struct IngestCounters {
     /// Legacy batches applied to the positional index.
     pub legacy_applied: AtomicU64,
+    /// Legacy batches from instances without an active index registration.
+    pub unbound_instance: AtomicU64,
+    /// Legacy batches rejected after a create-kind mismatch.
+    pub create_kind_mismatch: AtomicU64,
     /// Legacy frames that did not deserialize.
     pub legacy_undecodable: AtomicU64,
     /// Frames with no topic frame, routed to the legacy decoder for
@@ -76,8 +80,8 @@ impl IngestCounters {
 
 /// Everything the ingest loop writes into.
 pub struct IngestSinks {
-    /// Legacy positional block index.
-    pub index: Arc<PositionalIndex>,
+    /// Manifest-scoped positional indexes.
+    pub indexes: Arc<ManifestIndexes>,
     /// Advisory tier-placement projection.
     pub tier_placements: Arc<TierPlacementProjection>,
     /// Per-reason drop counters.
@@ -145,11 +149,13 @@ pub(super) fn dispatch(sinks: &IngestSinks, topic: &[u8], payload: &[u8]) {
     if topic == LEGACY_INDEX_SUBJECT.as_bytes() {
         match rmp_serde::from_slice::<KvbmCacheEvents>(payload) {
             Ok(batch) => {
-                sinks.index.apply(batch);
-                sinks
-                    .counters
-                    .legacy_applied
-                    .fetch_add(1, Ordering::Relaxed);
+                let outcome = sinks.indexes.apply(batch);
+                let counter = match outcome {
+                    ApplyOutcome::Applied => &sinks.counters.legacy_applied,
+                    ApplyOutcome::Unbound => &sinks.counters.unbound_instance,
+                    ApplyOutcome::KindMismatch => &sinks.counters.create_kind_mismatch,
+                };
+                counter.fetch_add(1, Ordering::Relaxed);
             }
             Err(error) => {
                 sinks
@@ -195,8 +201,11 @@ mod tests {
 
     use kvbm_common::LogicalResourceId;
     use kvbm_logical::SequenceHash;
-    use kvbm_logical::events::KvCacheEvents;
-    use kvbm_protocols::cache_manifest::{CacheManifestId, RegistrationEpoch};
+    use kvbm_logical::events::{CreateKind, KvCacheEvents};
+    use kvbm_protocols::cache_manifest::{
+        CacheManifest, CacheManifestId, ModelIdentity, RegistrationEpoch, ResourceRequirement,
+        ResourceRole,
+    };
     use kvbm_protocols::tier_protocol::{
         InstanceId, KeyRange, PhysicalPlacementMode, PlacementScope, TIER_PLACEMENT_SCHEMA_VERSION,
         TierDepth, TierPlacementBatchV1, TierPlacementOp,
@@ -205,17 +214,57 @@ mod tests {
     use super::*;
 
     fn sinks(instance: InstanceId) -> IngestSinks {
+        let manifest = test_manifest();
+        let indexes = Arc::new(ManifestIndexes::new(128, 4).unwrap());
+        indexes
+            .bind(instance.as_u128(), &manifest, CreateKind::Block, None)
+            .unwrap();
         let registered = Arc::new(RwLock::new(HashSet::from([instance])));
         IngestSinks {
-            index: Arc::new(PositionalIndex::new(128, 4).unwrap()),
+            indexes,
             tier_placements: Arc::new(TierPlacementProjection::new(registered)),
             counters: Arc::new(IngestCounters::default()),
         }
     }
 
+    fn unbound_sinks() -> IngestSinks {
+        IngestSinks {
+            indexes: Arc::new(ManifestIndexes::new(128, 4).unwrap()),
+            tier_placements: Arc::new(TierPlacementProjection::new(Arc::new(RwLock::new(
+                HashSet::new(),
+            )))),
+            counters: Arc::new(IngestCounters::default()),
+        }
+    }
+
+    fn test_manifest() -> CacheManifest {
+        CacheManifest::new(
+            ModelIdentity::new("test", "v1", [1; 32]).unwrap(),
+            "test",
+            vec![
+                ResourceRequirement::new(LogicalResourceId(0), ResourceRole::PrefixHistory, 4)
+                    .unwrap(),
+            ],
+            Default::default(),
+        )
+        .unwrap()
+    }
+
+    fn manifest_id() -> CacheManifestId {
+        test_manifest().id()
+    }
+
     fn legacy_payload(instance: InstanceId, hash: SequenceHash) -> Vec<u8> {
         rmp_serde::to_vec(&KvbmCacheEvents {
             events: KvCacheEvents::Create(vec![hash]),
+            instance_id: instance.as_u128(),
+        })
+        .unwrap()
+    }
+
+    fn carrier_payload(instance: InstanceId, hash: SequenceHash) -> Vec<u8> {
+        rmp_serde::to_vec(&KvbmCacheEvents {
+            events: KvCacheEvents::CarrierCreate(vec![hash]),
             instance_id: instance.as_u128(),
         })
         .unwrap()
@@ -252,7 +301,7 @@ mod tests {
             LEGACY_INDEX_SUBJECT.as_bytes(),
             &legacy_payload(instance, hash),
         );
-        assert!(sinks.index.query(&[hash]).is_some());
+        assert!(sinks.indexes.query(manifest_id(), &[hash]).is_some());
         assert_eq!(sinks.counters.legacy_applied.load(Ordering::Relaxed), 1);
         assert_eq!(sinks.counters.tier_accepted.load(Ordering::Relaxed), 0);
 
@@ -264,7 +313,45 @@ mod tests {
         assert_eq!(sinks.counters.legacy_undecodable.load(Ordering::Relaxed), 0);
         // ...and the block index still holds only what the legacy frame put
         // there.
-        assert!(sinks.index.query(&[hash]).is_some());
+        assert!(sinks.indexes.query(manifest_id(), &[hash]).is_some());
+    }
+
+    #[test]
+    fn legacy_batches_count_unbound_instances_and_kind_mismatches() {
+        let unbound_instance = InstanceId::new_v4();
+        let unbound = unbound_sinks();
+        dispatch(
+            &unbound,
+            LEGACY_INDEX_SUBJECT.as_bytes(),
+            &legacy_payload(unbound_instance, SequenceHash::root(3)),
+        );
+        assert_eq!(unbound.counters.unbound_instance.load(Ordering::Relaxed), 1);
+        assert_eq!(unbound.counters.legacy_applied.load(Ordering::Relaxed), 0);
+
+        let instance = InstanceId::new_v4();
+        let sinks = sinks(instance);
+        let hash = SequenceHash::root(4);
+        dispatch(
+            &sinks,
+            LEGACY_INDEX_SUBJECT.as_bytes(),
+            &carrier_payload(instance, hash),
+        );
+        assert_eq!(
+            sinks.counters.create_kind_mismatch.load(Ordering::Relaxed),
+            1
+        );
+        assert!(sinks.indexes.query(manifest_id(), &[hash]).is_none());
+
+        dispatch(
+            &sinks,
+            LEGACY_INDEX_SUBJECT.as_bytes(),
+            &legacy_payload(instance, hash),
+        );
+        assert_eq!(
+            sinks.counters.create_kind_mismatch.load(Ordering::Relaxed),
+            2
+        );
+        assert!(sinks.indexes.query(manifest_id(), &[hash]).is_none());
     }
 
     #[test]
@@ -281,7 +368,7 @@ mod tests {
         assert_eq!(sinks.counters.unknown_topic.load(Ordering::Relaxed), 1);
         assert_eq!(sinks.counters.legacy_applied.load(Ordering::Relaxed), 0);
         assert_eq!(sinks.counters.tier_accepted.load(Ordering::Relaxed), 0);
-        assert!(sinks.index.query(&[hash]).is_none());
+        assert!(sinks.indexes.query(manifest_id(), &[hash]).is_none());
     }
 
     /// A version rejection and a corrupt frame must never share a counter: one
@@ -338,7 +425,7 @@ mod tests {
         assert_eq!(topic, LEGACY_INDEX_SUBJECT.as_bytes());
         assert_eq!(sinks.counters.legacy_untopiced.load(Ordering::Relaxed), 1);
         dispatch(&sinks, topic, &payload);
-        assert!(sinks.index.query(&[hash]).is_some());
+        assert!(sinks.indexes.query(manifest_id(), &[hash]).is_some());
 
         // A two-frame message uses its topic, and does not count as untopiced.
         assert_eq!(

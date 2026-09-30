@@ -11,35 +11,61 @@ use std::time::{Duration, Instant};
 
 use dynamo_tokens::TokenBlockSequence;
 use futures::SinkExt;
-use kvbm_hub::{HubServer, IndexerConfigResponse};
+use kvbm_hub::{
+    Feature, FeatureManager, HubServer, IndexerConfigResponse, IndexerFeatureConfig, IndexerManager,
+};
 use kvbm_logical::events::{KvCacheEvents, KvbmCacheEvents};
 use kvbm_logical::{KvbmSequenceHashProvider, SequenceHash};
+use kvbm_protocols::cache_manifest::{
+    CacheManifest, ModelIdentity, ResourceRequirement, ResourceRole,
+};
 use serde_json::Value;
 use tmq::{Context, Multipart, publish::Publish, publish::publish};
+use velo_ext::InstanceId;
 
 const BLOCK_SIZE: u32 = 4;
 const MAX_SEQ_LEN: usize = 64;
 
-async fn start_hub() -> HubServer {
-    let manager = kvbm_hub::IndexerManager::new(
-        MAX_SEQ_LEN,
-        BLOCK_SIZE as usize,
-        Some("tcp://127.0.0.1:0".to_string()),
-        Some("127.0.0.1".to_string()),
+fn test_manifest() -> CacheManifest {
+    CacheManifest::new(
+        ModelIdentity::new("test-architecture", "test-revision", [7; 32]).unwrap(),
+        "test-cache-abi",
+        vec![
+            ResourceRequirement::new(
+                kvbm_common::LogicalResourceId(1),
+                ResourceRole::PrefixHistory,
+                BLOCK_SIZE,
+            )
+            .unwrap(),
+        ],
+        std::collections::BTreeMap::new(),
     )
-    .expect("build indexer manager");
+    .unwrap()
+}
 
-    kvbm_hub::create_server_builder()
+async fn start_hub() -> (HubServer, Arc<IndexerManager>) {
+    let manager = Arc::new(
+        kvbm_hub::IndexerManager::new(
+            MAX_SEQ_LEN,
+            BLOCK_SIZE as usize,
+            Some("tcp://127.0.0.1:0".to_string()),
+            Some("127.0.0.1".to_string()),
+        )
+        .expect("build indexer manager"),
+    );
+
+    let server = kvbm_hub::create_server_builder()
         .bind_addr("127.0.0.1".parse().unwrap())
         .discovery_port(0)
         .control_port(0)
         .heartbeat_interval(Duration::from_secs(3600))
         .heartbeat_max_failures(u32::MAX)
         .registration_ttl(Duration::from_secs(3600))
-        .add_feature_manager(Arc::new(manager) as Arc<dyn kvbm_hub::FeatureManager>)
+        .add_feature_manager(Arc::clone(&manager) as Arc<dyn FeatureManager>)
         .serve()
         .await
-        .expect("start hub")
+        .expect("start hub");
+    (server, manager)
 }
 
 /// Builds `n` PLHs at positions 0..n by laying down `n * BLOCK_SIZE` tokens.
@@ -93,9 +119,11 @@ fn instances(entry: &Value) -> Vec<String> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_instances_publish_index_and_query() {
-    let server = start_hub().await;
+    let (server, manager) = start_hub().await;
     let base = format!("http://{}", server.discovery_addr());
     let http = reqwest::Client::new();
+    let manifest = test_manifest();
+    let manifest_id = manifest.id();
 
     // GET /config: feature present, sizing reported, ZMQ endpoint advertised.
     let cfg: IndexerConfigResponse =
@@ -110,8 +138,56 @@ async fn two_instances_publish_index_and_query() {
     );
 
     // Two workers holding the same 3-block prefix.
-    let id_a: u128 = 0xA0;
-    let id_b: u128 = 0xB0;
+    let instance_a = InstanceId::new_v4();
+    let instance_b = InstanceId::new_v4();
+    let id_a = instance_a.as_u128();
+    let id_b = instance_b.as_u128();
+    let indexer = Feature::Indexer(IndexerFeatureConfig {
+        max_seq_len: Some(MAX_SEQ_LEN),
+        manifest,
+        create_kind: kvbm_logical::events::CreateKind::Block,
+    });
+    manager
+        .on_register(instance_a, &indexer)
+        .await
+        .expect("bind first indexer instance");
+    manager
+        .on_register(instance_b, &indexer)
+        .await
+        .expect("bind second indexer instance");
+    let registrations = get_json(&http, &base, "/instances").await;
+    assert_eq!(registrations["bindings"].as_array().unwrap().len(), 2);
+    let binding_instances = registrations["bindings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|binding| {
+            binding["instance"]
+                .as_str()
+                .unwrap()
+                .parse::<u128>()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        binding_instances.windows(2).all(|pair| pair[0] <= pair[1]),
+        "bindings are sorted by instance"
+    );
+    assert_eq!(
+        registrations["bindings"][0]["manifest"].as_str(),
+        Some(manifest_id.to_string().as_str())
+    );
+    let invalid_manifest_path = http
+        .get(format!(
+            "{base}/v1/features/indexer/manifests/not-hex/hashes/by_position/0"
+        ))
+        .send()
+        .await
+        .expect("bad manifest request");
+    assert_eq!(
+        invalid_manifest_path.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
     let hashes = plhs(3, 1337);
 
     let mut pub_a = connect_pub(&cfg.zmq_endpoint);
@@ -127,7 +203,12 @@ async fn two_instances_publish_index_and_query() {
         send_batch(&mut pub_a, KvCacheEvents::Create(hashes.clone()), id_a).await;
         send_batch(&mut pub_b, KvCacheEvents::Create(hashes.clone()), id_b).await;
         tokio::time::sleep(Duration::from_millis(150)).await;
-        let body = get_json(&http, &base, "/hashes/by_position/0").await;
+        let body = get_json(
+            &http,
+            &base,
+            &format!("/manifests/{manifest_id}/hashes/by_position/0"),
+        )
+        .await;
         let ready = body["entries"]
             .as_array()
             .map(|e| !e.is_empty() && instances(&e[0]).len() == 2)
@@ -148,7 +229,7 @@ async fn two_instances_publish_index_and_query() {
     // POST /query with the full sequence → deepest match (position 2).
     let resp: Value = http
         .post(format!("{base}/v1/features/indexer/query"))
-        .json(&serde_json::json!({ "hashes": hashes }))
+        .json(&serde_json::json!({ "manifest": manifest_id, "hashes": hashes }))
         .send()
         .await
         .expect("POST query")
@@ -164,7 +245,12 @@ async fn two_instances_publish_index_and_query() {
     let body = loop {
         send_batch(&mut pub_a, KvCacheEvents::Remove(hashes.clone()), id_a).await;
         tokio::time::sleep(Duration::from_millis(150)).await;
-        let body = get_json(&http, &base, "/hashes/by_position/0").await;
+        let body = get_json(
+            &http,
+            &base,
+            &format!("/manifests/{manifest_id}/hashes/by_position/0"),
+        )
+        .await;
         let ready = body["entries"]
             .as_array()
             .and_then(|e| e.first())

@@ -3,6 +3,7 @@
 
 use std::fmt;
 use std::num::NonZeroU64;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,25 @@ impl fmt::Display for CacheManifestId {
             write!(formatter, "{byte:02x}")?;
         }
         Ok(())
+    }
+}
+
+impl FromStr for CacheManifestId {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() != 64 {
+            return Err("cache manifest id must contain exactly 64 hexadecimal characters".into());
+        }
+        if !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("cache manifest id must contain only hexadecimal characters".into());
+        }
+        let mut bytes = [0; 32];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+                .map_err(|_| "cache manifest id must contain only hexadecimal characters")?;
+        }
+        Ok(Self(bytes))
     }
 }
 

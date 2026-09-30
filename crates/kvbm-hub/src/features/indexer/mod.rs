@@ -31,15 +31,15 @@ pub mod zmq;
 
 pub use client::IndexerLookupClient;
 pub use handlers::{create_bundle_handlers, create_query_handler};
-pub use index::PositionalIndex;
+pub use index::{ApplyOutcome, BindError, ManifestIndexes};
 pub use manager::IndexerManager;
 pub use protocol::{
     BUNDLE_INVALIDATE_HANDLER, BUNDLE_PUBLISH_HANDLER, BUNDLE_QUERY_HANDLER,
     BundleAdvertisementRecord, BundleInvalidateRequest, BundleInvalidationRecord,
     BundlePublishRequest, BundleQueryHit, BundleQueryMissReason, BundleQueryOutcome,
     BundleQueryRequest, ByPositionResponse, FindBlocksHit, IndexEntry, IndexerConfigResponse,
-    InstancesResponse, QUERY_HANDLER, QueryRequest, QueryResponse, ROUTE_PREFIX, ReadyPlacement,
-    TierPlacementSnapshotRequest, TierPlacementSnapshotResponse,
+    InstanceBinding, InstancesResponse, QUERY_HANDLER, QueryRequest, QueryResponse, ROUTE_PREFIX,
+    ReadyPlacement, TierPlacementSnapshotRequest, TierPlacementSnapshotResponse,
 };
 pub use tier_placement::{
     TIER_PLACEMENT_SNAPSHOT_REQUEST_HANDLER, TierPlacementHolder, TierPlacementProjection,

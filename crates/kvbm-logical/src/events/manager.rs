@@ -19,6 +19,7 @@ use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 use super::policy::EventEmissionPolicy;
 use super::protocol::{EventReleaseHandle, KvCacheEvent};
+use crate::SequenceHash;
 use crate::registry::BlockRegistrationHandle;
 
 /// Settings for constructing an [`EventsManager`].
@@ -211,6 +212,11 @@ impl EventsManager {
         let _ = self.event_tx.send(create_event);
 
         handle.attach_event_release(EventReleaseHandle::new(seq_hash, self.event_tx.clone()));
+    }
+
+    /// Replace the published indexed set with `hashes`.
+    pub fn snapshot(&self, hashes: Vec<SequenceHash>) {
+        let _ = self.event_tx.send(KvCacheEvent::Snapshot(hashes));
     }
 }
 

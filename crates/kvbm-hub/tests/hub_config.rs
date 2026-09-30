@@ -9,6 +9,7 @@
 //! - KV-index instances register and have their index entries swept on
 //!   unregister (closing the reclaim gap).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,12 +22,36 @@ use kvbm_hub::{
 };
 use kvbm_logical::events::{KvCacheEvents, KvbmCacheEvents};
 use kvbm_logical::{KvbmSequenceHashProvider, SequenceHash};
+use kvbm_protocols::cache_manifest::{
+    CacheManifest, ModelIdentity, ResourceRequirement, ResourceRole,
+};
 use serde_json::{Value, json};
 use tmq::{Context, Multipart, publish::Publish, publish::publish};
 use velo_ext::{InstanceId, PeerInfo, WorkerAddress};
 
 const BLOCK_SIZE: usize = 16;
 const MAX_SEQ_LEN: usize = 1024;
+
+fn indexer_config(max_seq_len: Option<usize>) -> IndexerFeatureConfig {
+    IndexerFeatureConfig {
+        max_seq_len,
+        manifest: CacheManifest::new(
+            ModelIdentity::new("test-architecture", "test-revision", [7; 32]).unwrap(),
+            "test-cache-abi",
+            vec![
+                ResourceRequirement::new(
+                    kvbm_common::LogicalResourceId(1),
+                    ResourceRole::PrefixHistory,
+                    BLOCK_SIZE as u32,
+                )
+                .unwrap(),
+            ],
+            BTreeMap::new(),
+        )
+        .unwrap(),
+        create_kind: kvbm_logical::events::CreateKind::Block,
+    }
+}
 
 /// Hub with the full feature stack and an authoritative `primary` config.
 async fn start_hub() -> HubServer {
@@ -186,7 +211,7 @@ async fn indexer_register_block_size_mismatch_rejected() {
         &http,
         &base,
         p,
-        vec![Feature::Indexer(IndexerFeatureConfig::default())],
+        vec![Feature::Indexer(indexer_config(None))],
         Some(RuntimeConfigSummary {
             block_size: Some(BLOCK_SIZE * 2), // wrong
             block_layout: None,
@@ -208,7 +233,7 @@ async fn indexer_register_block_size_mismatch_rejected() {
         &http,
         &base,
         p_empty,
-        vec![Feature::Indexer(IndexerFeatureConfig::default())],
+        vec![Feature::Indexer(indexer_config(None))],
         Some(RuntimeConfigSummary::default()),
     )
     .await;
@@ -224,7 +249,7 @@ async fn indexer_register_block_size_mismatch_rejected() {
         &http,
         &base,
         p_ok,
-        vec![Feature::Indexer(IndexerFeatureConfig::default())],
+        vec![Feature::Indexer(indexer_config(None))],
         Some(RuntimeConfigSummary {
             block_size: Some(BLOCK_SIZE),
             block_layout: None,
@@ -250,7 +275,7 @@ async fn indexer_register_without_runtime_summary_rejected() {
         &http,
         &base,
         p,
-        vec![Feature::Indexer(IndexerFeatureConfig::default())],
+        vec![Feature::Indexer(indexer_config(None))],
         None,
     )
     .await;
@@ -293,9 +318,7 @@ async fn indexer_register_grows_capacity() {
         &http,
         &ctrl,
         p,
-        vec![Feature::Indexer(IndexerFeatureConfig {
-            max_seq_len: Some(MAX_SEQ_LEN * 2),
-        })],
+        vec![Feature::Indexer(indexer_config(Some(MAX_SEQ_LEN * 2)))],
         Some(RuntimeConfigSummary {
             block_size: Some(BLOCK_SIZE),
             block_layout: None,
@@ -311,9 +334,7 @@ async fn indexer_register_grows_capacity() {
         &http,
         &ctrl,
         p2,
-        vec![Feature::Indexer(IndexerFeatureConfig {
-            max_seq_len: Some(BLOCK_SIZE),
-        })],
+        vec![Feature::Indexer(indexer_config(Some(BLOCK_SIZE)))],
         Some(RuntimeConfigSummary {
             block_size: Some(BLOCK_SIZE),
             block_layout: None,
@@ -351,12 +372,27 @@ async fn indexer_unregister_sweeps_index() {
         .unwrap()
         .to_string();
 
-    // A worker with a known InstanceId publishes a 3-block prefix, then
-    // registers under that same id (publisher stamps `instance_id.as_u128()`,
-    // which is what `on_unregister` sweeps).
+    // Register before publishing: the index drops events from unbound instances.
     let (id, p) = peer();
     let id_u128 = id.as_u128();
     let hashes = plhs(3, 1337);
+    let resp = register(
+        &http,
+        &ctrl,
+        p,
+        vec![Feature::Indexer(indexer_config(None))],
+        Some(RuntimeConfigSummary {
+            block_size: Some(BLOCK_SIZE),
+            block_layout: None,
+        }),
+    )
+    .await;
+    assert!(
+        resp.status().is_success(),
+        "register status {}",
+        resp.status()
+    );
+    let registration: kvbm_hub::protocol::RegisterResponse = resp.json().await.unwrap();
 
     let ctx = Context::new();
     let mut sock: Publish = publish(&ctx).set_linger(0).connect(&endpoint).unwrap();
@@ -372,27 +408,6 @@ async fn indexer_unregister_sweeps_index() {
         }
         assert!(Instant::now() < deadline, "timed out indexing creates");
     }
-
-    // Register the instance. KV-index mandates a runtime summary; supply a
-    // matching one (the point of this test is the registry↔index reclaim
-    // wiring, not the mismatch path).
-    let resp = register(
-        &http,
-        &ctrl,
-        p,
-        vec![Feature::Indexer(IndexerFeatureConfig::default())],
-        Some(RuntimeConfigSummary {
-            block_size: Some(BLOCK_SIZE),
-            block_layout: None,
-        }),
-    )
-    .await;
-    assert!(
-        resp.status().is_success(),
-        "register status {}",
-        resp.status()
-    );
-    let registration: kvbm_hub::protocol::RegisterResponse = resp.json().await.unwrap();
 
     // The instance now appears in the registered-instances set — this is
     // driven by registration (declaring `Feature::Indexer`), distinct from the
@@ -476,7 +491,8 @@ async fn send_create(sock: &mut Publish, hashes: Vec<SequenceHash>, instance_id:
 async fn index_has_instance(http: &reqwest::Client, disc_base: &str, id: &str) -> bool {
     let body: Value = http
         .get(format!(
-            "{disc_base}/v1/features/indexer/hashes/by_position/0"
+            "{disc_base}/v1/features/indexer/manifests/{}/hashes/by_position/0",
+            indexer_config(None).manifest.id()
         ))
         .send()
         .await

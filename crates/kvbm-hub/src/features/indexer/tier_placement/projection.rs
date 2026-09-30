@@ -643,9 +643,9 @@ impl TierPlacementProjection {
 
     /// Drop every projection for `instance`, across every cache.
     ///
-    /// Parity with `PositionalIndex::remove_instance` and
-    /// `BundleDirectory::remove_owner`: a deregistered publisher's advisory
-    /// state is not merely stale, it is about a process that no longer exists.
+    /// Parity with index and bundle-owner removal: a deregistered publisher's
+    /// advisory state is not merely stale, it is about a process that no longer
+    /// exists.
     pub fn remove_instance(&self, instance: InstanceId) {
         if let Ok(mut state) = self.state.write() {
             state.retain(|(_, entry_instance), _| *entry_instance != instance);

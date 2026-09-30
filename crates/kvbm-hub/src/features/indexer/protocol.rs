@@ -11,6 +11,7 @@
 
 use kvbm_common::LogicalResourceId;
 use kvbm_logical::SequenceHash;
+use kvbm_logical::events::CreateKind;
 use kvbm_protocols::cache_manifest::{
     BundleKey, BundleResourceLineage, CacheManifestId, RegistrationEpoch, ResourceRequirement,
 };
@@ -45,8 +46,8 @@ pub mod paths {
     /// events, so this is the *registered* (participating) set.
     pub const INSTANCES: &str = "/instances";
 
-    /// `GET /hashes/by_position/{pos}` — dump the index bucket at `pos`.
-    pub const BY_POSITION: &str = "/hashes/by_position/{pos}";
+    /// `GET /manifests/{manifest}/hashes/by_position/{pos}` — dump a scoped index bucket.
+    pub const BY_POSITION: &str = "/manifests/{manifest}/hashes/by_position/{pos}";
 
     /// `POST /query` — resolve a block-hash sequence to the holding instances.
     pub const QUERY: &str = "/query";
@@ -103,6 +104,19 @@ pub struct IndexerConfigResponse {
 pub struct InstancesResponse {
     /// Registered (participating) instance ids, decimal `u128`, sorted.
     pub instances: Vec<String>,
+    /// Manifest and event-kind binding for each registered index publisher.
+    pub bindings: Vec<InstanceBinding>,
+}
+
+/// One registered instance's cache-manifest index binding.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InstanceBinding {
+    /// Instance id as a decimal `u128`.
+    pub instance: String,
+    /// Cache manifest digest as 64 hexadecimal characters.
+    pub manifest: String,
+    /// The create-event kind accepted for this binding.
+    pub create_kind: CreateKind,
 }
 
 /// One indexed block: a positional-lineage hash and the instances holding it.
@@ -119,7 +133,7 @@ pub struct IndexEntry {
     pub instances: Vec<String>,
 }
 
-/// Response for `GET /hashes/by_position/{pos}`.
+/// Response for `GET /manifests/{manifest}/hashes/by_position/{pos}`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ByPositionResponse {
     /// The queried position.
@@ -134,6 +148,8 @@ pub struct ByPositionResponse {
 /// indexer walks them high → low and returns the deepest one present.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QueryRequest {
+    /// Cache ABI whose index should be queried.
+    pub manifest: CacheManifestId,
     /// Positional-lineage hashes of the candidate block sequence.
     pub hashes: Vec<SequenceHash>,
 }
@@ -160,6 +176,8 @@ pub struct FindBlocksHit {
     pub matched: SequenceHash,
     /// Instances currently holding `matched`. Always non-empty.
     pub candidates: Vec<InstanceId>,
+    /// Create kind accepted by the matched manifest index.
+    pub kind: CreateKind,
 }
 
 /// One complete-bundle owner record stored by the hub directory.

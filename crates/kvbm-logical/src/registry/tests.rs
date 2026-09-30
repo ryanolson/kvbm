@@ -731,6 +731,7 @@ fn concurrent_churn_never_publishes_a_remove_for_a_live_registration() {
                 );
                 held = false;
             }
+            KvCacheEvent::Snapshot(_) => panic!("unexpected snapshot event"),
         }
     }
     assert!(!held, "the churn ended with the hub still holding the hash");

@@ -19,6 +19,12 @@ pub(in crate::connector::leader) async fn wire_remote_search(
     handshake: &HubHandshake,
 ) -> Result<kvbm_engine::RemoteOps> {
     let runtime = &construction.runtime;
+    let manifest = construction
+        .cache_manifest
+        .lock()
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("remote search requires a registered cache manifest"))?;
+    let manifest_id = manifest.id();
     let velo = runtime
         .velo()
         .context("remote bundle search requires a Velo runtime")?
@@ -39,6 +45,8 @@ pub(in crate::connector::leader) async fn wire_remote_search(
         kvbm_hub::Feature::P2P(kvbm_hub::P2pConfig { layout_compat }),
         kvbm_hub::Feature::Indexer(kvbm_hub::IndexerFeatureConfig {
             max_seq_len: runtime.config().max_seq_len,
+            manifest,
+            create_kind: kvbm_logical::events::CreateKind::Block,
         }),
     ];
     let foundation = cd::wiring::wire_hub(runtime, &stack.instance_leader, handshake, features)
@@ -52,6 +60,7 @@ pub(in crate::connector::leader) async fn wire_remote_search(
     let discovery = HubRemoteDiscovery::new(
         index,
         Arc::clone(&foundation.peer_resolver) as Arc<dyn PeerResolver>,
+        manifest_id,
     );
 
     if let (Some(endpoint), Some(events)) = (

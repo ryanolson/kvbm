@@ -3,7 +3,7 @@
 
 //! Hub-side manager for the KV indexer feature.
 //!
-//! Owns a [`PositionalIndex`], binds the ZMQ ingest socket during
+//! Owns [`ManifestIndexes`], binds the ZMQ ingest socket during
 //! [`FeatureManager::attach`], and exports its own HTTP surface under
 //! `/v1/features/indexer` (the server nests it via
 //! [`FeatureManager::route_prefix`]).
@@ -23,7 +23,7 @@ use tokio::task::JoinHandle;
 use velo_ext::{InstanceId, PeerInfo};
 
 use super::bundle::{BundleDirectory, BundleDirectoryError};
-use super::index::PositionalIndex;
+use super::index::ManifestIndexes;
 use super::ingest::{IngestCounters, IngestSinks, run_ingest_loop};
 use super::protocol::{
     self, ByPositionResponse, IndexerConfigResponse, InstancesResponse, QueryRequest,
@@ -44,7 +44,7 @@ const DEFAULT_BUNDLE_LEASE_TTL_MS: u64 = 30_000;
 
 /// Hub-side KV block index feature manager.
 pub struct IndexerManager {
-    index: Arc<PositionalIndex>,
+    indexes: Arc<ManifestIndexes>,
     bundle_directory: Arc<BundleDirectory>,
     /// ZMQ bind spec (e.g. `tcp://0.0.0.0:0`).
     zmq_bind: String,
@@ -74,9 +74,8 @@ pub struct IndexerManager {
 impl std::fmt::Debug for IndexerManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IndexerManager")
-            .field("max_seq_len", &self.index.max_seq_len())
-            .field("block_size", &self.index.block_size())
-            .field("num_positions", &self.index.num_positions())
+            .field("max_seq_len", &self.indexes.max_seq_len())
+            .field("block_size", &self.indexes.block_size())
             .field("endpoint", &self.endpoint.get())
             .finish()
     }
@@ -92,10 +91,10 @@ impl IndexerManager {
         zmq_bind: Option<String>,
         advertise_host: Option<String>,
     ) -> anyhow::Result<Self> {
-        let index = Arc::new(PositionalIndex::new(max_seq_len, block_size)?);
+        let indexes = Arc::new(ManifestIndexes::new(max_seq_len, block_size)?);
         let instances = Arc::new(RwLock::new(HashSet::new()));
         Ok(Self {
-            index,
+            indexes,
             bundle_directory: Arc::new(BundleDirectory::new(DEFAULT_BUNDLE_LEASE_TTL_MS)),
             zmq_bind: zmq_bind.unwrap_or_else(|| "tcp://0.0.0.0:0".to_string()),
             advertise_host: advertise_host.unwrap_or_else(|| DEFAULT_ADVERTISE_HOST.to_string()),
@@ -191,12 +190,27 @@ impl IndexerManager {
             .map(|s| s.iter().map(|id| id.as_u128().to_string()).collect())
             .unwrap_or_default();
         instances.sort();
-        InstancesResponse { instances }
+        let bindings = self
+            .indexes
+            .bindings()
+            .into_iter()
+            .map(
+                |(instance, manifest, create_kind)| protocol::InstanceBinding {
+                    instance: instance.to_string(),
+                    manifest: manifest.to_string(),
+                    create_kind,
+                },
+            )
+            .collect();
+        InstancesResponse {
+            instances,
+            bindings,
+        }
     }
 
-    /// Shared index handle (for tests / introspection).
-    pub fn index(&self) -> &Arc<PositionalIndex> {
-        &self.index
+    /// Shared manifest-scoped indexes (for tests / introspection).
+    pub fn indexes(&self) -> &Arc<ManifestIndexes> {
+        &self.indexes
     }
 
     /// Resolved advertised ZMQ endpoint, once `attach` has bound it.
@@ -215,9 +229,9 @@ impl IndexerManager {
 
     fn config_response(&self) -> IndexerConfigResponse {
         IndexerConfigResponse {
-            max_seq_len: self.index.max_seq_len(),
-            block_size: self.index.block_size(),
-            num_positions: self.index.num_positions(),
+            max_seq_len: self.indexes.max_seq_len(),
+            block_size: self.indexes.block_size(),
+            num_positions: self.indexes.max_seq_len() / self.indexes.block_size(),
             zmq_endpoint: self.endpoint.get().cloned().unwrap_or_default(),
         }
     }
@@ -249,7 +263,7 @@ impl FeatureManager for IndexerManager {
         // The index block size is the source of truth publishers must match.
         // Reconciled into `primary` at startup so validation never depends on
         // the operator having also set `primary` explicitly.
-        Some(self.index.block_size())
+        Some(self.indexes.block_size())
     }
 
     fn descriptor(&self, _primary: &crate::protocol::PrimaryConfig) -> serde_json::Value {
@@ -274,14 +288,14 @@ impl FeatureManager for IndexerManager {
             tracing::info!(
                 bound = %bound,
                 advertised = %advertised,
-                max_seq_len = self.index.max_seq_len(),
-                block_size = self.index.block_size(),
+                max_seq_len = self.indexes.max_seq_len(),
+                block_size = self.indexes.block_size(),
                 "indexer ingest bound"
             );
             let _ = self.endpoint.set(advertised);
 
             let sinks = IngestSinks {
-                index: Arc::clone(&self.index),
+                indexes: Arc::clone(&self.indexes),
                 tier_placements: Arc::clone(&self.tier_placements),
                 counters: Arc::clone(&self.ingest_counters),
             };
@@ -295,7 +309,7 @@ impl FeatureManager for IndexerManager {
                 let messenger = velo.messenger();
                 messenger
                     .register_handler(super::handlers::create_query_handler(Arc::clone(
-                        &self.index,
+                        &self.indexes,
                     )))
                     .map_err(|e| {
                         FeatureError::Other(anyhow::anyhow!("indexer query handler: {e}"))
@@ -330,20 +344,20 @@ impl FeatureManager for IndexerManager {
         instance_id: InstanceId,
         feature: &'a Feature,
     ) -> BoxFuture<'a, Result<(), FeatureError>> {
-        // The client declares `Feature::Indexer` so the hub can reclaim its
-        // index entries on unregister (`on_unregister` → `remove_instance`).
-        // The index itself is populated out-of-band via the ZMQ ingest socket,
-        // so there is nothing to do here beyond accepting the (empty) payload
-        // and rejecting a misrouted key. Block-size / max-seq-len consistency
-        // is validated centrally via `RuntimeConfigSummary`.
+        // Bind the cache manifest and create kind before accepting publication.
         Box::pin(async move {
             match feature {
                 Feature::Indexer(cfg) => {
-                    // Grow the index to fit this registrant's max_seq_len (never
-                    // shrinks). Block-size consistency is validated centrally.
-                    if let Some(max_seq_len) = cfg.max_seq_len {
-                        self.index.grow_to_max_seq_len(max_seq_len);
-                    }
+                    self.indexes
+                        .bind(
+                            instance_id.as_u128(),
+                            &cfg.manifest,
+                            cfg.create_kind,
+                            cfg.max_seq_len,
+                        )
+                        .map_err(|error| {
+                            FeatureError::InvalidConfig(format!("indexer binding: {error}"))
+                        })?;
                     // Track the registered (participating) instance so
                     // `GET /instances` can report it even before it emits any
                     // KV events.
@@ -353,7 +367,7 @@ impl FeatureManager for IndexerManager {
                     tracing::debug!(
                         instance = %instance_id,
                         max_seq_len = ?cfg.max_seq_len,
-                        num_positions = self.index.num_positions(),
+                        num_positions = self.indexes.max_seq_len() / self.indexes.block_size(),
                         "indexer participation registered"
                     );
                     Ok(())
@@ -418,13 +432,14 @@ impl FeatureManager for IndexerManager {
         // or the publisher's periodic push. Dropping first would not fix it
         // either; it would only move the window.
         self.tier_placements.remove_instance(instance_id);
+        self.indexes.clear_instance(instance_id.as_u128());
         Ok(())
     }
 
     fn on_unregister(&self, instance_id: InstanceId) {
         // Bridge the registry's velo InstanceId to the u128 the events wire
         // format carries (publishers stamp `velo_id.as_u128()`).
-        self.index.remove_instance(instance_id.as_u128());
+        self.indexes.unbind(instance_id.as_u128());
         self.bundle_directory.remove_owner(instance_id);
         // Advisory placement state is about a process that no longer exists, so
         // it is dropped outright rather than aged out.
@@ -496,9 +511,12 @@ async fn get_instances(State(mgr): State<Arc<IndexerManager>>) -> Json<Instances
 
 async fn get_by_position(
     State(mgr): State<Arc<IndexerManager>>,
-    Path(pos): Path<usize>,
-) -> Json<ByPositionResponse> {
-    Json(mgr.index.by_position(pos))
+    Path((manifest, pos)): Path<(String, usize)>,
+) -> Result<Json<ByPositionResponse>, (StatusCode, String)> {
+    let manifest = manifest
+        .parse()
+        .map_err(|error: String| (StatusCode::BAD_REQUEST, error))?;
+    Ok(Json(mgr.indexes.by_position(manifest, pos)))
 }
 
 async fn post_query(
@@ -506,7 +524,7 @@ async fn post_query(
     Json(req): Json<QueryRequest>,
 ) -> Json<QueryResponse> {
     Json(QueryResponse {
-        hit: mgr.index.query(&req.hashes),
+        hit: mgr.indexes.query(req.manifest, &req.hashes),
     })
 }
 
@@ -520,8 +538,10 @@ async fn post_tier_placement_snapshot(
 #[cfg(test)]
 mod tests {
     use kvbm_common::{LogicalResourceId, SequenceHash};
+    use kvbm_logical::events::KvbmCacheEvents;
     use kvbm_protocols::cache_manifest::{
-        BundleKey, BundleResourceLineage, CacheManifestId, ResourceRequirement, ResourceRole,
+        BundleKey, BundleResourceLineage, CacheManifest, CacheManifestId, ModelIdentity,
+        ResourceRequirement, ResourceRole,
     };
 
     use super::*;
@@ -530,13 +550,48 @@ mod tests {
         BundleQueryRequest,
     };
 
+    fn test_indexer_feature() -> Feature {
+        Feature::Indexer(crate::protocol::IndexerFeatureConfig {
+            max_seq_len: None,
+            manifest: CacheManifest::new(
+                ModelIdentity::new("test-architecture", "test-revision", [41; 32]).unwrap(),
+                "test-cache-abi",
+                vec![
+                    ResourceRequirement::new(LogicalResourceId(1), ResourceRole::PrefixHistory, 4)
+                        .unwrap(),
+                ],
+                std::collections::BTreeMap::new(),
+            )
+            .unwrap(),
+            create_kind: kvbm_logical::events::CreateKind::Block,
+        })
+    }
+
+    #[tokio::test]
+    async fn rejected_carrier_binding_does_not_register_instance() {
+        let manager = IndexerManager::new(128, 4, None, None).unwrap();
+        let instance = InstanceId::new_v4();
+        let Feature::Indexer(mut config) = test_indexer_feature() else {
+            unreachable!()
+        };
+        config.create_kind = kvbm_logical::events::CreateKind::Carrier;
+
+        let error = manager
+            .on_register(instance, &Feature::Indexer(config))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, FeatureError::InvalidConfig(_)));
+        assert!(manager.instances_response().instances.is_empty());
+        assert!(manager.indexes.bindings().is_empty());
+    }
+
     #[tokio::test]
     async fn reregister_without_indexer_removes_owner_and_old_mutation_authority() {
         let manager = IndexerManager::new(128, 4, None, None).unwrap();
         #[cfg(feature = "test-support")]
         assert_eq!(manager.bundle_advertisement_count().unwrap(), 0);
         let owner = InstanceId::new_v4();
-        let feature = Feature::Indexer(Default::default());
+        let feature = test_indexer_feature();
         manager.on_register(owner, &feature).await.unwrap();
 
         let old_credential = MutationCredential::generate();
@@ -630,8 +685,22 @@ mod tests {
 
         let manager = IndexerManager::new(128, 4, None, None).unwrap();
         let owner = InstanceId::new_v4();
-        let feature = Feature::Indexer(Default::default());
+        let feature = test_indexer_feature();
         manager.on_register(owner, &feature).await.unwrap();
+        let Feature::Indexer(config) = &feature else {
+            unreachable!()
+        };
+        let hash = SequenceHash::root(1);
+        manager.indexes.apply(KvbmCacheEvents {
+            events: kvbm_logical::events::KvCacheEvents::Create(vec![hash]),
+            instance_id: owner.as_u128(),
+        });
+        assert!(
+            manager
+                .indexes
+                .query(config.manifest.id(), &[hash])
+                .is_some()
+        );
 
         let cache = CacheManifestId::from_bytes([7; 32]);
         let resource = LogicalResourceId(1);
@@ -693,6 +762,13 @@ mod tests {
                 true,
             )
             .unwrap();
+        assert!(
+            manager
+                .indexes
+                .query(config.manifest.id(), &[hash])
+                .is_none(),
+            "registration commit must clear the previous process lifetime's index entries"
+        );
         manager
             .bundle_directory
             .finalize_owner_registration(owner, incarnation)

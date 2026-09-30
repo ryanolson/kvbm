@@ -27,6 +27,7 @@ use dynamo_tokens::TokenBlockSequence;
 use kvbm_hub::IndexerManager;
 use kvbm_logical::events::{KvCacheEvents, KvbmCacheEvents};
 use kvbm_logical::{KvbmSequenceHashProvider, SequenceHash};
+use kvbm_protocols::cache_manifest::{CacheManifest, ModelIdentity};
 
 // ---- fixtures ---------------------------------------------------------------
 
@@ -1639,6 +1640,23 @@ fn idx_plhs(n: usize, salt: u64) -> Vec<SequenceHash> {
         .collect()
 }
 
+fn indexer_manifest() -> CacheManifest {
+    CacheManifest::new(
+        ModelIdentity::new("test-architecture", "test-revision", [42; 32]).unwrap(),
+        "test-cache-abi",
+        vec![
+            kvbm_protocols::cache_manifest::ResourceRequirement::new(
+                kvbm_common::LogicalResourceId(1),
+                kvbm_protocols::cache_manifest::ResourceRole::PrefixHistory,
+                IDX_BLOCK_SIZE as u32,
+            )
+            .unwrap(),
+        ],
+        std::collections::BTreeMap::new(),
+    )
+    .unwrap()
+}
+
 /// Hub with a TCP transport **and** an attached `IndexerManager`. Returns the
 /// manager handle so the test can seed the index directly.
 async fn start_server_with_indexer() -> (
@@ -1669,8 +1687,18 @@ async fn indexer_find_blocks_velo_lookup() {
     // Seed: this client's instance holds a 3-deep sequence. The index stores
     // holder ids as the velo id's u128 (publishers stamp `velo_id.as_u128()`).
     let holder = client_velo.instance_id();
+    let manifest = indexer_manifest();
+    let manifest_id = manifest.id();
+    mgr.indexes()
+        .bind(
+            holder.as_u128(),
+            &manifest,
+            kvbm_logical::events::CreateKind::Block,
+            None,
+        )
+        .unwrap();
     let hashes = idx_plhs(3, 4242);
-    mgr.index().apply(KvbmCacheEvents {
+    mgr.indexes().apply(KvbmCacheEvents {
         events: KvCacheEvents::Create(hashes.clone()),
         instance_id: holder.as_u128(),
     });
@@ -1684,11 +1712,12 @@ async fn indexer_find_blocks_velo_lookup() {
 
     // Full sequence → deepest hit (position 2), seeded holder present.
     let hit = lookup
-        .find_blocks(hashes.clone())
+        .find_blocks(manifest_id, hashes.clone())
         .await
         .unwrap()
         .expect("deepest hit");
     assert_eq!(hit.matched, hashes[2], "deepest candidate");
+    assert_eq!(hit.kind, kvbm_logical::events::CreateKind::Block);
     assert!(
         hit.candidates.contains(&holder),
         "candidates should reconstruct the seeded InstanceId"
@@ -1699,14 +1728,17 @@ async fn indexer_find_blocks_velo_lookup() {
     let mut mixed = vec![hashes[0], hashes[1]];
     mixed.extend_from_slice(&unknown[2..]); // positions 2..4 unknown
     let hit = lookup
-        .find_blocks(mixed)
+        .find_blocks(manifest_id, mixed)
         .await
         .unwrap()
         .expect("shallow hit");
     assert_eq!(hit.matched, hashes[1], "shallow fallback");
 
     // Full miss → None.
-    let miss = lookup.find_blocks(idx_plhs(2, 123_456)).await.unwrap();
+    let miss = lookup
+        .find_blocks(manifest_id, idx_plhs(2, 123_456))
+        .await
+        .unwrap();
     assert!(miss.is_none(), "no candidate indexed");
 }
 
@@ -1774,7 +1806,11 @@ async fn wire_indexer_participant(
     let hub_id = hub_client
         .register_instance_with_features_and_runtime(
             client_velo.peer_info(),
-            vec![Feature::Indexer(Default::default())],
+            vec![Feature::Indexer(kvbm_hub::IndexerFeatureConfig {
+                max_seq_len: None,
+                manifest: indexer_manifest(),
+                create_kind: kvbm_logical::events::CreateKind::Block,
+            })],
             kvbm_hub::protocol::RuntimeConfigSummary {
                 block_size: Some(IDX_BLOCK_SIZE),
                 block_layout: None,

@@ -644,10 +644,33 @@ mod tests {
     #[tokio::test]
     async fn on_register_rejects_wrong_feature() {
         use crate::protocol::IndexerFeatureConfig;
+        use kvbm_protocols::cache_manifest::{
+            CacheManifest, ModelIdentity, ResourceRequirement, ResourceRole,
+        };
         let mgr = PrefillRouterManager::new(cfg());
         let id = InstanceId::new_v4();
         let err = mgr
-            .on_register(id, &Feature::Indexer(IndexerFeatureConfig::default()))
+            .on_register(
+                id,
+                &Feature::Indexer(IndexerFeatureConfig {
+                    max_seq_len: None,
+                    manifest: CacheManifest::new(
+                        ModelIdentity::new("test-architecture", "test-revision", [1; 32]).unwrap(),
+                        "test-cache-abi",
+                        vec![
+                            ResourceRequirement::new(
+                                kvbm_common::LogicalResourceId(1),
+                                ResourceRole::PrefixHistory,
+                                4,
+                            )
+                            .unwrap(),
+                        ],
+                        std::collections::BTreeMap::new(),
+                    )
+                    .unwrap(),
+                    create_kind: kvbm_logical::events::CreateKind::Block,
+                }),
+            )
             .await
             .unwrap_err();
         match err {

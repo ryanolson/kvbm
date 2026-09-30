@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Position-bucketed block index.
+//! Manifest-scoped position-bucketed block index.
 //!
 //! Buckets are a sparse, **grow-only** `DashMap<position, …>`; the capacity
 //! (`max_positions = max_seq_len / block_size`) starts from the hub's optional
@@ -15,13 +15,15 @@
 //! holders of a deep block also hold its ancestors). A create whose position is
 //! `>= max_positions` is dropped (bounded against malformed input).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use dashmap::DashMap;
 use kvbm_logical::SequenceHash;
-use kvbm_logical::events::{KvCacheEvents, KvbmCacheEvents};
+use kvbm_logical::events::{CreateKind, KvCacheEvents, KvbmCacheEvents};
+use kvbm_protocols::cache_manifest::{CacheManifest, CacheManifestId, ResourceRole};
+use parking_lot::RwLock;
 
 use super::protocol::{ByPositionResponse, IndexEntry};
 
@@ -29,7 +31,7 @@ use super::protocol::{ByPositionResponse, IndexEntry};
 type Bucket = Arc<DashMap<SequenceHash, HashSet<u128>>>;
 
 /// Position-bucketed map of block hash → holding instances.
-pub struct PositionalIndex {
+pub(super) struct PositionalIndex {
     /// Sparse position → bucket map. Buckets are created on demand; missing
     /// positions are simply empty.
     buckets: DashMap<usize, Bucket>,
@@ -45,7 +47,7 @@ impl PositionalIndex {
     /// `block_size` tokens per block. Requires `block_size > 0` and
     /// `max_seq_len % block_size == 0` (`max_seq_len == 0` is allowed — the
     /// index starts empty and grows as registrants report their `max_seq_len`).
-    pub fn new(max_seq_len: usize, block_size: usize) -> anyhow::Result<Self> {
+    fn new(max_seq_len: usize, block_size: usize) -> anyhow::Result<Self> {
         anyhow::ensure!(block_size > 0, "block_size must be > 0");
         anyhow::ensure!(
             max_seq_len.is_multiple_of(block_size),
@@ -60,39 +62,36 @@ impl PositionalIndex {
     }
 
     /// Current number of position buckets (`max_seq_len / block_size`).
-    pub fn num_positions(&self) -> usize {
+    fn num_positions(&self) -> usize {
         self.max_positions.load(Ordering::Relaxed)
     }
 
-    /// Block size (tokens per block) the index was built for.
-    pub fn block_size(&self) -> usize {
-        self.block_size
-    }
-
     /// Current maximum sequence length (tokens) the index can hold.
-    pub fn max_seq_len(&self) -> usize {
+    fn max_seq_len(&self) -> usize {
         self.num_positions() * self.block_size
     }
 
     /// Raise capacity to fit `max_seq_len` tokens. Never lowers it. Called when
     /// a KV-index registrant reports its `max_seq_len` (floored to a whole
     /// number of blocks).
-    pub fn grow_to_max_seq_len(&self, max_seq_len: usize) {
+    fn grow_to_max_seq_len(&self, max_seq_len: usize) {
         self.max_positions
             .fetch_max(max_seq_len / self.block_size, Ordering::Relaxed);
     }
 
     /// Count of create events dropped because their position exceeded the
     /// current capacity.
-    pub fn dropped_out_of_range(&self) -> u64 {
+    #[cfg(test)]
+    fn dropped_out_of_range(&self) -> u64 {
         self.dropped_out_of_range.load(Ordering::Relaxed)
     }
 
     /// Applies one wire batch to the index.
-    pub fn apply(&self, batch: KvbmCacheEvents) {
+    #[cfg(test)]
+    fn apply(&self, batch: KvbmCacheEvents) {
         let instance = batch.instance_id;
         match batch.events {
-            KvCacheEvents::Create(hashes) => {
+            KvCacheEvents::Create(hashes) | KvCacheEvents::CarrierCreate(hashes) => {
                 for h in hashes {
                     self.insert(h, instance);
                 }
@@ -103,6 +102,12 @@ impl PositionalIndex {
                 }
             }
             KvCacheEvents::Shutdown => self.remove_instance(instance),
+            KvCacheEvents::Snapshot { hashes, .. } => {
+                self.remove_instance(instance);
+                for hash in hashes {
+                    self.insert(hash, instance);
+                }
+            }
         }
     }
 
@@ -140,7 +145,7 @@ impl PositionalIndex {
 
     /// Removes `instance` from every bucket (used for `Shutdown` and
     /// registry eviction). Empty entries are pruned.
-    pub fn remove_instance(&self, instance: u128) {
+    fn remove_instance(&self, instance: u128) {
         // Snapshot bucket Arcs so we don't hold the outer guard while mutating
         // inner maps.
         let buckets: Vec<Bucket> = self.buckets.iter().map(|b| Arc::clone(&b)).collect();
@@ -160,7 +165,7 @@ impl PositionalIndex {
     /// ids. Input order does not matter. This is the typed core shared by both
     /// the HTTP [`query`](Self::query) path (which stringifies into an
     /// [`IndexEntry`]) and the velo lookup handler (which keeps the types).
-    pub fn query_holders(&self, hashes: &[SequenceHash]) -> Option<(SequenceHash, Vec<u128>)> {
+    fn query_holders(&self, hashes: &[SequenceHash]) -> Option<(SequenceHash, Vec<u128>)> {
         let mut best: Option<(SequenceHash, Vec<u128>)> = None;
         for hash in hashes {
             let pos = hash.position();
@@ -187,14 +192,15 @@ impl PositionalIndex {
     /// Returns the entry with the greatest `position()` among supplied hashes
     /// that are currently held by at least one instance. Input order does not
     /// matter.
-    pub fn query(&self, hashes: &[SequenceHash]) -> Option<IndexEntry> {
+    #[cfg(test)]
+    fn query(&self, hashes: &[SequenceHash]) -> Option<IndexEntry> {
         self.query_holders(hashes)
             .map(|(hash, ids)| entry_of_ids(hash, ids))
     }
 
     /// Dumps the index bucket at `position`. Out-of-range positions yield an
     /// empty entry list.
-    pub fn by_position(&self, position: usize) -> ByPositionResponse {
+    fn by_position(&self, position: usize) -> ByPositionResponse {
         let entries = match self.bucket(position) {
             Some(bucket) => bucket
                 .iter()
@@ -203,6 +209,284 @@ impl PositionalIndex {
             None => Vec::new(),
         };
         ByPositionResponse { position, entries }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyOutcome {
+    Applied,
+    Unbound,
+    KindMismatch,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum BindError {
+    #[error("carrier registration requires a BoundaryCapsule resource")]
+    CarrierWithoutBoundaryCapsule,
+    #[error("manifest {manifest} is already indexed as {existing:?}, not {requested:?}")]
+    KindConflict {
+        manifest: CacheManifestId,
+        existing: CreateKind,
+        requested: CreateKind,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct IndexerBinding {
+    manifest: CacheManifestId,
+    kind: CreateKind,
+    poisoned: bool,
+}
+
+struct ManifestIndex {
+    kind: CreateKind,
+    index: Arc<PositionalIndex>,
+    swap: RwLock<()>,
+}
+
+/// Manifest-scoped positional indexes and the registered instance bindings.
+pub struct ManifestIndexes {
+    block_size: usize,
+    initial_max_seq_len: usize,
+    bindings: RwLock<HashMap<u128, IndexerBinding>>,
+    indexes: DashMap<CacheManifestId, Arc<ManifestIndex>>,
+}
+
+impl ManifestIndexes {
+    pub fn new(initial_max_seq_len: usize, block_size: usize) -> anyhow::Result<Self> {
+        PositionalIndex::new(initial_max_seq_len, block_size)?;
+        Ok(Self {
+            block_size,
+            initial_max_seq_len,
+            bindings: RwLock::new(HashMap::new()),
+            indexes: DashMap::new(),
+        })
+    }
+
+    pub fn bind(
+        &self,
+        instance: u128,
+        manifest: &CacheManifest,
+        kind: CreateKind,
+        max_seq_len: Option<usize>,
+    ) -> Result<(), BindError> {
+        if kind == CreateKind::Carrier
+            && !manifest
+                .resources()
+                .iter()
+                .any(|resource| resource.role() == ResourceRole::BoundaryCapsule)
+        {
+            return Err(BindError::CarrierWithoutBoundaryCapsule);
+        }
+
+        let manifest_id = manifest.id();
+        let mut bindings = self.bindings.write();
+        if let Some(index) = self.indexes.get(&manifest_id)
+            && index.kind != kind
+        {
+            return Err(BindError::KindConflict {
+                manifest: manifest_id,
+                existing: index.kind,
+                requested: kind,
+            });
+        }
+
+        let previous = bindings.get(&instance).copied();
+        if let Some(previous) = previous
+            && previous.manifest != manifest_id
+            && let Some(index) = self.indexes.get(&previous.manifest)
+        {
+            let _swap = index.swap.write();
+            index.index.remove_instance(instance);
+        }
+
+        if !self.indexes.contains_key(&manifest_id) {
+            let index = Arc::new(
+                PositionalIndex::new(self.initial_max_seq_len, self.block_size)
+                    .expect("manifest index configuration was validated at construction"),
+            );
+            self.indexes.insert(
+                manifest_id,
+                Arc::new(ManifestIndex {
+                    kind,
+                    index,
+                    swap: RwLock::new(()),
+                }),
+            );
+        }
+        if let Some(max_seq_len) = max_seq_len
+            && let Some(index) = self.indexes.get(&manifest_id)
+        {
+            index.index.grow_to_max_seq_len(max_seq_len);
+        }
+
+        bindings.insert(
+            instance,
+            IndexerBinding {
+                manifest: manifest_id,
+                kind,
+                poisoned: false,
+            },
+        );
+        if let Some(previous) = previous
+            && previous.manifest != manifest_id
+            && !bindings
+                .values()
+                .any(|binding| binding.manifest == previous.manifest)
+        {
+            self.indexes.remove(&previous.manifest);
+        }
+        Ok(())
+    }
+
+    pub fn unbind(&self, instance: u128) {
+        let mut bindings = self.bindings.write();
+        let Some(binding) = bindings.remove(&instance) else {
+            return;
+        };
+        if let Some(index) = self.indexes.get(&binding.manifest) {
+            let _swap = index.swap.write();
+            index.index.remove_instance(instance);
+        }
+        if !bindings
+            .values()
+            .any(|other| other.manifest == binding.manifest)
+        {
+            self.indexes.remove(&binding.manifest);
+        }
+    }
+
+    pub fn clear_instance(&self, instance: u128) {
+        let bindings = self.bindings.read();
+        let Some(binding) = bindings.get(&instance) else {
+            return;
+        };
+        if let Some(index) = self.indexes.get(&binding.manifest) {
+            let _swap = index.swap.write();
+            index.index.remove_instance(instance);
+        }
+    }
+
+    pub fn apply(&self, batch: KvbmCacheEvents) -> ApplyOutcome {
+        let instance = batch.instance_id;
+        let bindings = self.bindings.read();
+        let Some(binding) = bindings.get(&instance).copied() else {
+            return ApplyOutcome::Unbound;
+        };
+        if binding.poisoned {
+            return ApplyOutcome::KindMismatch;
+        }
+        let requested_kind = match &batch.events {
+            KvCacheEvents::Create(_) => Some(CreateKind::Block),
+            KvCacheEvents::CarrierCreate(_) => Some(CreateKind::Carrier),
+            KvCacheEvents::Snapshot { kind, .. } => Some(*kind),
+            KvCacheEvents::Remove(_) | KvCacheEvents::Shutdown => None,
+        };
+        if requested_kind.is_some_and(|kind| kind != binding.kind) {
+            drop(bindings);
+            let mut bindings = self.bindings.write();
+            let Some(current) = bindings.get_mut(&instance) else {
+                return ApplyOutcome::Unbound;
+            };
+            if current.manifest != binding.manifest || current.kind != binding.kind {
+                return ApplyOutcome::KindMismatch;
+            }
+            current.poisoned = true;
+            if let Some(index) = self.indexes.get(&binding.manifest) {
+                let _swap = index.swap.write();
+                index.index.remove_instance(instance);
+            }
+            tracing::error!(
+                instance,
+                manifest = %binding.manifest,
+                expected = ?binding.kind,
+                actual = ?requested_kind,
+                "indexer create kind mismatch; binding poisoned"
+            );
+            return ApplyOutcome::KindMismatch;
+        }
+
+        let Some(index) = self.indexes.get(&binding.manifest) else {
+            return ApplyOutcome::Unbound;
+        };
+        match batch.events {
+            KvCacheEvents::Create(hashes) | KvCacheEvents::CarrierCreate(hashes) => {
+                let _swap = index.swap.read();
+                for hash in hashes {
+                    index.index.insert(hash, instance);
+                }
+            }
+            KvCacheEvents::Remove(hashes) => {
+                let _swap = index.swap.read();
+                for hash in hashes {
+                    index.index.remove(hash, instance);
+                }
+            }
+            KvCacheEvents::Shutdown => {
+                let _swap = index.swap.read();
+                index.index.remove_instance(instance);
+            }
+            KvCacheEvents::Snapshot { hashes, .. } => {
+                let _swap = index.swap.write();
+                index.index.remove_instance(instance);
+                for hash in hashes {
+                    index.index.insert(hash, instance);
+                }
+            }
+        }
+        ApplyOutcome::Applied
+    }
+
+    pub fn query_holders(
+        &self,
+        manifest: CacheManifestId,
+        hashes: &[SequenceHash],
+    ) -> Option<(SequenceHash, Vec<u128>, CreateKind)> {
+        let index = self.indexes.get(&manifest)?;
+        let _swap = index.swap.read();
+        index
+            .index
+            .query_holders(hashes)
+            .map(|(hash, holders)| (hash, holders, index.kind))
+    }
+
+    pub fn query(&self, manifest: CacheManifestId, hashes: &[SequenceHash]) -> Option<IndexEntry> {
+        self.query_holders(manifest, hashes)
+            .map(|(hash, holders, _)| entry_of_ids(hash, holders))
+    }
+
+    pub fn by_position(&self, manifest: CacheManifestId, position: usize) -> ByPositionResponse {
+        let Some(index) = self.indexes.get(&manifest) else {
+            return ByPositionResponse {
+                position,
+                entries: Vec::new(),
+            };
+        };
+        let _swap = index.swap.read();
+        index.index.by_position(position)
+    }
+
+    pub fn block_size(&self) -> usize {
+        self.block_size
+    }
+
+    pub fn max_seq_len(&self) -> usize {
+        self.indexes
+            .iter()
+            .map(|index| index.index.max_seq_len())
+            .max()
+            .unwrap_or(self.initial_max_seq_len)
+    }
+
+    pub(super) fn bindings(&self) -> Vec<(u128, CacheManifestId, CreateKind)> {
+        let mut bindings = self
+            .bindings
+            .read()
+            .iter()
+            .map(|(&instance, binding)| (instance, binding.manifest, binding.kind))
+            .collect::<Vec<_>>();
+        bindings.sort_unstable_by_key(|(instance, _, _)| *instance);
+        bindings
     }
 }
 
@@ -229,6 +513,40 @@ mod tests {
     use super::*;
     use dynamo_tokens::TokenBlockSequence;
     use kvbm_logical::KvbmSequenceHashProvider;
+
+    fn manifest(seed: u8, boundary_capsule: bool) -> CacheManifest {
+        let resources = if boundary_capsule {
+            vec![
+                kvbm_protocols::cache_manifest::ResourceRequirement::new(
+                    kvbm_common::LogicalResourceId(1),
+                    ResourceRole::BoundaryCapsule,
+                    4,
+                )
+                .unwrap(),
+            ]
+        } else {
+            vec![
+                kvbm_protocols::cache_manifest::ResourceRequirement::new(
+                    kvbm_common::LogicalResourceId(1),
+                    ResourceRole::PrefixHistory,
+                    4,
+                )
+                .unwrap(),
+            ]
+        };
+        CacheManifest::new(
+            kvbm_protocols::cache_manifest::ModelIdentity::new(
+                "test-architecture",
+                "test-revision",
+                [seed; 32],
+            )
+            .unwrap(),
+            "test-cache-abi",
+            resources,
+            std::collections::BTreeMap::new(),
+        )
+        .unwrap()
+    }
 
     /// Builds `n` PLHs at positions 0..n for a given salt by laying down
     /// `n * block_size` tokens.
@@ -420,5 +738,201 @@ mod tests {
         assert_eq!(empty.dropped_out_of_range(), 4); // all dropped: capacity 0
         empty.grow_to_max_seq_len(16);
         assert_eq!(empty.num_positions(), 4);
+    }
+
+    #[test]
+    fn identical_hashes_are_isolated_by_manifest() {
+        let indexes = ManifestIndexes::new(32, 4).unwrap();
+        let manifest_a = manifest(1, false);
+        let manifest_b = manifest(2, false);
+        let hash = plhs(4, 1, 17)[0];
+        indexes
+            .bind(10, &manifest_a, CreateKind::Block, None)
+            .unwrap();
+        indexes
+            .bind(20, &manifest_b, CreateKind::Block, None)
+            .unwrap();
+        assert_eq!(indexes.apply(create(vec![hash], 10)), ApplyOutcome::Applied);
+        assert_eq!(indexes.apply(create(vec![hash], 20)), ApplyOutcome::Applied);
+
+        assert_eq!(
+            indexes.query_holders(manifest_a.id(), &[hash]).unwrap().1,
+            vec![10]
+        );
+        assert_eq!(
+            indexes.query_holders(manifest_b.id(), &[hash]).unwrap().1,
+            vec![20]
+        );
+        assert!(indexes.query(manifest(3, false).id(), &[hash]).is_none());
+    }
+
+    #[test]
+    fn kind_mismatch_clears_and_poisons_until_rebinding() {
+        let indexes = ManifestIndexes::new(32, 4).unwrap();
+        let manifest = manifest(4, false);
+        let hash = plhs(4, 1, 21)[0];
+        indexes
+            .bind(30, &manifest, CreateKind::Block, None)
+            .unwrap();
+        assert_eq!(indexes.apply(create(vec![hash], 30)), ApplyOutcome::Applied);
+        assert_eq!(
+            indexes.apply(KvbmCacheEvents {
+                events: KvCacheEvents::CarrierCreate(vec![hash]),
+                instance_id: 30,
+            }),
+            ApplyOutcome::KindMismatch
+        );
+        assert!(indexes.query(manifest.id(), &[hash]).is_none());
+        assert_eq!(
+            indexes.apply(create(vec![hash], 30)),
+            ApplyOutcome::KindMismatch
+        );
+
+        indexes
+            .bind(30, &manifest, CreateKind::Block, None)
+            .unwrap();
+        assert_eq!(indexes.apply(create(vec![hash], 30)), ApplyOutcome::Applied);
+        assert_eq!(
+            indexes.query_holders(manifest.id(), &[hash]).unwrap().1,
+            vec![30]
+        );
+    }
+
+    #[test]
+    fn carrier_requires_boundary_capsule_and_manifest_kind_is_fixed() {
+        let indexes = ManifestIndexes::new(32, 4).unwrap();
+        let no_capsule = manifest(5, false);
+        assert_eq!(
+            indexes.bind(40, &no_capsule, CreateKind::Carrier, None),
+            Err(BindError::CarrierWithoutBoundaryCapsule)
+        );
+
+        let capsule = manifest(6, true);
+        indexes.bind(41, &capsule, CreateKind::Block, None).unwrap();
+        assert!(matches!(
+            indexes.bind(42, &capsule, CreateKind::Carrier, None),
+            Err(BindError::KindConflict {
+                existing: CreateKind::Block,
+                requested: CreateKind::Carrier,
+                ..
+            })
+        ));
+
+        let carrier_manifest = manifest(10, true);
+        indexes
+            .bind(43, &carrier_manifest, CreateKind::Carrier, None)
+            .unwrap();
+        let hash = plhs(4, 1, 71)[0];
+        assert_eq!(
+            indexes.apply(KvbmCacheEvents {
+                events: KvCacheEvents::CarrierCreate(vec![hash]),
+                instance_id: 43,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            indexes
+                .query_holders(carrier_manifest.id(), &[hash])
+                .unwrap()
+                .2,
+            CreateKind::Carrier
+        );
+        assert_eq!(
+            indexes.apply(KvbmCacheEvents {
+                events: KvCacheEvents::Create(vec![hash]),
+                instance_id: 43,
+            }),
+            ApplyOutcome::KindMismatch
+        );
+        assert!(indexes.query(carrier_manifest.id(), &[hash]).is_none());
+        assert_eq!(
+            indexes.apply(KvbmCacheEvents {
+                events: KvCacheEvents::CarrierCreate(vec![hash]),
+                instance_id: 43,
+            }),
+            ApplyOutcome::KindMismatch
+        );
+        indexes
+            .bind(43, &carrier_manifest, CreateKind::Carrier, None)
+            .unwrap();
+        assert_eq!(
+            indexes.apply(KvbmCacheEvents {
+                events: KvCacheEvents::CarrierCreate(vec![hash]),
+                instance_id: 43,
+            }),
+            ApplyOutcome::Applied
+        );
+    }
+
+    #[test]
+    fn snapshot_replaces_instance_hashes_and_remove_keeps_event_order() {
+        let indexes = ManifestIndexes::new(32, 4).unwrap();
+        let manifest = manifest(7, false);
+        indexes
+            .bind(50, &manifest, CreateKind::Block, None)
+            .unwrap();
+        let hashes = plhs(4, 3, 44);
+        let shallow = hashes[0];
+        let deep = hashes[2];
+        assert_eq!(indexes.apply(create(vec![deep], 50)), ApplyOutcome::Applied);
+        assert_eq!(
+            indexes.apply(KvbmCacheEvents {
+                events: KvCacheEvents::Snapshot {
+                    kind: CreateKind::Block,
+                    hashes: vec![shallow],
+                },
+                instance_id: 50,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(indexes.query(manifest.id(), &[deep]).is_none());
+        assert_eq!(
+            indexes
+                .query(manifest.id(), &[deep, shallow])
+                .unwrap()
+                .hash_u128,
+            shallow.as_u128().to_string()
+        );
+
+        let new_hash = plhs(4, 1, 45)[0];
+        assert_eq!(
+            indexes.apply(create(vec![new_hash], 50)),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            indexes.apply(create(vec![new_hash], 50)),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            indexes.apply(KvbmCacheEvents {
+                events: KvCacheEvents::Remove(vec![new_hash]),
+                instance_id: 50,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(indexes.query(manifest.id(), &[new_hash]).is_none());
+    }
+
+    #[test]
+    fn rebinding_migrates_and_unbinding_drops_empty_indexes() {
+        let indexes = ManifestIndexes::new(32, 4).unwrap();
+        let manifest_a = manifest(8, false);
+        let manifest_b = manifest(9, false);
+        let hash = plhs(4, 1, 51)[0];
+        indexes
+            .bind(60, &manifest_a, CreateKind::Block, None)
+            .unwrap();
+        assert_eq!(indexes.apply(create(vec![hash], 60)), ApplyOutcome::Applied);
+
+        indexes
+            .bind(60, &manifest_b, CreateKind::Block, None)
+            .unwrap();
+        assert!(indexes.query(manifest_a.id(), &[hash]).is_none());
+        assert!(indexes.query(manifest_b.id(), &[hash]).is_none());
+        assert_eq!(indexes.apply(create(vec![hash], 60)), ApplyOutcome::Applied);
+        assert_eq!(indexes.bindings().len(), 1);
+        indexes.unbind(60);
+        assert!(indexes.query(manifest_b.id(), &[hash]).is_none());
+        assert!(indexes.bindings().is_empty());
     }
 }
