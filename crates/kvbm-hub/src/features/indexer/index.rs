@@ -66,12 +66,6 @@ impl PositionalIndex {
         self.max_positions.load(Ordering::Relaxed)
     }
 
-    /// Block size (tokens per block) the index was built for.
-    #[cfg(test)]
-    fn block_size(&self) -> usize {
-        self.block_size
-    }
-
     /// Current maximum sequence length (tokens) the index can hold.
     fn max_seq_len(&self) -> usize {
         self.num_positions() * self.block_size
@@ -300,11 +294,10 @@ impl ManifestIndexes {
         let previous = bindings.get(&instance).copied();
         if let Some(previous) = previous
             && previous.manifest != manifest_id
+            && let Some(index) = self.indexes.get(&previous.manifest)
         {
-            if let Some(index) = self.indexes.get(&previous.manifest) {
-                let _swap = index.swap.write();
-                index.index.remove_instance(instance);
-            }
+            let _swap = index.swap.write();
+            index.index.remove_instance(instance);
         }
 
         if !self.indexes.contains_key(&manifest_id) {
