@@ -372,31 +372,10 @@ async fn indexer_unregister_sweeps_index() {
         .unwrap()
         .to_string();
 
-    // A worker with a known InstanceId publishes a 3-block prefix, then
-    // registers under that same id (publisher stamps `instance_id.as_u128()`,
-    // which is what `on_unregister` sweeps).
+    // Register before publishing: the index drops events from unbound instances.
     let (id, p) = peer();
     let id_u128 = id.as_u128();
     let hashes = plhs(3, 1337);
-
-    let ctx = Context::new();
-    let mut sock: Publish = publish(&ctx).set_linger(0).connect(&endpoint).unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    // Resend to defeat ZMQ slow-joiner until the index shows our instance.
-    let deadline = Instant::now() + Duration::from_secs(8);
-    loop {
-        send_create(&mut sock, hashes.clone(), id_u128).await;
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        if index_has_instance(&http, &disc, &id_u128.to_string()).await {
-            break;
-        }
-        assert!(Instant::now() < deadline, "timed out indexing creates");
-    }
-
-    // Register the instance. KV-index mandates a runtime summary; supply a
-    // matching one (the point of this test is the registry↔index reclaim
-    // wiring, not the mismatch path).
     let resp = register(
         &http,
         &ctrl,
@@ -414,6 +393,21 @@ async fn indexer_unregister_sweeps_index() {
         resp.status()
     );
     let registration: kvbm_hub::protocol::RegisterResponse = resp.json().await.unwrap();
+
+    let ctx = Context::new();
+    let mut sock: Publish = publish(&ctx).set_linger(0).connect(&endpoint).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Resend to defeat ZMQ slow-joiner until the index shows our instance.
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        send_create(&mut sock, hashes.clone(), id_u128).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        if index_has_instance(&http, &disc, &id_u128.to_string()).await {
+            break;
+        }
+        assert!(Instant::now() < deadline, "timed out indexing creates");
+    }
 
     // The instance now appears in the registered-instances set — this is
     // driven by registration (declaring `Feature::Indexer`), distinct from the
