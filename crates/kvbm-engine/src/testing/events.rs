@@ -212,8 +212,8 @@ mod tests {
     use crate::G1;
     use crate::pubsub::{StubBus, Subscriber};
     use kvbm_logical::events::{
-        BatchingConfig, EventsManager, KvCacheEvents, KvbmCacheEvents, KvbmCacheEventsPublisher,
-        PowerOfTwoPolicy,
+        BatchingConfig, CreateKind, EventsManager, KvCacheEvents, KvbmCacheEvents,
+        KvbmCacheEventsPublisher, PowerOfTwoPolicy,
     };
 
     /// Full end-to-end test: G1 BlockManager -> EventsManager -> Batcher -> Publisher -> Subscriber

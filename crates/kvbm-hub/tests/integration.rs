@@ -1806,7 +1806,11 @@ async fn wire_indexer_participant(
     let hub_id = hub_client
         .register_instance_with_features_and_runtime(
             client_velo.peer_info(),
-            vec![Feature::Indexer(Default::default())],
+            vec![Feature::Indexer(kvbm_hub::IndexerFeatureConfig {
+                max_seq_len: None,
+                manifest: indexer_manifest(),
+                create_kind: kvbm_logical::events::CreateKind::Block,
+            })],
             kvbm_hub::protocol::RuntimeConfigSummary {
                 block_size: Some(IDX_BLOCK_SIZE),
                 block_layout: None,
