@@ -225,10 +225,12 @@ async fn indexer_cli_against_live_hub() {
         "expected empty registered set, got {v}"
     );
 
+    let manifest = "0000000000000000000000000000000000000000000000000000000000000000";
+
     // `by-pos 0` — fresh index, empty bucket.
     let m = cli
         .command()
-        .try_get_matches_from(["indexer", "by-pos", "0"])
+        .try_get_matches_from(["indexer", "by-pos", "--manifest", manifest, "0"])
         .expect("parse by-pos");
     let v = cli.run(&client, &m).await.expect("by-pos run");
     assert_eq!(v["position"], 0);
@@ -239,7 +241,13 @@ async fn indexer_cli_against_live_hub() {
     // on an empty index).
     let m = cli
         .command()
-        .try_get_matches_from(["indexer", "query", "166542759488764189892533901512933376"])
+        .try_get_matches_from([
+            "indexer",
+            "query",
+            "--manifest",
+            manifest,
+            "166542759488764189892533901512933376",
+        ])
         .expect("parse query");
     let v = cli.run(&client, &m).await.expect("query run");
     assert!(
