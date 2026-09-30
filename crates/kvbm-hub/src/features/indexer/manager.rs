@@ -194,11 +194,13 @@ impl IndexerManager {
             .indexes
             .bindings()
             .into_iter()
-            .map(|(instance, manifest, create_kind)| protocol::InstanceBinding {
-                instance: instance.to_string(),
-                manifest: manifest.to_string(),
-                create_kind,
-            })
+            .map(
+                |(instance, manifest, create_kind)| protocol::InstanceBinding {
+                    instance: instance.to_string(),
+                    manifest: manifest.to_string(),
+                    create_kind,
+                },
+            )
             .collect();
         InstancesResponse {
             instances,
@@ -554,12 +556,8 @@ mod tests {
                 ModelIdentity::new("test-architecture", "test-revision", [41; 32]).unwrap(),
                 "test-cache-abi",
                 vec![
-                    ResourceRequirement::new(
-                        LogicalResourceId(1),
-                        ResourceRole::PrefixHistory,
-                        4,
-                    )
-                    .unwrap(),
+                    ResourceRequirement::new(LogicalResourceId(1), ResourceRole::PrefixHistory, 4)
+                        .unwrap(),
                 ],
                 std::collections::BTreeMap::new(),
             )
@@ -696,7 +694,12 @@ mod tests {
             events: kvbm_logical::events::KvCacheEvents::Create(vec![hash]),
             instance_id: owner.as_u128(),
         });
-        assert!(manager.indexes.query(config.manifest.id(), &[hash]).is_some());
+        assert!(
+            manager
+                .indexes
+                .query(config.manifest.id(), &[hash])
+                .is_some()
+        );
 
         let cache = CacheManifestId::from_bytes([7; 32]);
         let resource = LogicalResourceId(1);
@@ -759,7 +762,10 @@ mod tests {
             )
             .unwrap();
         assert!(
-            manager.indexes.query(config.manifest.id(), &[hash]).is_none(),
+            manager
+                .indexes
+                .query(config.manifest.id(), &[hash])
+                .is_none(),
             "registration commit must clear the previous process lifetime's index entries"
         );
         manager

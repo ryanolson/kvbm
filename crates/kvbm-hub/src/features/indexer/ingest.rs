@@ -241,12 +241,10 @@ mod tests {
         CacheManifest::new(
             ModelIdentity::new("test", "v1", [1; 32]).unwrap(),
             "test",
-            vec![ResourceRequirement::new(
-                LogicalResourceId(0),
-                ResourceRole::PrefixHistory,
-                4,
-            )
-            .unwrap()],
+            vec![
+                ResourceRequirement::new(LogicalResourceId(0), ResourceRole::PrefixHistory, 4)
+                    .unwrap(),
+            ],
             Default::default(),
         )
         .unwrap()
@@ -327,13 +325,7 @@ mod tests {
             LEGACY_INDEX_SUBJECT.as_bytes(),
             &legacy_payload(unbound_instance, SequenceHash::root(3)),
         );
-        assert_eq!(
-            unbound
-                .counters
-                .unbound_instance
-                .load(Ordering::Relaxed),
-            1
-        );
+        assert_eq!(unbound.counters.unbound_instance.load(Ordering::Relaxed), 1);
         assert_eq!(unbound.counters.legacy_applied.load(Ordering::Relaxed), 0);
 
         let instance = InstanceId::new_v4();

@@ -39,8 +39,7 @@ pub use protocol::{
     BundlePublishRequest, BundleQueryHit, BundleQueryMissReason, BundleQueryOutcome,
     BundleQueryRequest, ByPositionResponse, FindBlocksHit, IndexEntry, IndexerConfigResponse,
     InstanceBinding, InstancesResponse, QUERY_HANDLER, QueryRequest, QueryResponse, ROUTE_PREFIX,
-    ReadyPlacement,
-    TierPlacementSnapshotRequest, TierPlacementSnapshotResponse,
+    ReadyPlacement, TierPlacementSnapshotRequest, TierPlacementSnapshotResponse,
 };
 pub use tier_placement::{
     TIER_PLACEMENT_SNAPSHOT_REQUEST_HANDLER, TierPlacementHolder, TierPlacementProjection,
