@@ -20,9 +20,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures::StreamExt;
 use kvbm_logical::events::KvbmCacheEvents;
-use kvbm_protocols::cache_manifest::{
-    CacheManifest, CacheManifestId, ModelIdentity, ResourceRequirement, ResourceRole,
-};
 use kvbm_protocols::tier_protocol::{
     TIER_PLACEMENT_SUBJECT, TierPlacementBatchV1, TierPlacementRejection,
 };
@@ -205,7 +202,10 @@ mod tests {
     use kvbm_common::LogicalResourceId;
     use kvbm_logical::SequenceHash;
     use kvbm_logical::events::{CreateKind, KvCacheEvents};
-    use kvbm_protocols::cache_manifest::{CacheManifestId, RegistrationEpoch};
+    use kvbm_protocols::cache_manifest::{
+        CacheManifest, CacheManifestId, ModelIdentity, RegistrationEpoch, ResourceRequirement,
+        ResourceRole,
+    };
     use kvbm_protocols::tier_protocol::{
         InstanceId, KeyRange, PhysicalPlacementMode, PlacementScope, TIER_PLACEMENT_SCHEMA_VERSION,
         TierDepth, TierPlacementBatchV1, TierPlacementOp,

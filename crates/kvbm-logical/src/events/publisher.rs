@@ -341,7 +341,10 @@ mod tests {
             .event_stream(event_stream)
             .publisher(mock_publisher)
             .build();
-        assert_eq!(result.unwrap_err().to_string(), "create_kind is required");
+        assert_eq!(
+            result.err().unwrap().to_string(),
+            "create_kind is required"
+        );
     }
 
     #[tokio::test]

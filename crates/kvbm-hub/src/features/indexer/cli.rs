@@ -99,6 +99,7 @@ impl FeatureCli for IndexerCli {
                         .get_one::<String>("manifest")
                         .expect("manifest is required")
                         .parse::<CacheManifestId>()
+                        .map_err(anyhow::Error::msg)
                         .context("--manifest must be 64 hexadecimal characters")?;
                     let r: ByPositionResponse = hub
                         .get_json(&format!(
@@ -112,6 +113,7 @@ impl FeatureCli for IndexerCli {
                         .get_one::<String>("manifest")
                         .expect("manifest is required")
                         .parse::<CacheManifestId>()
+                        .map_err(anyhow::Error::msg)
                         .context("--manifest must be 64 hexadecimal characters")?;
                     let hash_str = sm.get_one::<String>("hash").expect("hash is required");
                     let hash: u128 = hash_str.parse().with_context(|| {

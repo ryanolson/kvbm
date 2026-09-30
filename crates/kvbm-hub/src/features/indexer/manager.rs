@@ -538,6 +538,7 @@ async fn post_tier_placement_snapshot(
 #[cfg(test)]
 mod tests {
     use kvbm_common::{LogicalResourceId, SequenceHash};
+    use kvbm_logical::events::KvbmCacheEvents;
     use kvbm_protocols::cache_manifest::{
         BundleKey, BundleResourceLineage, CacheManifest, CacheManifestId, ModelIdentity,
         ResourceRequirement, ResourceRole,
