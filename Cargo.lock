@@ -1392,7 +1392,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 [[package]]
 name = "dynamo-kv-hashing"
 version = "1.6.0"
-source = "git+https://github.com/ai-dynamo/dynamo.git?rev=f1fa52254e2785f5072440e0b2077eb820cc548a#f1fa52254e2785f5072440e0b2077eb820cc548a"
+source = "git+https://github.com/ai-dynamo/dynamo.git?rev=574fb3ff9e8501743970160bd0cb6d80d33e71ed#574fb3ff9e8501743970160bd0cb6d80d33e71ed"
 dependencies = [
  "derive_builder",
  "dynamo-tokens",
@@ -1404,7 +1404,7 @@ dependencies = [
 [[package]]
 name = "dynamo-kv-router"
 version = "1.6.0"
-source = "git+https://github.com/ai-dynamo/dynamo.git?rev=f1fa52254e2785f5072440e0b2077eb820cc548a#f1fa52254e2785f5072440e0b2077eb820cc548a"
+source = "git+https://github.com/ai-dynamo/dynamo.git?rev=574fb3ff9e8501743970160bd0cb6d80d33e71ed#574fb3ff9e8501743970160bd0cb6d80d33e71ed"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1418,6 +1418,7 @@ dependencies = [
  "dynamo-truthy",
  "fastrand",
  "flume",
+ "futures-util",
  "indexmap",
  "ordered-float",
  "parking_lot",
@@ -1440,7 +1441,7 @@ dependencies = [
 [[package]]
 name = "dynamo-tokens"
 version = "1.6.0"
-source = "git+https://github.com/ai-dynamo/dynamo.git?rev=f1fa52254e2785f5072440e0b2077eb820cc548a#f1fa52254e2785f5072440e0b2077eb820cc548a"
+source = "git+https://github.com/ai-dynamo/dynamo.git?rev=574fb3ff9e8501743970160bd0cb6d80d33e71ed#574fb3ff9e8501743970160bd0cb6d80d33e71ed"
 dependencies = [
  "bs58",
  "bytemuck",
@@ -1456,7 +1457,7 @@ dependencies = [
 [[package]]
 name = "dynamo-truthy"
 version = "1.6.0"
-source = "git+https://github.com/ai-dynamo/dynamo.git?rev=f1fa52254e2785f5072440e0b2077eb820cc548a#f1fa52254e2785f5072440e0b2077eb820cc548a"
+source = "git+https://github.com/ai-dynamo/dynamo.git?rev=574fb3ff9e8501743970160bd0cb6d80d33e71ed#574fb3ff9e8501743970160bd0cb6d80d33e71ed"
 dependencies = [
  "anyhow",
 ]
@@ -2430,6 +2431,7 @@ dependencies = [
  "axum",
  "clap",
  "dashmap",
+ "dynamo-kv-router",
  "dynamo-tokens",
  "figment",
  "futures",
