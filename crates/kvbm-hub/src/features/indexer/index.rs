@@ -111,20 +111,13 @@ impl ManifestIndexes {
 
         if !self.indexes.contains_key(&manifest_id) {
             let index = LineageIndex::new((self.initial_max_seq_len / self.block_size) as u64);
-            self.indexes.insert(
-                manifest_id,
-                Arc::new(ManifestIndex {
-                    kind,
-                    index,
-                }),
-            );
+            self.indexes
+                .insert(manifest_id, Arc::new(ManifestIndex { kind, index }));
         }
         if let Some(max_seq_len) = max_seq_len
             && let Some(index) = self.indexes.get(&manifest_id)
         {
-            index
-                .index
-                .grow_to((max_seq_len / self.block_size) as u64);
+            index.index.grow_to((max_seq_len / self.block_size) as u64);
         }
 
         bindings.insert(
@@ -392,12 +385,8 @@ mod tests {
     fn shared_prefix_lists_both_instances() {
         let indexes = ManifestIndexes::new(16, 4).unwrap();
         let manifest = manifest(2, false);
-        indexes
-            .bind(1, &manifest, CreateKind::Block, None)
-            .unwrap();
-        indexes
-            .bind(2, &manifest, CreateKind::Block, None)
-            .unwrap();
+        indexes.bind(1, &manifest, CreateKind::Block, None).unwrap();
+        indexes.bind(2, &manifest, CreateKind::Block, None).unwrap();
         let hashes = plhs(4, 2, 1337);
         indexes.apply(create(hashes.clone(), 1));
         indexes.apply(create(hashes, 2));
@@ -414,9 +403,7 @@ mod tests {
     fn query_returns_deepest_match() {
         let indexes = ManifestIndexes::new(64, 4).unwrap();
         let manifest = manifest(3, false);
-        indexes
-            .bind(7, &manifest, CreateKind::Block, None)
-            .unwrap();
+        indexes.bind(7, &manifest, CreateKind::Block, None).unwrap();
         // instance 7 holds a 3-deep sequence.
         let hashes = plhs(4, 3, 42);
         indexes.apply(create(hashes.clone(), 7));
@@ -443,9 +430,7 @@ mod tests {
     fn query_miss_returns_none() {
         let indexes = ManifestIndexes::new(16, 4).unwrap();
         let manifest = manifest(4, false);
-        indexes
-            .bind(1, &manifest, CreateKind::Block, None)
-            .unwrap();
+        indexes.bind(1, &manifest, CreateKind::Block, None).unwrap();
         let hashes = plhs(4, 2, 1);
         assert!(indexes.query(manifest.id(), &hashes).is_none());
     }
@@ -454,20 +439,14 @@ mod tests {
     fn query_holders_returns_deepest_hash_and_sorted_ids() {
         let indexes = ManifestIndexes::new(64, 4).unwrap();
         let manifest = manifest(5, false);
-        indexes
-            .bind(9, &manifest, CreateKind::Block, None)
-            .unwrap();
-        indexes
-            .bind(2, &manifest, CreateKind::Block, None)
-            .unwrap();
+        indexes.bind(9, &manifest, CreateKind::Block, None).unwrap();
+        indexes.bind(2, &manifest, CreateKind::Block, None).unwrap();
         let hashes = plhs(4, 3, 42);
         // Two holders of the shared 3-deep sequence; insert ids out of order.
         indexes.apply(create(hashes.clone(), 9));
         indexes.apply(create(hashes.clone(), 2));
 
-        let (matched, ids, kind) = indexes
-            .query_holders(manifest.id(), &hashes)
-            .expect("hit");
+        let (matched, ids, kind) = indexes.query_holders(manifest.id(), &hashes).expect("hit");
         assert_eq!(matched, hashes[2], "deepest candidate hash");
         assert_eq!(ids, vec![2u128, 9u128], "holder ids, sorted");
         assert_eq!(kind, CreateKind::Block);
@@ -489,12 +468,8 @@ mod tests {
     fn remove_prunes_entry_when_last_holder_leaves() {
         let indexes = ManifestIndexes::new(16, 4).unwrap();
         let manifest = manifest(6, false);
-        indexes
-            .bind(1, &manifest, CreateKind::Block, None)
-            .unwrap();
-        indexes
-            .bind(2, &manifest, CreateKind::Block, None)
-            .unwrap();
+        indexes.bind(1, &manifest, CreateKind::Block, None).unwrap();
+        indexes.bind(2, &manifest, CreateKind::Block, None).unwrap();
         let hashes = plhs(4, 1, 5);
         indexes.apply(create(hashes.clone(), 1));
         indexes.apply(create(hashes.clone(), 2));
@@ -519,12 +494,8 @@ mod tests {
     fn remove_instance_sweeps_all_positions() {
         let indexes = ManifestIndexes::new(16, 4).unwrap();
         let manifest = manifest(7, false);
-        indexes
-            .bind(1, &manifest, CreateKind::Block, None)
-            .unwrap();
-        indexes
-            .bind(2, &manifest, CreateKind::Block, None)
-            .unwrap();
+        indexes.bind(1, &manifest, CreateKind::Block, None).unwrap();
+        indexes.bind(2, &manifest, CreateKind::Block, None).unwrap();
         let hashes = plhs(4, 3, 5);
         indexes.apply(create(hashes.clone(), 1));
         indexes.apply(create(hashes, 2));
@@ -551,9 +522,7 @@ mod tests {
     fn out_of_range_create_is_dropped() {
         let indexes = ManifestIndexes::new(8, 4).unwrap(); // 2 positions: 0,1
         let manifest = manifest(8, false);
-        indexes
-            .bind(1, &manifest, CreateKind::Block, None)
-            .unwrap();
+        indexes.bind(1, &manifest, CreateKind::Block, None).unwrap();
         let hashes = plhs(4, 4, 9); // positions 0..3
         indexes.apply(create(hashes, 1));
         assert_eq!(indexes.by_position(manifest.id(), 0).entries.len(), 1);
@@ -592,13 +561,7 @@ mod tests {
             .unwrap();
         assert_eq!(indexes.max_seq_len(), 16);
         indexes.apply(create(hashes.clone(), 1));
-        assert_eq!(
-            indexes
-                .by_position(index_manifest.id(), 3)
-                .entries
-                .len(),
-            1
-        );
+        assert_eq!(indexes.by_position(index_manifest.id(), 3).entries.len(), 1);
 
         // A smaller (or equal) max_seq_len never shrinks capacity.
         indexes
@@ -620,13 +583,7 @@ mod tests {
             .unwrap();
         assert_eq!(empty.max_seq_len(), 16);
         empty.apply(create(hashes, 2));
-        assert_eq!(
-            empty
-                .by_position(empty_manifest.id(), 3)
-                .entries
-                .len(),
-            1
-        );
+        assert_eq!(empty.by_position(empty_manifest.id(), 3).entries.len(), 1);
     }
 
     #[test]
