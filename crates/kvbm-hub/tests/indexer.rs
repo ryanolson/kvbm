@@ -226,10 +226,7 @@ async fn two_instances_publish_index_and_query() {
             "timed out indexing creates: {body}"
         );
     };
-    assert_eq!(
-        instances(&body["entries"][0]),
-        expected_holders
-    );
+    assert_eq!(instances(&body["entries"][0]), expected_holders);
 
     // POST /query with the full sequence → deepest match (position 2).
     let resp: Value = http
