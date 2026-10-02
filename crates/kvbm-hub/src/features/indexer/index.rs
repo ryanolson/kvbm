@@ -298,7 +298,7 @@ impl ManifestIndexes {
         let mut manifests = Vec::with_capacity(self.indexes.len());
 
         for entry in self.indexes.iter() {
-            let manifest = entry.key().clone();
+            let manifest_id = *entry.key();
             let index = entry.value();
             let mut hashes_by_holder = BTreeMap::<u128, Vec<SequenceHash>>::new();
             for position in 0..index.index.max_positions() {
@@ -313,7 +313,7 @@ impl ManifestIndexes {
                 .map(|(holder, hashes)| HolderSnapshot { holder, hashes })
                 .collect();
             manifests.push(ManifestSnapshot {
-                manifest: *manifest.as_bytes(),
+                manifest: *manifest_id.as_bytes(),
                 kind: feed_kind(index.kind),
                 max_positions: index.index.max_positions(),
                 holders,
@@ -497,9 +497,13 @@ mod tests {
     fn feed_frames_replay_into_a_router_replica() {
         let indexes = ManifestIndexes::new(16, 4).unwrap();
         let mut receiver = feed_receiver(&indexes);
-        let manifest = manifest(11, false);
-        indexes.bind(1, &manifest, CreateKind::Block, None).unwrap();
-        indexes.bind(2, &manifest, CreateKind::Block, None).unwrap();
+        let initial_manifest = manifest(11, false);
+        indexes
+            .bind(1, &initial_manifest, CreateKind::Block, None)
+            .unwrap();
+        indexes
+            .bind(2, &initial_manifest, CreateKind::Block, None)
+            .unwrap();
         let hashes = plhs(4, 3, 1337);
         assert_eq!(
             indexes.apply(create(hashes.clone(), 1)),
@@ -542,10 +546,10 @@ mod tests {
         }
 
         let expected = indexes
-            .query_holders(manifest.id(), &hashes)
+            .query_holders(initial_manifest.id(), &hashes)
             .map(|(hash, holders, _)| (hash, holders));
         let actual = replica
-            .deepest(&manifest.id().as_bytes().to_owned(), &hashes)
+            .deepest(&initial_manifest.id().as_bytes().to_owned(), &hashes)
             .map(|hit| (hit.hash, hit.holders));
         assert_eq!(actual, expected);
         let expected = indexes
