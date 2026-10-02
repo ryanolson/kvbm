@@ -3,8 +3,8 @@
 
 //! Hub-side manager for the KV indexer feature.
 //!
-//! Owns [`ManifestIndexes`], binds the ZMQ ingest socket during
-//! [`FeatureManager::attach`], and exports its own HTTP surface under
+//! Owns [`ManifestIndexes`], binds the ZMQ ingest and carrier-feed sockets
+//! during [`FeatureManager::attach`], and exports its own HTTP surface under
 //! `/v1/features/indexer` (the server nests it via
 //! [`FeatureManager::route_prefix`]).
 
@@ -13,16 +13,21 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use axum::{
     Json, Router,
+    body::Body,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderValue, StatusCode, header::CONTENT_TYPE},
+    response::Response,
     routing::{get, post},
 };
+use dynamo_kv_router::carrier_feed::encode_snapshot;
 use futures::future::BoxFuture;
 use kvbm_protocols::cache_manifest::RegistrationEpoch;
+use tokio::sync::mpsc::unbounded_channel;
 use tokio::task::JoinHandle;
 use velo_ext::{InstanceId, PeerInfo};
 
 use super::bundle::{BundleDirectory, BundleDirectoryError};
+use super::feed::{FeedCounters, bind_pub_socket, run_feed_publisher};
 use super::index::ManifestIndexes;
 use super::ingest::{IngestCounters, IngestSinks, run_ingest_loop};
 use super::protocol::{
@@ -36,9 +41,9 @@ use super::zmq::{bind_sub_socket, bound_endpoint, port_of};
 use crate::features::{FeatureError, FeatureManager, HubContext};
 use crate::protocol::{Feature, FeatureKey, MutationCredential};
 
-/// Default host advertised in `GET /config`'s `zmq_endpoint` when none is
-/// configured. Single-host / loopback deployments work out of the box;
-/// multi-host deployments must set an explicit advertise host.
+/// Default host advertised in `GET /config` endpoints when none is configured.
+/// Single-host / loopback deployments work out of the box; multi-host
+/// deployments must set an explicit advertise host.
 const DEFAULT_ADVERTISE_HOST: &str = "127.0.0.1";
 const DEFAULT_BUNDLE_LEASE_TTL_MS: u64 = 30_000;
 
@@ -48,12 +53,18 @@ pub struct IndexerManager {
     bundle_directory: Arc<BundleDirectory>,
     /// ZMQ bind spec (e.g. `tcp://0.0.0.0:0`).
     zmq_bind: String,
-    /// Host advertised to publishers in `GET /config`.
+    /// Carrier-feed PUB bind spec (e.g. `tcp://0.0.0.0:0`).
+    feed_bind: String,
+    /// Host advertised in `GET /config` for ingest and carrier-feed endpoints.
     advertise_host: String,
     /// Resolved advertised endpoint (`tcp://host:port`), set during `attach`.
     endpoint: OnceLock<String>,
+    /// Resolved advertised carrier-feed endpoint, set during `attach`.
+    feed_endpoint: OnceLock<String>,
     /// Ingest task handle (set once spawned during `attach`).
     ingest_task: OnceLock<JoinHandle<()>>,
+    /// Carrier-feed task handle (set once spawned during `attach`).
+    feed_task: OnceLock<JoinHandle<()>>,
     /// Instances that declared `Feature::Indexer` at registration. Tracked
     /// separately from the index contents: an instance can register
     /// (participate) before — or without ever — emitting KV events, so this is
@@ -69,6 +80,8 @@ pub struct IndexerManager {
     tier_placements: Arc<TierPlacementProjection>,
     /// Per-reason ZMQ ingest drop counters.
     ingest_counters: Arc<IngestCounters>,
+    /// Carrier-feed publisher counters.
+    feed_counters: Arc<FeedCounters>,
 }
 
 impl std::fmt::Debug for IndexerManager {
@@ -77,13 +90,14 @@ impl std::fmt::Debug for IndexerManager {
             .field("max_seq_len", &self.indexes.max_seq_len())
             .field("block_size", &self.indexes.block_size())
             .field("endpoint", &self.endpoint.get())
+            .field("feed_endpoint", &self.feed_endpoint.get())
             .finish()
     }
 }
 
 impl IndexerManager {
-    /// Builds a manager sized for `max_seq_len`/`block_size`, binding ingest to
-    /// `zmq_bind` (defaults to `tcp://0.0.0.0:0`) and advertising
+    /// Builds a manager sized for `max_seq_len`/`block_size`, binding ingest
+    /// and the carrier feed to OS-assigned ports by default, and advertising
     /// `advertise_host` (defaults to `127.0.0.1`).
     pub fn new(
         max_seq_len: usize,
@@ -97,13 +111,24 @@ impl IndexerManager {
             indexes,
             bundle_directory: Arc::new(BundleDirectory::new(DEFAULT_BUNDLE_LEASE_TTL_MS)),
             zmq_bind: zmq_bind.unwrap_or_else(|| "tcp://0.0.0.0:0".to_string()),
+            feed_bind: "tcp://0.0.0.0:0".to_string(),
             advertise_host: advertise_host.unwrap_or_else(|| DEFAULT_ADVERTISE_HOST.to_string()),
             endpoint: OnceLock::new(),
+            feed_endpoint: OnceLock::new(),
             ingest_task: OnceLock::new(),
+            feed_task: OnceLock::new(),
             tier_placements: Arc::new(TierPlacementProjection::new(Arc::clone(&instances))),
             ingest_counters: Arc::new(IngestCounters::default()),
+            feed_counters: Arc::new(FeedCounters::default()),
             instances,
         })
+    }
+
+    /// Sets the carrier-feed PUB bind spec.
+    #[must_use]
+    pub fn with_feed_bind(mut self, feed_bind: String) -> Self {
+        self.feed_bind = feed_bind;
+        self
     }
 
     /// Shared tier-placement projection handle (for tests / CT-2a consumers).
@@ -116,6 +141,12 @@ impl IndexerManager {
     #[must_use]
     pub fn ingest_counters(&self) -> &Arc<IngestCounters> {
         &self.ingest_counters
+    }
+
+    /// Carrier-feed publisher counters.
+    #[must_use]
+    pub fn feed_counters(&self) -> &Arc<FeedCounters> {
+        &self.feed_counters
     }
 
     /// Authorize and install a publisher's full tier-placement state.
@@ -218,6 +249,11 @@ impl IndexerManager {
         self.endpoint.get()
     }
 
+    /// Resolved advertised carrier-feed endpoint, once `attach` has bound it.
+    pub fn feed_endpoint(&self) -> Option<&String> {
+        self.feed_endpoint.get()
+    }
+
     /// Returns the current complete-bundle advertisement count for test gates.
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
@@ -233,6 +269,7 @@ impl IndexerManager {
             block_size: self.indexes.block_size(),
             num_positions: self.indexes.max_seq_len() / self.indexes.block_size(),
             zmq_endpoint: self.endpoint.get().cloned().unwrap_or_default(),
+            feed_endpoint: self.feed_endpoint.get().cloned().unwrap_or_default(),
         }
     }
 }
@@ -267,8 +304,8 @@ impl FeatureManager for IndexerManager {
     }
 
     fn descriptor(&self, _primary: &crate::protocol::PrimaryConfig) -> serde_json::Value {
-        // Advertise the ZMQ ingest endpoint + sizing so the connector can wire
-        // its publisher straight from the aggregate config (no separate probe).
+        // Advertise ingest and carrier-feed endpoints with sizing so clients
+        // can wire themselves from the aggregate config.
         serde_json::to_value(self.config_response()).unwrap_or(serde_json::Value::Null)
     }
 
@@ -285,14 +322,38 @@ impl FeatureManager for IndexerManager {
             let port = port_of(&bound)
                 .map_err(|e| FeatureError::Other(anyhow::anyhow!("indexer port: {e}")))?;
             let advertised = format!("tcp://{}:{}", self.advertise_host, port);
+            let pub_socket = bind_pub_socket(&self.feed_bind)
+                .map_err(|e| FeatureError::Other(anyhow::anyhow!("carrier feed bind: {e}")))?;
+            let feed_bound = bound_endpoint(&pub_socket).map_err(|e| {
+                FeatureError::Other(anyhow::anyhow!("carrier feed endpoint: {e}"))
+            })?;
+            let feed_port = port_of(&feed_bound)
+                .map_err(|e| FeatureError::Other(anyhow::anyhow!("carrier feed port: {e}")))?;
+            let feed_advertised = format!("tcp://{}:{}", self.advertise_host, feed_port);
             tracing::info!(
                 bound = %bound,
                 advertised = %advertised,
+                feed_bound = %feed_bound,
+                feed_advertised = %feed_advertised,
                 max_seq_len = self.indexes.max_seq_len(),
                 block_size = self.indexes.block_size(),
-                "indexer ingest bound"
+                "indexer ingest and carrier feed bound"
             );
             let _ = self.endpoint.set(advertised);
+            let _ = self.feed_endpoint.set(feed_advertised);
+
+            let (feed_tx, feed_rx) = unbounded_channel();
+            self.indexes.set_feed_sink(feed_tx).map_err(|_| {
+                FeatureError::Other(anyhow::anyhow!("carrier feed sink already installed"))
+            })?;
+            let feed_cancel = ctx.cancel.clone();
+            let feed_task = tokio::spawn(run_feed_publisher(
+                pub_socket,
+                feed_rx,
+                feed_cancel,
+                Arc::clone(&self.feed_counters),
+            ));
+            let _ = self.feed_task.set(feed_task);
 
             let sinks = IngestSinks {
                 indexes: Arc::clone(&self.indexes),
@@ -487,6 +548,7 @@ fn read_routes() -> Router<Arc<IndexerManager>> {
         .route(protocol::paths::INSTANCES, get(get_instances))
         .route(protocol::paths::BY_POSITION, get(get_by_position))
         .route(protocol::paths::QUERY, post(post_query))
+        .route(protocol::paths::FEED_SNAPSHOT, get(get_feed_snapshot))
 }
 
 /// Routes mounted on the control port only.
@@ -503,6 +565,22 @@ fn control_routes() -> Router<Arc<IndexerManager>> {
 
 async fn get_config(State(mgr): State<Arc<IndexerManager>>) -> Json<IndexerConfigResponse> {
     Json(mgr.config_response())
+}
+
+async fn get_feed_snapshot(
+    State(mgr): State<Arc<IndexerManager>>,
+) -> Result<Response, StatusCode> {
+    let snapshot = mgr.indexes.feed_snapshot();
+    let payload = encode_snapshot(&snapshot).map_err(|error| {
+        tracing::warn!(%error, "carrier feed snapshot encoding failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let mut response = Response::new(Body::from(payload));
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/msgpack"),
+    );
+    Ok(response)
 }
 
 async fn get_instances(State(mgr): State<Arc<IndexerManager>>) -> Json<InstancesResponse> {

@@ -149,7 +149,12 @@ struct Cli {
     #[arg(long)]
     kv_index_zmq_bind: Option<String>,
 
-    /// Host advertised to publishers in the KV indexer's `GET /config`
+    /// ZMQ bind spec for the KV indexer carrier-feed PUB socket
+    /// (default `tcp://0.0.0.0:0`, OS-assigned port).
+    #[arg(long)]
+    kv_index_feed_bind: Option<String>,
+
+    /// Host advertised for the KV indexer's ingest and carrier-feed endpoints
     /// (default `127.0.0.1`).
     #[arg(long)]
     kv_index_advertise_host: Option<String>,
@@ -406,7 +411,7 @@ fn build_config(cli: &Cli) -> anyhow::Result<ResolvedConfig> {
         }
     }
 
-    // KV indexer: resolve sizing from primary; carry ZMQ / advertise overrides.
+    // KV indexer: resolve sizing from primary; carry ZMQ / feed / advertise overrides.
     // Enabled iff selected in the feature set.
     if enabled.contains(&FeatureKey::Indexer) {
         let existing = config.indexer.take().unwrap_or_default();
@@ -414,6 +419,7 @@ fn build_config(cli: &Cli) -> anyhow::Result<ResolvedConfig> {
             max_seq_len: config.primary.max_seq_len,
             block_size: Some(block_size),
             zmq_bind: cli.kv_index_zmq_bind.clone().or(existing.zmq_bind),
+            feed_bind: cli.kv_index_feed_bind.clone().or(existing.feed_bind),
             advertise_host: cli
                 .kv_index_advertise_host
                 .clone()
@@ -576,7 +582,12 @@ async fn main() -> anyhow::Result<()> {
             block_size,
             kvi.zmq_bind.clone(),
             kvi.advertise_host.clone(),
-        )?;
+        )?
+        .with_feed_bind(
+            kvi.feed_bind
+                .clone()
+                .unwrap_or_else(|| "tcp://0.0.0.0:0".to_string()),
+        );
         tracing::info!(max_seq_len, block_size, "KV indexer feature enabled");
         builder =
             builder.add_feature_manager(Arc::new(manager) as Arc<dyn kvbm_hub::FeatureManager>);

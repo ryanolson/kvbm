@@ -37,7 +37,7 @@ pub const BUNDLE_QUERY_HANDLER: &str = "kvbm_hub_bundle_query";
 
 /// Relative route paths (mounted under `/v1/features/indexer`).
 pub mod paths {
-    /// `GET /config` — indexer configuration + ZMQ ingest endpoint. A `200`
+    /// `GET /config` — indexer configuration + ingest/feed endpoints. A `200`
     /// also serves as the capability probe used by connectors.
     pub const CONFIG: &str = "/config";
 
@@ -51,6 +51,9 @@ pub mod paths {
 
     /// `POST /query` — resolve a block-hash sequence to the holding instances.
     pub const QUERY: &str = "/query";
+
+    /// `GET /feed/snapshot` — full carrier-feed state for router resync.
+    pub const FEED_SNAPSHOT: &str = "/feed/snapshot";
 
     /// `POST /tier-placements/snapshot` — install a publisher's full
     /// tier-placement state (R7b §3).
@@ -94,6 +97,10 @@ pub struct IndexerConfigResponse {
     /// ZMQ endpoint a publisher connects its `PUB` socket to
     /// (e.g. `tcp://127.0.0.1:54231`). Empty when ingest is not yet bound.
     pub zmq_endpoint: String,
+    /// Carrier-feed PUB endpoint a router connects to
+    /// (e.g. `tcp://127.0.0.1:54232`). Empty when not yet bound.
+    #[serde(default)]
+    pub feed_endpoint: String,
 }
 
 /// Response for `GET /instances`. The set of instances that declared

@@ -53,9 +53,9 @@ pub struct HubConfig {
     /// here. See [`PrimaryConfig`].
     #[serde(default)]
     pub primary: PrimaryConfig,
-    /// Optional KV indexer feature. When set, the hub binds a ZMQ `SUB`
-    /// ingest socket and serves the index under `/v1/features/indexer`.
-    /// `None` (default) leaves the feature off.
+    /// Optional KV indexer feature. When set, the hub binds ZMQ `SUB` ingest
+    /// and `PUB` carrier-feed sockets and serves the index under
+    /// `/v1/features/indexer`. `None` (default) leaves the feature off.
     #[serde(default)]
     pub indexer: Option<IndexerConfig>,
 }
@@ -81,7 +81,11 @@ pub struct IndexerConfig {
     /// (OS-assigned port, reported via `GET /config`).
     #[serde(default)]
     pub zmq_bind: Option<String>,
-    /// Host advertised to publishers in `GET /config`'s `zmq_endpoint`.
+    /// ZMQ bind spec for the carrier-feed `PUB` socket. Default
+    /// `tcp://0.0.0.0:0` (OS-assigned port, reported via `GET /config`).
+    #[serde(default)]
+    pub feed_bind: Option<String>,
+    /// Host advertised in `GET /config`'s `zmq_endpoint` and `feed_endpoint`.
     /// Default `127.0.0.1`; multi-host deployments must set this to a
     /// routable address.
     #[serde(default)]

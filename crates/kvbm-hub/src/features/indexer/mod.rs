@@ -8,7 +8,8 @@
 //! ([`kvbm_logical::events::KvbmCacheEvents`]) to the ZMQ ingest endpoint
 //! advertised by `GET /v1/features/indexer/config`; the hub buckets them by
 //! block position and resolves "who holds this sequence?" queries to the
-//! deepest matching block's holders.
+//! deepest matching block's holders. Accepted mutations are also published as
+//! a sequenced carrier feed with a MessagePack snapshot for router resync.
 //!
 //! The feature owns its whole HTTP namespace via
 //! [`FeatureManager::route_prefix`](crate::features::FeatureManager::route_prefix)
@@ -19,6 +20,7 @@ pub mod bundle;
 #[cfg(feature = "kvbmctl")]
 pub mod cli;
 pub mod client;
+pub mod feed;
 pub mod handlers;
 pub mod index;
 pub mod ingest;

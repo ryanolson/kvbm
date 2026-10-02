@@ -7,15 +7,21 @@
 //! (`max_seq_len / block_size`). Block/carrier kind binding and poisoning live
 //! here; Dynamo's index owns PLH storage and holder operations.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
+use dynamo_kv_router::carrier_feed::{
+    CarrierFeedFrame, CarrierFeedOp, CarrierFeedSnapshot, FeedKind, HolderSnapshot,
+    ManifestSnapshot, CARRIER_FEED_VERSION,
+};
 use dynamo_kv_router::indexer::positional_carrier::PositionalCarrierIndex;
 use kvbm_logical::SequenceHash;
 use kvbm_logical::events::{CreateKind, KvCacheEvents, KvbmCacheEvents};
 use kvbm_protocols::cache_manifest::{CacheManifest, CacheManifestId, ResourceRole};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
+use tokio::sync::mpsc::UnboundedSender;
+use uuid::Uuid;
 
 use super::protocol::{ByPositionResponse, IndexEntry};
 
@@ -50,12 +56,54 @@ struct ManifestIndex {
     index: PositionalCarrierIndex<u128>,
 }
 
+struct CarrierFeedSequencer {
+    epoch: u64,
+    seq: u64,
+    sink: OnceLock<UnboundedSender<CarrierFeedFrame>>,
+}
+
+impl CarrierFeedSequencer {
+    fn new() -> Self {
+        Self {
+            epoch: Uuid::new_v4().as_u64_pair().0,
+            seq: 0,
+            sink: OnceLock::new(),
+        }
+    }
+
+    fn publish(
+        &mut self,
+        manifest: CacheManifestId,
+        index: &ManifestIndex,
+        holder: u128,
+        op: CarrierFeedOp,
+    ) {
+        self.seq = self.seq.checked_add(1).expect("carrier feed sequence overflow");
+        let frame = CarrierFeedFrame {
+            version: CARRIER_FEED_VERSION,
+            epoch: self.epoch,
+            seq: self.seq,
+            manifest: *manifest.as_bytes(),
+            kind: feed_kind(index.kind),
+            max_positions: index.index.max_positions(),
+            holder,
+            op,
+        };
+        if let Some(sink) = self.sink.get()
+            && let Err(error) = sink.send(frame)
+        {
+            tracing::warn!(%error, "carrier feed publisher is no longer connected");
+        }
+    }
+}
+
 /// Manifest-scoped carrier indexes and the registered instance bindings.
 pub struct ManifestIndexes {
     block_size: usize,
     initial_max_seq_len: usize,
     bindings: RwLock<HashMap<u128, IndexerBinding>>,
     indexes: DashMap<CacheManifestId, Arc<ManifestIndex>>,
+    feed: Mutex<CarrierFeedSequencer>,
 }
 
 impl ManifestIndexes {
@@ -70,7 +118,15 @@ impl ManifestIndexes {
             initial_max_seq_len,
             bindings: RwLock::new(HashMap::new()),
             indexes: DashMap::new(),
+            feed: Mutex::new(CarrierFeedSequencer::new()),
         })
+    }
+
+    pub(crate) fn set_feed_sink(
+        &self,
+        sink: UnboundedSender<CarrierFeedFrame>,
+    ) -> Result<(), UnboundedSender<CarrierFeedFrame>> {
+        self.feed.lock().sink.set(sink)
     }
 
     pub fn bind(
@@ -104,9 +160,8 @@ impl ManifestIndexes {
         let previous = bindings.get(&instance).copied();
         if let Some(previous) = previous
             && previous.manifest != manifest_id
-            && let Some(index) = self.indexes.get(&previous.manifest)
         {
-            index.index.remove_holder(instance);
+            self.mutate_index(previous.manifest, instance, CarrierFeedOp::RemoveHolder);
         }
 
         if !self.indexes.contains_key(&manifest_id) {
@@ -145,9 +200,7 @@ impl ManifestIndexes {
         let Some(binding) = bindings.remove(&instance) else {
             return;
         };
-        if let Some(index) = self.indexes.get(&binding.manifest) {
-            index.index.remove_holder(instance);
-        }
+        self.mutate_index(binding.manifest, instance, CarrierFeedOp::RemoveHolder);
         if !bindings
             .values()
             .any(|other| other.manifest == binding.manifest)
@@ -161,9 +214,7 @@ impl ManifestIndexes {
         let Some(binding) = bindings.get(&instance) else {
             return;
         };
-        if let Some(index) = self.indexes.get(&binding.manifest) {
-            index.index.remove_holder(instance);
-        }
+        self.mutate_index(binding.manifest, instance, CarrierFeedOp::RemoveHolder);
     }
 
     pub fn apply(&self, batch: KvbmCacheEvents) -> ApplyOutcome {
@@ -191,9 +242,7 @@ impl ManifestIndexes {
                 return ApplyOutcome::KindMismatch;
             }
             current.poisoned = true;
-            if let Some(index) = self.indexes.get(&binding.manifest) {
-                index.index.remove_holder(instance);
-            }
+            self.mutate_index(binding.manifest, instance, CarrierFeedOp::RemoveHolder);
             tracing::error!(
                 instance,
                 manifest = %binding.manifest,
@@ -204,22 +253,78 @@ impl ManifestIndexes {
             return ApplyOutcome::KindMismatch;
         }
 
-        let Some(index) = self.indexes.get(&binding.manifest) else {
+        if !self.indexes.contains_key(&binding.manifest) {
             return ApplyOutcome::Unbound;
-        };
+        }
         match batch.events {
-            KvCacheEvents::Create(hashes) | KvCacheEvents::CarrierCreate(hashes) => {
-                index.index.insert(instance, &hashes);
-            }
+            KvCacheEvents::Create(hashes) | KvCacheEvents::CarrierCreate(hashes) => self
+                .mutate_index(binding.manifest, instance, CarrierFeedOp::Insert(hashes)),
             KvCacheEvents::Remove(hashes) => {
-                index.index.remove(instance, &hashes);
+                self.mutate_index(binding.manifest, instance, CarrierFeedOp::Remove(hashes))
             }
-            KvCacheEvents::Shutdown => index.index.remove_holder(instance),
-            KvCacheEvents::Snapshot { hashes, .. } => {
-                index.index.replace_holder(instance, &hashes);
+            KvCacheEvents::Shutdown => {
+                self.mutate_index(binding.manifest, instance, CarrierFeedOp::RemoveHolder)
             }
+            KvCacheEvents::Snapshot { hashes, .. } => self.mutate_index(
+                binding.manifest,
+                instance,
+                CarrierFeedOp::ReplaceHolder(hashes),
+            ),
         }
         ApplyOutcome::Applied
+    }
+
+    fn mutate_index(&self, manifest: CacheManifestId, holder: u128, op: CarrierFeedOp) {
+        let Some(index) = self.indexes.get(&manifest) else {
+            return;
+        };
+        let mut feed = self.feed.lock();
+        match &op {
+            CarrierFeedOp::Insert(hashes) => index.index.insert(holder, hashes),
+            CarrierFeedOp::Remove(hashes) => index.index.remove(holder, hashes),
+            CarrierFeedOp::RemoveHolder => index.index.remove_holder(holder),
+            CarrierFeedOp::ReplaceHolder(hashes) => index.index.replace_holder(holder, hashes),
+        }
+        feed.publish(manifest, index.value().as_ref(), holder, op);
+    }
+
+    pub fn feed_snapshot(&self) -> CarrierFeedSnapshot {
+        let _bindings = self.bindings.read();
+        let feed = self.feed.lock();
+        let mut manifests = Vec::with_capacity(self.indexes.len());
+
+        for entry in self.indexes.iter() {
+            let manifest = entry.key().clone();
+            let index = entry.value();
+            let mut hashes_by_holder = BTreeMap::<u128, Vec<SequenceHash>>::new();
+            for position in 0..index.index.max_positions() {
+                for hit in index.index.entries_at(position) {
+                    for holder in hit.holders {
+                        hashes_by_holder
+                            .entry(holder)
+                            .or_default()
+                            .push(hit.hash);
+                    }
+                }
+            }
+            let holders = hashes_by_holder
+                .into_iter()
+                .map(|(holder, hashes)| HolderSnapshot { holder, hashes })
+                .collect();
+            manifests.push(ManifestSnapshot {
+                manifest: *manifest.as_bytes(),
+                kind: feed_kind(index.kind),
+                max_positions: index.index.max_positions(),
+                holders,
+            });
+        }
+        manifests.sort_unstable_by_key(|manifest| manifest.manifest);
+        CarrierFeedSnapshot {
+            version: CARRIER_FEED_VERSION,
+            epoch: feed.epoch,
+            seq: feed.seq,
+            manifests,
+        }
     }
 
     /// Returns the deepest held hash and holders for an ascending-position query.
@@ -287,6 +392,13 @@ impl ManifestIndexes {
     }
 }
 
+fn feed_kind(kind: CreateKind) -> FeedKind {
+    match kind {
+        CreateKind::Block => FeedKind::Block,
+        CreateKind::Carrier => FeedKind::Carrier,
+    }
+}
+
 /// Builds a serializable [`IndexEntry`] from an already-sorted id list.
 fn entry_of_ids(hash: SequenceHash, ids: Vec<u128>) -> IndexEntry {
     IndexEntry {
@@ -300,8 +412,10 @@ fn entry_of_ids(hash: SequenceHash, ids: Vec<u128>) -> IndexEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dynamo_kv_router::carrier_feed::{CarrierFeedFrame, CarrierFeedReplica, FeedApply};
     use dynamo_tokens::TokenBlockSequence;
     use kvbm_logical::KvbmSequenceHashProvider;
+    use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
     fn manifest(seed: u8, boundary_capsule: bool) -> CacheManifest {
         let resources = if boundary_capsule {
@@ -353,6 +467,120 @@ mod tests {
             events: KvCacheEvents::Create(hashes),
             instance_id: instance,
         }
+    }
+
+    fn feed_receiver(indexes: &ManifestIndexes) -> UnboundedReceiver<CarrierFeedFrame> {
+        let (sender, receiver) = unbounded_channel();
+        indexes.set_feed_sink(sender).unwrap();
+        receiver
+    }
+
+    fn drain_feed(receiver: &mut UnboundedReceiver<CarrierFeedFrame>) -> Vec<CarrierFeedFrame> {
+        let mut frames = Vec::new();
+        while let Ok(frame) = receiver.try_recv() {
+            frames.push(frame);
+        }
+        frames
+    }
+
+    #[test]
+    fn feed_sequence_advances_without_a_publisher() {
+        let indexes = ManifestIndexes::new(16, 4).unwrap();
+        let manifest = manifest(10, false);
+        indexes.bind(1, &manifest, CreateKind::Block, None).unwrap();
+        indexes.apply(create(plhs(4, 2, 1337), 1));
+        assert_eq!(indexes.feed_snapshot().seq, 1);
+    }
+
+    #[test]
+    fn feed_frames_replay_into_a_router_replica() {
+        let indexes = ManifestIndexes::new(16, 4).unwrap();
+        let mut receiver = feed_receiver(&indexes);
+        let manifest = manifest(11, false);
+        indexes.bind(1, &manifest, CreateKind::Block, None).unwrap();
+        indexes.bind(2, &manifest, CreateKind::Block, None).unwrap();
+        let hashes = plhs(4, 3, 1337);
+        assert_eq!(
+            indexes.apply(create(hashes.clone(), 1)),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            indexes.apply(create(hashes.clone(), 2)),
+            ApplyOutcome::Applied
+        );
+
+        let snapshot = indexes.feed_snapshot();
+        assert_eq!(drain_feed(&mut receiver).len(), 2);
+        let replica = CarrierFeedReplica::new(8);
+        assert_eq!(
+            replica.install_snapshot(snapshot).unwrap(),
+            FeedApply::Applied
+        );
+
+        indexes.apply(KvbmCacheEvents {
+            events: KvCacheEvents::Remove(hashes[..2].to_vec()),
+            instance_id: 1,
+        });
+        indexes.apply(KvbmCacheEvents {
+            events: KvCacheEvents::Shutdown,
+            instance_id: 2,
+        });
+        let migrated_manifest = manifest(13, false);
+        indexes
+            .bind(1, &migrated_manifest, CreateKind::Block, None)
+            .unwrap();
+        indexes.apply(create(hashes.clone(), 1));
+        indexes.unbind(2);
+        let tail = drain_feed(&mut receiver);
+        assert_eq!(
+            tail.iter().map(|frame| frame.seq).collect::<Vec<_>>(),
+            vec![3, 4, 5, 6, 7]
+        );
+        for frame in tail {
+            assert_eq!(replica.apply(frame), FeedApply::Applied);
+        }
+
+        let expected = indexes
+            .query_holders(manifest.id(), &hashes)
+            .map(|(hash, holders, _)| (hash, holders));
+        let actual = replica
+            .deepest(&manifest.id().as_bytes().to_owned(), &hashes)
+            .map(|hit| (hit.hash, hit.holders));
+        assert_eq!(actual, expected);
+        let expected = indexes
+            .query_holders(migrated_manifest.id(), &hashes)
+            .map(|(hash, holders, _)| (hash, holders));
+        let actual = replica
+            .deepest(&migrated_manifest.id().as_bytes().to_owned(), &hashes)
+            .map(|hit| (hit.hash, hit.holders));
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn feed_snapshot_replays_a_buffered_tail() {
+        let indexes = ManifestIndexes::new(16, 4).unwrap();
+        let mut receiver = feed_receiver(&indexes);
+        let manifest = manifest(12, false);
+        indexes.bind(1, &manifest, CreateKind::Block, None).unwrap();
+        let hashes = plhs(4, 2, 1337);
+        indexes.apply(create(hashes.clone(), 1));
+        let snapshot = indexes.feed_snapshot();
+        drain_feed(&mut receiver);
+
+        indexes.apply(KvbmCacheEvents {
+            events: KvCacheEvents::Remove(hashes.clone()),
+            instance_id: 1,
+        });
+        let tail = receiver.try_recv().unwrap();
+        let replica = CarrierFeedReplica::new(8);
+        assert_eq!(replica.apply(tail), FeedApply::NeedsSnapshot);
+        assert_eq!(
+            replica.install_snapshot(snapshot).unwrap(),
+            FeedApply::Applied
+        );
+        assert!(replica
+            .deepest(&manifest.id().as_bytes().to_owned(), &hashes)
+            .is_none());
     }
 
     #[test]
