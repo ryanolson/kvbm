@@ -394,7 +394,7 @@ async fn carrier_feed_publishes_frames_and_snapshots() {
     let manifest_snapshot = snapshot
         .manifests
         .iter()
-        .find(|entry| entry.manifest == manifest_id.as_bytes().to_owned())
+        .find(|entry| entry.manifest == *manifest_id.as_bytes())
         .expect("carrier manifest in snapshot");
     assert_eq!(manifest_snapshot.kind, FeedKind::Carrier);
     assert_eq!(

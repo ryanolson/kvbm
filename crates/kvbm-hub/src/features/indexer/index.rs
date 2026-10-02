@@ -549,14 +549,14 @@ mod tests {
             .query_holders(initial_manifest.id(), &hashes)
             .map(|(hash, holders, _)| (hash, holders));
         let actual = replica
-            .deepest(&initial_manifest.id().as_bytes().to_owned(), &hashes)
+            .deepest(initial_manifest.id().as_bytes(), &hashes)
             .map(|hit| (hit.hash, hit.holders));
         assert_eq!(actual, expected);
         let expected = indexes
             .query_holders(migrated_manifest.id(), &hashes)
             .map(|(hash, holders, _)| (hash, holders));
         let actual = replica
-            .deepest(&migrated_manifest.id().as_bytes().to_owned(), &hashes)
+            .deepest(migrated_manifest.id().as_bytes(), &hashes)
             .map(|hit| (hit.hash, hit.holders));
         assert_eq!(actual, expected);
     }
@@ -583,11 +583,7 @@ mod tests {
             replica.install_snapshot(snapshot).unwrap(),
             FeedApply::Applied
         );
-        assert!(
-            replica
-                .deepest(&manifest.id().as_bytes().to_owned(), &hashes)
-                .is_none()
-        );
+        assert!(replica.deepest(manifest.id().as_bytes(), &hashes).is_none());
     }
 
     #[test]
