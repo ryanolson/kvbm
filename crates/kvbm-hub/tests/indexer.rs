@@ -107,14 +107,14 @@ async fn get_json(http: &reqwest::Client, base: &str, path: &str) -> Value {
 }
 
 fn instances(entry: &Value) -> Vec<String> {
-    let mut v: Vec<String> = entry["instances"]
+    let mut ids: Vec<u128> = entry["instances"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|v| v.as_str().unwrap().to_string())
+        .map(|value| value.as_str().unwrap().parse().unwrap())
         .collect();
-    v.sort();
-    v
+    ids.sort_unstable();
+    ids.into_iter().map(|id| id.to_string()).collect()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -142,6 +142,11 @@ async fn two_instances_publish_index_and_query() {
     let instance_b = InstanceId::new_v4();
     let id_a = instance_a.as_u128();
     let id_b = instance_b.as_u128();
+    let expected_holders = {
+        let mut ids = [id_a, id_b];
+        ids.sort_unstable();
+        ids.into_iter().map(|id| id.to_string()).collect::<Vec<_>>()
+    };
     let indexer = Feature::Indexer(IndexerFeatureConfig {
         max_seq_len: Some(MAX_SEQ_LEN),
         manifest,
@@ -221,10 +226,7 @@ async fn two_instances_publish_index_and_query() {
             "timed out indexing creates: {body}"
         );
     };
-    assert_eq!(
-        instances(&body["entries"][0]),
-        vec![id_a.to_string(), id_b.to_string()]
-    );
+    assert_eq!(instances(&body["entries"][0]), expected_holders);
 
     // POST /query with the full sequence → deepest match (position 2).
     let resp: Value = http
@@ -238,7 +240,7 @@ async fn two_instances_publish_index_and_query() {
         .expect("query json");
     let hit = &resp["hit"];
     assert_eq!(hit["position"].as_u64(), Some(2));
-    assert_eq!(instances(hit), vec![id_a.to_string(), id_b.to_string()]);
+    assert_eq!(instances(hit), expected_holders);
 
     // Remove instance A's blocks → only B remains at position 0.
     let deadline = Instant::now() + Duration::from_secs(8);

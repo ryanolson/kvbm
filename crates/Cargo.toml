@@ -53,9 +53,10 @@ kvbm-service = { path = "kvbm-service" }
 # NOTE: dynamo-kv-router is intentionally featureless. The `runtime-protocols`
 # feature pulls `dynamo-runtime` (and its dynamo-core closure); kvbm-consolidator
 # only consumes `dynamo_kv_router::zmq_wire`, which is available without features.
-dynamo-tokens = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "f1fa52254e2785f5072440e0b2077eb820cc548a" }
-dynamo-kv-router = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "f1fa52254e2785f5072440e0b2077eb820cc548a" }
-dynamo-kv-hashing = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "f1fa52254e2785f5072440e0b2077eb820cc548a" }
+# Pinned to a rev on ai-dynamo/dynamo branch ryan/carrier.
+dynamo-tokens = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "6b5fb097628b9b1d8d7e3115435229b8366aa9e4" }
+dynamo-kv-router = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "6b5fb097628b9b1d8d7e3115435229b8366aa9e4" }
+dynamo-kv-hashing = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "6b5fb097628b9b1d8d7e3115435229b8366aa9e4" }
 
 # velo (registry — 0.4.1 / 0.2.0 are published on crates.io)
 velo     = { version = "0.4.1" }

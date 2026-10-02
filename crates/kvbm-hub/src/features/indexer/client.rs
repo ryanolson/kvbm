@@ -106,7 +106,8 @@ impl IndexerLookupClient {
     /// Resolve a candidate block sequence to the deepest indexed block and its
     /// holders, over velo.
     ///
-    /// `hashes` are the block-sequence PLHs in position order (low → high).
+    /// `hashes` must be ordered by ascending `position()`, as produced by
+    /// `positional_lineage_hashes`.
     /// `manifest` scopes the lookup to one cache ABI. The hub walks the hashes
     /// and returns the deepest one present — so `[x, y, z]` with
     /// `z` missing but `y` indexed yields `Some(hit)` where `hit.matched == y`

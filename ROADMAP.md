@@ -51,10 +51,10 @@ day-to-day development; they are the forward work.
   arm runner labels (currently placeholders), and the `DYNAMO_GIT_TOKEN` secret if the
   `ai-dynamo/dynamo` branch the deps point at is private.
 
-### Pin the dynamo git-deps to an immutable rev
-- `crates/Cargo.toml` git-deps `dynamo-tokens` / `dynamo-kv-router` /
-  `dynamo-kv-hashing` on the floating branch `ryan/kvbm-engine-service`. Pin to an immutable
-  rev (or tag) for reproducible builds, and keep that branch alive until then.
+### Dynamo git-dependency pins
+- `crates/Cargo.toml` pins `dynamo-tokens` / `dynamo-kv-router` /
+  `dynamo-kv-hashing` to immutable revs on `ryan/carrier`. Keep that branch alive while
+  those revisions are in use.
   (`dynamo-memory` was replaced by the locally-owned `kvbm-memory` crate — no
   longer a git dep.)
 

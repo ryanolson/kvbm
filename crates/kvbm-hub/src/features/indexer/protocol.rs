@@ -144,13 +144,14 @@ pub struct ByPositionResponse {
 
 /// Request body for `POST /query`.
 ///
-/// `hashes` are the block-sequence PLHs in position order (low → high). The
-/// indexer walks them high → low and returns the deepest one present.
+/// `hashes` must be ordered by ascending `position()`, as produced by
+/// `positional_lineage_hashes`. The indexer searches from the end; unsorted
+/// input may return a shallower match.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QueryRequest {
     /// Cache ABI whose index should be queried.
     pub manifest: CacheManifestId,
-    /// Positional-lineage hashes of the candidate block sequence.
+    /// Positional-lineage hashes of the candidate block sequence, ascending by position.
     pub hashes: Vec<SequenceHash>,
 }
 

@@ -31,6 +31,7 @@ kvbm-protocols = { workspace = true, features = ["client"] }
 kvbm-observability = { workspace = true }
 kvbm-logical   = { workspace = true }
 dynamo-tokens  = { workspace = true }
+dynamo-kv-router = { workspace = true }
 # Pure config crate (no velo, no CUDA — runtime construction lives in
 # `kvbm-runtime`). Used by the `kvbm_hub` server's `--kvbm`/`--kvbm-config`
 # flags and the `kvbmctl` render module to apply + round-trip-validate a
@@ -39,7 +40,7 @@ dynamo-tokens  = { workspace = true }
 # base dependency; the hub server stays CUDA-free.
 kvbm-config    = { workspace = true }
 
-# KV index feature (positional block index + ZMQ event ingest)
+# KV index feature (manifest-scoped carrier index + ZMQ event ingest)
 dashmap      = { workspace = true }
 rmp-serde    = { workspace = true }
 tmq          = { workspace = true }
