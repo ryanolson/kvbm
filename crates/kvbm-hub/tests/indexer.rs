@@ -107,14 +107,14 @@ async fn get_json(http: &reqwest::Client, base: &str, path: &str) -> Value {
 }
 
 fn instances(entry: &Value) -> Vec<String> {
-    let mut v: Vec<String> = entry["instances"]
+    let mut ids: Vec<u128> = entry["instances"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|v| v.as_str().unwrap().to_string())
+        .map(|value| value.as_str().unwrap().parse().unwrap())
         .collect();
-    v.sort();
-    v
+    ids.sort_unstable();
+    ids.into_iter().map(|id| id.to_string()).collect()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
