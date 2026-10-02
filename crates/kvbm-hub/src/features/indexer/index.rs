@@ -12,8 +12,8 @@ use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
 use dynamo_kv_router::carrier_feed::{
-    CarrierFeedFrame, CarrierFeedOp, CarrierFeedSnapshot, FeedKind, HolderSnapshot,
-    ManifestSnapshot, CARRIER_FEED_VERSION,
+    CARRIER_FEED_VERSION, CarrierFeedFrame, CarrierFeedOp, CarrierFeedSnapshot, FeedKind,
+    HolderSnapshot, ManifestSnapshot,
 };
 use dynamo_kv_router::indexer::positional_carrier::PositionalCarrierIndex;
 use kvbm_logical::SequenceHash;
@@ -78,7 +78,10 @@ impl CarrierFeedSequencer {
         holder: u128,
         op: CarrierFeedOp,
     ) {
-        self.seq = self.seq.checked_add(1).expect("carrier feed sequence overflow");
+        self.seq = self
+            .seq
+            .checked_add(1)
+            .expect("carrier feed sequence overflow");
         let frame = CarrierFeedFrame {
             version: CARRIER_FEED_VERSION,
             epoch: self.epoch,
@@ -257,8 +260,9 @@ impl ManifestIndexes {
             return ApplyOutcome::Unbound;
         }
         match batch.events {
-            KvCacheEvents::Create(hashes) | KvCacheEvents::CarrierCreate(hashes) => self
-                .mutate_index(binding.manifest, instance, CarrierFeedOp::Insert(hashes)),
+            KvCacheEvents::Create(hashes) | KvCacheEvents::CarrierCreate(hashes) => {
+                self.mutate_index(binding.manifest, instance, CarrierFeedOp::Insert(hashes))
+            }
             KvCacheEvents::Remove(hashes) => {
                 self.mutate_index(binding.manifest, instance, CarrierFeedOp::Remove(hashes))
             }
@@ -300,10 +304,7 @@ impl ManifestIndexes {
             for position in 0..index.index.max_positions() {
                 for hit in index.index.entries_at(position) {
                     for holder in hit.holders {
-                        hashes_by_holder
-                            .entry(holder)
-                            .or_default()
-                            .push(hit.hash);
+                        hashes_by_holder.entry(holder).or_default().push(hit.hash);
                     }
                 }
             }
@@ -578,9 +579,11 @@ mod tests {
             replica.install_snapshot(snapshot).unwrap(),
             FeedApply::Applied
         );
-        assert!(replica
-            .deepest(&manifest.id().as_bytes().to_owned(), &hashes)
-            .is_none());
+        assert!(
+            replica
+                .deepest(&manifest.id().as_bytes().to_owned(), &hashes)
+                .is_none()
+        );
     }
 
     #[test]

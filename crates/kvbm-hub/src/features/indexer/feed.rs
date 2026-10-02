@@ -3,13 +3,11 @@
 
 //! Carrier-feed PUB socket and publisher loop.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context as _, Result};
-use dynamo_kv_router::carrier_feed::{
-    CarrierFeedFrame, CARRIER_FEED_TOPIC, encode_frame,
-};
+use dynamo_kv_router::carrier_feed::{CARRIER_FEED_TOPIC, CarrierFeedFrame, encode_frame};
 use futures::SinkExt;
 use tmq::{
     Context, Multipart,

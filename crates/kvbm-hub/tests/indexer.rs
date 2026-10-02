@@ -8,10 +8,10 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use dynamo_tokens::TokenBlockSequence;
 use dynamo_kv_router::carrier_feed::{
-    CarrierFeedOp, FeedKind, CARRIER_FEED_TOPIC, decode_frame, decode_snapshot,
+    CARRIER_FEED_TOPIC, CarrierFeedOp, FeedKind, decode_frame, decode_snapshot,
 };
+use dynamo_tokens::TokenBlockSequence;
 use futures::{SinkExt, StreamExt};
 use kvbm_hub::{
     Feature, FeatureManager, HubServer, IndexerConfigResponse, IndexerFeatureConfig, IndexerManager,
@@ -356,7 +356,10 @@ async fn carrier_feed_publishes_frames_and_snapshots() {
 
     assert_eq!(frame.manifest, manifest_id.as_bytes().to_owned());
     assert_eq!(frame.kind, FeedKind::Carrier);
-    assert_eq!(frame.max_positions, (MAX_SEQ_LEN / BLOCK_SIZE as usize) as u64);
+    assert_eq!(
+        frame.max_positions,
+        (MAX_SEQ_LEN / BLOCK_SIZE as usize) as u64
+    );
     assert_eq!(frame.holder, instance_id);
     assert!(matches!(
         &frame.op,
@@ -375,13 +378,8 @@ async fn carrier_feed_publishes_frames_and_snapshots() {
             .and_then(|value| value.to_str().ok()),
         Some("application/msgpack")
     );
-    let snapshot = decode_snapshot(
-        &snapshot_response
-            .bytes()
-            .await
-            .expect("read feed snapshot"),
-    )
-    .expect("decode feed snapshot");
+    let snapshot = decode_snapshot(&snapshot_response.bytes().await.expect("read feed snapshot"))
+        .expect("decode feed snapshot");
     let control_snapshot = http
         .get(format!(
             "http://{}/v1/features/indexer/feed/snapshot",

@@ -324,9 +324,8 @@ impl FeatureManager for IndexerManager {
             let advertised = format!("tcp://{}:{}", self.advertise_host, port);
             let pub_socket = bind_pub_socket(&self.feed_bind)
                 .map_err(|e| FeatureError::Other(anyhow::anyhow!("carrier feed bind: {e}")))?;
-            let feed_bound = bound_endpoint(&pub_socket).map_err(|e| {
-                FeatureError::Other(anyhow::anyhow!("carrier feed endpoint: {e}"))
-            })?;
+            let feed_bound = bound_endpoint(&pub_socket)
+                .map_err(|e| FeatureError::Other(anyhow::anyhow!("carrier feed endpoint: {e}")))?;
             let feed_port = port_of(&feed_bound)
                 .map_err(|e| FeatureError::Other(anyhow::anyhow!("carrier feed port: {e}")))?;
             let feed_advertised = format!("tcp://{}:{}", self.advertise_host, feed_port);
@@ -567,9 +566,7 @@ async fn get_config(State(mgr): State<Arc<IndexerManager>>) -> Json<IndexerConfi
     Json(mgr.config_response())
 }
 
-async fn get_feed_snapshot(
-    State(mgr): State<Arc<IndexerManager>>,
-) -> Result<Response, StatusCode> {
+async fn get_feed_snapshot(State(mgr): State<Arc<IndexerManager>>) -> Result<Response, StatusCode> {
     let snapshot = mgr.indexes.feed_snapshot();
     let payload = encode_snapshot(&snapshot).map_err(|error| {
         tracing::warn!(%error, "carrier feed snapshot encoding failed");
