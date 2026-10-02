@@ -63,10 +63,10 @@ pub(in crate::connector::leader) async fn wire_remote_search(
         manifest_id,
     );
 
-    if let (Some(endpoint), Some(events)) = (
-        handshake.indexer_zmq_endpoint.as_ref(),
+    if let (Some(transport), Some(events)) = (
+        handshake.indexer_transport.as_ref(),
         stack.events_manager.as_ref(),
-    ) && let Some(publisher) = build_indexer_publisher(runtime, endpoint, events)
+    ) && let Some(publisher) = build_indexer_publisher(runtime, transport, events).await
     {
         let _ = leader.indexer_publisher.set(publisher);
     }

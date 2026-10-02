@@ -3,9 +3,9 @@
 
 //! Hub-side manager for the KV indexer feature.
 //!
-//! Owns [`ManifestIndexes`], binds the ZMQ ingest and carrier-feed sockets
-//! during [`FeatureManager::attach`], and exports its own HTTP surface under
-//! `/v1/features/indexer` (the server nests it via
+//! Owns [`ManifestIndexes`], attaches the configured ingest and carrier-feed
+//! transport during [`FeatureManager::attach`], and exports its own HTTP surface
+//! under `/v1/features/indexer` (the server nests it via
 //! [`FeatureManager::route_prefix`]).
 
 use std::collections::HashSet;
@@ -19,7 +19,7 @@ use axum::{
     response::Response,
     routing::{get, post},
 };
-use dynamo_kv_router::carrier_feed::encode_snapshot;
+use dynamo_kv_router::carrier_feed::{CARRIER_FEED_TOPIC, encode_snapshot};
 use futures::future::BoxFuture;
 use kvbm_protocols::cache_manifest::RegistrationEpoch;
 use tokio::sync::mpsc::unbounded_channel;
@@ -27,11 +27,11 @@ use tokio::task::JoinHandle;
 use velo_ext::{InstanceId, PeerInfo};
 
 use super::bundle::{BundleDirectory, BundleDirectoryError};
-use super::feed::{FeedCounters, bind_pub_socket, run_feed_publisher};
+use super::feed::{FeedCounters, bind_pub_socket, run_feed_publisher, run_nats_feed_publisher};
 use super::index::ManifestIndexes;
 use super::ingest::{IngestCounters, IngestSinks, run_ingest_loop};
 use super::protocol::{
-    self, ByPositionResponse, IndexerConfigResponse, InstancesResponse, QueryRequest,
+    self, ByPositionResponse, EventPlane, IndexerConfigResponse, InstancesResponse, QueryRequest,
     QueryResponse, TierPlacementSnapshotRequest, TierPlacementSnapshotResponse,
 };
 use super::tier_placement::{
@@ -55,6 +55,9 @@ pub struct IndexerManager {
     zmq_bind: String,
     /// Carrier-feed PUB bind spec (e.g. `tcp://0.0.0.0:0`).
     feed_bind: String,
+    event_plane: EventPlane,
+    nats_server: String,
+    nats_subject_prefix: String,
     /// Host advertised in `GET /config` for ingest and carrier-feed endpoints.
     advertise_host: String,
     /// Resolved advertised endpoint (`tcp://host:port`), set during `attach`.
@@ -78,7 +81,7 @@ pub struct IndexerManager {
     instances: Arc<RwLock<HashSet<InstanceId>>>,
     /// Advisory tier-placement projection (R7b §4).
     tier_placements: Arc<TierPlacementProjection>,
-    /// Per-reason ZMQ ingest drop counters.
+    /// Per-reason ingest drop counters.
     ingest_counters: Arc<IngestCounters>,
     /// Carrier-feed publisher counters.
     feed_counters: Arc<FeedCounters>,
@@ -91,14 +94,14 @@ impl std::fmt::Debug for IndexerManager {
             .field("block_size", &self.indexes.block_size())
             .field("endpoint", &self.endpoint.get())
             .field("feed_endpoint", &self.feed_endpoint.get())
+            .field("event_plane", &self.event_plane)
             .finish()
     }
 }
 
 impl IndexerManager {
-    /// Builds a manager sized for `max_seq_len`/`block_size`, binding ingest
-    /// and the carrier feed to OS-assigned ports by default, and advertising
-    /// `advertise_host` (defaults to `127.0.0.1`).
+    /// Builds a manager sized for `max_seq_len`/`block_size`. In ZMQ mode,
+    /// ingest and carrier-feed sockets use OS-assigned ports by default.
     pub fn new(
         max_seq_len: usize,
         block_size: usize,
@@ -112,6 +115,9 @@ impl IndexerManager {
             bundle_directory: Arc::new(BundleDirectory::new(DEFAULT_BUNDLE_LEASE_TTL_MS)),
             zmq_bind: zmq_bind.unwrap_or_else(|| "tcp://0.0.0.0:0".to_string()),
             feed_bind: "tcp://0.0.0.0:0".to_string(),
+            event_plane: EventPlane::Zmq,
+            nats_server: "nats://localhost:4222".to_string(),
+            nats_subject_prefix: format!("kvbm.hub.{}", uuid::Uuid::new_v4().simple()),
             advertise_host: advertise_host.unwrap_or_else(|| DEFAULT_ADVERTISE_HOST.to_string()),
             endpoint: OnceLock::new(),
             feed_endpoint: OnceLock::new(),
@@ -124,10 +130,26 @@ impl IndexerManager {
         })
     }
 
-    /// Sets the carrier-feed PUB bind spec.
+    /// Sets the carrier-feed ZMQ PUB bind spec.
     #[must_use]
     pub fn with_feed_bind(mut self, feed_bind: String) -> Self {
         self.feed_bind = feed_bind;
+        self
+    }
+
+    /// Selects the event transport and its NATS connection and namespace.
+    #[must_use]
+    pub fn with_event_plane(
+        mut self,
+        event_plane: EventPlane,
+        nats_server: String,
+        nats_subject_prefix: Option<String>,
+    ) -> Self {
+        self.event_plane = event_plane;
+        self.nats_server = nats_server;
+        if let Some(prefix) = nats_subject_prefix.filter(|prefix| !prefix.is_empty()) {
+            self.nats_subject_prefix = prefix;
+        }
         self
     }
 
@@ -137,7 +159,7 @@ impl IndexerManager {
         &self.tier_placements
     }
 
-    /// Per-reason ZMQ ingest drop counters.
+    /// Per-reason event-plane ingest drop counters.
     #[must_use]
     pub fn ingest_counters(&self) -> &Arc<IngestCounters> {
         &self.ingest_counters
@@ -244,7 +266,7 @@ impl IndexerManager {
         &self.indexes
     }
 
-    /// Resolved advertised ZMQ endpoint, once `attach` has bound it.
+    /// Resolved advertised ingest endpoint, once `attach` has bound it.
     pub fn endpoint(&self) -> Option<&String> {
         self.endpoint.get()
     }
@@ -265,11 +287,25 @@ impl IndexerManager {
 
     fn config_response(&self) -> IndexerConfigResponse {
         IndexerConfigResponse {
+            event_plane: self.event_plane,
             max_seq_len: self.indexes.max_seq_len(),
             block_size: self.indexes.block_size(),
             num_positions: self.indexes.max_seq_len() / self.indexes.block_size(),
-            zmq_endpoint: self.endpoint.get().cloned().unwrap_or_default(),
-            feed_endpoint: self.feed_endpoint.get().cloned().unwrap_or_default(),
+            zmq_endpoint: if self.event_plane == EventPlane::Zmq {
+                self.endpoint.get().cloned().unwrap_or_default()
+            } else {
+                String::new()
+            },
+            feed_endpoint: if self.event_plane == EventPlane::Zmq {
+                self.feed_endpoint.get().cloned().unwrap_or_default()
+            } else {
+                String::new()
+            },
+            nats_subject_prefix: if self.event_plane == EventPlane::Nats {
+                self.nats_subject_prefix.clone()
+            } else {
+                String::new()
+            },
         }
     }
 }
@@ -315,52 +351,105 @@ impl FeatureManager for IndexerManager {
 
     fn attach<'a>(&'a self, ctx: HubContext) -> BoxFuture<'a, Result<(), FeatureError>> {
         Box::pin(async move {
-            let sub = bind_sub_socket(&self.zmq_bind)
-                .map_err(|e| FeatureError::Other(anyhow::anyhow!("indexer bind: {e}")))?;
-            let bound = bound_endpoint(&sub)
-                .map_err(|e| FeatureError::Other(anyhow::anyhow!("indexer endpoint: {e}")))?;
-            let port = port_of(&bound)
-                .map_err(|e| FeatureError::Other(anyhow::anyhow!("indexer port: {e}")))?;
-            let advertised = format!("tcp://{}:{}", self.advertise_host, port);
-            let pub_socket = bind_pub_socket(&self.feed_bind)
-                .map_err(|e| FeatureError::Other(anyhow::anyhow!("carrier feed bind: {e}")))?;
-            let feed_bound = bound_endpoint(&pub_socket)
-                .map_err(|e| FeatureError::Other(anyhow::anyhow!("carrier feed endpoint: {e}")))?;
-            let feed_port = port_of(&feed_bound)
-                .map_err(|e| FeatureError::Other(anyhow::anyhow!("carrier feed port: {e}")))?;
-            let feed_advertised = format!("tcp://{}:{}", self.advertise_host, feed_port);
-            tracing::info!(
-                bound = %bound,
-                advertised = %advertised,
-                feed_bound = %feed_bound,
-                feed_advertised = %feed_advertised,
-                max_seq_len = self.indexes.max_seq_len(),
-                block_size = self.indexes.block_size(),
-                "indexer ingest and carrier feed bound"
-            );
-            let _ = self.endpoint.set(advertised);
-            let _ = self.feed_endpoint.set(feed_advertised);
-
             let (feed_tx, feed_rx) = unbounded_channel();
-            self.indexes.set_feed_sink(feed_tx).map_err(|_| {
-                FeatureError::Other(anyhow::anyhow!("carrier feed sink already installed"))
-            })?;
-            let feed_cancel = ctx.cancel.clone();
-            let feed_task = tokio::spawn(run_feed_publisher(
-                pub_socket,
-                feed_rx,
-                feed_cancel,
-                Arc::clone(&self.feed_counters),
-            ));
-            let _ = self.feed_task.set(feed_task);
-
             let sinks = IngestSinks {
                 indexes: Arc::clone(&self.indexes),
                 tier_placements: Arc::clone(&self.tier_placements),
                 counters: Arc::clone(&self.ingest_counters),
             };
-            let task = tokio::spawn(run_ingest_loop(sub, sinks, ctx.cancel));
-            let _ = self.ingest_task.set(task);
+            match self.event_plane {
+                EventPlane::Zmq => {
+                    let sub = bind_sub_socket(&self.zmq_bind)
+                        .map_err(|e| FeatureError::Other(anyhow::anyhow!("indexer bind: {e}")))?;
+                    let bound = bound_endpoint(&sub).map_err(|e| {
+                        FeatureError::Other(anyhow::anyhow!("indexer endpoint: {e}"))
+                    })?;
+                    let port = port_of(&bound)
+                        .map_err(|e| FeatureError::Other(anyhow::anyhow!("indexer port: {e}")))?;
+                    let advertised = format!("tcp://{}:{}", self.advertise_host, port);
+                    let pub_socket = bind_pub_socket(&self.feed_bind).map_err(|e| {
+                        FeatureError::Other(anyhow::anyhow!("carrier feed bind: {e}"))
+                    })?;
+                    let feed_bound = bound_endpoint(&pub_socket).map_err(|e| {
+                        FeatureError::Other(anyhow::anyhow!("carrier feed endpoint: {e}"))
+                    })?;
+                    let feed_port = port_of(&feed_bound).map_err(|e| {
+                        FeatureError::Other(anyhow::anyhow!("carrier feed port: {e}"))
+                    })?;
+                    let feed_advertised = format!("tcp://{}:{}", self.advertise_host, feed_port);
+                    tracing::info!(
+                        bound = %bound,
+                        advertised = %advertised,
+                        feed_bound = %feed_bound,
+                        feed_advertised = %feed_advertised,
+                        max_seq_len = self.indexes.max_seq_len(),
+                        block_size = self.indexes.block_size(),
+                        "indexer ingest and carrier feed bound"
+                    );
+                    let _ = self.endpoint.set(advertised);
+                    let _ = self.feed_endpoint.set(feed_advertised);
+                    self.indexes.set_feed_sink(feed_tx).map_err(|_| {
+                        FeatureError::Other(anyhow::anyhow!("carrier feed sink already installed"))
+                    })?;
+                    let feed_task = tokio::spawn(run_feed_publisher(
+                        pub_socket,
+                        feed_rx,
+                        ctx.cancel.clone(),
+                        Arc::clone(&self.feed_counters),
+                    ));
+                    let _ = self.feed_task.set(feed_task);
+                    let task = tokio::spawn(run_ingest_loop(sub, sinks, ctx.cancel.clone()));
+                    let _ = self.ingest_task.set(task);
+                }
+                EventPlane::Nats => {
+                    let client = async_nats::connect(&self.nats_server)
+                        .await
+                        .map_err(|error| {
+                            FeatureError::Other(anyhow::anyhow!(
+                                "connecting indexer to NATS {}: {error}",
+                                self.nats_server
+                            ))
+                        })?;
+                    let subscriber = client
+                        .subscribe(format!("{}.>", self.nats_subject_prefix))
+                        .await
+                        .map_err(|error| {
+                            FeatureError::Other(anyhow::anyhow!(
+                                "subscribing indexer to NATS: {error}"
+                            ))
+                        })?;
+                    let feed_topic =
+                        std::str::from_utf8(CARRIER_FEED_TOPIC).expect("feed topic is valid UTF-8");
+                    let feed_subject =
+                        super::ingest::nats_subject(&self.nats_subject_prefix, feed_topic);
+                    tracing::info!(
+                        nats_server = %self.nats_server,
+                        subject_prefix = %self.nats_subject_prefix,
+                        feed_subject,
+                        max_seq_len = self.indexes.max_seq_len(),
+                        block_size = self.indexes.block_size(),
+                        "indexer NATS transport attached"
+                    );
+                    self.indexes.set_feed_sink(feed_tx).map_err(|_| {
+                        FeatureError::Other(anyhow::anyhow!("carrier feed sink already installed"))
+                    })?;
+                    let feed_task = tokio::spawn(run_nats_feed_publisher(
+                        client,
+                        feed_subject,
+                        feed_rx,
+                        ctx.cancel.clone(),
+                        Arc::clone(&self.feed_counters),
+                    ));
+                    let _ = self.feed_task.set(feed_task);
+                    let task = tokio::spawn(super::ingest::run_nats_ingest_loop(
+                        subscriber,
+                        self.nats_subject_prefix.clone(),
+                        sinks,
+                        ctx.cancel.clone(),
+                    ));
+                    let _ = self.ingest_task.set(task);
+                }
+            }
 
             // Expose the velo-plane block lookup (`QUERY_HANDLER`) when the hub
             // runs with a transport. Discovery-only hubs skip it — clients fall

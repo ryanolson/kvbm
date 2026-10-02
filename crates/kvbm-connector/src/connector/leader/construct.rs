@@ -138,30 +138,30 @@ async fn register_indexer_only(
     Ok(hub)
 }
 
-/// Connect the KV-index ZMQ publisher and wire it to the events manager
+/// Connect the KV-index publisher and wire it to the events manager
 /// (init.rs:505-528). Both callers — the indexer-only arm below and the
 /// CD-case wiring in `Leader::initialize_async` — must hold a LIVE hub
 /// registration before invoking this (the publisher-implies-registration
 /// invariant). Connect/build failures degrade to `None` with a warning, never
 /// an error: a broken publisher loses index freshness, not correctness.
-pub(super) fn build_indexer_publisher(
+pub(super) async fn build_indexer_publisher(
     runtime: &Arc<KvbmRuntime>,
-    endpoint: &str,
+    transport: &super::hub_handshake::IndexerTransport,
     events_manager: &Arc<EventsManager>,
 ) -> Option<KvbmCacheEventsPublisher> {
-    match hub_indexer::ZmqHubPublisher::connect(endpoint) {
-        Ok(zmq_pub) => {
+    match hub_indexer::connect_hub_index_publisher(transport).await {
+        Ok((publisher, subject)) => {
             let instance_id = runtime.messenger().instance_id().as_u128();
             match KvbmCacheEventsPublisher::builder()
                 .instance_id(instance_id)
                 .create_kind(CreateKind::Block)
                 .event_stream(events_manager.subscribe())
-                .publisher(Arc::new(zmq_pub))
-                .subject(hub_indexer::SUBJECT)
+                .publisher(Arc::new(SharedPublisher(publisher)))
+                .subject(subject)
                 .build()
             {
                 Ok(publisher) => {
-                    tracing::info!(endpoint, instance_id, "indexer publisher wired");
+                    tracing::info!(?transport, instance_id, "indexer publisher wired");
                     Some(publisher)
                 }
                 Err(e) => {
@@ -171,9 +171,21 @@ pub(super) fn build_indexer_publisher(
             }
         }
         Err(e) => {
-            tracing::warn!(error = %e, "indexer PUB connect failed; skipping");
+            tracing::warn!(error = %e, "indexer publisher connect failed; skipping");
             None
         }
+    }
+}
+
+struct SharedPublisher(Arc<dyn kvbm_logical::pubsub::Publisher>);
+
+impl kvbm_logical::pubsub::Publisher for SharedPublisher {
+    fn publish(&self, subject: &str, payload: bytes::Bytes) -> Result<()> {
+        self.0.publish(subject, payload)
+    }
+
+    fn flush(&self) -> futures::future::BoxFuture<'static, Result<()>> {
+        self.0.flush()
     }
 }
 
@@ -340,9 +352,7 @@ pub(super) async fn build_engine_stack(c: &Construction) -> Result<EngineStack> 
         ),
         None => None,
     };
-    let indexer_endpoint = handshake
-        .as_ref()
-        .and_then(|h| h.indexer_zmq_endpoint.clone());
+    let indexer_transport = handshake.as_ref().and_then(|h| h.indexer_transport.clone());
 
     // Fail fast (before any registration) if remote search is requested but the
     // hub's indexer isn't effective.
@@ -355,7 +365,7 @@ pub(super) async fn build_engine_stack(c: &Construction) -> Result<EngineStack> 
     // block-registration events — the same Arc wires into the BlockRegistry and
     // every subscriber (init.rs:474-487).
     let events_manager: Option<Arc<EventsManager>> = (c.consolidator_endpoints.is_some()
-        || indexer_endpoint.is_some())
+        || indexer_transport.is_some())
     .then(|| Arc::new(EventsManager::builder().build()));
 
     // KV-index registration + publisher (init.rs:489-528). INVARIANT: the
@@ -385,8 +395,8 @@ pub(super) async fn build_engine_stack(c: &Construction) -> Result<EngineStack> 
             // Register first, so the publisher never emits without a live registration.
             indexer_hub_client = Some(register_indexer_only(runtime, h, manifest).await?);
 
-            if let (Some(endpoint), Some(em)) = (&indexer_endpoint, events_manager.as_ref()) {
-                indexer_publisher = build_indexer_publisher(runtime, endpoint, em);
+            if let (Some(transport), Some(em)) = (&indexer_transport, events_manager.as_ref()) {
+                indexer_publisher = build_indexer_publisher(runtime, transport, em).await;
             }
         } else {
             warn_missing_registered_cache_manifest();

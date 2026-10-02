@@ -268,7 +268,7 @@ pub enum Feature {
     #[serde(rename = "disagg")]
     ConditionalDisagg(ConditionalDisaggConfig),
     /// The client participates in the hub-side KV block index: it publishes
-    /// block create/remove events to the ZMQ ingest endpoint advertised in
+    /// block create/remove events to the event-plane ingest endpoint advertised in
     /// the aggregate config, and registers here so the hub sweeps its index
     /// entries on unregister (TTL or explicit `DELETE`). Carries no payload
     /// today — block-size consistency is validated via [`RuntimeConfigSummary`]
@@ -296,8 +296,8 @@ pub enum FeatureKey {
     /// payload — the manager only contributes axum routes, so this key
     /// never matches an incoming registration.
     ConnectorControl,
-    /// Hub-side KV block index. The client publishes block events to the ZMQ
-    /// ingest endpoint (advertised in the aggregate config) *and* declares
+    /// Hub-side KV block index. The client publishes block events over the
+    /// event plane advertised in the aggregate config *and* declares
     /// [`Feature::Indexer`] at registration so the hub reclaims its index
     /// entries on unregister. The manager also contributes axum routes and the
     /// ingest loop.
@@ -390,7 +390,7 @@ pub struct PrimaryConfig {
     /// connector config; not validated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub g2_blocks: Option<usize>,
-    /// Host advertised to publishers (e.g. KV-index ZMQ endpoint). Advisory.
+    /// Host advertised to publishers (e.g. a KV-index endpoint). Advisory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub advertise_host: Option<String>,
 }

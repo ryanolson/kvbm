@@ -53,9 +53,8 @@ pub struct HubConfig {
     /// here. See [`PrimaryConfig`].
     #[serde(default)]
     pub primary: PrimaryConfig,
-    /// Optional KV indexer feature. When set, the hub binds ZMQ `SUB` ingest
-    /// and `PUB` carrier-feed sockets and serves the index under
-    /// `/v1/features/indexer`. `None` (default) leaves the feature off.
+    /// Optional KV indexer feature. When set, the hub serves the index under
+    /// `/v1/features/indexer` using the fleet event plane.
     #[serde(default)]
     pub indexer: Option<IndexerConfig>,
 }
@@ -77,19 +76,20 @@ pub struct IndexerConfig {
     /// Inherits from `primary.block_size` when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_size: Option<usize>,
-    /// ZMQ bind spec for the ingest `SUB` socket. Default `tcp://0.0.0.0:0`
-    /// (OS-assigned port, reported via `GET /config`).
+    /// ZMQ bind spec for the ingest `SUB` socket when `DYN_EVENT_PLANE=zmq`.
     #[serde(default)]
     pub zmq_bind: Option<String>,
-    /// ZMQ bind spec for the carrier-feed `PUB` socket. Default
-    /// `tcp://0.0.0.0:0` (OS-assigned port, reported via `GET /config`).
+    /// ZMQ bind spec for the carrier-feed `PUB` socket when `DYN_EVENT_PLANE=zmq`.
     #[serde(default)]
     pub feed_bind: Option<String>,
-    /// Host advertised in `GET /config`'s `zmq_endpoint` and `feed_endpoint`.
-    /// Default `127.0.0.1`; multi-host deployments must set this to a
-    /// routable address.
+    /// Host advertised in `GET /config`'s `zmq_endpoint` and `feed_endpoint`
+    /// when `DYN_EVENT_PLANE=zmq`. Default `127.0.0.1`; multi-host deployments
+    /// must set this to a routable address.
     #[serde(default)]
     pub advertise_host: Option<String>,
+    /// NATS subject namespace. Defaults to a process-unique `kvbm.hub.<uuid>`.
+    #[serde(default)]
+    pub nats_subject_prefix: Option<String>,
 }
 
 fn default_registration_ttl_secs() -> u64 {
@@ -137,6 +137,10 @@ impl HubConfig {
                 f = f.merge(Toml::file(path));
             }
         }
-        f.merge(Env::prefixed("KVBM_HUB_").ignore(&["CONFIG"]))
+        let f = f.merge(Env::prefixed("KVBM_HUB_").ignore(&["CONFIG"]));
+        match std::env::var("KVBM_HUB_INDEXER_NATS_SUBJECT_PREFIX") {
+            Ok(prefix) => f.merge(("indexer.nats_subject_prefix", prefix)),
+            Err(_) => f,
+        }
     }
 }

@@ -136,11 +136,11 @@ pub(super) async fn wire_disagg(
     // `Feature::Indexer` when effective, so the publisher-implies-registration
     // invariant now holds for this path too.
     if indexer_registered
-        && let (Some(endpoint), Some(em)) = (
-            handshake.indexer_zmq_endpoint.as_ref(),
+        && let (Some(transport), Some(em)) = (
+            handshake.indexer_transport.as_ref(),
             stack.events_manager.as_ref(),
         )
-        && let Some(publisher) = build_indexer_publisher(runtime, endpoint, em)
+        && let Some(publisher) = build_indexer_publisher(runtime, transport, em).await
     {
         let _ = leader.indexer_publisher.set(publisher);
     }
@@ -215,7 +215,7 @@ mod tests {
         HubHandshake {
             url: "http://127.0.0.1:1337".to_string(),
             effective: HashSet::from_iter(features.iter().copied()),
-            indexer_zmq_endpoint: None,
+            indexer_transport: None,
             runtime_summary: kvbm_hub::RuntimeConfigSummary::default(),
         }
     }

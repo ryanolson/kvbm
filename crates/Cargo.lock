@@ -2668,6 +2668,7 @@ name = "kvbm-hub"
 version = "1.2.0"
 dependencies = [
  "anyhow",
+ "async-nats",
  "async-trait",
  "axum",
  "clap",

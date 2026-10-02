@@ -3,10 +3,10 @@
 
 //! KV-index hub publisher wiring.
 //!
-//! The hub's KV-index ZMQ ingest endpoint is discovered by the hub handshake
+//! The hub's KV-index ingest transport is discovered by the hub handshake
 //! ([`super::hub_handshake`]) from the aggregate `GET /v1/config`. When the
 //! Indexer feature is effective and block-size-compatible, the connector
-//! connects a ZMQ `PUB` socket to that endpoint and wires a [`Publisher`] into
+//! connects the advertised transport and wires a [`Publisher`] into
 //! the block-registry [`EventsManager`] so block create/remove events flow to
 //! the hub's index. The connector also registers `Feature::Indexer` with the
 //! hub so the hub's `on_unregister` sweep reclaims this instance's entries.
@@ -22,10 +22,34 @@ use kvbm_logical::pubsub::Publisher;
 use tmq::{Context as ZmqContext, Multipart, publish::Publish, publish::publish};
 use tokio::sync::{Mutex, mpsc};
 
+use super::hub_handshake::IndexerTransport;
+
 /// Subject/topic frame prepended to each published batch.
 pub const SUBJECT: &str = "kvbm.kv_index";
 
 const ZMQ_LINGER_MS: i32 = 0;
+
+/// Connects the publisher for the negotiated hub event transport.
+pub async fn connect_hub_index_publisher(
+    transport: &IndexerTransport,
+) -> Result<(Arc<dyn Publisher>, String)> {
+    match transport {
+        IndexerTransport::Zmq { endpoint } => Ok((
+            Arc::new(ZmqHubPublisher::connect(endpoint)?),
+            SUBJECT.to_string(),
+        )),
+        IndexerTransport::Nats {
+            server,
+            subject_prefix,
+        } => {
+            let publisher = kvbm_engine::pubsub::NatsPublisher::connect(
+                kvbm_engine::pubsub::NatsConfig::new(server.clone()),
+            )
+            .await?;
+            Ok((Arc::new(publisher), format!("{subject_prefix}.{SUBJECT}")))
+        }
+    }
+}
 
 /// [`Publisher`] backed by a ZMQ `PUB` socket connected to the hub's `SUB`
 /// ingest socket.

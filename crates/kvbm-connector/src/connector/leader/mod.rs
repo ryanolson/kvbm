@@ -32,10 +32,12 @@ pub(crate) mod peer_resolver;
 mod remote_discovery;
 
 pub use hub_handshake::{
-    HubHandshake, WorkerCapabilities, resolve as resolve_hub_handshake,
+    HubHandshake, IndexerTransport, WorkerCapabilities, resolve as resolve_hub_handshake,
     validate_remote_search_availability,
 };
-pub use hub_indexer::{SUBJECT as HUB_INDEXER_SUBJECT, ZmqHubPublisher};
+pub use hub_indexer::{
+    SUBJECT as HUB_INDEXER_SUBJECT, ZmqHubPublisher, connect_hub_index_publisher,
+};
 pub use peer_resolver::HubPeerResolver;
 pub use remote_discovery::HubRemoteDiscovery;
 

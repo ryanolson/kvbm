@@ -148,7 +148,7 @@ pub trait FeatureManager: Send + Sync + 'static {
     /// Feature-specific config view for the aggregate `GET /v1/config`
     /// response, given the resolved hub `primary`. Default: `null` (the feature
     /// exposes nothing beyond its key + dependencies). KV-index overrides this
-    /// to advertise its ZMQ ingest endpoint.
+    /// to advertise its event-plane ingest endpoint.
     fn descriptor(&self, _primary: &PrimaryConfig) -> serde_json::Value {
         serde_json::Value::Null
     }

@@ -144,20 +144,24 @@ struct Cli {
     #[arg(long)]
     kv_index_block_size: Option<usize>,
 
-    /// ZMQ bind spec for the KV indexer ingest socket
-    /// (default `tcp://0.0.0.0:0`, OS-assigned port).
+    /// ZMQ bind spec for the KV indexer ingest socket when
+    /// `DYN_EVENT_PLANE=zmq` (default `tcp://0.0.0.0:0`, OS-assigned port).
     #[arg(long)]
     kv_index_zmq_bind: Option<String>,
 
-    /// ZMQ bind spec for the KV indexer carrier-feed PUB socket
-    /// (default `tcp://0.0.0.0:0`, OS-assigned port).
+    /// ZMQ bind spec for the KV indexer carrier-feed PUB socket when
+    /// `DYN_EVENT_PLANE=zmq` (default `tcp://0.0.0.0:0`, OS-assigned port).
     #[arg(long)]
     kv_index_feed_bind: Option<String>,
 
     /// Host advertised for the KV indexer's ingest and carrier-feed endpoints
-    /// (default `127.0.0.1`).
+    /// in ZMQ mode (default `127.0.0.1`).
     #[arg(long)]
     kv_index_advertise_host: Option<String>,
+
+    /// NATS subject namespace for KV-index ingest and carrier feed.
+    #[arg(long = "kv-index-nats-subject-prefix")]
+    kv_index_nats_subject_prefix: Option<String>,
 
     /// Override a base connector-config key: `--kvbm <dotted.path>=<value>`
     /// (repeatable). The first path segment may be a profile
@@ -411,7 +415,7 @@ fn build_config(cli: &Cli) -> anyhow::Result<ResolvedConfig> {
         }
     }
 
-    // KV indexer: resolve sizing from primary; carry ZMQ / feed / advertise overrides.
+    // KV indexer: resolve sizing from primary; carry transport-specific overrides.
     // Enabled iff selected in the feature set.
     if enabled.contains(&FeatureKey::Indexer) {
         let existing = config.indexer.take().unwrap_or_default();
@@ -425,6 +429,10 @@ fn build_config(cli: &Cli) -> anyhow::Result<ResolvedConfig> {
                 .clone()
                 .or(existing.advertise_host)
                 .or_else(|| config.primary.advertise_host.clone()),
+            nats_subject_prefix: cli
+                .kv_index_nats_subject_prefix
+                .clone()
+                .or(existing.nats_subject_prefix),
         });
     } else {
         config.indexer = None;
@@ -467,6 +475,8 @@ async fn main() -> anyhow::Result<()> {
         enabled,
         base_config,
     } = build_config(&cli)?;
+    let event_plane = kvbm_hub::EventPlane::from_env()?;
+    let nats_server = kvbm_hub::nats_server_from_env();
 
     tracing::info!(
         bind_addr = %config.bind_addr,
@@ -587,7 +597,8 @@ async fn main() -> anyhow::Result<()> {
             kvi.feed_bind
                 .clone()
                 .unwrap_or_else(|| "tcp://0.0.0.0:0".to_string()),
-        );
+        )
+        .with_event_plane(event_plane, nats_server, kvi.nats_subject_prefix.clone());
         tracing::info!(max_seq_len, block_size, "KV indexer feature enabled");
         builder =
             builder.add_feature_manager(Arc::new(manager) as Arc<dyn kvbm_hub::FeatureManager>);

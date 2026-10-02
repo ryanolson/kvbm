@@ -91,6 +91,33 @@ async fn start_hub() -> (HubServer, Arc<IndexerManager>) {
     (server, manager)
 }
 
+async fn start_nats_hub(
+    server_url: &str,
+    subject_prefix: &str,
+) -> (HubServer, Arc<IndexerManager>) {
+    let manager = Arc::new(
+        IndexerManager::new(MAX_SEQ_LEN, BLOCK_SIZE as usize, None, None)
+            .expect("build indexer manager")
+            .with_event_plane(
+                kvbm_hub::EventPlane::Nats,
+                server_url.to_string(),
+                Some(subject_prefix.to_string()),
+            ),
+    );
+    let server = kvbm_hub::create_server_builder()
+        .bind_addr("127.0.0.1".parse().unwrap())
+        .discovery_port(0)
+        .control_port(0)
+        .heartbeat_interval(Duration::from_secs(3600))
+        .heartbeat_max_failures(u32::MAX)
+        .registration_ttl(Duration::from_secs(3600))
+        .add_feature_manager(Arc::clone(&manager) as Arc<dyn FeatureManager>)
+        .serve()
+        .await
+        .expect("start hub");
+    (server, manager)
+}
+
 /// Builds `n` PLHs at positions 0..n by laying down `n * BLOCK_SIZE` tokens.
 fn plhs(n: usize, salt: u64) -> Vec<SequenceHash> {
     let tokens: Vec<u32> = (0..(BLOCK_SIZE as usize * n) as u32).collect();
@@ -403,6 +430,94 @@ async fn carrier_feed_publishes_frames_and_snapshots() {
             holder: instance_id,
             hashes,
         }]
+    );
+
+    server.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nats_carrier_feed_publishes_frames_and_snapshots_when_configured() {
+    let Ok(nats_server) = std::env::var("KVBM_TEST_NATS_SERVER") else {
+        return;
+    };
+    let subject_prefix = format!("kvbm.hub.test.{}", InstanceId::new_v4().as_u128());
+    let (server, manager) = start_nats_hub(&nats_server, &subject_prefix).await;
+    let base = format!("http://{}", server.discovery_addr());
+    let http = reqwest::Client::new();
+    let cfg: IndexerConfigResponse =
+        serde_json::from_value(get_json(&http, &base, "/config").await).expect("config");
+    assert_eq!(cfg.event_plane, kvbm_hub::EventPlane::Nats);
+    assert!(cfg.zmq_endpoint.is_empty());
+    assert!(cfg.feed_endpoint.is_empty());
+    assert_eq!(cfg.nats_subject_prefix, subject_prefix);
+
+    let client = async_nats::connect(&nats_server)
+        .await
+        .expect("connect test NATS client");
+    let feed_topic = std::str::from_utf8(CARRIER_FEED_TOPIC).expect("feed topic is valid UTF-8");
+    let mut feed_sub = client
+        .subscribe(format!("{subject_prefix}.{feed_topic}"))
+        .await
+        .expect("subscribe to NATS carrier feed");
+    let manifest = carrier_manifest();
+    let manifest_id = manifest.id();
+    let instance = InstanceId::new_v4();
+    let instance_id = instance.as_u128();
+    manager
+        .on_register(
+            instance,
+            &Feature::Indexer(IndexerFeatureConfig {
+                max_seq_len: Some(MAX_SEQ_LEN),
+                manifest,
+                create_kind: kvbm_logical::events::CreateKind::Carrier,
+            }),
+        )
+        .await
+        .expect("bind carrier indexer instance");
+
+    let hashes = plhs(2, 1337);
+    let batch = KvbmCacheEvents {
+        events: KvCacheEvents::CarrierCreate(hashes.clone()),
+        instance_id,
+    };
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        client.publish(
+            format!("{subject_prefix}.kvbm.kv_index"),
+            rmp_serde::to_vec(&batch)
+                .expect("encode carrier batch")
+                .into(),
+        ),
+    )
+    .await
+    .expect("publish carrier event")
+    .expect("NATS publish");
+    let message = tokio::time::timeout(Duration::from_secs(5), feed_sub.next())
+        .await
+        .expect("wait for NATS feed frame")
+        .expect("feed subscription ended");
+    let frame = decode_frame(&message.payload).expect("decode carrier feed frame");
+    assert_eq!(frame.manifest, manifest_id.as_bytes().to_owned());
+    assert_eq!(frame.kind, FeedKind::Carrier);
+    assert_eq!(frame.holder, instance_id);
+    assert!(matches!(
+        &frame.op,
+        CarrierFeedOp::Insert(frame_hashes) if frame_hashes == &hashes
+    ));
+
+    let snapshot_response = http
+        .get(format!("{base}/v1/features/indexer/feed/snapshot"))
+        .send()
+        .await
+        .expect("GET feed snapshot");
+    let snapshot = decode_snapshot(&snapshot_response.bytes().await.expect("read feed snapshot"))
+        .expect("decode feed snapshot");
+    assert!(snapshot.seq >= frame.seq);
+    assert!(
+        snapshot
+            .manifests
+            .iter()
+            .any(|entry| entry.manifest == *manifest_id.as_bytes())
     );
 
     server.shutdown().await.expect("shutdown");

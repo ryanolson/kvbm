@@ -1417,7 +1417,7 @@ dependencies = [
  "dynamo-tokens",
  "dynamo-truthy",
  "fastrand",
- "flume",
+ "flume 0.12.0",
  "futures-util",
  "indexmap",
  "ordered-float",
@@ -1609,6 +1609,18 @@ name = "fixedbitset"
 version = "0.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
+
+[[package]]
+name = "flume"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da0e4dd2a88388a1f4ccc7c9ce104604dab68d9f408dc34cd45823d5a9069095"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+ "nanorand",
+ "spin 0.9.8",
+]
 
 [[package]]
 name = "flume"
@@ -2385,6 +2397,7 @@ name = "kvbm-engine"
 version = "1.2.0"
 dependencies = [
  "anyhow",
+ "async-nats",
  "aws-config",
  "aws-sdk-s3",
  "blake3",
@@ -2394,6 +2407,7 @@ dependencies = [
  "cudarc",
  "dashmap",
  "derive_builder",
+ "flume 0.11.1",
  "futures",
  "kvbm-common",
  "kvbm-config",
@@ -2427,6 +2441,7 @@ name = "kvbm-hub"
 version = "1.2.0"
 dependencies = [
  "anyhow",
+ "async-nats",
  "async-trait",
  "axum",
  "clap",
@@ -2796,6 +2811,15 @@ dependencies = [
  "num-traits",
  "simba",
  "typenum",
+]
+
+[[package]]
+name = "nanorand"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a51313c5820b0b02bd422f4b44776fbf47961755c74ce64afc73bfad10226c3"
+dependencies = [
+ "getrandom 0.2.17",
 ]
 
 [[package]]
@@ -5197,7 +5221,7 @@ dependencies = [
  "dashmap",
  "derive-getters",
  "derive_builder",
- "flume",
+ "flume 0.12.0",
  "fs4",
  "futures",
  "http 1.4.2",
@@ -5235,7 +5259,7 @@ checksum = "9bbf99f74c0202bd1bf6caaa8bb784f461b757df7beafe734273519caf65372e"
 dependencies = [
  "anyhow",
  "bytes",
- "flume",
+ "flume 0.12.0",
  "futures",
  "rmp-serde",
  "serde",

@@ -6,8 +6,8 @@
 //! # What this owns
 //!
 //! One projection per `(cache, instance)` of "which keys this instance holds
-//! Ready, at which depth". Deltas arrive lossily over ZMQ; snapshots arrive
-//! reliably and authenticated over the HTTP control plane. The projection
+//! Ready, at which depth". Deltas arrive lossily over the event plane;
+//! snapshots arrive reliably and authenticated over the HTTP control plane. The projection
 //! tracks the continuity evidence that reaches it. If it detects a
 //! failure, it answers **empty** until an authorized snapshot installs.
 //!
@@ -17,10 +17,10 @@
 //! `valid` before it consults the ready map. Thus, a detected continuity failure
 //! cannot produce a holder.
 //!
-//! This guarantee starts after detection. ZMQ can drop a terminal delta with no
-//! later sequence evidence. The projection then remains valid by its local
-//! evidence. A lost terminal `Remove` can leave a stale holder until a
-//! successful snapshot installs. Every holder is advisory. The caller must
+//! This guarantee starts after detection. The event plane can drop a terminal
+//! delta with no later sequence evidence. The projection then remains valid by
+//! its local evidence. A lost terminal `Remove` can leave a stale holder until
+//! a successful snapshot installs. Every holder is advisory. The caller must
 //! acquire the exact owner `BundleLease` before it trusts that holder.
 //!
 //! # Why this is a sub-module of `indexer`, not its own feature
@@ -57,7 +57,7 @@
 //!
 //! It does **not** stop there, and an earlier version of this note wrongly said
 //! the window was bounded by the publisher's push latency. The delta that
-//! outran the snapshot is dropped, and ZMQ pub/sub has no retransmission, so
+//! outran the snapshot is dropped, and core pub/sub has no retransmission, so
 //! after the install resumes the projection at `seq_floor + 1` the next real
 //! delta is `seq_floor + 2` and gaps. The publisher then pushes another
 //! snapshot, whose own successor delta outruns it in turn. Under sustained
@@ -179,7 +179,7 @@ pub struct TierPlacementSnapshotRequestAck {
 /// Fire-and-forget snapshot request, behind a seam.
 ///
 /// The hub side of the recovery loop is "ask, then wait": it must not block a
-/// ZMQ ingest tick on an active message, and it must not care whether the
+/// ingest tick on an active message, and it must not care whether the
 /// request is delivered — an undelivered request costs one more interval of
 /// empty answers, and the publisher's periodic push is the backstop.
 pub trait SnapshotRequester: Send + Sync {

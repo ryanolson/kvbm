@@ -1,17 +1,18 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! ZMQ ingest loop: dispatch published frames by topic, decode them, and apply
-//! them to the [`ManifestIndexes`] or the [`TierPlacementProjection`].
+//! Event-plane ingest loops: dispatch published frames by topic, decode them,
+//! and apply them to the [`ManifestIndexes`] or the [`TierPlacementProjection`].
 //!
 //! # Why this dispatches on the topic frame
 //!
-//! R7b §6 assumes a new ZMQ subject means "old subscribers never see unknown
-//! frames". That is false for this hub: [`bind_sub_socket`](super::zmq) calls
-//! `subscribe(b"")`, i.e. *every* topic, so a new subject lands in this same
-//! loop. Isolation has to come from the decoder. Without the dispatch below,
-//! every tier-placement batch would arrive as a warn-logged "undecodable batch"
-//! — and a mis-decode, rather than a drop, would corrupt the block index.
+//! R7b §6 assumes a new event subject means "old subscribers never see unknown
+//! frames". ZMQ's [`bind_sub_socket`](super::zmq) subscribes to every topic,
+//! and the NATS subscriber listens to the full hub namespace, so new topics
+//! land in this same loop. Isolation has to come from the decoder. Without the
+//! dispatch below, every tier-placement batch would arrive as a warn-logged
+//! "undecodable batch" — and a mis-decode, rather than a drop, would corrupt
+//! the block index.
 //! `kvbm-logical`'s cross-decode tests assert neither stream can be read as the
 //! other, which is the guardrail behind this dispatch.
 
@@ -32,6 +33,25 @@ use super::tier_placement::TierPlacementProjection;
 /// ZMQ topic frame the legacy KV index stream publishes under. Matches
 /// `kvbm-connector`'s `ZmqHubPublisher::SUBJECT`.
 pub const LEGACY_INDEX_SUBJECT: &str = "kvbm.kv_index";
+
+/// Prefix an existing event topic with the hub's NATS namespace.
+pub fn nats_subject(prefix: &str, topic: &str) -> String {
+    format!("{prefix}.{topic}")
+}
+
+fn topic_from_nats_subject<'a>(prefix: &str, subject: &'a str) -> Option<&'a [u8]> {
+    subject
+        .strip_prefix(&format!("{prefix}."))
+        .map(str::as_bytes)
+}
+
+fn dispatch_nats_message(sinks: &IngestSinks, prefix: &str, subject: &str, payload: &[u8]) {
+    dispatch(
+        sinks,
+        topic_from_nats_subject(prefix, subject).unwrap_or_default(),
+        payload,
+    );
+}
 
 /// Per-reason ingest drop counters.
 ///
@@ -120,6 +140,32 @@ pub async fn run_ingest_loop(mut sub: Subscribe, sinks: IngestSinks, cancel: Can
         }
     }
     tracing::info!("indexer ingest loop stopped");
+}
+
+/// Drains a NATS subscription until cancelled.
+pub async fn run_nats_ingest_loop(
+    mut subscriber: async_nats::Subscriber,
+    subject_prefix: String,
+    sinks: IngestSinks,
+    cancel: CancellationToken,
+) {
+    tracing::info!("indexer NATS ingest loop started");
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            message = subscriber.next() => match message {
+                Some(message) => dispatch_nats_message(
+                    &sinks,
+                    &subject_prefix,
+                    &message.subject,
+                    &message.payload,
+                ),
+                None => break,
+            }
+        }
+    }
+    tracing::info!("indexer NATS ingest loop stopped");
 }
 
 /// Pick the topic a multipart message should be routed under.
@@ -314,6 +360,22 @@ mod tests {
         // ...and the block index still holds only what the legacy frame put
         // there.
         assert!(sinks.indexes.query(manifest_id(), &[hash]).is_some());
+    }
+
+    #[test]
+    fn nats_subject_is_stripped_before_dispatch() {
+        let instance = InstanceId::new_v4();
+        let sinks = sinks(instance);
+        assert_eq!(
+            topic_from_nats_subject("kvbm.hub.test", "kvbm.hub.test.kvbm.kv_index"),
+            Some(LEGACY_INDEX_SUBJECT.as_bytes())
+        );
+
+        dispatch_nats_message(&sinks, "kvbm.hub.test", "kvbm.hub.test.unknown", b"payload");
+        assert_eq!(sinks.counters.unknown_topic.load(Ordering::Relaxed), 1);
+
+        dispatch_nats_message(&sinks, "kvbm.hub.test", LEGACY_INDEX_SUBJECT, b"payload");
+        assert_eq!(sinks.counters.unknown_topic.load(Ordering::Relaxed), 2);
     }
 
     #[test]

@@ -1554,7 +1554,7 @@ fn seal(publisher: &mut TierPlacementSequencer, ops: Vec<TierPlacementOp>) -> Ti
 /// sequence numbers, because the number the publisher would actually stamp next
 /// is the whole point. An earlier version of this test re-applied the *same*
 /// batch at the same `seq` after the install and called the result "heals";
-/// that models a retransmission ZMQ pub/sub does not provide. The publisher's
+/// that models retransmission the lossy event pub/sub does not provide. The publisher's
 /// sequencer already consumed that number for the batch the hub dropped, so the
 /// real next batch is `seq_floor + 2` and it gaps — and the recovery snapshot
 /// that follows loses the same race again.

@@ -21,6 +21,46 @@ use velo_ext::InstanceId;
 
 use crate::protocol::MutationCredential;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EventPlane {
+    #[default]
+    Zmq,
+    Nats,
+}
+
+impl EventPlane {
+    pub const ENV: &'static str = "DYN_EVENT_PLANE";
+
+    pub fn parse(value: Option<&str>) -> anyhow::Result<Self> {
+        match value {
+            None | Some("") | Some("zmq") => Ok(Self::Zmq),
+            Some("nats") => Ok(Self::Nats),
+            Some(other) => anyhow::bail!(
+                "invalid {} value {other:?}; valid values are `zmq` and `nats`",
+                Self::ENV
+            ),
+        }
+    }
+
+    pub fn from_env() -> anyhow::Result<Self> {
+        match std::env::var(Self::ENV) {
+            Ok(value) => Self::parse(Some(&value)),
+            Err(std::env::VarError::NotPresent) => Self::parse(None),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                anyhow::bail!("{} must contain a valid Unicode value", Self::ENV)
+            }
+        }
+    }
+}
+
+pub fn nats_server_from_env() -> String {
+    std::env::var("NATS_SERVER")
+        .ok()
+        .filter(|server| !server.is_empty())
+        .unwrap_or_else(|| "nats://localhost:4222".to_string())
+}
+
 /// URL segment the server nests this feature's routers under
 /// (`/v1/features/indexer/...`).
 pub const ROUTE_PREFIX: &str = "indexer";
@@ -69,7 +109,7 @@ pub mod paths {
 /// One Ready placement asserted by a bundle advertisement (R7b §5).
 ///
 /// This is the *owner-asserted, credential-authenticated* view of placement, as
-/// distinct from the advisory ZMQ projection. Query rows are derived from these,
+/// distinct from the advisory event-plane projection. Query rows are derived from these,
 /// not from the projection, so a directory read never has to take a second lock
 /// or reconcile two sources mid-answer.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -88,6 +128,9 @@ pub struct ReadyPlacement {
 /// `200` tells a connector the indexer is present and where to publish.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IndexerConfigResponse {
+    /// Fleet event-plane transport selected by `DYN_EVENT_PLANE`.
+    #[serde(default)]
+    pub event_plane: EventPlane,
     /// Maximum sequence length (tokens) the index is sized for.
     pub max_seq_len: usize,
     /// Block size (tokens per block). Must match the publisher's page size.
@@ -95,12 +138,55 @@ pub struct IndexerConfigResponse {
     /// Number of position buckets (`max_seq_len / block_size`).
     pub num_positions: usize,
     /// ZMQ endpoint a publisher connects its `PUB` socket to
-    /// (e.g. `tcp://127.0.0.1:54231`). Empty when ingest is not yet bound.
+    /// (e.g. `tcp://127.0.0.1:54231`). Empty for NATS.
     pub zmq_endpoint: String,
     /// Carrier-feed PUB endpoint a router connects to
-    /// (e.g. `tcp://127.0.0.1:54232`). Empty when not yet bound.
+    /// (e.g. `tcp://127.0.0.1:54232`). Empty for NATS.
     #[serde(default)]
     pub feed_endpoint: String,
+    /// NATS subject namespace. Empty for ZMQ.
+    #[serde(default)]
+    pub nats_subject_prefix: String,
+}
+
+#[cfg(test)]
+mod event_plane_tests {
+    use super::*;
+
+    #[test]
+    fn parse_event_plane_values() {
+        assert_eq!(EventPlane::parse(None).unwrap(), EventPlane::Zmq);
+        assert_eq!(EventPlane::parse(Some("")).unwrap(), EventPlane::Zmq);
+        assert_eq!(EventPlane::parse(Some("zmq")).unwrap(), EventPlane::Zmq);
+        assert_eq!(EventPlane::parse(Some("nats")).unwrap(), EventPlane::Nats);
+        assert!(EventPlane::parse(Some("NATS")).is_err());
+        assert!(EventPlane::parse(Some("bogus")).is_err());
+    }
+
+    #[test]
+    fn indexer_config_response_accepts_legacy_and_round_trips_nats() {
+        let legacy: IndexerConfigResponse = serde_json::from_str(
+            r#"{"max_seq_len":16,"block_size":16,"num_positions":1,"zmq_endpoint":"tcp://host:1"}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.event_plane, EventPlane::Zmq);
+        assert!(legacy.nats_subject_prefix.is_empty());
+
+        let nats = IndexerConfigResponse {
+            event_plane: EventPlane::Nats,
+            max_seq_len: 16,
+            block_size: 16,
+            num_positions: 1,
+            zmq_endpoint: String::new(),
+            feed_endpoint: String::new(),
+            nats_subject_prefix: "kvbm.hub.test".to_string(),
+        };
+        assert_eq!(
+            serde_json::from_str::<IndexerConfigResponse>(&serde_json::to_string(&nats).unwrap())
+                .unwrap(),
+            nats
+        );
+    }
 }
 
 /// Response for `GET /instances`. The set of instances that declared
@@ -319,7 +405,7 @@ pub struct BundleQueryHit {
     ///
     /// **Echoed from the advertisement, not joined against the advisory
     /// projection.** The advertisement is the authenticated, owner-asserted
-    /// source; consulting the ZMQ projection here would put a second lock inside
+    /// source; consulting the advisory projection here would put a second lock inside
     /// the bundle query path and open the torn-read surface the transactional
     /// snapshot install exists to close.
     #[serde(default)]

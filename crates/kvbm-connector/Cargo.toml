@@ -16,7 +16,7 @@ keywords.workspace = true
 # Internal workspace crates
 kvbm-common   = { workspace = true }
 kvbm-config   = { workspace = true }
-kvbm-engine   = { workspace = true }
+kvbm-engine   = { workspace = true, features = ["nats"] }
 kvbm-hub      = { workspace = true }
 kvbm-logical  = { workspace = true }
 kvbm-physical = { workspace = true }

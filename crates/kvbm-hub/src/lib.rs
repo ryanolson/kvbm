@@ -73,9 +73,9 @@ pub use features::disagg::{
 pub use features::indexer::{
     ApplyOutcome, BindError, BundleAdvertisementRecord, BundleInvalidateRequest,
     BundleInvalidationRecord, BundlePublishRequest, BundleQueryHit, BundleQueryMissReason,
-    BundleQueryOutcome, BundleQueryRequest, FindBlocksHit, IndexerConfigResponse,
+    BundleQueryOutcome, BundleQueryRequest, EventPlane, FindBlocksHit, IndexerConfigResponse,
     IndexerLookupClient, IndexerManager, InstanceBinding, InstancesResponse, ManifestIndexes,
-    QueryRequest, QueryResponse,
+    QueryRequest, QueryResponse, nats_server_from_env,
 };
 #[cfg(feature = "kvbmctl")]
 pub use features::p2p::cli::{p2p_command, run_p2p};
