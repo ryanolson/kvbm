@@ -29,7 +29,9 @@ use super::protocol::{
 /// Resolves the candidate hashes to the deepest indexed block and its holders
 /// via [`ManifestIndexes::query_holders`], reconstructing each holder's
 /// [`InstanceId`] from the raw `u128` the index stores (publishers stamp
-/// `velo_id.as_u128()`). Returns `Ok(None)` on a full miss.
+/// `velo_id.as_u128()`). Request hashes must be ordered by ascending
+/// `position()`; unsorted input may return a shallower match. Returns
+/// `Ok(None)` on a full miss.
 pub fn create_query_handler(indexes: Arc<ManifestIndexes>) -> Handler {
     Handler::typed_unary_async::<QueryRequest, Option<FindBlocksHit>, _, _>(
         QUERY_HANDLER,

@@ -27,7 +27,7 @@ or modify dynamo from here.
 
 ## External dependencies
 
-- Three **git** deps on dynamo, pinned to branch `ryan/kvbm-engine-service`:
+- Three **git** deps on dynamo, pinned to revs on branch `ryan/carrier`:
   `dynamo-tokens`, `dynamo-kv-router`, `dynamo-kv-hashing` (the latter two
   via `kvbm-consolidator`). The dependency only runs kvbm → dynamo; dynamo does not depend
   on this repo. Keep that branch fetchable; prefer pinning to an immutable rev for CI

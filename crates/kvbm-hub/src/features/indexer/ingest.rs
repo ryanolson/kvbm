@@ -42,7 +42,7 @@ pub const LEGACY_INDEX_SUBJECT: &str = "kvbm.kv_index";
 /// answer none of those questions.
 #[derive(Debug, Default)]
 pub struct IngestCounters {
-    /// Legacy batches applied to the manifest lineage indexes.
+    /// Legacy batches applied to the manifest carrier indexes.
     pub legacy_applied: AtomicU64,
     /// Legacy batches from instances without an active index registration.
     pub unbound_instance: AtomicU64,
@@ -80,7 +80,7 @@ impl IngestCounters {
 
 /// Everything the ingest loop writes into.
 pub struct IngestSinks {
-    /// Manifest-scoped lineage indexes.
+    /// Manifest-scoped carrier indexes.
     pub indexes: Arc<ManifestIndexes>,
     /// Advisory tier-placement projection.
     pub tier_placements: Arc<TierPlacementProjection>,

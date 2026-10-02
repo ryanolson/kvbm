@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Manifest-scoped wrapper over Dynamo's [`LineageIndex`].
+//! Manifest-scoped wrapper over Dynamo's [`PositionalCarrierIndex`].
 //!
 //! Each manifest has a grow-only capacity measured in positions
 //! (`max_seq_len / block_size`). Block/carrier kind binding and poisoning live
@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use dynamo_kv_router::indexer::lineage::LineageIndex;
+use dynamo_kv_router::indexer::positional_carrier::PositionalCarrierIndex;
 use kvbm_logical::SequenceHash;
 use kvbm_logical::events::{CreateKind, KvCacheEvents, KvbmCacheEvents};
 use kvbm_protocols::cache_manifest::{CacheManifest, CacheManifestId, ResourceRole};
@@ -47,10 +47,10 @@ struct IndexerBinding {
 
 struct ManifestIndex {
     kind: CreateKind,
-    index: LineageIndex<u128>,
+    index: PositionalCarrierIndex<u128>,
 }
 
-/// Manifest-scoped lineage indexes and the registered instance bindings.
+/// Manifest-scoped carrier indexes and the registered instance bindings.
 pub struct ManifestIndexes {
     block_size: usize,
     initial_max_seq_len: usize,
@@ -110,7 +110,8 @@ impl ManifestIndexes {
         }
 
         if !self.indexes.contains_key(&manifest_id) {
-            let index = LineageIndex::new((self.initial_max_seq_len / self.block_size) as u64);
+            let index =
+                PositionalCarrierIndex::new((self.initial_max_seq_len / self.block_size) as u64);
             self.indexes
                 .insert(manifest_id, Arc::new(ManifestIndex { kind, index }));
         }
@@ -221,6 +222,10 @@ impl ManifestIndexes {
         ApplyOutcome::Applied
     }
 
+    /// Returns the deepest held hash and holders for an ascending-position query.
+    ///
+    /// `hashes` must be ordered by ascending `position()`, as produced by
+    /// `positional_lineage_hashes`. Unsorted input may return a shallower result.
     pub fn query_holders(
         &self,
         manifest: CacheManifestId,
@@ -233,6 +238,10 @@ impl ManifestIndexes {
             .map(|hit| (hit.hash, hit.holders, index.kind))
     }
 
+    /// Returns the deepest held entry for an ascending-position query.
+    ///
+    /// `hashes` must be ordered by ascending `position()`, as produced by
+    /// `positional_lineage_hashes`. Unsorted input may return a shallower result.
     pub fn query(&self, manifest: CacheManifestId, hashes: &[SequenceHash]) -> Option<IndexEntry> {
         self.query_holders(manifest, hashes)
             .map(|(hash, holders, _)| entry_of_ids(hash, holders))
@@ -412,11 +421,6 @@ mod tests {
         let hit = indexes.query(manifest.id(), &hashes).expect("hit");
         assert_eq!(hit.position, 2);
         assert_eq!(hit.instances, vec!["7".to_string()]);
-
-        // Unsorted input still yields the deepest present.
-        let mut shuffled = hashes.clone();
-        shuffled.reverse();
-        assert_eq!(indexes.query(manifest.id(), &shuffled).unwrap().position, 2);
 
         // A query whose deep blocks are unknown falls back to the shallow hit.
         let unknown = plhs(4, 5, 999);
@@ -734,7 +738,7 @@ mod tests {
         assert!(indexes.query(manifest.id(), &[deep]).is_none());
         assert_eq!(
             indexes
-                .query(manifest.id(), &[deep, shallow])
+                .query(manifest.id(), &[shallow, deep])
                 .unwrap()
                 .hash_u128,
             shallow.as_u128().to_string()

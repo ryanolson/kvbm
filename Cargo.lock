@@ -1392,7 +1392,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 [[package]]
 name = "dynamo-kv-hashing"
 version = "1.6.0"
-source = "git+https://github.com/ai-dynamo/dynamo.git?rev=73b2a9ba4881e8621fe64bd3238f7948cf577f46#73b2a9ba4881e8621fe64bd3238f7948cf577f46"
+source = "git+https://github.com/ai-dynamo/dynamo.git?rev=7fb8885c9c40eadded4293ba1d2654b103e5a10a#7fb8885c9c40eadded4293ba1d2654b103e5a10a"
 dependencies = [
  "derive_builder",
  "dynamo-tokens",
@@ -1404,7 +1404,7 @@ dependencies = [
 [[package]]
 name = "dynamo-kv-router"
 version = "1.6.0"
-source = "git+https://github.com/ai-dynamo/dynamo.git?rev=73b2a9ba4881e8621fe64bd3238f7948cf577f46#73b2a9ba4881e8621fe64bd3238f7948cf577f46"
+source = "git+https://github.com/ai-dynamo/dynamo.git?rev=7fb8885c9c40eadded4293ba1d2654b103e5a10a#7fb8885c9c40eadded4293ba1d2654b103e5a10a"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1441,7 +1441,7 @@ dependencies = [
 [[package]]
 name = "dynamo-tokens"
 version = "1.6.0"
-source = "git+https://github.com/ai-dynamo/dynamo.git?rev=73b2a9ba4881e8621fe64bd3238f7948cf577f46#73b2a9ba4881e8621fe64bd3238f7948cf577f46"
+source = "git+https://github.com/ai-dynamo/dynamo.git?rev=7fb8885c9c40eadded4293ba1d2654b103e5a10a#7fb8885c9c40eadded4293ba1d2654b103e5a10a"
 dependencies = [
  "bs58",
  "bytemuck",
@@ -1457,7 +1457,7 @@ dependencies = [
 [[package]]
 name = "dynamo-truthy"
 version = "1.6.0"
-source = "git+https://github.com/ai-dynamo/dynamo.git?rev=73b2a9ba4881e8621fe64bd3238f7948cf577f46#73b2a9ba4881e8621fe64bd3238f7948cf577f46"
+source = "git+https://github.com/ai-dynamo/dynamo.git?rev=7fb8885c9c40eadded4293ba1d2654b103e5a10a#7fb8885c9c40eadded4293ba1d2654b103e5a10a"
 dependencies = [
  "anyhow",
 ]
