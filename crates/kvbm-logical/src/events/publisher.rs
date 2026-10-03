@@ -53,7 +53,7 @@ impl<S, P: ?Sized> Default for KvbmCacheEventsPublisherBuilder<S, P> {
     }
 }
 
-impl<S, P: ?Sized> KvbmCacheEventsPublisherBuilder<S, P>
+impl<S, P> KvbmCacheEventsPublisherBuilder<S, P>
 where
     S: Stream<Item = KvCacheEvent> + Send + 'static,
     P: Publisher + ?Sized + 'static,
@@ -185,7 +185,7 @@ pub struct KvbmCacheEventsPublisher {
 
 impl KvbmCacheEventsPublisher {
     /// Creates a new builder for constructing a publisher.
-    pub fn builder<S, P: ?Sized>() -> KvbmCacheEventsPublisherBuilder<S, P>
+    pub fn builder<S, P>() -> KvbmCacheEventsPublisherBuilder<S, P>
     where
         S: Stream<Item = KvCacheEvent> + Send + 'static,
         P: Publisher + ?Sized + 'static,
