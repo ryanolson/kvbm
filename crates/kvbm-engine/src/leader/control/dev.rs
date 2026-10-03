@@ -20,6 +20,7 @@ use kvbm_protocols::control::{
 
 use super::ControlModule;
 use crate::leader::InstanceLeader;
+use crate::p2p::session::LocalTierReset;
 
 /// The `dev` control module — opt-in.
 pub struct DevModule {
@@ -82,10 +83,7 @@ async fn reset(leader: &InstanceLeader, req: ResetRequest) -> Result<ResetRespon
     let mut hook_errors = if hook_tiers.is_empty() {
         HashMap::new()
     } else {
-        local_reset
-            .as_ref()
-            .expect("plan_reset only allows configured local tiers")
-            .reset(hook_tiers)
+        reset_local_tiers(local_reset.as_deref(), hook_tiers)
             .await
             .into_iter()
             .map(|error| (error.tier, error))
@@ -120,10 +118,14 @@ async fn reset(leader: &InstanceLeader, req: ResetRequest) -> Result<ResetRespon
                 reset.push(tier);
             }
             Tier::G3 => {
-                let drained = leader
-                    .g3_manager()
-                    .expect("plan_reset already verified G3 is configured")
-                    .drain_inactive_pool();
+                let Some(manager) = leader.g3_manager() else {
+                    failed.push(TierError {
+                        tier,
+                        message: "G3 is not configured".into(),
+                    });
+                    continue;
+                };
+                let drained = manager.drain_inactive_pool();
                 tracing::info!(?tier, drained, "tier reset drained inactive blocks");
                 reset.push(tier);
             }
@@ -135,6 +137,19 @@ async fn reset(leader: &InstanceLeader, req: ResetRequest) -> Result<ResetRespon
         failed,
         skipped_unconfigured: skipped,
     })
+}
+
+async fn reset_local_tiers(hook: Option<&dyn LocalTierReset>, tiers: Vec<Tier>) -> Vec<TierError> {
+    let Some(hook) = hook else {
+        return tiers
+            .into_iter()
+            .map(|tier| TierError {
+                tier,
+                message: "no local tier reset hook installed".into(),
+            })
+            .collect();
+    };
+    hook.reset(tiers).await
 }
 
 #[cfg(test)]
