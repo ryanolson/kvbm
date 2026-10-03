@@ -31,7 +31,7 @@ use crate::pubsub::Publisher;
 ///     .subject("kvbm.events")
 ///     .build()?;
 /// ```
-pub struct KvbmCacheEventsPublisherBuilder<S, P> {
+pub struct KvbmCacheEventsPublisherBuilder<S, P: ?Sized> {
     instance_id: Option<InstanceId>,
     event_stream: Option<S>,
     publisher: Option<Arc<P>>,
@@ -40,7 +40,7 @@ pub struct KvbmCacheEventsPublisherBuilder<S, P> {
     create_kind: Option<CreateKind>,
 }
 
-impl<S, P> Default for KvbmCacheEventsPublisherBuilder<S, P> {
+impl<S, P: ?Sized> Default for KvbmCacheEventsPublisherBuilder<S, P> {
     fn default() -> Self {
         Self {
             instance_id: None,
@@ -53,10 +53,10 @@ impl<S, P> Default for KvbmCacheEventsPublisherBuilder<S, P> {
     }
 }
 
-impl<S, P> KvbmCacheEventsPublisherBuilder<S, P>
+impl<S, P: ?Sized> KvbmCacheEventsPublisherBuilder<S, P>
 where
     S: Stream<Item = KvCacheEvent> + Send + 'static,
-    P: Publisher + 'static,
+    P: Publisher + ?Sized + 'static,
 {
     /// Creates a new builder with default settings.
     pub fn new() -> Self {
@@ -185,10 +185,10 @@ pub struct KvbmCacheEventsPublisher {
 
 impl KvbmCacheEventsPublisher {
     /// Creates a new builder for constructing a publisher.
-    pub fn builder<S, P>() -> KvbmCacheEventsPublisherBuilder<S, P>
+    pub fn builder<S, P: ?Sized>() -> KvbmCacheEventsPublisherBuilder<S, P>
     where
         S: Stream<Item = KvCacheEvent> + Send + 'static,
-        P: Publisher + 'static,
+        P: Publisher + ?Sized + 'static,
     {
         KvbmCacheEventsPublisherBuilder::new()
     }

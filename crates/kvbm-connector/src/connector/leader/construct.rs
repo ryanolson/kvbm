@@ -156,7 +156,7 @@ pub(super) async fn build_indexer_publisher(
                 .instance_id(instance_id)
                 .create_kind(CreateKind::Block)
                 .event_stream(events_manager.subscribe())
-                .publisher(Arc::new(SharedPublisher(publisher)))
+                .publisher(publisher)
                 .subject(subject)
                 .build()
             {
@@ -174,18 +174,6 @@ pub(super) async fn build_indexer_publisher(
             tracing::warn!(error = %e, "indexer publisher connect failed; skipping");
             None
         }
-    }
-}
-
-struct SharedPublisher(Arc<dyn kvbm_logical::pubsub::Publisher>);
-
-impl kvbm_logical::pubsub::Publisher for SharedPublisher {
-    fn publish(&self, subject: &str, payload: bytes::Bytes) -> Result<()> {
-        self.0.publish(subject, payload)
-    }
-
-    fn flush(&self) -> futures::future::BoxFuture<'static, Result<()>> {
-        self.0.flush()
     }
 }
 
