@@ -720,18 +720,22 @@ mod tests {
     #[test]
     fn shared_read_api_returns_deepest_hash_per_holder_and_kind() {
         let indexes = ManifestIndexes::new(64, 4).unwrap();
-        let manifest = manifest(15, false);
-        indexes.bind(1, &manifest, CreateKind::Block, None).unwrap();
-        indexes.bind(2, &manifest, CreateKind::Block, None).unwrap();
+        let bound_manifest = manifest(15, false);
+        indexes
+            .bind(1, &bound_manifest, CreateKind::Block, None)
+            .unwrap();
+        indexes
+            .bind(2, &bound_manifest, CreateKind::Block, None)
+            .unwrap();
         let hashes = plhs(4, 3, 42);
         indexes.apply(create(hashes.clone(), 1));
         indexes.apply(create(vec![hashes[0]], 2));
 
-        let deepest = indexes.deepest_by_holder(manifest.id(), &hashes);
+        let deepest = indexes.deepest_by_holder(bound_manifest.id(), &hashes);
         assert_eq!(deepest.len(), 2);
         assert!(deepest.contains(&(1, hashes[2])));
         assert!(deepest.contains(&(2, hashes[0])));
-        assert_eq!(indexes.kind(manifest.id()), Some(CreateKind::Block));
+        assert_eq!(indexes.kind(bound_manifest.id()), Some(CreateKind::Block));
 
         let unknown_manifest = manifest(16, false);
         assert!(

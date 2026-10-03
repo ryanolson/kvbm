@@ -203,7 +203,7 @@ mod tests {
         let mut manager_set = BlockManagerSet::new();
         for (index, manager) in managers.into_iter().enumerate() {
             manager_set
-                .insert(LogicalResourceId(index as u64 + 1), manager)
+                .insert(LogicalResourceId(index as u16 + 1), manager)
                 .unwrap();
         }
         InstanceLeader::builder()
