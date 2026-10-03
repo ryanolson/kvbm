@@ -5,10 +5,11 @@
 //!
 //! A hub-side, router-like index of which worker instances hold which KV
 //! blocks. Workers publish block create/remove events
-//! ([`kvbm_logical::events::KvbmCacheEvents`]) to the ZMQ ingest endpoint
-//! advertised by `GET /v1/features/indexer/config`; the hub buckets them by
-//! block position and resolves "who holds this sequence?" queries to the
-//! deepest matching block's holders.
+//! ([`kvbm_logical::events::KvbmCacheEvents`]) using the configured fleet event
+//! plane advertised by `GET /v1/features/indexer/config`; the hub buckets them
+//! by block position and resolves "who holds this sequence?" queries to the
+//! deepest matching block's holders. Accepted mutations are also published as
+//! a sequenced carrier feed with a MessagePack snapshot for router resync.
 //!
 //! The feature owns its whole HTTP namespace via
 //! [`FeatureManager::route_prefix`](crate::features::FeatureManager::route_prefix)
@@ -19,6 +20,7 @@ pub mod bundle;
 #[cfg(feature = "kvbmctl")]
 pub mod cli;
 pub mod client;
+pub mod feed;
 pub mod handlers;
 pub mod index;
 pub mod ingest;
@@ -37,9 +39,10 @@ pub use protocol::{
     BUNDLE_INVALIDATE_HANDLER, BUNDLE_PUBLISH_HANDLER, BUNDLE_QUERY_HANDLER,
     BundleAdvertisementRecord, BundleInvalidateRequest, BundleInvalidationRecord,
     BundlePublishRequest, BundleQueryHit, BundleQueryMissReason, BundleQueryOutcome,
-    BundleQueryRequest, ByPositionResponse, FindBlocksHit, IndexEntry, IndexerConfigResponse,
-    InstanceBinding, InstancesResponse, QUERY_HANDLER, QueryRequest, QueryResponse, ROUTE_PREFIX,
-    ReadyPlacement, TierPlacementSnapshotRequest, TierPlacementSnapshotResponse,
+    BundleQueryRequest, ByPositionResponse, EventPlane, FindBlocksHit, IndexEntry,
+    IndexerConfigResponse, InstanceBinding, InstancesResponse, QUERY_HANDLER, QueryRequest,
+    QueryResponse, ROUTE_PREFIX, ReadyPlacement, TierPlacementSnapshotRequest,
+    TierPlacementSnapshotResponse, nats_server_from_env,
 };
 pub use tier_placement::{
     TIER_PLACEMENT_SNAPSHOT_REQUEST_HANDLER, TierPlacementHolder, TierPlacementProjection,

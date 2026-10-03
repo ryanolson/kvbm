@@ -31,8 +31,9 @@ pub fn bind_sub_socket(endpoint: &str) -> Result<Subscribe> {
 
 /// Reads back the concrete endpoint the socket bound to — resolves the
 /// OS-assigned port when bound to `:0`.
-pub fn bound_endpoint(sub: &Subscribe) -> Result<String> {
-    sub.get_socket()
+pub fn bound_endpoint<S: AsZmqSocket>(socket: &S) -> Result<String> {
+    socket
+        .get_socket()
         .get_last_endpoint()
         .context("zmq get_last_endpoint")?
         .map_err(|_| anyhow::anyhow!("zmq last endpoint is not valid UTF-8"))

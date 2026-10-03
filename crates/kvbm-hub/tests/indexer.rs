@@ -1,16 +1,18 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! End-to-end test for the KV indexer feature: two mock `PUB` publishers push
-//! `KvbmCacheEvents` over ZMQ to the hub's `SUB` ingest socket; the test then
-//! asserts the index via the feature's own HTTP surface
-//! (`/v1/features/indexer/...`).
+//! End-to-end tests for the KV indexer feature: mock `PUB` publishers push
+//! `KvbmCacheEvents` over ZMQ to the hub's `SUB` ingest socket; tests assert the
+//! index and its carrier feed through `/v1/features/indexer/...`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use dynamo_kv_router::carrier_feed::{
+    CARRIER_FEED_TOPIC, CarrierFeedOp, FeedKind, decode_frame, decode_snapshot,
+};
 use dynamo_tokens::TokenBlockSequence;
-use futures::SinkExt;
+use futures::{SinkExt, StreamExt};
 use kvbm_hub::{
     Feature, FeatureManager, HubServer, IndexerConfigResponse, IndexerFeatureConfig, IndexerManager,
 };
@@ -20,7 +22,11 @@ use kvbm_protocols::cache_manifest::{
     CacheManifest, ModelIdentity, ResourceRequirement, ResourceRole,
 };
 use serde_json::Value;
-use tmq::{Context, Multipart, publish::Publish, publish::publish};
+use tmq::{
+    Context, Multipart,
+    publish::{Publish, publish},
+    subscribe::{Subscribe, subscribe},
+};
 use velo_ext::InstanceId;
 
 const BLOCK_SIZE: u32 = 4;
@@ -34,6 +40,23 @@ fn test_manifest() -> CacheManifest {
             ResourceRequirement::new(
                 kvbm_common::LogicalResourceId(1),
                 ResourceRole::PrefixHistory,
+                BLOCK_SIZE,
+            )
+            .unwrap(),
+        ],
+        std::collections::BTreeMap::new(),
+    )
+    .unwrap()
+}
+
+fn carrier_manifest() -> CacheManifest {
+    CacheManifest::new(
+        ModelIdentity::new("test-architecture", "test-revision", [8; 32]).unwrap(),
+        "test-carrier-cache-abi",
+        vec![
+            ResourceRequirement::new(
+                kvbm_common::LogicalResourceId(1),
+                ResourceRole::BoundaryCapsule,
                 BLOCK_SIZE,
             )
             .unwrap(),
@@ -68,6 +91,33 @@ async fn start_hub() -> (HubServer, Arc<IndexerManager>) {
     (server, manager)
 }
 
+async fn start_nats_hub(
+    server_url: &str,
+    subject_prefix: &str,
+) -> (HubServer, Arc<IndexerManager>) {
+    let manager = Arc::new(
+        IndexerManager::new(MAX_SEQ_LEN, BLOCK_SIZE as usize, None, None)
+            .expect("build indexer manager")
+            .with_event_plane(
+                kvbm_hub::EventPlane::Nats,
+                server_url.to_string(),
+                Some(subject_prefix.to_string()),
+            ),
+    );
+    let server = kvbm_hub::create_server_builder()
+        .bind_addr("127.0.0.1".parse().unwrap())
+        .discovery_port(0)
+        .control_port(0)
+        .heartbeat_interval(Duration::from_secs(3600))
+        .heartbeat_max_failures(u32::MAX)
+        .registration_ttl(Duration::from_secs(3600))
+        .add_feature_manager(Arc::clone(&manager) as Arc<dyn FeatureManager>)
+        .serve()
+        .await
+        .expect("start hub");
+    (server, manager)
+}
+
 /// Builds `n` PLHs at positions 0..n by laying down `n * BLOCK_SIZE` tokens.
 fn plhs(n: usize, salt: u64) -> Vec<SequenceHash> {
     let tokens: Vec<u32> = (0..(BLOCK_SIZE as usize * n) as u32).collect();
@@ -84,6 +134,16 @@ fn connect_pub(endpoint: &str) -> Publish {
         .set_linger(0)
         .connect(endpoint)
         .expect("connect PUB")
+}
+
+fn connect_sub(endpoint: &str) -> Subscribe {
+    let ctx = Context::new();
+    subscribe(&ctx)
+        .set_linger(0)
+        .connect(endpoint)
+        .expect("connect SUB")
+        .subscribe(CARRIER_FEED_TOPIC)
+        .expect("subscribe to carrier feed")
 }
 
 async fn send_batch(sock: &mut Publish, events: KvCacheEvents, instance_id: u128) {
@@ -267,6 +327,198 @@ async fn two_instances_publish_index_and_query() {
         );
     };
     assert_eq!(instances(&body["entries"][0]), vec![id_b.to_string()]);
+
+    server.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn carrier_feed_publishes_frames_and_snapshots() {
+    let (server, manager) = start_hub().await;
+    let base = format!("http://{}", server.discovery_addr());
+    let http = reqwest::Client::new();
+    let manifest = carrier_manifest();
+    let manifest_id = manifest.id();
+    let cfg: IndexerConfigResponse =
+        serde_json::from_value(get_json(&http, &base, "/config").await).expect("config");
+    assert!(cfg.feed_endpoint.starts_with("tcp://127.0.0.1:"));
+
+    let instance = InstanceId::new_v4();
+    let instance_id = instance.as_u128();
+    manager
+        .on_register(
+            instance,
+            &Feature::Indexer(IndexerFeatureConfig {
+                max_seq_len: Some(MAX_SEQ_LEN),
+                manifest,
+                create_kind: kvbm_logical::events::CreateKind::Carrier,
+            }),
+        )
+        .await
+        .expect("bind carrier indexer instance");
+
+    let mut feed_sub = connect_sub(&cfg.feed_endpoint);
+    let mut event_pub = connect_pub(&cfg.zmq_endpoint);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let hashes = plhs(2, 1337);
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let frame = loop {
+        send_batch(
+            &mut event_pub,
+            KvCacheEvents::CarrierCreate(hashes.clone()),
+            instance_id,
+        )
+        .await;
+        if let Ok(Some(Ok(multipart))) =
+            tokio::time::timeout(Duration::from_millis(200), feed_sub.next()).await
+            && let Some(payload) = multipart.iter().last()
+            && let Ok(frame) = decode_frame(payload)
+        {
+            break frame;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for a carrier feed frame"
+        );
+    };
+
+    assert_eq!(frame.manifest, manifest_id.as_bytes().to_owned());
+    assert_eq!(frame.kind, FeedKind::Carrier);
+    assert_eq!(
+        frame.max_positions,
+        (MAX_SEQ_LEN / BLOCK_SIZE as usize) as u64
+    );
+    assert_eq!(frame.holder, instance_id);
+    assert!(matches!(
+        &frame.op,
+        CarrierFeedOp::Insert(frame_hashes) if frame_hashes == &hashes
+    ));
+
+    let snapshot_response = http
+        .get(format!("{base}/v1/features/indexer/feed/snapshot"))
+        .send()
+        .await
+        .expect("GET feed snapshot");
+    assert_eq!(
+        snapshot_response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/msgpack")
+    );
+    let snapshot = decode_snapshot(&snapshot_response.bytes().await.expect("read feed snapshot"))
+        .expect("decode feed snapshot");
+    let control_snapshot = http
+        .get(format!(
+            "http://{}/v1/features/indexer/feed/snapshot",
+            server.control_addr()
+        ))
+        .send()
+        .await
+        .expect("GET feed snapshot from control port");
+    assert_eq!(control_snapshot.status(), reqwest::StatusCode::OK);
+    assert_eq!(snapshot.epoch, frame.epoch);
+    assert!(snapshot.seq >= frame.seq);
+    let manifest_snapshot = snapshot
+        .manifests
+        .iter()
+        .find(|entry| entry.manifest == *manifest_id.as_bytes())
+        .expect("carrier manifest in snapshot");
+    assert_eq!(manifest_snapshot.kind, FeedKind::Carrier);
+    assert_eq!(
+        manifest_snapshot.holders,
+        vec![dynamo_kv_router::carrier_feed::HolderSnapshot {
+            holder: instance_id,
+            hashes,
+        }]
+    );
+
+    server.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nats_carrier_feed_publishes_frames_and_snapshots_when_configured() {
+    let Ok(nats_server) = std::env::var("KVBM_TEST_NATS_SERVER") else {
+        return;
+    };
+    let subject_prefix = format!("kvbm.hub.test.{}", InstanceId::new_v4().as_u128());
+    let (server, manager) = start_nats_hub(&nats_server, &subject_prefix).await;
+    let base = format!("http://{}", server.discovery_addr());
+    let http = reqwest::Client::new();
+    let cfg: IndexerConfigResponse =
+        serde_json::from_value(get_json(&http, &base, "/config").await).expect("config");
+    assert_eq!(cfg.event_plane, kvbm_hub::EventPlane::Nats);
+    assert!(cfg.zmq_endpoint.is_empty());
+    assert!(cfg.feed_endpoint.is_empty());
+    assert_eq!(cfg.nats_subject_prefix, subject_prefix);
+
+    let client = async_nats::connect(&nats_server)
+        .await
+        .expect("connect test NATS client");
+    let feed_topic = std::str::from_utf8(CARRIER_FEED_TOPIC).expect("feed topic is valid UTF-8");
+    let mut feed_sub = client
+        .subscribe(format!("{subject_prefix}.{feed_topic}"))
+        .await
+        .expect("subscribe to NATS carrier feed");
+    let manifest = carrier_manifest();
+    let manifest_id = manifest.id();
+    let instance = InstanceId::new_v4();
+    let instance_id = instance.as_u128();
+    manager
+        .on_register(
+            instance,
+            &Feature::Indexer(IndexerFeatureConfig {
+                max_seq_len: Some(MAX_SEQ_LEN),
+                manifest,
+                create_kind: kvbm_logical::events::CreateKind::Carrier,
+            }),
+        )
+        .await
+        .expect("bind carrier indexer instance");
+
+    let hashes = plhs(2, 1337);
+    let batch = KvbmCacheEvents {
+        events: KvCacheEvents::CarrierCreate(hashes.clone()),
+        instance_id,
+    };
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        client.publish(
+            format!("{subject_prefix}.kvbm.kv_index"),
+            rmp_serde::to_vec(&batch)
+                .expect("encode carrier batch")
+                .into(),
+        ),
+    )
+    .await
+    .expect("publish carrier event")
+    .expect("NATS publish");
+    let message = tokio::time::timeout(Duration::from_secs(5), feed_sub.next())
+        .await
+        .expect("wait for NATS feed frame")
+        .expect("feed subscription ended");
+    let frame = decode_frame(&message.payload).expect("decode carrier feed frame");
+    assert_eq!(frame.manifest, manifest_id.as_bytes().to_owned());
+    assert_eq!(frame.kind, FeedKind::Carrier);
+    assert_eq!(frame.holder, instance_id);
+    assert!(matches!(
+        &frame.op,
+        CarrierFeedOp::Insert(frame_hashes) if frame_hashes == &hashes
+    ));
+
+    let snapshot_response = http
+        .get(format!("{base}/v1/features/indexer/feed/snapshot"))
+        .send()
+        .await
+        .expect("GET feed snapshot");
+    let snapshot = decode_snapshot(&snapshot_response.bytes().await.expect("read feed snapshot"))
+        .expect("decode feed snapshot");
+    assert!(snapshot.seq >= frame.seq);
+    assert!(
+        snapshot
+            .manifests
+            .iter()
+            .any(|entry| entry.manifest == *manifest_id.as_bytes())
+    );
 
     server.shutdown().await.expect("shutdown");
 }

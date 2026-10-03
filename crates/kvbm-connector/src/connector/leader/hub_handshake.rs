@@ -23,8 +23,8 @@ use kvbm_config::{
     BlockLayoutMode, DisaggConfig, DisaggregationRole, LeaderHubConfig, RemoteSearch,
 };
 use kvbm_hub::{
-    FeatureConfigRequirements, FeatureDescriptor, FeatureKey, HubConfigResponse, PrimaryConfig,
-    RuntimeConfigSummary,
+    EventPlane, FeatureConfigRequirements, FeatureDescriptor, FeatureKey, HubConfigResponse,
+    PrimaryConfig, RuntimeConfigSummary,
 };
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -63,11 +63,22 @@ pub struct HubHandshake {
     pub url: String,
     /// Effective connector-level features (a subset of [`CONNECTOR_CAPS`]).
     pub effective: HashSet<FeatureKey>,
-    /// KV-index ZMQ ingest endpoint — `Some` iff Indexer is effective and the
-    /// hub advertised a block-size-compatible endpoint.
-    pub indexer_zmq_endpoint: Option<String>,
+    /// KV-index ingest transport — `Some` iff Indexer is effective and local
+    /// transport matches the hub's advertised plane.
+    pub indexer_transport: Option<IndexerTransport>,
     /// Must-match summary to send at registration.
     pub runtime_summary: RuntimeConfigSummary,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IndexerTransport {
+    Zmq {
+        endpoint: String,
+    },
+    Nats {
+        server: String,
+        subject_prefix: String,
+    },
 }
 
 impl HubHandshake {
@@ -163,7 +174,7 @@ pub async fn resolve(
             return Ok(HubHandshake {
                 url: hub.url.clone(),
                 effective: HashSet::new(),
-                indexer_zmq_endpoint: None,
+                indexer_transport: None,
                 runtime_summary,
             });
         }
@@ -266,8 +277,8 @@ pub async fn resolve(
         effective.insert(FeatureKey::P2P);
     }
 
-    let indexer_zmq_endpoint = if effective.contains(&FeatureKey::Indexer) {
-        indexer_endpoint(&aggregate, page_size)
+    let indexer_transport = if effective.contains(&FeatureKey::Indexer) {
+        indexer_transport(&aggregate, page_size, EventPlane::from_env())
     } else {
         None
     };
@@ -275,7 +286,7 @@ pub async fn resolve(
     Ok(HubHandshake {
         url: hub.url.clone(),
         effective,
-        indexer_zmq_endpoint,
+        indexer_transport,
         runtime_summary,
     })
 }
@@ -435,9 +446,12 @@ fn first_missing_dep(
     None
 }
 
-/// Pull the KV-index ZMQ endpoint from the aggregate descriptor, guarding that
-/// the hub's block size matches this worker's page size.
-fn indexer_endpoint(aggregate: &HubConfigResponse, page_size: usize) -> Option<String> {
+/// Resolve the KV-index transport after checking block size and local plane.
+fn indexer_transport(
+    aggregate: &HubConfigResponse,
+    page_size: usize,
+    local: anyhow::Result<EventPlane>,
+) -> Option<IndexerTransport> {
     let descriptor: &FeatureDescriptor = aggregate
         .features
         .iter()
@@ -452,16 +466,78 @@ fn indexer_endpoint(aggregate: &HubConfigResponse, page_size: usize) -> Option<S
         );
         return None;
     }
-    let endpoint = descriptor
+
+    let local = match local {
+        Ok(local) => local,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                env = EventPlane::ENV,
+                "invalid local event plane; refusing to wire KV-index publisher"
+            );
+            return None;
+        }
+    };
+    let remote_value = descriptor
         .config
-        .get("zmq_endpoint")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    if endpoint.is_empty() {
-        tracing::warn!("indexer advertised an empty zmq_endpoint; publisher disabled");
+        .get("event_plane")
+        .and_then(|value| value.as_str());
+    let remote = match EventPlane::parse(remote_value) {
+        Ok(remote) => remote,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                hub_event_plane = ?remote_value,
+                local_event_plane = ?local,
+                "invalid hub event plane; refusing to wire KV-index publisher"
+            );
+            return None;
+        }
+    };
+    if local != remote {
+        tracing::error!(
+            local_event_plane = ?local,
+            hub_event_plane = ?remote,
+            env = EventPlane::ENV,
+            "event-plane mismatch; refusing to wire KV-index publisher"
+        );
         return None;
     }
-    Some(endpoint.to_string())
+    match local {
+        EventPlane::Zmq => {
+            let endpoint = descriptor
+                .config
+                .get("zmq_endpoint")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            if endpoint.is_empty() {
+                tracing::warn!("indexer advertised an empty zmq_endpoint; publisher disabled");
+                None
+            } else {
+                Some(IndexerTransport::Zmq {
+                    endpoint: endpoint.to_string(),
+                })
+            }
+        }
+        EventPlane::Nats => {
+            let subject_prefix = descriptor
+                .config
+                .get("nats_subject_prefix")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            if subject_prefix.is_empty() {
+                tracing::warn!(
+                    "indexer advertised an empty nats_subject_prefix; publisher disabled"
+                );
+                None
+            } else {
+                Some(IndexerTransport::Nats {
+                    server: kvbm_hub::nats_server_from_env(),
+                    subject_prefix: subject_prefix.to_string(),
+                })
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -551,12 +627,87 @@ mod tests {
         HubHandshake {
             url: "http://hub".to_string(),
             effective: effective.iter().copied().collect(),
-            indexer_zmq_endpoint: None,
+            indexer_transport: None,
             runtime_summary: RuntimeConfigSummary {
                 block_size: Some(BS),
                 block_layout: Some(BlockLayoutMode::Operational),
             },
         }
+    }
+
+    fn aggregate_with_indexer(config: serde_json::Value) -> HubConfigResponse {
+        HubConfigResponse {
+            primary: PrimaryConfig {
+                block_size: Some(BS),
+                ..Default::default()
+            },
+            features: vec![FeatureDescriptor {
+                key: FeatureKey::Indexer,
+                dependencies: Vec::new(),
+                render_implies: Vec::new(),
+                config_requirements: FeatureConfigRequirements::default(),
+                config,
+            }],
+            base_config: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn indexer_transport_negotiates_zmq_and_nats() {
+        let zmq = aggregate_with_indexer(serde_json::json!({
+            "block_size": BS,
+            "zmq_endpoint": "tcp://127.0.0.1:54231"
+        }));
+        assert_eq!(
+            indexer_transport(&zmq, BS, Ok(EventPlane::Zmq)),
+            Some(IndexerTransport::Zmq {
+                endpoint: "tcp://127.0.0.1:54231".to_string()
+            })
+        );
+
+        let nats = aggregate_with_indexer(serde_json::json!({
+            "block_size": BS,
+            "event_plane": "nats",
+            "nats_subject_prefix": "kvbm.hub.test"
+        }));
+        assert!(matches!(
+            indexer_transport(&nats, BS, Ok(EventPlane::Nats)),
+            Some(IndexerTransport::Nats {
+                subject_prefix,
+                ..
+            }) if subject_prefix == "kvbm.hub.test"
+        ));
+    }
+
+    #[test]
+    fn indexer_transport_fails_closed_on_mismatch_invalid_local_and_empty_prefix() {
+        let nats = aggregate_with_indexer(serde_json::json!({
+            "block_size": BS,
+            "event_plane": "nats",
+            "nats_subject_prefix": "kvbm.hub.test"
+        }));
+        assert!(indexer_transport(&nats, BS, Ok(EventPlane::Zmq)).is_none());
+
+        let legacy_zmq = aggregate_with_indexer(serde_json::json!({
+            "block_size": BS,
+            "zmq_endpoint": "tcp://127.0.0.1:54231"
+        }));
+        assert!(indexer_transport(&legacy_zmq, BS, Ok(EventPlane::Nats)).is_none());
+        assert!(
+            indexer_transport(
+                &legacy_zmq,
+                BS,
+                Err(anyhow::anyhow!("invalid DYN_EVENT_PLANE"))
+            )
+            .is_none()
+        );
+
+        let empty_prefix = aggregate_with_indexer(serde_json::json!({
+            "block_size": BS,
+            "event_plane": "nats",
+            "nats_subject_prefix": ""
+        }));
+        assert!(indexer_transport(&empty_prefix, BS, Ok(EventPlane::Nats)).is_none());
     }
 
     #[test]
@@ -781,7 +932,10 @@ mod tests {
         .unwrap();
         assert!(h.has(FeatureKey::Indexer));
         assert!(h.has(FeatureKey::ConditionalDisagg));
-        assert!(h.indexer_zmq_endpoint.is_some());
+        assert!(matches!(
+            h.indexer_transport,
+            Some(IndexerTransport::Zmq { .. })
+        ));
 
         // Auto + no disagg role → CD dropped (best-effort), indexer stays.
         let h = resolve(
