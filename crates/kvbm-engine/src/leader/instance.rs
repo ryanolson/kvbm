@@ -26,7 +26,7 @@ use crate::{
     object::ObjectBlockOps,
     p2p::{
         RemoteBlockSet,
-        session::{SessionFactory, SessionManager},
+        session::{LocalTierReset, SessionFactory, SessionManager},
     },
     worker::RemoteDescriptor,
 };
@@ -206,6 +206,9 @@ pub struct InstanceLeader {
     /// `transfer` module reads it at RPC-invocation time, by which point a
     /// remote client could only have connected after full init.
     session_factory: Arc<OnceLock<Arc<dyn SessionFactory>>>,
+
+    /// Local GPU-side tier reset hook, injected after construction.
+    local_tier_reset: Arc<OnceLock<Arc<dyn LocalTierReset>>>,
 
     // ========================================================================
     // Describe state (Phase C)
@@ -605,6 +608,7 @@ impl InstanceLeaderBuilder {
             block_layout_mode: self.block_layout_mode,
             session_manager: SessionManager::with_default_watchdog(runtime),
             session_factory: Arc::new(OnceLock::new()),
+            local_tier_reset: Arc::new(OnceLock::new()),
             role: self.role,
             started_at: SystemTime::now(),
             hub_instance_id: Arc::new(OnceLock::new()),
@@ -924,6 +928,17 @@ impl InstanceLeader {
     /// connector init). Returns whether this call set the value.
     pub fn set_session_factory(&self, factory: Arc<dyn SessionFactory>) -> bool {
         self.session_factory.set(factory).is_ok()
+    }
+
+    pub(crate) fn local_tier_reset(&self) -> Option<Arc<dyn LocalTierReset>> {
+        self.local_tier_reset.get().cloned()
+    }
+
+    /// Set the local GPU-side tier reset hook.
+    ///
+    /// First-write-wins. Returns whether this call set the hook.
+    pub fn set_local_tier_reset(&self, hook: Arc<dyn LocalTierReset>) -> bool {
+        self.local_tier_reset.set(hook).is_ok()
     }
 
     /// Inject the remote-block discovery seam (the hub's KV indexer, wrapped by

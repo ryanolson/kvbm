@@ -13,19 +13,19 @@ use crate::control::ControlError;
 
 /// Logical block-manager tier identifier.
 ///
-/// Add variants here as new tiers come online. Wire format mirror
-/// (`"g2"` / `"g3"`) is held by `#[serde(rename_all = "lowercase")]`.
+/// Wire names are lowercase: `"carrier"`, `"g1"`, `"g2"`, and `"g3"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Tier {
+    Carrier,
+    G1,
     G2,
     G3,
 }
 
 impl Tier {
-    /// Iteration order used by `reset` when honoring "all" — outer
-    /// tiers (closer to GPU) first.
-    pub const ORDERED: &'static [Tier] = &[Tier::G2, Tier::G3];
+    /// Reset order, with outermost/GPU-side state first.
+    pub const ORDERED: &'static [Tier] = &[Tier::Carrier, Tier::G1, Tier::G2, Tier::G3];
 }
 
 // ---------------------------------------------------------------------------
@@ -148,17 +148,38 @@ mod tests {
     }
 
     #[test]
+    fn tier_serde_uses_lowercase_wire_names() {
+        for (tier, wire_name) in [
+            (Tier::Carrier, "carrier"),
+            (Tier::G1, "g1"),
+            (Tier::G2, "g2"),
+            (Tier::G3, "g3"),
+        ] {
+            let encoded = serde_json::to_string(&tier).unwrap();
+            assert_eq!(encoded, format!("\"{wire_name}\""));
+            assert_eq!(serde_json::from_str::<Tier>(&encoded).unwrap(), tier);
+        }
+    }
+
+    #[test]
     fn plan_all_with_g2_only() {
         let (r, s) = plan_reset(&ResetRequest::default(), &avail(&[Tier::G2])).unwrap();
         assert_eq!(r, vec![Tier::G2]);
-        assert_eq!(s, vec![Tier::G3]);
+        assert_eq!(s, vec![Tier::Carrier, Tier::G1, Tier::G3]);
     }
 
     #[test]
     fn plan_all_with_both() {
         let (r, s) = plan_reset(&ResetRequest::default(), &avail(&[Tier::G2, Tier::G3])).unwrap();
         assert_eq!(r, vec![Tier::G2, Tier::G3]);
-        assert!(s.is_empty());
+        assert_eq!(s, vec![Tier::Carrier, Tier::G1]);
+    }
+
+    #[test]
+    fn plan_all_with_g1_and_g2() {
+        let (r, s) = plan_reset(&ResetRequest::default(), &avail(&[Tier::G1, Tier::G2])).unwrap();
+        assert_eq!(r, vec![Tier::G1, Tier::G2]);
+        assert_eq!(s, vec![Tier::Carrier, Tier::G3]);
     }
 
     #[test]
