@@ -261,7 +261,7 @@ impl IndexerManager {
         }
     }
 
-    /// Shared manifest-scoped indexes (for tests / introspection).
+    /// Shared manifest-scoped indexes, read by embedding processes through this accessor.
     pub fn indexes(&self) -> &Arc<ManifestIndexes> {
         &self.indexes
     }

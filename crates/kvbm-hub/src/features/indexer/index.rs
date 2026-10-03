@@ -344,6 +344,24 @@ impl ManifestIndexes {
             .map(|hit| (hit.hash, hit.holders, index.kind))
     }
 
+    /// Kind of a manifest that has at least one binding or applied event; None if unknown.
+    pub fn kind(&self, manifest: CacheManifestId) -> Option<CreateKind> {
+        self.indexes.get(&manifest).map(|index| index.kind)
+    }
+
+    /// Each holder's deepest held hash. `hashes` must be ordered by ascending
+    /// `position()`. Empty if the manifest is unknown.
+    pub fn deepest_by_holder(
+        &self,
+        manifest: CacheManifestId,
+        hashes: &[SequenceHash],
+    ) -> Vec<(u128, SequenceHash)> {
+        self.indexes
+            .get(&manifest)
+            .map(|index| index.index.deepest_by_holder(hashes))
+            .unwrap_or_default()
+    }
+
     /// Returns the deepest held entry for an ascending-position query.
     ///
     /// `hashes` must be ordered by ascending `position()`, as produced by
@@ -697,6 +715,35 @@ mod tests {
                 .query_holders(manifest.id(), &plhs(4, 2, 999))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn shared_read_api_returns_deepest_hash_per_holder_and_kind() {
+        let indexes = ManifestIndexes::new(64, 4).unwrap();
+        let bound_manifest = manifest(15, false);
+        indexes
+            .bind(1, &bound_manifest, CreateKind::Block, None)
+            .unwrap();
+        indexes
+            .bind(2, &bound_manifest, CreateKind::Block, None)
+            .unwrap();
+        let hashes = plhs(4, 3, 42);
+        indexes.apply(create(hashes.clone(), 1));
+        indexes.apply(create(vec![hashes[0]], 2));
+
+        let deepest = indexes.deepest_by_holder(bound_manifest.id(), &hashes);
+        assert_eq!(deepest.len(), 2);
+        assert!(deepest.contains(&(1, hashes[2])));
+        assert!(deepest.contains(&(2, hashes[0])));
+        assert_eq!(indexes.kind(bound_manifest.id()), Some(CreateKind::Block));
+
+        let unknown_manifest = manifest(16, false);
+        assert!(
+            indexes
+                .deepest_by_holder(unknown_manifest.id(), &hashes)
+                .is_empty()
+        );
+        assert_eq!(indexes.kind(unknown_manifest.id()), None);
     }
 
     #[test]

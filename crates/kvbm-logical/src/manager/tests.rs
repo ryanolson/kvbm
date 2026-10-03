@@ -3473,6 +3473,40 @@ mod audit_counter_tests {
         );
     }
 
+    #[test]
+    fn drain_inactive_pool_preserves_live_blocks() {
+        let manager = create_test_manager(3);
+        let mut hashes = Vec::with_capacity(3);
+        let completes = manager
+            .allocate_blocks(3)
+            .unwrap()
+            .into_iter()
+            .enumerate()
+            .map(|(i, block)| {
+                let token_block = create_test_token_block_from_iota((90_000 + i * 4) as u32);
+                hashes.push(token_block.kvbm_sequence_hash());
+                block.complete(&token_block).unwrap()
+            })
+            .collect();
+        let mut registered = manager.register_blocks(completes);
+        let live = registered.pop().unwrap();
+        drop(registered);
+
+        assert_eq!(manager.drain_inactive_pool(), 2);
+        assert!(manager.match_blocks(&hashes[..2]).is_empty());
+        assert_eq!(manager.match_blocks(&[hashes[2]]).len(), 1);
+        assert!(matches!(
+            manager.reset_inactive_pool(),
+            Err(BlockManagerResetError::BlockCountMismatch {
+                expected: 3,
+                actual: 2
+            })
+        ));
+        assert_eq!(manager.match_blocks(&[hashes[2]]).len(), 1);
+
+        drop(live);
+    }
+
     /// Partial under-allocation: backend reports `len=4`, returns 2
     /// pairs from `allocate(3)`. Rollback must reinsert those 2 into
     /// the inactive index (covering the loop body in the rollback

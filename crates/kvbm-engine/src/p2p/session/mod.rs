@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 
 use kvbm_common::LogicalResourceId;
 use kvbm_logical::blocks::{ImmutableBlock, MutableBlock};
+use kvbm_protocols::control::{Tier, TierError};
 
 use super::SessionEndpoint;
 use crate::p2p::PayloadChecksum;
@@ -441,6 +442,16 @@ pub trait SessionFactory: Send + Sync {
     /// completed indicates a leak — typically a held `Arc`
     /// somewhere that the lifecycle watchers didn't release.
     fn active_session_count(&self) -> usize;
+}
+
+/// Resets locally owned block-manager tiers.
+pub trait LocalTierReset: Send + Sync {
+    /// Tiers this hook owns. Only Carrier and G1 are honored; others are ignored.
+    fn tiers(&self) -> Vec<Tier>;
+
+    /// Reset the given tiers (subset of `tiers()`, in Tier::ORDERED order).
+    /// Returns one TierError per tier that failed; tiers not listed succeeded.
+    fn reset(&self, tiers: Vec<Tier>) -> BoxFuture<'static, Vec<TierError>>;
 }
 
 // ============================================================================

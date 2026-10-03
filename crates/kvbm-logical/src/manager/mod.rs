@@ -296,12 +296,19 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
         Ok((blocks, notification))
     }
 
-    /// Drain the inactive pool, returning all blocks to the reset pool.
-    pub fn reset_inactive_pool(&self) -> Result<(), BlockManagerResetError> {
+    /// Move every inactive block to the reset pool and drop its hash. Live blocks are not touched.
+    /// Returns the number of blocks drained.
+    pub fn drain_inactive_pool(&self) -> usize {
         let (blocks, evicted) = self.store.drain_inactive_to_mutable();
+        let drained = blocks.len();
         self.notify_evictions(&evicted);
         drop(blocks);
+        drained
+    }
 
+    /// Drain the inactive pool, returning all blocks to the reset pool.
+    pub fn reset_inactive_pool(&self) -> Result<(), BlockManagerResetError> {
+        self.drain_inactive_pool();
         let reset_count = self.store.reset_len();
         if reset_count != self.total_blocks() {
             return Err(BlockManagerResetError::BlockCountMismatch {
