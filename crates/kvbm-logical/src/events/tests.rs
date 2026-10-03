@@ -135,6 +135,32 @@ async fn test_full_event_pipeline() {
     }
 }
 
+#[tokio::test]
+async fn test_event_publisher_accepts_trait_object() {
+    let manager = Arc::new(EventsManager::builder().build());
+    let registry = BlockRegistry::new();
+    let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
+    let publisher: Arc<dyn Publisher> = Arc::new(MockPublisher::new(captured_tx));
+
+    let _publisher = KvbmCacheEventsPublisher::builder()
+        .instance_id(12345)
+        .create_kind(CreateKind::Block)
+        .event_stream(manager.subscribe())
+        .publisher(publisher)
+        .batching_config(BatchingConfig::default().with_window(Duration::from_millis(50)))
+        .build()
+        .unwrap();
+
+    let handle = registry.register_sequence_hash(create_seq_hash_at_position(0));
+    manager.on_block_registered(&handle);
+
+    let batch = tokio::time::timeout(Duration::from_millis(200), captured_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(batch.events, KvCacheEvents::Create(_)));
+}
+
 /// Test that type switches cause immediate flush
 #[tokio::test]
 async fn test_type_switch_flushes_batch() {
