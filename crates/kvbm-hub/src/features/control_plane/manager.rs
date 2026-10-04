@@ -43,7 +43,10 @@ use crate::features::http::{
 use crate::features::p2p::P2pManager;
 use crate::features::{FeatureError, FeatureManager, HubContext};
 use crate::handlers::{HEARTBEAT_HANDLER, HeartbeatAck, HeartbeatRequest};
-use crate::protocol::{self, Feature, FeatureKey, MetricsFanoutResponse, MetricsInstanceEntry};
+use crate::protocol::{
+    self, Feature, FeatureKey, MetricsFanoutResponse, MetricsInstanceEntry, ResetFanoutResponse,
+    ResetInstanceEntry,
+};
 use crate::registry::{PeerRegistry, RegistryIncarnation};
 
 /// Per-leader budget for the `/v1/metrics` fanout. A leader that doesn't
@@ -51,6 +54,7 @@ use crate::registry::{PeerRegistry, RegistryIncarnation};
 /// entry; the rest of the fanout still completes. Kept short on purpose —
 /// the UI polls this and a sluggish leader shouldn't drag the whole tab.
 const METRICS_FANOUT_PER_LEADER: Duration = Duration::from_secs(2);
+const RESET_FANOUT_PER_LEADER: Duration = Duration::from_secs(30);
 
 /// Cached `list_modules` result for one instance.
 #[derive(Clone, Debug)]
@@ -308,15 +312,17 @@ impl FeatureManager for ControlPlaneManager {
     }
 
     fn control_router(self: Arc<Self>) -> Router {
-        routes(self)
+        routes()
+            .route(protocol::paths::RESET_FANOUT, post(reset_fanout))
+            .with_state(self)
     }
 
     fn public_router(self: Arc<Self>) -> Router {
-        routes(self)
+        routes().with_state(self)
     }
 }
 
-fn routes(manager: Arc<ControlPlaneManager>) -> Router {
+fn routes() -> Router<Arc<ControlPlaneManager>> {
     use protocol::paths::*;
     Router::new()
         .route(CONNECTOR_HEALTH, get(health_probe))
@@ -330,7 +336,6 @@ fn routes(manager: Arc<ControlPlaneManager>) -> Router {
         // feature is enabled.
         .route(CONTROL_METRICS_SNAPSHOT, post(metrics_snapshot))
         .route(METRICS_FANOUT, get(metrics_fanout))
-        .with_state(manager)
 }
 
 // ---------------------------------------------------------------------------
@@ -503,6 +508,78 @@ async fn metrics_fanout(State(mgr): State<Arc<ControlPlaneManager>>) -> Response
         gathered_at_unix_ms,
         instances,
     })
+}
+
+/// `POST /v1/reset` — reset the requested tiers on registered leaders.
+async fn reset_fanout(
+    State(mgr): State<Arc<ControlPlaneManager>>,
+    body: Option<Json<ResetRequest>>,
+) -> Response {
+    let Some(velo) = mgr.velo.get().cloned() else {
+        return service_unavailable("hub has no velo transport configured");
+    };
+    let Some(registry) = mgr.registry.get().cloned() else {
+        return service_unavailable("registry not attached");
+    };
+    let self_id = velo.instance_id();
+    let req = body.map(|Json(request)| request).unwrap_or_default();
+
+    let candidates: Vec<InstanceId> = registry
+        .list()
+        .into_iter()
+        .map(|peer| peer.instance_id())
+        .filter(|id| *id != self_id)
+        .filter(|id| !matches!(mgr.has_module(*id, ModuleId::Dev), Some(false)))
+        .collect();
+
+    let messenger = velo.messenger().clone();
+    let calls = candidates.into_iter().map(|id| {
+        let messenger = messenger.clone();
+        let req = req.clone();
+        async move {
+            let client = LeaderControlClient::new(messenger, id);
+            let outcome = tokio::time::timeout(
+                RESET_FANOUT_PER_LEADER,
+                client.dev().reset(req),
+            )
+            .await;
+            (id, outcome)
+        }
+    });
+    let results = futures::future::join_all(calls).await;
+
+    let mut instances = BTreeMap::new();
+    for (id, outcome) in results {
+        let entry = match outcome {
+            Ok(Ok(response)) => ResetInstanceEntry {
+                response: Some(response),
+                error: None,
+            },
+            Ok(Err(err)) => {
+                tracing::debug!(
+                    instance = %id, kind = err.kind(), error = %err,
+                    "reset_fanout: leader returned error"
+                );
+                ResetInstanceEntry {
+                    response: None,
+                    error: Some(err.to_string()),
+                }
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    instance = %id, budget = ?RESET_FANOUT_PER_LEADER,
+                    "reset_fanout: leader did not respond within budget"
+                );
+                ResetInstanceEntry {
+                    response: None,
+                    error: Some("timeout after 30s".to_string()),
+                }
+            }
+        };
+        instances.insert(id.to_string(), entry);
+    }
+
+    ok_response(&ResetFanoutResponse { instances })
 }
 
 /// Module-gating guard for the route handlers.

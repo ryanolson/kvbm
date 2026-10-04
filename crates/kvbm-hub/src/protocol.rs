@@ -13,7 +13,7 @@
 use kvbm_common::BlockLayoutMode;
 use kvbm_logical::events::CreateKind;
 use kvbm_protocols::cache_manifest::{CacheManifest, RegistrationEpoch};
-use kvbm_protocols::control::MetricsSnapshotResponse;
+use kvbm_protocols::control::{MetricsSnapshotResponse, ResetResponse};
 pub use kvbm_protocols::control::layout_compat::LayoutCompatPayload;
 /// Remote-prefill request payload carried by the hub's CD queue.
 ///
@@ -197,6 +197,10 @@ pub mod paths {
     /// leaders surface as `{ "error": "<msg>" }` for their entry rather than
     /// failing the whole response. See [`super::MetricsFanoutResponse`].
     pub const METRICS_FANOUT: &str = "/v1/metrics";
+
+    /// `POST` reset to each registered leader except this hub and leaders whose
+    /// cached module list lacks `dev`. The response includes one result per leader.
+    pub const RESET_FANOUT: &str = "/v1/reset";
 
     /// `GET` the set of control-plane modules enabled on this instance.
     /// Body: `{ "modules": [..], "cached": bool, "age_secs": u64 }`. Cache is
@@ -615,6 +619,22 @@ pub struct MetricsInstanceEntry {
     pub snapshot: Option<MetricsSnapshotResponse>,
     /// Error string from the velo call or module-gate check. `Some` iff
     /// `snapshot` is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Response body for `POST /v1/reset`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResetFanoutResponse {
+    /// Per-instance reset results keyed by stringified [`InstanceId`].
+    pub instances: BTreeMap<String, ResetInstanceEntry>,
+}
+
+/// One leader's contribution to [`ResetFanoutResponse`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResetInstanceEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<ResetResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
