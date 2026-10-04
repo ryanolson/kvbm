@@ -57,20 +57,25 @@ impl ControlModule for DevModule {
 }
 
 /// Reset the inactive pools of the requested (or all configured) tiers.
+///
+/// A local hook can own G2-side state. It releases that state before the
+/// engine drains G2.
 async fn reset(leader: &InstanceLeader, req: ResetRequest) -> Result<ResetResponse, ControlError> {
     let local_reset = leader.local_tier_reset();
     let mut available = HashSet::new();
+    let mut advertised_hook_tiers = HashSet::new();
     // G2 is always present once an InstanceLeader is up.
     available.insert(Tier::G2);
     if leader.g3_manager().is_some() {
         available.insert(Tier::G3);
     }
     if let Some(hook) = &local_reset {
-        available.extend(
+        advertised_hook_tiers.extend(
             hook.tiers()
                 .into_iter()
-                .filter(|tier| matches!(*tier, Tier::Carrier | Tier::G1)),
+                .filter(|tier| matches!(*tier, Tier::Carrier | Tier::G1 | Tier::G2)),
         );
+        available.extend(advertised_hook_tiers.iter().copied());
     }
 
     let (to_reset, skipped) = plan_reset(&req, &available)?;
@@ -78,7 +83,7 @@ async fn reset(leader: &InstanceLeader, req: ResetRequest) -> Result<ResetRespon
     let hook_tiers: Vec<_> = Tier::ORDERED
         .iter()
         .copied()
-        .filter(|tier| matches!(*tier, Tier::Carrier | Tier::G1) && to_reset.contains(tier))
+        .filter(|tier| advertised_hook_tiers.contains(tier) && to_reset.contains(tier))
         .collect();
     let mut hook_errors = if hook_tiers.is_empty() {
         HashMap::new()
@@ -108,15 +113,21 @@ async fn reset(leader: &InstanceLeader, req: ResetRequest) -> Result<ResetRespon
                     reset.push(tier);
                 }
             },
-            Tier::G2 => {
-                let drained = leader
-                    .g2_managers()
-                    .iter()
-                    .map(|(_, manager)| manager.drain_inactive_pool())
-                    .sum::<usize>();
-                tracing::info!(?tier, drained, "tier reset drained inactive blocks");
-                reset.push(tier);
-            }
+            Tier::G2 => match hook_errors.remove(&tier) {
+                Some(error) => {
+                    tracing::warn!(?tier, message = %error.message, "tier reset failed");
+                    failed.push(error);
+                }
+                None => {
+                    let drained = leader
+                        .g2_managers()
+                        .iter()
+                        .map(|(_, manager)| manager.drain_inactive_pool())
+                        .sum::<usize>();
+                    tracing::info!(?tier, drained, "tier reset drained inactive blocks");
+                    reset.push(tier);
+                }
+            },
             Tier::G3 => {
                 let Some(manager) = leader.g3_manager() else {
                     failed.push(TierError {
@@ -189,6 +200,25 @@ mod tests {
         }
     }
 
+    struct ReleasingG2Reset {
+        calls: Mutex<Vec<Vec<Tier>>>,
+        held: Mutex<Option<ImmutableBlock<G2>>>,
+    }
+
+    impl LocalTierReset for ReleasingG2Reset {
+        fn tiers(&self) -> Vec<Tier> {
+            vec![Tier::G2]
+        }
+
+        fn reset(&self, tiers: Vec<Tier>) -> BoxFuture<'static, Vec<TierError>> {
+            self.calls.lock().unwrap().push(tiers.clone());
+            if tiers.contains(&Tier::G2) {
+                drop(self.held.lock().unwrap().take());
+            }
+            Box::pin(async { Vec::new() })
+        }
+    }
+
     fn manager(block_count: usize) -> Arc<BlockManager<G2>> {
         Arc::new(
             TestManagerBuilder::<G2>::new()
@@ -245,7 +275,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reset_calls_local_hook_in_tier_order() {
+    async fn reset_calls_local_hook_in_tier_order_including_g2() {
         let hook = Arc::new(RecordingReset {
             tiers: vec![Tier::G1, Tier::Carrier, Tier::G2],
             calls: Mutex::new(Vec::new()),
@@ -254,20 +284,13 @@ mod tests {
         let leader = leader_with_managers(vec![manager(2)]).await;
         assert!(leader.set_local_tier_reset(hook.clone()));
 
-        let response = reset(
-            &leader,
-            ResetRequest {
-                tiers: Some(vec![Tier::G1, Tier::Carrier]),
-            },
-        )
-        .await
-        .unwrap();
+        let response = reset(&leader, ResetRequest { tiers: None }).await.unwrap();
 
         assert_eq!(
             *hook.calls.lock().unwrap(),
-            vec![vec![Tier::Carrier, Tier::G1]]
+            vec![vec![Tier::Carrier, Tier::G1, Tier::G2]]
         );
-        assert_eq!(response.reset, vec![Tier::Carrier, Tier::G1]);
+        assert_eq!(response.reset, vec![Tier::Carrier, Tier::G1, Tier::G2]);
     }
 
     #[tokio::test]
@@ -336,6 +359,112 @@ mod tests {
         assert_eq!(first.match_blocks(&[first_live_hash]).len(), 1);
         assert!(second.match_blocks(&[second_inactive]).is_empty());
         assert_eq!(second.match_blocks(&[second_live_hash]).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reset_releases_hook_g2_pin_before_draining() {
+        let manager = manager(1);
+        let token_block = create_sequential_block(300_000, 4);
+        let hash = token_block.kvbm_sequence_hash();
+        let complete = manager
+            .allocate_blocks(1)
+            .unwrap()
+            .pop()
+            .unwrap()
+            .complete(&token_block)
+            .unwrap();
+        let held = manager.register_blocks(vec![complete]).pop().unwrap();
+        let hook = Arc::new(ReleasingG2Reset {
+            calls: Mutex::new(Vec::new()),
+            held: Mutex::new(Some(held)),
+        });
+        let leader = leader_with_managers(vec![Arc::clone(&manager)]).await;
+        assert!(leader.set_local_tier_reset(hook.clone()));
+
+        let response = reset(
+            &leader,
+            ResetRequest {
+                tiers: Some(vec![Tier::G2]),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(*hook.calls.lock().unwrap(), vec![vec![Tier::G2]]);
+        assert_eq!(response.reset, vec![Tier::G2]);
+        assert!(manager.match_blocks(&[hash]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn reset_skips_g2_drain_after_hook_error() {
+        let manager = manager(1);
+        let token_block = create_sequential_block(400_000, 4);
+        let hash = token_block.kvbm_sequence_hash();
+        let complete = manager
+            .allocate_blocks(1)
+            .unwrap()
+            .pop()
+            .unwrap()
+            .complete(&token_block)
+            .unwrap();
+        drop(manager.register_blocks(vec![complete]));
+        let hook = Arc::new(RecordingReset {
+            tiers: vec![Tier::G2],
+            calls: Mutex::new(Vec::new()),
+            errors: vec![TierError {
+                tier: Tier::G2,
+                message: "G2 reset failed".into(),
+            }],
+        });
+        let leader = leader_with_managers(vec![Arc::clone(&manager)]).await;
+        assert!(leader.set_local_tier_reset(hook.clone()));
+
+        let response = reset(
+            &leader,
+            ResetRequest {
+                tiers: Some(vec![Tier::G2]),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(*hook.calls.lock().unwrap(), vec![vec![Tier::G2]]);
+        assert!(response.reset.is_empty());
+        assert_eq!(response.failed.len(), 1);
+        assert_eq!(response.failed[0].tier, Tier::G2);
+        assert_eq!(response.failed[0].message, "G2 reset failed");
+        assert_eq!(manager.match_blocks(&[hash]).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reset_drains_g2_without_advertised_hook_tier() {
+        let manager = manager(1);
+        let token_block = create_sequential_block(500_000, 4);
+        let hash = token_block.kvbm_sequence_hash();
+        let complete = manager
+            .allocate_blocks(1)
+            .unwrap()
+            .pop()
+            .unwrap()
+            .complete(&token_block)
+            .unwrap();
+        drop(manager.register_blocks(vec![complete]));
+        let hook = Arc::new(RecordingReset {
+            tiers: vec![Tier::Carrier, Tier::G1],
+            calls: Mutex::new(Vec::new()),
+            errors: Vec::new(),
+        });
+        let leader = leader_with_managers(vec![Arc::clone(&manager)]).await;
+        assert!(leader.set_local_tier_reset(hook.clone()));
+
+        let response = reset(&leader, ResetRequest { tiers: None }).await.unwrap();
+
+        assert_eq!(
+            *hook.calls.lock().unwrap(),
+            vec![vec![Tier::Carrier, Tier::G1]]
+        );
+        assert_eq!(response.reset, vec![Tier::Carrier, Tier::G1, Tier::G2]);
+        assert!(manager.match_blocks(&[hash]).is_empty());
     }
 
     #[tokio::test]

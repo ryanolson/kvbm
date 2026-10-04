@@ -446,7 +446,12 @@ pub trait SessionFactory: Send + Sync {
 
 /// Resets locally owned block-manager tiers.
 pub trait LocalTierReset: Send + Sync {
-    /// Tiers this hook owns. Only Carrier and G1 are honored; others are ignored.
+    /// The tiers that this hook owns.
+    ///
+    /// The engine honors Carrier, G1, and G2. It ignores other tiers.
+    ///
+    /// A hook can own G2-side state. It must release that state before the
+    /// engine drains G2.
     fn tiers(&self) -> Vec<Tier>;
 
     /// Reset the given tiers (subset of `tiers()`, in Tier::ORDERED order).
