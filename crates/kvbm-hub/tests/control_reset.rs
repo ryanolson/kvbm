@@ -120,17 +120,10 @@ fn fanout_url(server: &HubServer, control: bool) -> String {
 }
 
 fn modules_url(server: &HubServer, id: velo_ext::InstanceId) -> String {
-    format!(
-        "http://{}/v1/instances/{id}/modules",
-        server.control_addr()
-    )
+    format!("http://{}/v1/instances/{id}/modules", server.control_addr())
 }
 
-async fn wait_for_modules_cached(
-    server: &HubServer,
-    id: velo_ext::InstanceId,
-    deadline: Duration,
-) {
+async fn wait_for_modules_cached(server: &HubServer, id: velo_ext::InstanceId, deadline: Duration) {
     let started = Instant::now();
     loop {
         let response = http()
@@ -243,7 +236,12 @@ async fn fanout_filters_leaders_without_dev_module() {
         .await
         .expect("register leader without dev");
     wait_for_modules_cached(&server, peer_dev.instance_id(), Duration::from_secs(2)).await;
-    wait_for_modules_cached(&server, peer_without_dev.instance_id(), Duration::from_secs(2)).await;
+    wait_for_modules_cached(
+        &server,
+        peer_without_dev.instance_id(),
+        Duration::from_secs(2),
+    )
+    .await;
 
     let response = http()
         .post(fanout_url(&server, true))
@@ -269,12 +267,7 @@ async fn fanout_returns_leader_error_without_failing_other_results() {
 
     let peer_ok = new_velo().await;
     install_modules(&peer_ok, vec![ModuleId::Core, ModuleId::Dev]);
-    install_reset_handler(
-        &peer_ok,
-        reset_reply(),
-        None,
-        Arc::new(AtomicUsize::new(0)),
-    );
+    install_reset_handler(&peer_ok, reset_reply(), None, Arc::new(AtomicUsize::new(0)));
 
     let peer_error = new_velo().await;
     install_modules(&peer_error, vec![ModuleId::Core, ModuleId::Dev]);

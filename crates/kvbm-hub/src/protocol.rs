@@ -13,8 +13,8 @@
 use kvbm_common::BlockLayoutMode;
 use kvbm_logical::events::CreateKind;
 use kvbm_protocols::cache_manifest::{CacheManifest, RegistrationEpoch};
-use kvbm_protocols::control::{MetricsSnapshotResponse, ResetResponse};
 pub use kvbm_protocols::control::layout_compat::LayoutCompatPayload;
+use kvbm_protocols::control::{MetricsSnapshotResponse, ResetResponse};
 /// Remote-prefill request payload carried by the hub's CD queue.
 ///
 /// The payload shape is owned by `kvbm-protocols (disagg)`; the hub owns only

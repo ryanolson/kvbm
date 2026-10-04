@@ -54,6 +54,7 @@ use crate::registry::{PeerRegistry, RegistryIncarnation};
 /// entry; the rest of the fanout still completes. Kept short on purpose —
 /// the UI polls this and a sluggish leader shouldn't drag the whole tab.
 const METRICS_FANOUT_PER_LEADER: Duration = Duration::from_secs(2);
+/// The hub waits this long for each leader reset request.
 const RESET_FANOUT_PER_LEADER: Duration = Duration::from_secs(30);
 
 /// Cached `list_modules` result for one instance.
@@ -538,11 +539,8 @@ async fn reset_fanout(
         let req = req.clone();
         async move {
             let client = LeaderControlClient::new(messenger, id);
-            let outcome = tokio::time::timeout(
-                RESET_FANOUT_PER_LEADER,
-                client.dev().reset(req),
-            )
-            .await;
+            let outcome =
+                tokio::time::timeout(RESET_FANOUT_PER_LEADER, client.dev().reset(req)).await;
             (id, outcome)
         }
     });
@@ -572,7 +570,7 @@ async fn reset_fanout(
                 );
                 ResetInstanceEntry {
                     response: None,
-                    error: Some("timeout after 30s".to_string()),
+                    error: Some(format!("timeout after {RESET_FANOUT_PER_LEADER:?}")),
                 }
             }
         };
