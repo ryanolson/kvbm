@@ -83,9 +83,7 @@ async fn reset(leader: &InstanceLeader, req: ResetRequest) -> Result<ResetRespon
     let hook_tiers: Vec<_> = Tier::ORDERED
         .iter()
         .copied()
-        .filter(|tier| {
-            advertised_hook_tiers.contains(tier) && to_reset.contains(tier)
-        })
+        .filter(|tier| advertised_hook_tiers.contains(tier) && to_reset.contains(tier))
         .collect();
     let mut hook_errors = if hook_tiers.is_empty() {
         HashMap::new()
