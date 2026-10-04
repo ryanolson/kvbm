@@ -63,17 +63,19 @@ impl ControlModule for DevModule {
 async fn reset(leader: &InstanceLeader, req: ResetRequest) -> Result<ResetResponse, ControlError> {
     let local_reset = leader.local_tier_reset();
     let mut available = HashSet::new();
+    let mut advertised_hook_tiers = HashSet::new();
     // G2 is always present once an InstanceLeader is up.
     available.insert(Tier::G2);
     if leader.g3_manager().is_some() {
         available.insert(Tier::G3);
     }
     if let Some(hook) = &local_reset {
-        available.extend(
+        advertised_hook_tiers.extend(
             hook.tiers()
                 .into_iter()
                 .filter(|tier| matches!(*tier, Tier::Carrier | Tier::G1 | Tier::G2)),
         );
+        available.extend(advertised_hook_tiers.iter().copied());
     }
 
     let (to_reset, skipped) = plan_reset(&req, &available)?;
@@ -82,7 +84,7 @@ async fn reset(leader: &InstanceLeader, req: ResetRequest) -> Result<ResetRespon
         .iter()
         .copied()
         .filter(|tier| {
-            matches!(*tier, Tier::Carrier | Tier::G1 | Tier::G2) && to_reset.contains(tier)
+            advertised_hook_tiers.contains(tier) && to_reset.contains(tier)
         })
         .collect();
     let mut hook_errors = if hook_tiers.is_empty() {
