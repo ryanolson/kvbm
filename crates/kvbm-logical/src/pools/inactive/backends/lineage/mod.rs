@@ -646,6 +646,53 @@ impl InactiveIndex for LineageBackend {
         }
     }
 
+    fn take_with_descendants(
+        &mut self,
+        seq_hash: SequenceHash,
+        block_id: BlockId,
+    ) -> Vec<(SequenceHash, BlockId)> {
+        let position = seq_hash.position();
+        let fragment = seq_hash.parent_fragment_for_child_position(position + 1);
+        let Some(&root) = self.index.get(&(position, fragment)) else {
+            return Vec::new();
+        };
+        if !matches!(
+            self.slots[root as usize].data,
+            SlotData::Real {
+                seq_hash: stored,
+                block_id: stored_id,
+            } if stored == seq_hash && stored_id == block_id
+        ) {
+            return Vec::new();
+        }
+
+        let mut order = Vec::new();
+        let mut stack = vec![(root, false)];
+        while let Some((idx, expanded)) = stack.pop() {
+            if expanded {
+                if matches!(self.slots[idx as usize].data, SlotData::Real { .. }) {
+                    order.push(idx);
+                }
+                continue;
+            }
+            stack.push((idx, true));
+            let mut children = Vec::new();
+            let mut child = self.slots[idx as usize].first_child;
+            while let Some(child_idx) = child {
+                children.push(child_idx);
+                child = self.slots[child_idx as usize].next_sibling;
+            }
+            for child_idx in children.into_iter().rev() {
+                stack.push((child_idx, false));
+            }
+        }
+
+        order
+            .into_iter()
+            .map(|idx| self.remove_node_at(idx))
+            .collect()
+    }
+
     fn take_complete_lineage(
         &mut self,
         seq_hash: SequenceHash,
@@ -895,6 +942,42 @@ mod tests {
 
         let allocated2 = backend.allocate(1);
         assert_eq!(allocated2[0].1, 0);
+    }
+
+    #[test]
+    fn take_with_descendants_removes_leaf_to_root() {
+        let mut backend = LineageBackend::new();
+        let chain = create_chain(3, 0);
+
+        for (id, hash) in &chain {
+            backend.insert(*hash, *id);
+        }
+
+        assert_eq!(
+            backend.take_with_descendants(chain[0].1, chain[0].0),
+            vec![
+                (chain[2].1, chain[2].0),
+                (chain[1].1, chain[1].0),
+                (chain[0].1, chain[0].0),
+            ]
+        );
+        assert!(backend.is_graph_empty());
+    }
+
+    #[test]
+    fn take_with_descendants_stops_at_a_hole() {
+        let mut backend = LineageBackend::new();
+        let chain = create_chain(3, 0);
+
+        backend.insert(chain[0].1, chain[0].0);
+        backend.insert(chain[2].1, chain[2].0);
+
+        assert_eq!(
+            backend.take_with_descendants(chain[0].1, chain[0].0),
+            vec![(chain[0].1, chain[0].0)]
+        );
+        assert_eq!(backend.len(), 1);
+        assert!(backend.contains(chain[2].1, chain[2].0));
     }
 
     #[test]

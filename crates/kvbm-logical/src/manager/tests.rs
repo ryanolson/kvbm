@@ -160,6 +160,65 @@ fn inactive_tail_release_preserves_low_cache_and_notifies_evictions() {
 }
 
 #[test]
+fn lineage_tail_release_evicts_descendants_in_lower_slots() {
+    let manager = BlockManager::<TestBlockData>::builder()
+        .block_count(4)
+        .block_size(1)
+        .registry(BlockRegistry::new())
+        .with_lineage_backend()
+        .build()
+        .unwrap();
+    let token_sequence = dynamo_tokens::TokenBlockSequence::from_slice(&[1, 2, 3], 1, Some(42));
+    let token_blocks = token_sequence.blocks();
+    let mut allocated = manager.allocate_blocks(4).unwrap().into_iter();
+    let middle = allocated.next().unwrap();
+    let leaf = allocated.next().unwrap();
+    let _live = allocated.next().unwrap();
+    let root = allocated.next().unwrap();
+    let cached = manager.register_blocks(vec![
+        leaf.complete(&token_blocks[2]).unwrap(),
+        middle.complete(&token_blocks[1]).unwrap(),
+        root.complete(&token_blocks[0]).unwrap(),
+    ]);
+    drop(cached);
+
+    assert_eq!(manager.release_inactive_tail(2), 3);
+    assert_eq!(manager.occupied_high_water(), 3);
+    assert_eq!(manager.metrics().snapshot().inactive_pool_size, 0);
+}
+
+#[test]
+fn lineage_tail_release_preserves_low_root_when_leaf_is_high() {
+    let manager = BlockManager::<TestBlockData>::builder()
+        .block_count(3)
+        .block_size(1)
+        .registry(BlockRegistry::new())
+        .with_lineage_backend()
+        .build()
+        .unwrap();
+    let token_sequence = dynamo_tokens::TokenBlockSequence::from_slice(&[4, 5], 1, Some(43));
+    let token_blocks = token_sequence.blocks();
+    let mut allocated = manager.allocate_blocks(3).unwrap().into_iter();
+    let root = allocated.next().unwrap();
+    let unused = allocated.next().unwrap();
+    let leaf = allocated.next().unwrap();
+    drop(unused);
+    let cached = manager.register_blocks(vec![
+        root.complete(&token_blocks[0]).unwrap(),
+        leaf.complete(&token_blocks[1]).unwrap(),
+    ]);
+    drop(cached);
+
+    assert_eq!(manager.release_inactive_tail(2), 2);
+    assert_eq!(
+        manager
+            .match_blocks(&[token_blocks[0].kvbm_sequence_hash()])
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn inactive_tail_release_preserves_staged_transfer_and_shared_prefix_pins() {
     let manager = create_test_manager(4);
     let mut blocks = manager.allocate_blocks(4).unwrap();
