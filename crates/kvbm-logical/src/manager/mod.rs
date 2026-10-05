@@ -320,7 +320,10 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
         Ok(())
     }
 
-    /// Release inactive cached tail blocks without moving live blocks.
+    /// Release cached slots above the highest live slot and requested minimum.
+    ///
+    /// Each selected inactive block is retired together with its inactive
+    /// descendants, so no cached chain retains a block whose parent was evicted.
     /// The returned bound is a snapshot. Capacity changes still validate live slots.
     pub fn release_inactive_tail(&self, min_capacity: usize) -> usize {
         let (blocks, evicted) = self.store.inactive_tail_to_mutable(min_capacity);

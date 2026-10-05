@@ -117,6 +117,22 @@ pub(crate) trait InactiveIndex: Send + Sync {
     #[allow(dead_code)]
     fn take(&mut self, seq_hash: SequenceHash, block_id: BlockId) -> bool;
 
+    /// Remove the exact pair and every real inactive descendant.
+    ///
+    /// Returned pairs are ordered leaf-to-root, with the named block last.
+    /// An empty vector means that the exact pair was absent.
+    fn take_with_descendants(
+        &mut self,
+        seq_hash: SequenceHash,
+        block_id: BlockId,
+    ) -> Vec<(SequenceHash, BlockId)> {
+        if self.take(seq_hash, block_id) {
+            vec![(seq_hash, block_id)]
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Atomically remove the complete real lineage from root through the
     /// exact inactive leaf. Backends without lineage data return `None`.
     fn take_complete_lineage(
@@ -920,7 +936,8 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         (out, evicted)
     }
 
-    /// Evict cached slots above the highest live slot and the requested minimum.
+    /// Evict cached slots above the highest live slot and the requested minimum,
+    /// together with their inactive descendants.
     pub(crate) fn inactive_tail_to_mutable(
         self: &Arc<Self>,
         min_capacity: usize,
@@ -938,15 +955,23 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
             let SlotState::Inactive { seq_hash, .. } = inner.slots[block_id].state else {
                 continue;
             };
-            if !inner.inactive.take(seq_hash, block_id) {
-                continue;
+            for (evicted_hash, evicted_block_id) in
+                inner.inactive.take_with_descendants(seq_hash, block_id)
+            {
+                handles.push(take_inactive_handle(
+                    &mut inner.slots[evicted_block_id],
+                    evicted_block_id,
+                ));
+                inner.slots[evicted_block_id].state = SlotState::Mutable;
+                inner.reset_on_release[evicted_block_id] = self.default_reset_on_release;
+                let block_size = inner.slots[evicted_block_id].block_size;
+                blocks.push(MutableBlock::from_store(
+                    self.clone(),
+                    evicted_block_id,
+                    block_size,
+                ));
+                evicted.push(evicted_hash);
             }
-            handles.push(take_inactive_handle(&mut inner.slots[block_id], block_id));
-            inner.slots[block_id].state = SlotState::Mutable;
-            inner.reset_on_release[block_id] = self.default_reset_on_release;
-            let block_size = inner.slots[block_id].block_size;
-            blocks.push(MutableBlock::from_store(self.clone(), block_id, block_size));
-            evicted.push(seq_hash);
         }
         let count = evicted.len();
         self.metrics.dec_inactive_pool_size_by(count as i64);
