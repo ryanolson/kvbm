@@ -945,7 +945,27 @@ mod tests {
     }
 
     #[test]
-    fn take_with_descendants_removes_leaf_to_root_through_ghosts() {
+    fn take_with_descendants_removes_leaf_to_root() {
+        let mut backend = LineageBackend::new();
+        let chain = create_chain(3, 0);
+
+        for (id, hash) in &chain {
+            backend.insert(*hash, *id);
+        }
+
+        assert_eq!(
+            backend.take_with_descendants(chain[0].1, chain[0].0),
+            vec![
+                (chain[2].1, chain[2].0),
+                (chain[1].1, chain[1].0),
+                (chain[0].1, chain[0].0),
+            ]
+        );
+        assert!(backend.is_graph_empty());
+    }
+
+    #[test]
+    fn take_with_descendants_stops_at_a_hole() {
         let mut backend = LineageBackend::new();
         let chain = create_chain(3, 0);
 
@@ -954,9 +974,10 @@ mod tests {
 
         assert_eq!(
             backend.take_with_descendants(chain[0].1, chain[0].0),
-            vec![(chain[2].1, chain[2].0), (chain[0].1, chain[0].0)]
+            vec![(chain[0].1, chain[0].0)]
         );
-        assert!(backend.is_graph_empty());
+        assert_eq!(backend.len(), 1);
+        assert!(backend.contains(chain[2].1, chain[2].0));
     }
 
     #[test]
