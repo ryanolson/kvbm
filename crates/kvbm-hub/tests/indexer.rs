@@ -91,6 +91,34 @@ async fn start_hub() -> (HubServer, Arc<IndexerManager>) {
     (server, manager)
 }
 
+async fn start_hub_with_required_kind(
+    kind: kvbm_logical::events::CreateKind,
+) -> (HubServer, Arc<IndexerManager>) {
+    let manager = Arc::new(
+        IndexerManager::new(
+            MAX_SEQ_LEN,
+            BLOCK_SIZE as usize,
+            Some("tcp://127.0.0.1:0".to_string()),
+            Some("127.0.0.1".to_string()),
+        )
+        .expect("build indexer manager")
+        .with_required_kind(kind),
+    );
+
+    let server = kvbm_hub::create_server_builder()
+        .bind_addr("127.0.0.1".parse().unwrap())
+        .discovery_port(0)
+        .control_port(0)
+        .heartbeat_interval(Duration::from_secs(3600))
+        .heartbeat_max_failures(u32::MAX)
+        .registration_ttl(Duration::from_secs(3600))
+        .add_feature_manager(Arc::clone(&manager) as Arc<dyn FeatureManager>)
+        .serve()
+        .await
+        .expect("start hub");
+    (server, manager)
+}
+
 async fn start_nats_hub(
     server_url: &str,
     subject_prefix: &str,
@@ -175,6 +203,41 @@ fn instances(entry: &Value) -> Vec<String> {
         .collect();
     ids.sort_unstable();
     ids.into_iter().map(|id| id.to_string()).collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn required_create_kind_rejects_carrier_and_accepts_block() {
+    let (server, manager) =
+        start_hub_with_required_kind(kvbm_logical::events::CreateKind::Block).await;
+    let manifest = test_manifest();
+    let manifest_id = manifest.id();
+    let carrier_registration = Feature::Indexer(IndexerFeatureConfig {
+        max_seq_len: Some(MAX_SEQ_LEN),
+        manifest: manifest.clone(),
+        create_kind: kvbm_logical::events::CreateKind::Carrier,
+    });
+
+    let rejected = manager
+        .on_register(InstanceId::new_v4(), &carrier_registration)
+        .await;
+    assert!(rejected.is_err());
+    assert_eq!(manager.indexes().kind(manifest_id), None);
+
+    let block_registration = Feature::Indexer(IndexerFeatureConfig {
+        max_seq_len: Some(MAX_SEQ_LEN),
+        manifest,
+        create_kind: kvbm_logical::events::CreateKind::Block,
+    });
+    manager
+        .on_register(InstanceId::new_v4(), &block_registration)
+        .await
+        .expect("register block publisher");
+    assert_eq!(
+        manager.indexes().kind(manifest_id),
+        Some(kvbm_logical::events::CreateKind::Block)
+    );
+
+    server.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
