@@ -210,7 +210,12 @@ fn lineage_tail_release_preserves_low_root_when_leaf_is_high() {
     drop(cached);
 
     assert_eq!(manager.release_inactive_tail(2), 2);
-    assert_eq!(manager.match_blocks(&[token_blocks[0].kvbm_sequence_hash()]).len(), 1);
+    assert_eq!(
+        manager
+            .match_blocks(&[token_blocks[0].kvbm_sequence_hash()])
+            .len(),
+        1
+    );
 }
 
 #[test]
