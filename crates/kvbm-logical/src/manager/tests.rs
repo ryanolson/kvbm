@@ -162,7 +162,7 @@ fn inactive_tail_release_preserves_low_cache_and_notifies_evictions() {
 #[test]
 fn lineage_tail_release_evicts_descendants_in_lower_slots() {
     let manager = BlockManager::<TestBlockData>::builder()
-        .block_count(3)
+        .block_count(4)
         .block_size(1)
         .registry(BlockRegistry::new())
         .with_lineage_backend()
@@ -170,9 +170,10 @@ fn lineage_tail_release_evicts_descendants_in_lower_slots() {
         .unwrap();
     let token_sequence = dynamo_tokens::TokenBlockSequence::from_slice(&[1, 2, 3], 1, Some(42));
     let token_blocks = token_sequence.blocks();
-    let mut allocated = manager.allocate_blocks(3).unwrap().into_iter();
+    let mut allocated = manager.allocate_blocks(4).unwrap().into_iter();
     let middle = allocated.next().unwrap();
     let leaf = allocated.next().unwrap();
+    let _live = allocated.next().unwrap();
     let root = allocated.next().unwrap();
     let cached = manager.register_blocks(vec![
         leaf.complete(&token_blocks[2]).unwrap(),
@@ -181,7 +182,7 @@ fn lineage_tail_release_evicts_descendants_in_lower_slots() {
     ]);
     drop(cached);
 
-    assert_eq!(manager.release_inactive_tail(2), 2);
+    assert_eq!(manager.release_inactive_tail(2), 3);
     assert_eq!(manager.metrics().snapshot().inactive_pool_size, 0);
 }
 
