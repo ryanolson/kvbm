@@ -183,6 +183,7 @@ fn lineage_tail_release_evicts_descendants_in_lower_slots() {
     drop(cached);
 
     assert_eq!(manager.release_inactive_tail(2), 3);
+    assert_eq!(manager.occupied_high_water(), 3);
     assert_eq!(manager.metrics().snapshot().inactive_pool_size, 0);
 }
 
