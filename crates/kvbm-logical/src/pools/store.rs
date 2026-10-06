@@ -657,19 +657,17 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
             inner.fenced.retain(|id| *id < capacity);
             self.metrics
                 .dec_reset_pool_size_by((previous - capacity) as i64);
-        } else if capacity > previous {
-            if capacity > inner.slots.len() {
-                inner.slots.resize_with(capacity, || BlockSlot {
-                    block_size: self.block_size,
-                    generation: 0,
-                    inactive_epoch: 0,
-                    state: SlotState::Reset,
-                });
-                inner
-                    .reset_on_release
-                    .resize(capacity, self.default_reset_on_release);
-                inner.inactive.grow_capacity(capacity);
-            }
+        } else if capacity > previous && capacity > inner.slots.len() {
+            inner.slots.resize_with(capacity, || BlockSlot {
+                block_size: self.block_size,
+                generation: 0,
+                inactive_epoch: 0,
+                state: SlotState::Reset,
+            });
+            inner
+                .reset_on_release
+                .resize(capacity, self.default_reset_on_release);
+            inner.inactive.grow_capacity(capacity);
         }
         inner.capacity = capacity;
         if capacity > previous {
@@ -690,13 +688,13 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
 
     pub(crate) fn set_allocation_ceiling(&self, fence: Option<usize>) -> Result<(), String> {
         let mut inner = self.inner.lock();
-        if let Some(fence) = fence {
-            if fence > inner.capacity {
-                return Err(format!(
-                    "allocation ceiling {fence} exceeds block capacity {}",
-                    inner.capacity
-                ));
-            }
+        if let Some(fence) = fence
+            && fence > inner.capacity
+        {
+            return Err(format!(
+                "allocation ceiling {fence} exceeds block capacity {}",
+                inner.capacity
+            ));
         }
         inner.fence = fence;
         let reset_ids: Vec<_> = inner.free.union(&inner.fenced).copied().collect();
