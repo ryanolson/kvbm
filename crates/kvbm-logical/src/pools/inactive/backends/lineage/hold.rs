@@ -223,7 +223,7 @@ impl LineageBackend {
         Some((indices_leaf_first, source_blocks))
     }
 
-    fn real_index(&self, seq_hash: SequenceHash, block_id: BlockId) -> Option<u32> {
+    pub(super) fn real_index(&self, seq_hash: SequenceHash, block_id: BlockId) -> Option<u32> {
         let position = seq_hash.position();
         let fragment = seq_hash.parent_fragment_for_child_position(position + 1);
         let index = *self.index.get(&(position, fragment))?;

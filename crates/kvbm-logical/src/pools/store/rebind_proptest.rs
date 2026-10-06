@@ -71,10 +71,7 @@ fn assert_model_invariants(
         assert_eq!(record.src, record.plan.src());
         assert_eq!(record.dst, record.plan.dst());
         assert_eq!(record.seq_hash, record.plan.sequence_hash());
-        assert!(matches!(
-            &snapshot.slots[record.dst],
-            SlotKind::Mutable
-        ));
+        assert!(matches!(&snapshot.slots[record.dst], SlotKind::Mutable));
         assert!(!snapshot.free.contains(&record.dst));
         assert!(!snapshot.fenced.contains(&record.dst));
     }

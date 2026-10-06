@@ -107,7 +107,10 @@ impl<T: BlockMetadata> RebindPlan<T> {
         if source_identity {
             let rebound = inner.inactive.rebind(self.seq_hash, self.src, self.dst);
             if !rebound {
-                debug_assert!(rebound, "inactive source identity was missing from its index");
+                debug_assert!(
+                    rebound,
+                    "inactive source identity was missing from its index"
+                );
                 release_reserved_destination(&store, &mut inner, self.dst);
                 self.armed = false;
                 return RebindOutcome::Stale;

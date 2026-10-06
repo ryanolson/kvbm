@@ -1,16 +1,20 @@
 use super::*;
-use dynamo_tokens::TokenBlockSequence;
 use crate::manager::InactiveBackendConfig;
 use crate::pools::store::SlotKind;
+use dynamo_tokens::TokenBlockSequence;
 
 type BackendBuilder =
     fn(BlockManagerConfigBuilder<TestBlockData>) -> BlockManagerConfigBuilder<TestBlockData>;
 
-fn hashmap_backend(builder: BlockManagerConfigBuilder<TestBlockData>) -> BlockManagerConfigBuilder<TestBlockData> {
+fn hashmap_backend(
+    builder: BlockManagerConfigBuilder<TestBlockData>,
+) -> BlockManagerConfigBuilder<TestBlockData> {
     builder.inactive_backend(InactiveBackendConfig::HashMap)
 }
 
-fn lru_backend(builder: BlockManagerConfigBuilder<TestBlockData>) -> BlockManagerConfigBuilder<TestBlockData> {
+fn lru_backend(
+    builder: BlockManagerConfigBuilder<TestBlockData>,
+) -> BlockManagerConfigBuilder<TestBlockData> {
     builder.with_lru_backend()
 }
 
@@ -46,11 +50,8 @@ fn register_and_release(
         .next()
         .unwrap();
     let block_id = mutable.block_id();
-    let immutable = manager.register_block(
-        mutable
-            .complete(&token_block)
-            .expect("matching block size"),
-    );
+    let immutable =
+        manager.register_block(mutable.complete(&token_block).expect("matching block size"));
     drop(immutable);
     (seq_hash, block_id)
 }
@@ -60,9 +61,7 @@ fn register_and_release(
 #[case::lru(lru_backend)]
 #[case::multi_lru(multi_lru_backend)]
 #[case::lineage(lineage_backend)]
-fn prepare_commit_moves_the_inactive_registration_and_handle(
-    #[case] backend: BackendBuilder,
-) {
+fn prepare_commit_moves_the_inactive_registration_and_handle(#[case] backend: BackendBuilder) {
     let manager = manager_with_backend(4, backend);
     let token_block = create_test_token_block_from_iota(101);
     let seq_hash = token_block.kvbm_sequence_hash();
@@ -73,21 +72,23 @@ fn prepare_commit_moves_the_inactive_registration_and_handle(
         .next()
         .unwrap();
     let src = mutable.block_id();
-    let immutable = manager.register_block(
-        mutable
-            .complete(&token_block)
-            .expect("matching block size"),
-    );
+    let immutable =
+        manager.register_block(mutable.complete(&token_block).expect("matching block size"));
     let handle = immutable.registration_handle();
     drop(immutable);
 
     let before_prepare = manager.metrics().snapshot();
     let destination_generation = manager.store_for_test().slot_generation_for_test(1);
-    let plan = manager.prepare_rebind(src).expect("inactive source and reset destination");
+    let plan = manager
+        .prepare_rebind(src)
+        .expect("inactive source and reset destination");
     let dst = plan.dst();
     let during_prepare = manager.metrics().snapshot();
     assert_eq!(during_prepare.allocations, before_prepare.allocations);
-    assert_eq!(during_prepare.inflight_mutable, before_prepare.inflight_mutable);
+    assert_eq!(
+        during_prepare.inflight_mutable,
+        before_prepare.inflight_mutable
+    );
     assert_eq!(during_prepare.evictions, before_prepare.evictions);
     assert_eq!(
         during_prepare.reset_pool_size,
@@ -112,7 +113,10 @@ fn prepare_commit_moves_the_inactive_registration_and_handle(
     );
     let after_commit = manager.metrics().snapshot();
     assert_eq!(after_commit.allocations, before_prepare.allocations);
-    assert_eq!(after_commit.inflight_mutable, before_prepare.inflight_mutable);
+    assert_eq!(
+        after_commit.inflight_mutable,
+        before_prepare.inflight_mutable
+    );
     assert_eq!(after_commit.evictions, before_prepare.evictions);
 
     assert_eq!(manager.inactive_len(), 1);
@@ -183,7 +187,10 @@ fn lineage_parent_rebind_preserves_chain_lookup_and_tail_release() {
     let hashes: Vec<_> = original.iter().map(|(hash, _)| *hash).collect();
     let matched = manager.match_blocks(&hashes);
     assert_eq!(
-        matched.iter().map(|block| block.block_id()).collect::<Vec<_>>(),
+        matched
+            .iter()
+            .map(|block| block.block_id())
+            .collect::<Vec<_>>(),
         vec![dst, original[1].1, original[2].1]
     );
     drop(matched);
@@ -283,7 +290,14 @@ fn stale_rebind_releases_its_destination_after_eviction_and_reregistration() {
     let (mutables, evicted) = manager.allocate_blocks_with_evictions(1).unwrap();
     assert_eq!(mutables[0].block_id(), src);
     assert_eq!(evicted, vec![seq_hash]);
-    let re_registered = manager.register_block(mutables.into_iter().next().unwrap().complete(&token_block).unwrap());
+    let re_registered = manager.register_block(
+        mutables
+            .into_iter()
+            .next()
+            .unwrap()
+            .complete(&token_block)
+            .unwrap(),
+    );
     drop(re_registered);
 
     assert!(matches!(plan.commit(), RebindOutcome::Stale));
@@ -389,7 +403,10 @@ fn ceiling_rebalances_resets_and_reset_inactive_pool_keeps_fenced_slots() {
     assert!(manager.allocate_blocks_from_reset(3).is_none());
     let eligible = manager.allocate_blocks_from_reset(2).unwrap();
     assert_eq!(
-        eligible.iter().map(|block| block.block_id()).collect::<Vec<_>>(),
+        eligible
+            .iter()
+            .map(|block| block.block_id())
+            .collect::<Vec<_>>(),
         vec![0, 1]
     );
     drop(eligible);
@@ -422,7 +439,10 @@ fn over_ceiling_evictions_are_fenced_while_eligible_victims_are_returned() {
 
     let (blocks, evicted) = manager.allocate_blocks_with_evictions(2).unwrap();
     assert_eq!(
-        blocks.iter().map(|block| block.block_id()).collect::<Vec<_>>(),
+        blocks
+            .iter()
+            .map(|block| block.block_id())
+            .collect::<Vec<_>>(),
         vec![0, 1]
     );
     assert_eq!(evicted, vec![hashes[2], hashes[3], hashes[0], hashes[1]]);

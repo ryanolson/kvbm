@@ -118,7 +118,10 @@ impl fmt::Display for ExactAllocationError {
                 write!(f, "victim slot {block_id} has a stale identity")
             }
             Self::FencedVictim { block_id } => {
-                write!(f, "victim slot {block_id} is outside the allocation ceiling")
+                write!(
+                    f,
+                    "victim slot {block_id} is outside the allocation ceiling"
+                )
             }
             Self::ActiveVictim { block_id } => {
                 write!(f, "victim slot {block_id} is not inactive")

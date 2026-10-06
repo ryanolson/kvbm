@@ -95,8 +95,7 @@ impl InactiveIndex for HashMapBackend {
     }
 
     fn rebind(&mut self, seq_hash: SequenceHash, src: BlockId, dst: BlockId) -> bool {
-        if self.blocks.get(&seq_hash) != Some(&src)
-            || !self.reuse_policy.rebind(seq_hash, src, dst)
+        if self.blocks.get(&seq_hash) != Some(&src) || !self.reuse_policy.rebind(seq_hash, src, dst)
         {
             return false;
         }

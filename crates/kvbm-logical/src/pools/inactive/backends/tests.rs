@@ -79,7 +79,10 @@ mod backend_tests {
             expected.iter().map(|(hash, _)| hash).collect::<Vec<_>>()
         );
         for ((_, expected_id), (_, actual_id)) in expected.iter().zip(actual) {
-            assert_eq!(actual_id, if *expected_id == src { 9 } else { *expected_id });
+            assert_eq!(
+                actual_id,
+                if *expected_id == src { 9 } else { *expected_id }
+            );
         }
     }
 

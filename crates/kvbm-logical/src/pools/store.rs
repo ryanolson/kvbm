@@ -25,7 +25,7 @@
 //! `BlockRegistrationHandle.attachments` (Mutex inside the registry) →
 //! `BlockStore.inner` (Mutex). Never the reverse.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::{Arc, Weak};
 
 // Under `#[cfg(test)]` use `tracing-mutex`'s parking_lot wrapper, which
@@ -62,7 +62,7 @@ mod rebind_proptest;
 
 pub(crate) use exact_reclaim::ExactReclaimPlanError;
 pub(crate) use inactive_lineage_hold::StoreInactiveLineageHold;
-pub(crate) use rebind::{RebindOutcome, RebindPlan, RebindPrepareError};
+pub use rebind::{RebindOutcome, RebindPlan, RebindPrepareError};
 
 /// Index trait for inactive-pool eviction backends. T-free: backends only
 /// need `(SequenceHash, BlockId)` pairs.
@@ -1043,8 +1043,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
                     evicted_block_id,
                 ));
                 if evicted_block_id < ceiling {
-                    let block_size =
-                        self.allocate_mutable_slot(&mut inner, evicted_block_id);
+                    let block_size = self.allocate_mutable_slot(&mut inner, evicted_block_id);
                     blocks.push(MutableBlock::from_store(
                         self.clone(),
                         evicted_block_id,
