@@ -129,11 +129,21 @@ fn prepare_commit_moves_the_inactive_registration_and_handle(
 }
 
 #[test]
-fn direct_rebind_moves_a_copied_block_to_the_requested_reset_slot() {
-    let mut manager = manager_with_backend(2, hashmap_backend);
+fn prepare_rebind_commits_a_copied_block_to_the_reserved_reset_slot() {
+    let manager = manager_with_backend(2, hashmap_backend);
     let (seq_hash, src) = register_and_release(&manager, 1_500);
     let generation = manager.store_for_test().slot_generation_for_test(1);
-    assert!(manager.rebind(seq_hash, src, 1));
+    let plan = manager.prepare_rebind(src).unwrap();
+    assert_eq!(plan.sequence_hash(), seq_hash);
+    assert_eq!(plan.dst(), 1);
+    assert!(matches!(
+        plan.commit(),
+        RebindOutcome::Moved {
+            seq_hash: moved_hash,
+            src: moved_src,
+            dst: moved_dst,
+        } if moved_hash == seq_hash && moved_src == src && moved_dst == 1
+    ));
     assert_eq!(
         manager.store_for_test().slot_generation_for_test(1),
         generation + 1

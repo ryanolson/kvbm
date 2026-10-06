@@ -195,42 +195,6 @@ impl<T: BlockMetadata> BlockStore<T> {
             armed: true,
         })
     }
-
-    pub(crate) fn rebind(&self, seq_hash: SequenceHash, src: BlockId, dst: BlockId) -> bool {
-        let mut inner = self.inner.lock();
-        if src >= inner.capacity
-            || dst >= inner.capacity
-            || src == dst
-            || dst >= effective_ceiling(&inner)
-            || !inner.free.contains(&dst)
-            || !matches!(
-                &inner.slots[src].state,
-                SlotState::Inactive { seq_hash: stored, .. } if *stored == seq_hash
-            )
-        {
-            return false;
-        }
-
-        let handle = match &inner.slots[src].state {
-            SlotState::Inactive { handle, .. } => handle.clone(),
-            _ => unreachable!(),
-        };
-        let rebound = inner.inactive.rebind(seq_hash, src, dst);
-        if !rebound {
-            debug_assert!(rebound, "inactive source identity was missing from its index");
-            return false;
-        }
-
-        let reset_on_release = inner.reset_on_release[src];
-        inner.free.remove(&dst);
-        let _ = self.allocate_mutable_slot(&mut inner, dst);
-        self.set_inactive_tenure_state_locked(&mut inner, dst, seq_hash, handle);
-        inner.reset_on_release[dst] = reset_on_release;
-        inner.reset_on_release[src] = self.default_reset_on_release;
-        self.reset_slot_locked(&mut inner, src);
-        self.metrics.dec_reset_pool_size();
-        true
-    }
 }
 
 fn release_reserved_destination<T: BlockMetadata>(

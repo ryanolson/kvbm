@@ -765,19 +765,13 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
         self.store.prepare_rebind(src)
     }
 
-    /// Rebind an inactive registration after its contents have been copied to
-    /// the supplied reset destination.
-    pub fn rebind(&mut self, seq_hash: SequenceHash, src: BlockId, dst: BlockId) -> bool {
-        self.store.rebind(seq_hash, src, dst)
-    }
-
     /// Blocks available for allocation (eligible reset + inactive pools).
     ///
     /// Reads both pool sizes under a single store-lock acquisition so the
     /// returned value is a coherent snapshot, never an over- or under-count
     /// produced by a concurrent reset↔inactive transition.
     pub fn available_blocks(&self) -> usize {
-        self.store.available_blocks_len()
+        self.store.available_len()
     }
 
     /// Tokens per block (constant after construction).

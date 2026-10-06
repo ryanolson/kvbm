@@ -370,7 +370,7 @@ pub(crate) struct BlockSlot<T: BlockMetadata> {
 /// Inner state of a `BlockStore` — protected by a single mutex.
 pub(crate) struct BlockStoreInner<T: BlockMetadata> {
     capacity: usize,
-    /// `slots[block_id]` — grows with published capacity and is never shrunk.
+    /// `slots[block_id]` — created at construction, never grows.
     slots: Vec<BlockSlot<T>>,
     /// Reset blocks in ascending index order.
     free: BTreeSet<BlockId>,
@@ -521,19 +521,22 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         metrics: Arc<BlockPoolMetrics>,
         default_reset_on_release: bool,
     ) -> Arc<Self> {
-        let slots = (0..total_blocks)
-            .map(|_| BlockSlot {
+        let mut slots = Vec::with_capacity(total_blocks);
+        let mut free = BTreeSet::new();
+        for id in 0..total_blocks {
+            slots.push(BlockSlot {
                 block_size,
                 generation: 0,
                 inactive_epoch: 0,
                 state: SlotState::Reset,
-            })
-            .collect();
+            });
+            free.insert(id);
+        }
         let reset_on_release = vec![default_reset_on_release; total_blocks];
-        let mut inner = BlockStoreInner {
+        let inner = BlockStoreInner {
             capacity: total_blocks,
             slots,
-            free: BTreeSet::new(),
+            free,
             fenced: BTreeSet::new(),
             fence: None,
             inactive,
@@ -541,9 +544,6 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
             held_by_hash: SeqHashMap::default(),
             reset_on_release,
         };
-        for id in 0..total_blocks {
-            push_reset_id_locked(&mut inner, id);
-        }
         Arc::new(Self {
             id: crate::ManagerId::next(),
             inner: Mutex::new(inner),
@@ -670,14 +670,15 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
                     .resize(capacity, self.default_reset_on_release);
                 inner.inactive.grow_capacity(capacity);
             }
-            inner.capacity = capacity;
+        }
+        inner.capacity = capacity;
+        if capacity > previous {
             for id in previous..capacity {
                 push_reset_id_locked(&mut inner, id);
             }
             self.metrics
                 .inc_reset_pool_size_by((capacity - previous) as i64);
         }
-        inner.capacity = capacity;
         let reset_ids: Vec<_> = inner.free.union(&inner.fenced).copied().collect();
         inner.free.clear();
         inner.fenced.clear();
@@ -725,14 +726,8 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         self.inner.lock().inactive.len()
     }
 
-    /// Number of reset slots eligible for allocation.
-    #[allow(dead_code)]
+    /// Number of eligible reset slots and inactive cached blocks.
     pub(crate) fn available_len(&self) -> usize {
-        self.inner.lock().free.len()
-    }
-
-    /// Atomic count of reset slots and inactive cached blocks.
-    pub(crate) fn available_blocks_len(&self) -> usize {
         let inner = self.inner.lock();
         inner.free.len() + inner.inactive.len()
     }
@@ -895,6 +890,9 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
             return Some((Vec::new(), Vec::new()));
         }
         let mut inner = self.inner.lock();
+        if inner.free.len() + inner.inactive.len() < count {
+            return None;
+        }
         let from_reset = std::cmp::min(count, inner.free.len());
         let inactive_needed = count - from_reset;
         let ceiling = effective_ceiling(&inner);
@@ -2148,8 +2146,17 @@ pub(crate) enum SlotKind {
 pub(crate) struct DebugStoreSnapshot {
     /// Every slot's kind, in `block_id` order.
     pub(crate) slots: Vec<SlotKind>,
-    /// Allocation-eligible Reset slots, in ascending physical-id order.
-    /// Allocation pops the lowest id first.
+    /// The reset (free) pool, in exact FIFO order. Order-sensitive on
+    /// purpose: `allocate_reset_blocks`/`allocate_atomic` pop the front,
+    /// so a different push order hands a different physical block to
+    /// the next allocation — that's observable, not just an internal
+    /// bookkeeping detail. `release_blocks` must reproduce the exact
+    /// push order that dropping the same guards one at a time would
+    /// produce, including when a batch contains a primary and its live
+    /// duplicate (see `release_blocks`'s and `release_entry_at`'s design
+    /// notes for how the keepalive cascade is replayed at the correct
+    /// relative position instead of being deferred to `Drop`'s arbitrary
+    /// timing).
     pub(crate) free: Vec<BlockId>,
     /// Reset blocks outside the current allocation ceiling.
     pub(crate) fenced: Vec<BlockId>,
