@@ -3622,10 +3622,10 @@ mod audit_counter_tests {
 
         let metrics = Arc::new(BlockPoolMetrics::new("test".to_string()));
         let tracker = FrequencyTrackingCapacity::default().create_tracker();
-        // Pre-populate the inner backend with 4 entries by inserting
+        // Pre-populate the inner backend with 2 entries by inserting
         // synthetic (hash, block_id) pairs.
         let mut inner = MultiLruBackend::new(NonZeroUsize::new(4).unwrap(), tracker);
-        for i in 0..4u32 {
+        for i in 0..2u32 {
             let h = create_test_token_block_from_iota(90_000 + i * 4).kvbm_sequence_hash();
             inner.insert(h, i as BlockId);
         }
