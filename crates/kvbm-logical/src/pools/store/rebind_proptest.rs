@@ -26,7 +26,7 @@ fn assert_model_invariants(
     assert_eq!(snapshot.slots.len(), capacity);
     assert_eq!(content.len(), capacity);
 
-    for id in 0..capacity {
+    for (id, content_at_id) in content.iter().enumerate() {
         let is_free = snapshot.free.contains(&id);
         let is_fenced = snapshot.fenced.contains(&id);
         if matches!(&snapshot.slots[id], SlotKind::Reset) {
@@ -44,7 +44,7 @@ fn assert_model_invariants(
             SlotKind::Primary(hash)
             | SlotKind::Duplicate(hash)
             | SlotKind::Inactive(hash)
-            | SlotKind::Held(hash) => assert_eq!(content[id], Some(*hash)),
+            | SlotKind::Held(hash) => assert_eq!(*content_at_id, Some(*hash)),
             SlotKind::Reset | SlotKind::Mutable | SlotKind::Staged(_) => {}
         }
     }
@@ -167,11 +167,11 @@ proptest! {
                 7 => {
                     if !plans.is_empty() {
                         let index = argument as usize % plans.len();
-                        if let Some(record) = plans[index].as_mut() {
-                            if !record.copied {
-                                content[record.dst] = content[record.src];
-                                record.copied = true;
-                            }
+                        if let Some(record) = plans[index].as_mut()
+                            && !record.copied
+                        {
+                            content[record.dst] = content[record.src];
+                            record.copied = true;
                         }
                     }
                 }
