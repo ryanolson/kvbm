@@ -94,6 +94,16 @@ impl InactiveIndex for HashMapBackend {
         self.blocks.insert(seq_hash, block_id);
     }
 
+    fn rebind(&mut self, seq_hash: SequenceHash, src: BlockId, dst: BlockId) -> bool {
+        if self.blocks.get(&seq_hash) != Some(&src)
+            || !self.reuse_policy.rebind(seq_hash, src, dst)
+        {
+            return false;
+        }
+        self.blocks.insert(seq_hash, dst);
+        true
+    }
+
     fn len(&self) -> usize {
         self.blocks.len()
     }

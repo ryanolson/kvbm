@@ -243,6 +243,11 @@ impl<T: BlockMetadata> BlockStore<T> {
                     });
                 }
             }
+            if victim.block_id >= super::effective_ceiling(&inner) {
+                return Err(ExactAllocationError::FencedVictim {
+                    block_id: victim.block_id,
+                });
+            }
         }
 
         inner
@@ -262,7 +267,7 @@ impl<T: BlockMetadata> BlockStore<T> {
             let handle = take_inactive_handle(&mut inner.slots[victim.block_id], victim.block_id);
             inner.slots[victim.block_id].state = SlotState::Reset;
             inner.reset_on_release[victim.block_id] = self.default_reset_on_release;
-            inner.free.insert(victim.block_id);
+            super::push_reset_id_locked(&mut inner, victim.block_id);
             evicted.push(victim.seq_hash);
             handles.push(handle);
         }

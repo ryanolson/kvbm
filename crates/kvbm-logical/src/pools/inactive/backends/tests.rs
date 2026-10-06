@@ -55,6 +55,37 @@ mod backend_tests {
     #[rstest]
     #[case::hashmap(BackendType::HashMap)]
     #[case::lru(BackendType::Lru)]
+    #[case::multi_lru(BackendType::MultiLru)]
+    #[case::lineage(BackendType::Lineage)]
+    fn rebind_preserves_eviction_order(#[case] backend_type: BackendType) {
+        let mut control = create_backend(backend_type);
+        let mut rebound = create_backend(backend_type);
+        let entries: Vec<_> = (0..3)
+            .map(|id| block_id_and_hash(id, &tokens_for_id(id)))
+            .collect();
+        for &(id, hash) in &entries {
+            control.insert(hash, id);
+            rebound.insert(hash, id);
+        }
+
+        let (src, seq_hash) = entries[1];
+        assert!(rebound.rebind(seq_hash, src, 9));
+        assert!(!rebound.rebind(seq_hash, src, 10));
+
+        let expected = control.allocate(3);
+        let actual = rebound.allocate(3);
+        assert_eq!(
+            actual.iter().map(|(hash, _)| hash).collect::<Vec<_>>(),
+            expected.iter().map(|(hash, _)| hash).collect::<Vec<_>>()
+        );
+        for ((_, expected_id), (_, actual_id)) in expected.iter().zip(actual) {
+            assert_eq!(actual_id, if *expected_id == src { 9 } else { *expected_id });
+        }
+    }
+
+    #[rstest]
+    #[case::hashmap(BackendType::HashMap)]
+    #[case::lru(BackendType::Lru)]
     #[case::lineage(BackendType::Lineage)]
     fn test_has_block(#[case] backend_type: BackendType) {
         let mut backend = create_backend(backend_type);

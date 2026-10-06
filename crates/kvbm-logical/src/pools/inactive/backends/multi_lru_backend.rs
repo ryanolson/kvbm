@@ -174,6 +174,19 @@ impl InactiveIndex for MultiLruBackend {
         self.priority_pools[level].put(seq_hash, block_id);
     }
 
+    fn rebind(&mut self, seq_hash: SequenceHash, src: BlockId, dst: BlockId) -> bool {
+        for pool in &mut self.priority_pools {
+            if let Some(block_id) = pool.peek_mut(&seq_hash) {
+                if *block_id != src {
+                    return false;
+                }
+                *block_id = dst;
+                return true;
+            }
+        }
+        false
+    }
+
     fn len(&self) -> usize {
         self.priority_pools.iter().map(|pool| pool.len()).sum()
     }

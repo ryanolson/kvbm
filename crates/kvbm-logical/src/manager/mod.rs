@@ -25,12 +25,12 @@ pub use inactive_lineage_hold::{
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::blocks::{BlockMetadata, CompleteBlock, ImmutableBlock, MutableBlock};
+use crate::blocks::{BlockId, BlockMetadata, CompleteBlock, ImmutableBlock, MutableBlock};
 use crate::metrics::BlockPoolMetrics;
 use crate::pools::{
     BlockDuplicationPolicy, BlockStore, ExactReclaimEntryPlan, ExactReclaimExecuteError,
     ExactReclaimNameError, ExactReclaimRefreshError, FreshExactReclaimPlan, InactiveCandidate,
-    InactiveFeatures, ReleaseOpts, SequenceHash,
+    InactiveFeatures, RebindPlan, RebindPrepareError, ReleaseOpts, SequenceHash,
 };
 #[cfg(test)]
 use crate::pools::{ExactAllocationError, ExactInactiveVictim};
@@ -300,7 +300,7 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
     /// Returns the number of blocks drained.
     pub fn drain_inactive_pool(&self) -> usize {
         let (blocks, evicted) = self.store.drain_inactive_to_mutable();
-        let drained = blocks.len();
+        let drained = evicted.len();
         self.notify_evictions(&evicted);
         drop(blocks);
         drained
@@ -713,10 +713,7 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
         self.store.inactive_len()
     }
 
-    /// Number of blocks currently in the reset (free) pool. Cheap: one
-    /// store-lock acquisition. `reset_len + inactive_len` is the same quantity
-    /// as [`available_blocks`](Self::available_blocks), but that one reads both
-    /// under a *single* lock — prefer it when the sum is what matters.
+    /// Number of blocks in Reset state, including slots fenced from allocation.
     pub fn reset_len(&self) -> usize {
         self.store.reset_len()
     }
@@ -752,13 +749,35 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
         self.store.set_capacity(capacity)
     }
 
-    /// Blocks available for allocation (reset + inactive pools).
+    /// Set the optional physical allocation ceiling.
+    pub fn set_allocation_ceiling(&self, fence: Option<usize>) -> Result<(), String> {
+        self.store.set_allocation_ceiling(fence)
+    }
+
+    /// Effective physical allocation ceiling, clamped to current capacity.
+    pub fn allocation_ceiling(&self) -> usize {
+        self.store.allocation_ceiling()
+    }
+
+    /// Reserve an allocation-eligible reset slot while copying an inactive
+    /// block's physical contents out of band.
+    pub fn prepare_rebind(&self, src: BlockId) -> Result<RebindPlan<T>, RebindPrepareError> {
+        self.store.prepare_rebind(src)
+    }
+
+    /// Rebind an inactive registration after its contents have been copied to
+    /// the supplied reset destination.
+    pub fn rebind(&mut self, seq_hash: SequenceHash, src: BlockId, dst: BlockId) -> bool {
+        self.store.rebind(seq_hash, src, dst)
+    }
+
+    /// Blocks available for allocation (eligible reset + inactive pools).
     ///
     /// Reads both pool sizes under a single store-lock acquisition so the
     /// returned value is a coherent snapshot, never an over- or under-count
     /// produced by a concurrent reset↔inactive transition.
     pub fn available_blocks(&self) -> usize {
-        self.store.available_len()
+        self.store.available_blocks_len()
     }
 
     /// Tokens per block (constant after construction).

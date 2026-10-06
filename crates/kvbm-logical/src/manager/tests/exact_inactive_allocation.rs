@@ -184,6 +184,33 @@ fn invalid_exact_targets_leave_pool_state_unchanged() {
 }
 
 #[test]
+fn exact_inactive_rejects_a_fenced_victim_without_mutation() {
+    let manager = valued_manager(2);
+    let eligible = register_inactive(&manager, 350);
+    let fenced = register_inactive(&manager, 450);
+    manager.set_allocation_ceiling(Some(1)).unwrap();
+    let before = (
+        manager.reset_len(),
+        manager.inactive_len(),
+        manager.available_blocks(),
+    );
+
+    assert!(matches!(
+        manager.allocate_blocks_with_exact_inactive(1, &[fenced.exact_victim(manager.id())]),
+        Err(ExactAllocationError::FencedVictim { block_id }) if block_id == fenced.block_id
+    ));
+    assert_eq!(
+        (
+            manager.reset_len(),
+            manager.inactive_len(),
+            manager.available_blocks(),
+        ),
+        before
+    );
+    assert_eq!(manager.match_blocks(&[eligible.seq_hash]).len(), 1);
+}
+
+#[test]
 fn stale_generation_rejects_a_reused_slot_without_evicting_the_current_entry() {
     let manager = valued_manager(1);
     let token_block = create_iota_token_block(400, 4);

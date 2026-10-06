@@ -16,6 +16,7 @@ mod inactive_lineage_hold;
 mod opaque_exact_reclaim;
 mod registered_presence;
 mod registration_provenance;
+mod rebind;
 mod reset_only_allocation;
 mod retained_race;
 mod temporary_registration;
@@ -3412,6 +3413,9 @@ mod audit_counter_tests {
             fn insert(&mut self, seq_hash: SequenceHash, block_id: BlockId) {
                 self.inner.insert(seq_hash, block_id);
             }
+            fn rebind(&mut self, seq_hash: SequenceHash, src: BlockId, dst: BlockId) -> bool {
+                self.inner.rebind(seq_hash, src, dst)
+            }
             fn len(&self) -> usize {
                 self.reported_len
             }
@@ -3598,6 +3602,9 @@ mod audit_counter_tests {
             }
             fn insert(&mut self, seq_hash: SequenceHash, block_id: BlockId) {
                 self.inner.insert(seq_hash, block_id);
+            }
+            fn rebind(&mut self, seq_hash: SequenceHash, src: BlockId, dst: BlockId) -> bool {
+                self.inner.rebind(seq_hash, src, dst)
             }
             fn len(&self) -> usize {
                 self.reported_len
