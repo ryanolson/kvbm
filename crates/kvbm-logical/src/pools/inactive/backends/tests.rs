@@ -61,7 +61,7 @@ mod backend_tests {
         let mut control = create_backend(backend_type);
         let mut rebound = create_backend(backend_type);
         let entries: Vec<_> = (0..3)
-            .map(|id| block_id_and_hash(id, &tokens_for_id(id)))
+            .map(|id| block_id_and_hash(id, &tokens_for_id(u64::try_from(id).unwrap())))
             .collect();
         for &(id, hash) in &entries {
             control.insert(hash, id);

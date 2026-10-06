@@ -166,7 +166,8 @@ proptest! {
                 }
                 7 => {
                     if !plans.is_empty() {
-                        if let Some(record) = plans[argument as usize % plans.len()].as_mut() {
+                        let index = argument as usize % plans.len();
+                        if let Some(record) = plans[index].as_mut() {
                             if !record.copied {
                                 content[record.dst] = content[record.src];
                                 record.copied = true;

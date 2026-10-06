@@ -1,4 +1,5 @@
 use super::*;
+use crate::RebindOutcome;
 use crate::manager::InactiveBackendConfig;
 use crate::pools::store::SlotKind;
 use dynamo_tokens::TokenBlockSequence;
