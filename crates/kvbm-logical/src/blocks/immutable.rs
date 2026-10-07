@@ -104,6 +104,10 @@ impl<T: BlockMetadata + Sync> ImmutableBlockInner<T> {
         self.block_id.load(Ordering::Acquire)
     }
 
+    pub(crate) fn set_block_id(&self, block_id: BlockId) {
+        self.block_id.store(block_id, Ordering::Release);
+    }
+
     /// Crate-private inherent accessor for the block's [`SequenceHash`].
     ///
     /// `LifecyclePin::sequence_hash` exposes the same value, but the

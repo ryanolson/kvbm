@@ -1,4 +1,3 @@
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 
 use crate::blocks::{BlockMetadata, ImmutableBlock, ImmutableBlockInner};
@@ -278,7 +277,7 @@ impl<T: BlockMetadata> RebindPlan<T> {
             debug_assert_eq!(previous, Some(self.src));
         }
         store.reset_slot_locked(&mut inner, self.src);
-        live_inner.block_id.store(self.dst, Ordering::Release);
+        live_inner.set_block_id(self.dst);
         self.armed = false;
 
         drop(inner);
