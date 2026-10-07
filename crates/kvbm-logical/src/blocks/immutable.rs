@@ -21,6 +21,7 @@
 //! resurrecting an evicted block from the store's inactive pool through
 //! the registry (slow path).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 use crate::ManagerId;
@@ -39,7 +40,7 @@ use crate::pools::{BlockStore, store::upgrade_or_resurrect};
 /// when this Inner is mid-drop.
 pub(crate) struct ImmutableBlockInner<T: BlockMetadata> {
     store: Arc<BlockStore<T>>,
-    block_id: BlockId,
+    block_id: AtomicUsize,
     seq_hash: SequenceHash,
     handle: BlockRegistrationHandle,
     is_primary: bool,
@@ -72,7 +73,7 @@ impl<T: BlockMetadata + Sync> ImmutableBlockInner<T> {
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
-            block_id,
+            block_id: AtomicUsize::new(block_id),
             seq_hash,
             handle,
             is_primary: true,
@@ -90,7 +91,7 @@ impl<T: BlockMetadata + Sync> ImmutableBlockInner<T> {
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
-            block_id,
+            block_id: AtomicUsize::new(block_id),
             seq_hash,
             handle,
             is_primary: false,
@@ -100,7 +101,7 @@ impl<T: BlockMetadata + Sync> ImmutableBlockInner<T> {
     }
 
     pub(crate) fn block_id(&self) -> BlockId {
-        self.block_id
+        self.block_id.load(Ordering::Acquire)
     }
 
     /// Crate-private inherent accessor for the block's [`SequenceHash`].
@@ -144,7 +145,7 @@ impl<T: BlockMetadata + Sync> ImmutableBlockInner<T> {
 
 impl<T: BlockMetadata + Sync> LifecyclePin for ImmutableBlockInner<T> {
     fn block_id(&self) -> BlockId {
-        self.block_id
+        self.block_id.load(Ordering::Acquire)
     }
     fn sequence_hash(&self) -> SequenceHash {
         self.seq_hash
@@ -175,11 +176,10 @@ impl<T: BlockMetadata> Drop for ImmutableBlockInner<T> {
         // the store call is a no-op. The destination decision (Inactive
         // vs Reset) is taken inside `release_primary` from the
         // store-owned per-slot atomic.
-        let self_ptr = self as *const ImmutableBlockInner<T> as *const ();
         if self.is_primary {
-            self.store.release_primary(self.block_id, self_ptr);
+            self.store.release_primary(self);
         } else {
-            self.store.release_duplicate(self.block_id, self_ptr);
+            self.store.release_duplicate(self);
         }
     }
 }
@@ -213,7 +213,11 @@ impl<T: BlockMetadata + Sync> ImmutableBlock<T> {
 
     /// Returns the [`BlockId`] assigned to this block.
     pub fn block_id(&self) -> BlockId {
-        self.inner.block_id
+        self.inner.block_id()
+    }
+
+    pub(crate) fn inner_arc(&self) -> &Arc<ImmutableBlockInner<T>> {
+        &self.inner
     }
 
     /// Returns the [`SequenceHash`] that identifies this block's content.
@@ -260,7 +264,7 @@ impl<T: BlockMetadata + Sync> ImmutableBlock<T> {
     pub fn set_evict_on_reset(&self, value: bool) {
         self.inner
             .store
-            .store_reset_on_release(self.inner.block_id, value);
+            .store_reset_on_release_inner(&self.inner, value);
     }
 
     /// Consume the guard for a batched release
@@ -321,7 +325,7 @@ impl<T: BlockMetadata> Drop for ImmutableBlock<T> {
 impl<T: BlockMetadata> std::fmt::Debug for ImmutableBlock<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ImmutableBlock")
-            .field("block_id", &self.inner.block_id)
+            .field("block_id", &self.inner.block_id())
             .field("sequence_hash", &self.inner.seq_hash)
             .finish()
     }

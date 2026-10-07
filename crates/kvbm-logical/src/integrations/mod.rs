@@ -8,7 +8,7 @@
 mod request;
 mod scheduled;
 
-pub use request::RequestSequence;
+pub use request::{PageSwapError, RequestSequence};
 pub use scheduled::{
     ApplyError, DecodeOutcome, NoopDelegate, SchedulableSequence, SchedulableSequenceBuilder,
     ScheduleError, SequenceDelegate, SequenceEvent, SequenceState,

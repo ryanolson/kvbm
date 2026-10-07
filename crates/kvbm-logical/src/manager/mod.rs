@@ -765,6 +765,17 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
         self.store.prepare_rebind(src)
     }
 
+    /// Reserve a reset destination for a currently-held primary or duplicate.
+    ///
+    /// Copy the source data to [`RebindPlan::dst`] before committing the plan
+    /// with [`RebindPlan::commit_live`].
+    pub fn prepare_live_rebind(
+        &self,
+        block: &ImmutableBlock<T>,
+    ) -> Result<RebindPlan<T>, RebindPrepareError> {
+        self.store.prepare_live_rebind(block)
+    }
+
     /// Blocks available for allocation (eligible reset + inactive pools).
     ///
     /// Reads both pool sizes under a single store-lock acquisition so the

@@ -57,6 +57,14 @@ fn register_and_release(
     (seq_hash, block_id)
 }
 
+fn force_primary_inactive_while_guarded(
+    manager: &BlockManager<TestBlockData>,
+    block: &crate::blocks::ImmutableBlock<TestBlockData>,
+) {
+    let inner = block.clone().into_inner_for_batch_release();
+    manager.store.release_primary(&inner);
+}
+
 #[rstest]
 #[case::hashmap(hashmap_backend)]
 #[case::lru(lru_backend)]
@@ -270,6 +278,247 @@ fn busy_rebind_can_retry_after_the_primary_releases() {
     drop(matched);
     assert!(matches!(plan.commit(), RebindOutcome::Moved { .. }));
     assert_eq!(manager.inactive_len(), 1);
+}
+
+#[test]
+fn live_primary_rebind_updates_every_holder_and_fences_the_source() {
+    let manager = manager_with_backend(3, lru_backend);
+    let mut mutables = manager.allocate_blocks(3).unwrap();
+    let source = mutables.pop().unwrap();
+    let src = source.block_id();
+    drop(mutables);
+    let token_block = create_test_token_block_from_iota(2_500);
+    let seq_hash = token_block.kvbm_sequence_hash();
+    let block = manager.register_block(source.complete(&token_block).unwrap());
+    let clone = block.clone();
+    let pin = block.pin();
+    let weak = block.downgrade();
+
+    manager.set_allocation_ceiling(Some(2)).unwrap();
+    let plan = manager.prepare_live_rebind(&block).unwrap();
+    let dst = plan.dst();
+    assert_eq!(src, 2);
+    assert_eq!(dst, 0);
+    assert!(matches!(
+        plan.commit_live(),
+        RebindOutcome::Moved {
+            seq_hash: moved_hash,
+            src: moved_src,
+            dst: moved_dst,
+        } if moved_hash == seq_hash && moved_src == src && moved_dst == dst
+    ));
+
+    assert_eq!(block.block_id(), dst);
+    assert_eq!(clone.block_id(), dst);
+    assert_eq!(pin.block_id(), dst);
+    let weak_upgrade = weak.upgrade().unwrap();
+    assert_eq!(weak_upgrade.block_id(), dst);
+    drop(weak_upgrade);
+
+    let matched = manager.match_blocks(&[seq_hash]);
+    assert_eq!(matched.len(), 1);
+    assert_eq!(matched[0].block_id(), dst);
+    drop(matched);
+
+    drop(block);
+    drop(clone);
+    drop(pin);
+    drop(weak);
+
+    assert!(manager.has_inactive(seq_hash));
+    assert_eq!(manager.inactive_len(), 1);
+    assert_eq!(manager.occupied_blocks(), 1);
+    assert_eq!(manager.available_blocks(), 2);
+    assert_eq!(manager.reset_len(), 2);
+    let snapshot = manager.store.debug_snapshot();
+    assert_eq!(snapshot.slots[dst], SlotKind::Inactive(seq_hash));
+    assert_eq!(snapshot.slots[src], SlotKind::Reset);
+    assert!(snapshot.fenced.contains(&src));
+    assert_eq!(snapshot.free, vec![1]);
+}
+
+#[test]
+fn live_duplicate_and_its_primary_can_move_in_place() {
+    let manager = manager_with_backend(4, lru_backend);
+    let token_block = create_test_token_block_from_iota(2_600);
+    let seq_hash = token_block.kvbm_sequence_hash();
+    let mut mutables = manager.allocate_blocks(2).unwrap();
+    let primary_mutable = mutables.remove(0);
+    let duplicate_mutable = mutables.remove(0);
+    let primary = manager.register_block(primary_mutable.complete(&token_block).unwrap());
+    let duplicate = manager.register_block(duplicate_mutable.complete(&token_block).unwrap());
+    let duplicate_weak = duplicate.downgrade();
+
+    let duplicate_src = duplicate.block_id();
+    let duplicate_plan = manager.prepare_live_rebind(&duplicate).unwrap();
+    let duplicate_dst = duplicate_plan.dst();
+    assert!(matches!(
+        duplicate_plan.commit_live(),
+        RebindOutcome::Moved {
+            seq_hash: moved_hash,
+            src,
+            dst,
+        } if moved_hash == seq_hash && src == duplicate_src && dst == duplicate_dst
+    ));
+    assert_eq!(duplicate.block_id(), duplicate_dst);
+    let duplicate_upgrade = duplicate_weak.upgrade().unwrap();
+    assert_eq!(duplicate_upgrade.block_id(), duplicate_dst);
+    drop(duplicate_upgrade);
+
+    let primary_src = primary.block_id();
+    let primary_plan = manager.prepare_live_rebind(&primary).unwrap();
+    let primary_dst = primary_plan.dst();
+    assert!(matches!(
+        primary_plan.commit_live(),
+        RebindOutcome::Moved {
+            seq_hash: moved_hash,
+            src,
+            dst,
+        } if moved_hash == seq_hash && src == primary_src && dst == primary_dst
+    ));
+    assert_eq!(primary.block_id(), primary_dst);
+    assert_eq!(duplicate.block_id(), duplicate_dst);
+
+    let matched = manager.match_blocks(&[seq_hash]);
+    assert_eq!(matched.len(), 1);
+    assert_eq!(matched[0].block_id(), primary_dst);
+    drop(matched);
+
+    let snapshot = manager.store.debug_snapshot();
+    assert_eq!(snapshot.slots[duplicate_dst], SlotKind::Duplicate(seq_hash));
+    assert_eq!(snapshot.slots[primary_dst], SlotKind::Primary(seq_hash));
+    assert_eq!(snapshot.active_by_hash.get(&seq_hash), Some(&primary_dst));
+
+    drop(duplicate);
+    drop(duplicate_weak);
+    drop(primary);
+    assert_eq!(manager.inactive_len(), 1);
+    assert_eq!(
+        manager.store.debug_snapshot().slots[primary_dst],
+        SlotKind::Inactive(seq_hash)
+    );
+}
+
+#[test]
+fn prepare_live_rebind_rejects_inactive_and_reused_slots() {
+    let manager = manager_with_backend(2, hashmap_backend);
+    let first = create_test_token_block_from_iota(2_700);
+    let first_hash = first.kvbm_sequence_hash();
+    let mutable = manager.allocate_blocks(1).unwrap().pop().unwrap();
+    let src = mutable.block_id();
+    let stale = manager.register_block(mutable.complete(&first).unwrap());
+    force_primary_inactive_while_guarded(&manager, &stale);
+    assert!(matches!(
+        manager.prepare_live_rebind(&stale),
+        Err(RebindPrepareError::NotLive { block_id }) if block_id == src
+    ));
+
+    let reserved = manager.allocate_blocks(1).unwrap().pop().unwrap();
+    let (mutables, evicted) = manager.allocate_blocks_with_evictions(1).unwrap();
+    assert_eq!(mutables[0].block_id(), src);
+    assert_eq!(evicted, vec![first_hash]);
+    let second = create_test_token_block_from_iota(2_800);
+    let replacement = manager.register_block(
+        mutables
+            .into_iter()
+            .next()
+            .unwrap()
+            .complete(&second)
+            .unwrap(),
+    );
+    assert!(matches!(
+        manager.prepare_live_rebind(&stale),
+        Err(RebindPrepareError::NotLive { block_id }) if block_id == src
+    ));
+
+    drop(stale);
+    drop(replacement);
+    drop(reserved);
+}
+
+#[test]
+fn live_rebind_is_stale_after_source_eviction_and_reallocation() {
+    let manager = manager_with_backend(2, hashmap_backend);
+    let token_block = create_test_token_block_from_iota(2_900);
+    let seq_hash = token_block.kvbm_sequence_hash();
+    let mutable = manager.allocate_blocks(1).unwrap().pop().unwrap();
+    let src = mutable.block_id();
+    let block = manager.register_block(mutable.complete(&token_block).unwrap());
+    let source_generation = manager.store_for_test().slot_generation_for_test(src);
+    let plan = manager.prepare_live_rebind(&block).unwrap();
+    let dst = plan.dst();
+    drop(block);
+
+    let (mutables, evicted) = manager.allocate_blocks_with_evictions(1).unwrap();
+    assert_eq!(mutables[0].block_id(), src);
+    assert_eq!(evicted, vec![seq_hash]);
+    assert_eq!(
+        manager.store_for_test().slot_generation_for_test(src),
+        source_generation + 1
+    );
+    let replacement_token = create_test_token_block_from_iota(3_000);
+    let replacement = manager.register_block(
+        mutables
+            .into_iter()
+            .next()
+            .unwrap()
+            .complete(&replacement_token)
+            .unwrap(),
+    );
+
+    assert!(matches!(plan.commit_live(), RebindOutcome::Stale));
+    let snapshot = manager.store.debug_snapshot();
+    assert!(snapshot.free.contains(&dst));
+    assert_eq!(
+        snapshot.slots[src],
+        SlotKind::Primary(replacement_token.kvbm_sequence_hash())
+    );
+    drop(replacement);
+}
+
+#[test]
+fn live_rebind_fences_a_destination_below_a_lowered_ceiling() {
+    let manager = manager_with_backend(3, lru_backend);
+    let token_block = create_test_token_block_from_iota(3_100);
+    let mutable = manager.allocate_blocks(1).unwrap().pop().unwrap();
+    let block = manager.register_block(mutable.complete(&token_block).unwrap());
+    let plan = manager.prepare_live_rebind(&block).unwrap();
+    let dst = plan.dst();
+    manager.set_allocation_ceiling(Some(dst)).unwrap();
+
+    assert!(matches!(plan.commit_live(), RebindOutcome::Fenced));
+    let snapshot = manager.store.debug_snapshot();
+    assert_eq!(snapshot.slots[dst], SlotKind::Reset);
+    assert!(snapshot.fenced.contains(&dst));
+    assert_eq!(block.block_id(), 0);
+}
+
+#[test]
+fn inactive_rebind_plan_can_commit_live_after_reactivation() {
+    let manager = manager_with_backend(2, hashmap_backend);
+    let token_block = create_test_token_block_from_iota(3_200);
+    let seq_hash = token_block.kvbm_sequence_hash();
+    let mutable = manager.allocate_blocks(1).unwrap().pop().unwrap();
+    let src = mutable.block_id();
+    drop(manager.register_block(mutable.complete(&token_block).unwrap()));
+
+    let plan = manager.prepare_rebind(src).unwrap();
+    let dst = plan.dst();
+    let mut reactivated = manager.match_blocks(&[seq_hash]);
+    assert_eq!(reactivated[0].block_id(), src);
+
+    assert!(matches!(
+        plan.commit_live(),
+        RebindOutcome::Moved {
+            seq_hash: moved_hash,
+            src: moved_src,
+            dst: moved_dst,
+        } if moved_hash == seq_hash && moved_src == src && moved_dst == dst
+    ));
+    assert_eq!(reactivated[0].block_id(), dst);
+    drop(reactivated.pop());
+    assert!(manager.has_inactive(seq_hash));
+    assert_eq!(manager.store.debug_snapshot().slots[src], SlotKind::Reset);
 }
 
 #[test]
