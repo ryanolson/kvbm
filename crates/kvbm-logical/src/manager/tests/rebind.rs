@@ -325,7 +325,7 @@ fn live_primary_rebind_updates_every_holder_and_fences_the_source() {
     drop(pin);
     drop(weak);
 
-    assert!(manager.has_inactive(seq_hash));
+    assert!(manager.store.has_inactive(seq_hash));
     assert_eq!(manager.inactive_len(), 1);
     assert_eq!(manager.occupied_blocks(), 1);
     assert_eq!(manager.available_blocks(), 2);
@@ -558,7 +558,7 @@ fn inactive_rebind_plan_can_commit_live_after_reactivation() {
     ));
     assert_eq!(reactivated[0].block_id(), dst);
     drop(reactivated.pop());
-    assert!(manager.has_inactive(seq_hash));
+    assert!(manager.store.has_inactive(seq_hash));
     assert_eq!(manager.store.debug_snapshot().slots[src], SlotKind::Reset);
 }
 
