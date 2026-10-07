@@ -7,6 +7,7 @@
 //! block should be allocated next when the reset pool is exhausted.
 
 use super::{BlockId, InactiveBlock};
+use crate::blocks::SequenceHash;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ReusePolicyError {
@@ -32,6 +33,9 @@ pub(crate) trait ReusePolicy: Send + Sync + std::fmt::Debug {
 
     /// Remove a specific block from the free list
     fn remove(&mut self, block_id: BlockId) -> Result<(), ReusePolicyError>;
+
+    /// Replace a block id without changing its priority.
+    fn rebind(&mut self, seq_hash: SequenceHash, src: BlockId, dst: BlockId) -> bool;
 
     /// Get the next free block based on the implementation's priority strategy
     ///

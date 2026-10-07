@@ -240,6 +240,7 @@ impl From<ExactAllocationError> for ExactReclaimExecuteError {
             ExactAllocationError::VictimCountMismatch { .. } => Self::StalePlan,
             ExactAllocationError::DuplicateVictim { .. }
             | ExactAllocationError::StaleVictim { .. }
+            | ExactAllocationError::FencedVictim { .. }
             | ExactAllocationError::ActiveVictim { .. }
             | ExactAllocationError::InvalidVictimOrder { .. }
             | ExactAllocationError::IncompleteVictimSet { .. }

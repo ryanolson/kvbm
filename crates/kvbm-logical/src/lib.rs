@@ -51,6 +51,7 @@ pub(crate) use pools::ExactInactiveVictim;
 pub use pools::{
     ExactReclaimEntryPlan, ExactReclaimExecuteError, ExactReclaimNameError,
     ExactReclaimRefreshError, FreshExactReclaimPlan, InactiveCandidate, InactiveFeatures,
+    RebindOutcome, RebindPlan, RebindPrepareError,
 };
 pub use registry::BlockRegistry;
 pub use resources::{BlockManagerSet, DuplicateLogicalResource, LogicalResourceId};

@@ -14,6 +14,7 @@ mod exact_reclaim_allocation;
 mod exact_reclaim_by_hash;
 mod inactive_lineage_hold;
 mod opaque_exact_reclaim;
+mod rebind;
 mod registered_presence;
 mod registration_provenance;
 mod reset_only_allocation;
@@ -3412,6 +3413,9 @@ mod audit_counter_tests {
             fn insert(&mut self, seq_hash: SequenceHash, block_id: BlockId) {
                 self.inner.insert(seq_hash, block_id);
             }
+            fn rebind(&mut self, seq_hash: SequenceHash, src: BlockId, dst: BlockId) -> bool {
+                self.inner.rebind(seq_hash, src, dst)
+            }
             fn len(&self) -> usize {
                 self.reported_len
             }
@@ -3599,6 +3603,9 @@ mod audit_counter_tests {
             fn insert(&mut self, seq_hash: SequenceHash, block_id: BlockId) {
                 self.inner.insert(seq_hash, block_id);
             }
+            fn rebind(&mut self, seq_hash: SequenceHash, src: BlockId, dst: BlockId) -> bool {
+                self.inner.rebind(seq_hash, src, dst)
+            }
             fn len(&self) -> usize {
                 self.reported_len
             }
@@ -3615,10 +3622,10 @@ mod audit_counter_tests {
 
         let metrics = Arc::new(BlockPoolMetrics::new("test".to_string()));
         let tracker = FrequencyTrackingCapacity::default().create_tracker();
-        // Pre-populate the inner backend with 4 entries by inserting
+        // Pre-populate the inner backend with 2 entries by inserting
         // synthetic (hash, block_id) pairs.
         let mut inner = MultiLruBackend::new(NonZeroUsize::new(4).unwrap(), tracker);
-        for i in 0..4u32 {
+        for i in 0..2u32 {
             let h = create_test_token_block_from_iota(90_000 + i * 4).kvbm_sequence_hash();
             inner.insert(h, i as BlockId);
         }

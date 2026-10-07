@@ -91,6 +91,17 @@ impl InactiveIndex for LruBackend {
         self.cache.put(seq_hash, block_id);
     }
 
+    fn rebind(&mut self, seq_hash: SequenceHash, src: BlockId, dst: BlockId) -> bool {
+        let Some(block_id) = self.cache.peek_mut(&seq_hash) else {
+            return false;
+        };
+        if *block_id != src {
+            return false;
+        }
+        *block_id = dst;
+        true
+    }
+
     fn len(&self) -> usize {
         self.cache.len()
     }

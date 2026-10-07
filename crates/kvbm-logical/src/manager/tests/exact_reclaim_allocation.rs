@@ -200,6 +200,34 @@ fn exact_reclaim_rejects_duplicate_slots_without_mutation() {
 }
 
 #[test]
+fn exact_reclaim_rejects_a_fenced_victim_without_mutation() {
+    let manager = valued_manager(2);
+    let mut mutables = manager.allocate_blocks(2).unwrap().into_iter();
+    let eligible_reset = mutables.next().unwrap();
+    let fenced_mutable = mutables.next().unwrap();
+    let fenced_block_id = fenced_mutable.block_id();
+    drop(eligible_reset);
+
+    let token_sequence = TokenBlockSequence::from_slice(&[97], 1, Some(TEST_SALT));
+    let immutable = manager.register_block(
+        fenced_mutable
+            .complete(&token_sequence.blocks()[0])
+            .expect("complete fenced source block"),
+    );
+    let seq_hash = immutable.sequence_hash();
+    drop(immutable);
+    manager.set_allocation_ceiling(Some(1)).unwrap();
+    let fenced = victim(&manager, (seq_hash, fenced_block_id));
+    let before = unchanged_state(&manager);
+
+    assert!(matches!(
+        manager.allocate_blocks_with_exact_reclaim(1, 1, &[fenced]),
+        Err(ExactAllocationError::FencedVictim { block_id }) if block_id == fenced_block_id
+    ));
+    assert_eq!(unchanged_state(&manager), before);
+}
+
+#[test]
 fn exact_reclaim_rejects_insufficient_total_capacity_without_mutation() {
     let manager = valued_manager(3);
     let source_blocks = inactive_chain(&manager, &[50]);

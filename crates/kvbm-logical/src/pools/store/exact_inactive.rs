@@ -129,6 +129,11 @@ impl<T: BlockMetadata> BlockStore<T> {
                     });
                 }
             }
+            if victim.block_id >= super::effective_ceiling(&inner) {
+                return Err(ExactAllocationError::FencedVictim {
+                    block_id: victim.block_id,
+                });
+            }
         }
 
         let mut blocks = Vec::with_capacity(count);

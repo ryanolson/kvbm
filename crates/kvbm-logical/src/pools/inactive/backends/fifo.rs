@@ -13,6 +13,7 @@ use super::reuse_policy::*;
 use std::collections::{BTreeMap, HashMap};
 
 use super::{BlockId, InactiveBlock};
+use crate::blocks::SequenceHash;
 
 /// Monotonic sequence number used as priority key for FIFO ordering.
 pub type PriorityKey = u64;
@@ -65,6 +66,28 @@ impl ReusePolicy for FifoReusePolicy {
             "block not found"
         );
         Ok(())
+    }
+
+    fn rebind(&mut self, seq_hash: SequenceHash, src: BlockId, dst: BlockId) -> bool {
+        let Some(&priority_key) = self.keys.get(&src) else {
+            return false;
+        };
+        if self.keys.contains_key(&dst)
+            || !self
+                .blocks
+                .get(&priority_key)
+                .is_some_and(|block| block.seq_hash == seq_hash && block.block_id == src)
+        {
+            return false;
+        }
+
+        self.keys.remove(&src);
+        self.keys.insert(dst, priority_key);
+        self.blocks
+            .get_mut(&priority_key)
+            .expect("validated FIFO priority entry")
+            .block_id = dst;
+        true
     }
 
     fn next_free(&mut self) -> Option<InactiveBlock> {

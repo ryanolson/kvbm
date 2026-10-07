@@ -589,6 +589,19 @@ impl InactiveIndex for LineageBackend {
         self.insert_inner(seq_hash, block_id);
     }
 
+    fn rebind(&mut self, seq_hash: SequenceHash, src: BlockId, dst: BlockId) -> bool {
+        let Some(index) = self.real_index(seq_hash, src) else {
+            return false;
+        };
+        match &mut self.slots[index as usize].data {
+            SlotData::Real { block_id, .. } => {
+                *block_id = dst;
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn len(&self) -> usize {
         self.count
     }
@@ -962,6 +975,34 @@ mod tests {
             ]
         );
         assert!(backend.is_graph_empty());
+    }
+
+    #[test]
+    fn rebind_updates_a_parent_without_changing_its_lineage_position() {
+        let mut backend = LineageBackend::new();
+        let chain = create_chain(3, 0);
+        for (id, hash) in &chain {
+            backend.insert(*hash, *id);
+        }
+
+        let destination = 9;
+        assert!(backend.rebind(chain[0].1, chain[0].0, destination));
+        assert_eq!(
+            backend.complete_lineage(chain[2].1, chain[2].0),
+            Some(vec![
+                (chain[0].1, destination),
+                (chain[1].1, chain[1].0),
+                (chain[2].1, chain[2].0),
+            ])
+        );
+        assert_eq!(
+            backend.take_with_descendants(chain[0].1, destination),
+            vec![
+                (chain[2].1, chain[2].0),
+                (chain[1].1, chain[1].0),
+                (chain[0].1, destination),
+            ]
+        );
     }
 
     #[test]
