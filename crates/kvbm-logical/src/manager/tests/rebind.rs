@@ -400,6 +400,47 @@ fn live_duplicate_and_its_primary_can_move_in_place() {
 }
 
 #[test]
+fn live_blocks_from_returns_tail_primary_and_duplicate_in_id_order() {
+    let manager = manager_with_backend(8, hashmap_backend);
+    let mut mutables = manager.allocate_blocks(8).unwrap();
+    mutables.sort_by_key(|block| block.block_id());
+    let inactive_mutable = mutables.remove(6);
+    let duplicate_mutable = mutables.remove(5);
+    let primary_mutable = mutables.remove(3);
+    let below_mutable = mutables.remove(0);
+
+    let below_tokens = create_test_token_block_from_iota(2_650);
+    let below = manager.register_block(below_mutable.complete(&below_tokens).unwrap());
+    let live_tokens = create_test_token_block_from_iota(2_660);
+    let primary = manager.register_block(primary_mutable.complete(&live_tokens).unwrap());
+    let duplicate = manager.register_block(duplicate_mutable.complete(&live_tokens).unwrap());
+    let inactive_tokens = create_test_token_block_from_iota(2_670);
+    let inactive = manager.register_block(inactive_mutable.complete(&inactive_tokens).unwrap());
+    drop(inactive);
+    drop(mutables);
+
+    let first = 3;
+    let live_blocks = manager.live_blocks_from(first);
+    assert_eq!(below.block_id(), 0);
+    assert_eq!(primary.block_id(), 3);
+    assert_eq!(duplicate.block_id(), 5);
+    assert_eq!(
+        live_blocks
+            .iter()
+            .map(|block| block.block_id())
+            .collect::<Vec<_>>(),
+        vec![3, 5]
+    );
+    assert!(manager.live_blocks_from(8).is_empty());
+
+    let plans = live_blocks
+        .iter()
+        .map(|block| manager.prepare_live_rebind(block).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(plans.len(), 2);
+}
+
+#[test]
 fn prepare_live_rebind_rejects_inactive_and_reused_slots() {
     let manager = manager_with_backend(2, hashmap_backend);
     let first = create_test_token_block_from_iota(2_700);

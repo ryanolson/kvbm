@@ -1116,10 +1116,7 @@ mod tests {
         let replacement = 100;
         seq.swap_page(0, original[0] as BlockId, replacement)
             .unwrap();
-        assert_eq!(
-            seq.page_indices(),
-            vec![replacement as u32, original[1]]
-        );
+        assert_eq!(seq.page_indices(), vec![replacement as u32, original[1]]);
 
         let detached = seq.detach_registered_blocks();
         seq.swap_page(0, replacement, 200).unwrap();

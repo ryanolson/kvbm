@@ -341,6 +341,26 @@ impl<T: BlockMetadata> BlockStore<T> {
 }
 
 impl<T: BlockMetadata + Sync> BlockStore<T> {
+    pub(crate) fn live_blocks_from(&self, first: BlockId) -> Vec<ImmutableBlock<T>> {
+        let inner = self.inner.lock();
+        if first >= inner.capacity {
+            return Vec::new();
+        }
+
+        // Upgrades only add strong references; they do not drop Arcs under this lock.
+        let mut blocks = Vec::new();
+        for slot in &inner.slots[first..inner.capacity] {
+            let block_inner = match &slot.state {
+                SlotState::Primary { inner, .. } | SlotState::Duplicate { inner, .. } => inner,
+                _ => continue,
+            };
+            if let Some(block_inner) = block_inner.upgrade() {
+                blocks.push(ImmutableBlock::from_inner(block_inner));
+            }
+        }
+        blocks
+    }
+
     pub(crate) fn prepare_live_rebind(
         self: &Arc<Self>,
         block: &ImmutableBlock<T>,

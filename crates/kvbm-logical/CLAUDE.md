@@ -63,6 +63,7 @@ The type parameter `T: BlockMetadata` is a marker for the storage tier (G1=GPU, 
 
 - **Synchronous core with interior mutability**: Pool operations use `parking_lot` locks, no async channels. RAII returns execute inline.
 - **Allocation ceiling and rebind**: An allocation ceiling splits reset blocks into allocatable and fenced sets. Inactive plans preserve the source eviction position. Live plans move a held primary or duplicate in place. Clones, pins, and weak references then report the destination ID.
+  Use `BlockManager::live_blocks_from` to find live tail blocks for a shrink.
 - **Registry uses weak references**: `PositionalRadixTree<Weak<BlockRegistrationHandleInner>>`. Entries auto-clean when all strong refs drop.
 - **Attachment system**: Extensible typed metadata on `BlockRegistrationHandle` via `attach_unique<T>()`/`attach<T>()` — no struct modification needed.
 - **`docs/advancements.md`** contains the detailed design doc comparing v1 vs kvbm-logical architecture.

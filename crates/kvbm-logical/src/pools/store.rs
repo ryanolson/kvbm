@@ -565,11 +565,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         self.default_reset_on_release
     }
 
-    pub(crate) fn store_reset_on_release_inner(
-        &self,
-        block: &ImmutableBlockInner<T>,
-        value: bool,
-    ) {
+    pub(crate) fn store_reset_on_release_inner(&self, block: &ImmutableBlockInner<T>, value: bool) {
         let mut inner = self.inner.lock();
         let block_id = block.block_id();
         let self_ptr = block as *const ImmutableBlockInner<T> as *const ();

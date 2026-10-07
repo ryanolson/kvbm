@@ -776,6 +776,12 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
         self.store.prepare_live_rebind(block)
     }
 
+    /// Strong guards for every live primary or duplicate block at or above
+    /// `first`, in block-id order. Use it to plan live rebinds for a shrink.
+    pub fn live_blocks_from(&self, first: BlockId) -> Vec<ImmutableBlock<T>> {
+        self.store.live_blocks_from(first)
+    }
+
     /// Blocks available for allocation (eligible reset + inactive pools).
     ///
     /// Reads both pool sizes under a single store-lock acquisition so the
