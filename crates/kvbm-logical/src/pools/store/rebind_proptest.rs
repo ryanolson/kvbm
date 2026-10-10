@@ -10,6 +10,7 @@ use super::{RebindPlan, SlotKind};
 struct ModelPlan {
     plan: RebindPlan<TestMeta>,
     copied: bool,
+    live: bool,
     seq_hash: crate::SequenceHash,
     src: usize,
     dst: usize,
@@ -82,7 +83,7 @@ proptest! {
 
     #[test]
     fn random_store_operations_preserve_rebind_and_content_invariants(
-        operations in prop::collection::vec((0u8..10, any::<u8>()), 0..80),
+        operations in prop::collection::vec((0u8..11, any::<u8>()), 0..80),
     ) {
         let capacity = 8;
         let manager = create_test_manager::<TestMeta>(capacity);
@@ -158,6 +159,7 @@ proptest! {
                         plans.push(Some(ModelPlan {
                             plan,
                             copied: false,
+                            live: false,
                             seq_hash,
                             src,
                             dst,
@@ -179,28 +181,69 @@ proptest! {
                     if !plans.is_empty() {
                         let index = argument as usize % plans.len();
                         if plans[index].as_ref().is_some_and(|record| record.copied) {
-                            let ModelPlan { plan, copied: _, seq_hash, src, dst } =
+                            let ModelPlan {
+                                plan,
+                                copied: _,
+                                live,
+                                seq_hash,
+                                src,
+                                dst,
+                            } =
                                 plans[index].take().unwrap();
-                            match plan.commit() {
+                            let outcome = if live {
+                                plan.commit_live()
+                            } else {
+                                plan.commit()
+                            };
+                            match outcome {
                                 super::RebindOutcome::Moved {
                                     seq_hash: moved_hash,
                                     src: moved_src,
                                     dst: moved_dst,
                                 } => {
-                                    assert_eq!((moved_hash, moved_src, moved_dst), (seq_hash, src, dst));
+                                    assert_eq!(
+                                        (moved_hash, moved_src, moved_dst),
+                                        (seq_hash, src, dst)
+                                    );
                                     assert_eq!(content[dst], Some(seq_hash));
+                                    content[src] = None;
                                 }
                                 super::RebindOutcome::Busy(plan) => {
                                     plans[index] = Some(ModelPlan {
                                         plan,
                                         copied: true,
+                                        live,
                                         seq_hash,
                                         src,
                                         dst,
                                     });
                                 }
-                                super::RebindOutcome::Stale | super::RebindOutcome::Fenced => {}
+                                super::RebindOutcome::Stale | super::RebindOutcome::Fenced => {
+                                    content[dst] = None;
+                                }
                             }
+                        }
+                    }
+                }
+                9 => {
+                    if !guards.is_empty() {
+                        let index = argument as usize % guards.len();
+                        if let Some(block) = guards[index].as_ref()
+                            && let Ok(plan) = manager.prepare_live_rebind(block)
+                        {
+                            let src = plan.src();
+                            let dst = plan.dst();
+                            let seq_hash = plan.sequence_hash();
+                            assert!(dst < manager.allocation_ceiling());
+                            content[dst] = None;
+                            plans.push(Some(ModelPlan {
+                                plan,
+                                copied: false,
+                                live: true,
+                                seq_hash,
+                                src,
+                                dst,
+                            }));
                         }
                     }
                 }

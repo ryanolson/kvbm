@@ -108,6 +108,24 @@ use crate::{BlockId, KvbmSequenceHashProvider, SequenceHash};
 
 use dynamo_tokens::{SaltHash, Token};
 
+/// Error returned when replacing a cached page identity.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum PageSwapError {
+    /// The requested page position is outside `page_indices()`.
+    #[error("page position {position} is out of range")]
+    OutOfRange { position: usize },
+    /// The cached ID at the position differs from the expected source.
+    #[error("page ID mismatch at position {position}: expected {expected}, found {found}")]
+    Mismatch {
+        position: usize,
+        expected: BlockId,
+        found: BlockId,
+    },
+    /// The position belongs to a staged or mutable page.
+    #[error("page position {position} is not registered")]
+    NotRegistered { position: usize },
+}
+
 /// Manages a request's block lifecycle through direct RAII integration with
 /// [`BlockManager`], bypassing the `MoveBlock` signal protocol.
 ///
@@ -552,6 +570,62 @@ impl<T: BlockMetadata> RequestSequence<T> {
             .chain(self.assignments.all_block_ids())
             .map(|&id| id as u32)
             .collect()
+    }
+
+    /// Replace a cached page ID at the position used by [`Self::page_indices`].
+    ///
+    /// Reserve the replacement ID for this page.
+    /// Do not use an ID that identifies another page in this sequence.
+    pub fn swap_page(
+        &mut self,
+        position: usize,
+        expected: BlockId,
+        replacement: BlockId,
+    ) -> Result<(), PageSwapError> {
+        let detached_count = self.detached_assigned.len();
+        let assigned_count = self.assignments.assigned_count();
+        let total_count = detached_count + self.assignments.all_block_ids().count();
+        if position >= total_count {
+            return Err(PageSwapError::OutOfRange { position });
+        }
+
+        if position < detached_count {
+            let found = self.detached_assigned[position].0;
+            if found != expected {
+                return Err(PageSwapError::Mismatch {
+                    position,
+                    expected,
+                    found,
+                });
+            }
+            self.detached_assigned[position].0 = replacement;
+            return Ok(());
+        }
+
+        let assigned_position = position - detached_count;
+        if assigned_position >= assigned_count {
+            return Err(PageSwapError::NotRegistered { position });
+        }
+
+        let Some((found, _)) = self.assignments.get_assigned(assigned_position) else {
+            return Err(PageSwapError::NotRegistered { position });
+        };
+        let found = *found;
+        if found != expected {
+            return Err(PageSwapError::Mismatch {
+                position,
+                expected,
+                found,
+            });
+        }
+        if self
+            .assignments
+            .replace_assigned_block_id(assigned_position, replacement)
+            .is_none()
+        {
+            return Err(PageSwapError::NotRegistered { position });
+        }
+        Ok(())
     }
 
     /// Drop excess unassigned blocks beyond `keep` count.
@@ -1030,6 +1104,68 @@ mod tests {
     // =========================================================================
     // Release / reacquire
     // =========================================================================
+
+    #[test]
+    fn swap_page_updates_assigned_and_detached_ids() {
+        let manager = create_test_manager::<TestMeta>(8);
+        let mut seq = RequestSequence::<TestMeta>::new(make_tokens(8), 0, BLOCK_SIZE);
+        assert!(seq.allocate_blocks(2, &manager));
+        seq.complete_and_register_pending(&manager);
+
+        let original = seq.page_indices();
+        let replacement = 100;
+        seq.swap_page(0, original[0] as BlockId, replacement)
+            .unwrap();
+        assert_eq!(seq.page_indices(), vec![replacement as u32, original[1]]);
+
+        let detached = seq.detach_registered_blocks();
+        seq.swap_page(0, replacement, 200).unwrap();
+        assert_eq!(seq.page_indices(), vec![200, original[1]]);
+        drop(detached);
+    }
+
+    #[test]
+    fn swap_page_reports_mismatch_and_out_of_range() {
+        let manager = create_test_manager::<TestMeta>(4);
+        let mut seq = RequestSequence::<TestMeta>::new(make_tokens(4), 0, BLOCK_SIZE);
+        assert!(seq.allocate_blocks(1, &manager));
+        seq.complete_and_register_pending(&manager);
+        let page_id = seq.page_indices()[0] as BlockId;
+
+        assert_eq!(
+            seq.swap_page(0, page_id + 1, 100),
+            Err(PageSwapError::Mismatch {
+                position: 0,
+                expected: page_id + 1,
+                found: page_id,
+            })
+        );
+        assert_eq!(
+            seq.swap_page(1, page_id, 100),
+            Err(PageSwapError::OutOfRange { position: 1 })
+        );
+    }
+
+    #[test]
+    fn swap_page_rejects_staged_and_mutable_positions() {
+        let manager = create_test_manager::<TestMeta>(8);
+        let mut staged = RequestSequence::<TestMeta>::new(make_tokens(8), 0, BLOCK_SIZE);
+        assert!(staged.allocate_blocks(2, &manager));
+        staged.stage_pending();
+        let staged_id = staged.page_indices()[0] as BlockId;
+        assert_eq!(
+            staged.swap_page(0, staged_id, 100),
+            Err(PageSwapError::NotRegistered { position: 0 })
+        );
+
+        let mut mutable = RequestSequence::<TestMeta>::new(make_tokens(4), 1, BLOCK_SIZE);
+        assert!(mutable.allocate_blocks(1, &manager));
+        let mutable_id = mutable.page_indices()[0] as BlockId;
+        assert_eq!(
+            mutable.swap_page(0, mutable_id, 100),
+            Err(PageSwapError::NotRegistered { position: 0 })
+        );
+    }
 
     #[test]
     fn test_detach_registered_blocks_preserves_identity_and_decode_offsets() {

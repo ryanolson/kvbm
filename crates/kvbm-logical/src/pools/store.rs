@@ -506,7 +506,6 @@ enum SlotIdentityMatch {
 /// "unresolved" — not yet released inline and not yet swept into the
 /// deferred/external set. See [`BlockStore::release_entry_at`].
 struct ReleaseEntry<T: BlockMetadata> {
-    block_id: BlockId,
     self_ptr: *const (),
     arc: Option<Arc<ImmutableBlockInner<T>>>,
 }
@@ -566,15 +565,24 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         self.default_reset_on_release
     }
 
-    /// Set the per-block "reset on last drop" override for `block_id`.
-    /// Backs [`crate::blocks::ImmutableBlock::set_evict_on_reset`].
-    ///
-    /// Acquires the store mutex so the write is published to any future
-    /// mutex acquirer through release-acquire on the mutex itself —
-    /// the per-slot value lives inside `BlockStoreInner` and is only
-    /// read under that same mutex.
     pub(crate) fn store_reset_on_release(&self, block_id: BlockId, value: bool) {
-        self.inner.lock().reset_on_release[block_id] = value;
+        let mut inner = self.inner.lock();
+        inner.reset_on_release[block_id] = value;
+    }
+
+    pub(crate) fn store_reset_on_release_inner(&self, block: &ImmutableBlockInner<T>, value: bool) {
+        let mut inner = self.inner.lock();
+        let block_id = block.block_id();
+        let self_ptr = block as *const ImmutableBlockInner<T> as *const ();
+        let matches = match &inner.slots[block_id].state {
+            SlotState::Primary { inner: weak, .. } | SlotState::Duplicate { inner: weak, .. } => {
+                weak.as_ptr() as *const () == self_ptr
+            }
+            _ => false,
+        };
+        if matches {
+            inner.reset_on_release[block_id] = value;
+        }
     }
 
     /// Stable, process-unique identifier of this store. See
@@ -1655,7 +1663,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
 
     /// Drop transition for the last clone of a primary `ImmutableBlockInner`.
     ///
-    /// Identity-checked against `self_ptr`. If a concurrent
+    /// Identity-checked against the inner Arc. If a concurrent
     /// `acquire_for_hash` already eagerly transitioned the slot (or the
     /// slot has since been resurrected to a different Inner), this is a
     /// no-op.
@@ -1666,7 +1674,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
     /// - `true` → `SlotState::Reset` + push to the eligible or fenced reset set +
     ///   `handle.mark_absent::<T>()`. Mirrors `release_duplicate`. The
     ///   block is *not* cached and cannot be matched/resurrected later.
-    pub(crate) fn release_primary(&self, block_id: BlockId, self_ptr: *const ()) {
+    pub(crate) fn release_primary(&self, block: &ImmutableBlockInner<T>) {
         // Test-only deterministic race-window widening:
         //   1. Bump the arrival counter so a coordinating test can
         //      observe "the drop has entered release_primary" without
@@ -1682,6 +1690,8 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         let _gate = self.release_primary_gate.lock();
         let handle_to_mark_absent = {
             let mut inner = self.inner.lock();
+            let block_id = block.block_id();
+            let self_ptr = block as *const ImmutableBlockInner<T> as *const ();
             let (seq_hash, handle) = match &inner.slots[block_id].state {
                 SlotState::Primary {
                     seq_hash,
@@ -1730,9 +1740,11 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
 
     /// Drop transition for the last clone of a duplicate `ImmutableBlockInner`:
     /// `Duplicate` → `Reset` (with `mark_absent::<T>`). Identity-checked.
-    pub(crate) fn release_duplicate(&self, block_id: BlockId, self_ptr: *const ()) {
+    pub(crate) fn release_duplicate(&self, block: &ImmutableBlockInner<T>) {
         let handle = {
             let mut inner = self.inner.lock();
+            let block_id = block.block_id();
+            let self_ptr = block as *const ImmutableBlockInner<T> as *const ();
             let handle = match &inner.slots[block_id].state {
                 SlotState::Duplicate {
                     handle,
@@ -1826,11 +1838,9 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         // identity pointer while the Arc is still alive.
         let mut entries: Vec<ReleaseEntry<T>> = Vec::with_capacity(blocks.len());
         for block in blocks {
-            let block_id = block.block_id();
             let arc = block.into_inner_for_batch_release();
             let self_ptr = Arc::as_ptr(&arc) as *const ();
             entries.push(ReleaseEntry {
-                block_id,
                 self_ptr,
                 arc: Some(arc),
             });
@@ -1959,7 +1969,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         let Some(arc) = entries[idx].arc.take() else {
             return; // Already resolved.
         };
-        let block_id = entries[idx].block_id;
+        let block_id = arc.block_id();
         let self_ptr = entries[idx].self_ptr;
 
         // Applies to every entry we reach, matched or not — replaces a

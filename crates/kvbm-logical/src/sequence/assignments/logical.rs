@@ -100,6 +100,14 @@ impl<T: BlockMetadata> LogicalBlockAssignments<T> {
         self.store.get_assigned(index)
     }
 
+    pub(crate) fn replace_assigned_block_id(
+        &mut self,
+        index: usize,
+        replacement: BlockId,
+    ) -> Option<BlockId> {
+        self.store.replace_assigned_key(index, replacement)
+    }
+
     /// Returns the staged block at the given index (staging order).
     pub fn get_staged(&self, index: usize) -> Option<(&BlockId, &CompleteBlock<T>)> {
         self.store.get_staged(index)
