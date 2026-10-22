@@ -35,9 +35,9 @@ use std::sync::{Arc, Weak};
 // runtime-enforced behaviour during the test suite. In release/non-test
 // builds the alias resolves to plain `parking_lot::Mutex` — zero cost.
 #[cfg(not(test))]
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 #[cfg(test)]
-use tracing_mutex::parkinglot::Mutex;
+use tracing_mutex::parkinglot::{Mutex, MutexGuard};
 
 use crate::BlockId;
 use crate::blocks::{
@@ -1454,6 +1454,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
                 };
                 results.push(inner_arc);
             }
+            MutexGuard::unlock_fair(inner);
         } // store lock released here
 
         // mark_present takes the attachments lock; lock-order
@@ -1894,6 +1895,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
                     deferred.push(arc);
                 }
             }
+            MutexGuard::unlock_fair(inner);
         } // store lock released here
 
         // Phase 2: drop everything deferred or released-and-defused, now

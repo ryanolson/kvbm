@@ -101,6 +101,8 @@
 //! | `is_complete()`           | `generated_tokens >= max_output_tokens`         |
 //! | `new_tokens_for_prefill()`| Tokens not covered by cache hits               |
 
+use std::collections::VecDeque;
+
 use crate::blocks::{BlockMetadata, CompleteBlock, ImmutableBlock, MutableBlock};
 use crate::manager::{BlockManager, RegisteredBlock};
 use crate::sequence::{BlockSequence, LogicalBlockAssignmentError, LogicalBlockAssignments};
@@ -155,7 +157,7 @@ pub struct RequestSequence<T: BlockMetadata> {
     /// Staged blocks that the caller took out to register elsewhere. They
     /// keep their sequence position and page mapping, after the assigned
     /// blocks, until [`install_registered`](Self::install_registered).
-    registering: Vec<(BlockId, SequenceHash)>,
+    registering: VecDeque<(BlockId, SequenceHash)>,
     generated_tokens: usize,
     max_output_tokens: usize,
     num_input_tokens: usize,
@@ -209,7 +211,7 @@ impl<T: BlockMetadata> RequestSequence<T> {
             sequence,
             assignments,
             detached_assigned: Vec::new(),
-            registering: Vec::new(),
+            registering: VecDeque::new(),
             generated_tokens: 0,
             max_output_tokens,
             num_input_tokens,
@@ -374,25 +376,20 @@ impl<T: BlockMetadata> RequestSequence<T> {
         self.register_staged(manager);
     }
 
-    /// Transfer every newly registered strong block to a policy owner while
-    /// retaining its physical identity and logical sequence position.
-    ///
-    /// Detached identities continue to participate in staging offsets and
-    /// [`page_indices`](Self::page_indices), but this sequence no longer keeps
-    /// their `ImmutableBlock` guards alive. The caller becomes responsible for
-    /// the returned guards' strong/weak/null lifecycle.
-    /// Takes the staged blocks out, in order, to register them elsewhere,
-    /// for example on another thread. Their block IDs stay in
+    /// Takes up to `max_blocks` staged blocks, in order, to register them
+    /// elsewhere, for example on another thread. Their block IDs stay in
     /// [`page_indices`](Self::page_indices) until
     /// [`install_registered`](Self::install_registered).
-    pub fn take_staged_for_registration(&mut self) -> Vec<CompleteBlock<T>> {
-        let staged = self.assignments.take_staged();
-        self.registering.extend(
-            staged
-                .iter()
-                .map(|(block_id, block)| (*block_id, block.sequence_hash())),
-        );
-        staged.into_iter().map(|(_, block)| block).collect()
+    pub fn take_staged_for_registration(&mut self, max_blocks: usize) -> Vec<CompleteBlock<T>> {
+        let count = max_blocks.min(self.assignments.staged_count());
+        let mut blocks = Vec::with_capacity(count);
+        let registering = &mut self.registering;
+        self.assignments
+            .take_staged_prefix_with(max_blocks, |block_id, block| {
+                registering.push_back((block_id, block.sequence_hash()));
+                blocks.push(block);
+            });
+        blocks
     }
 
     /// Installs the results of
@@ -419,7 +416,11 @@ impl<T: BlockMetadata> RequestSequence<T> {
         );
         let mut assigned = Vec::with_capacity(results.len());
         let mut originals = Vec::new();
-        for ((block_id, seq_hash), result) in self.registering.drain(..results.len()).zip(results) {
+        for result in results {
+            let (block_id, seq_hash) = self
+                .registering
+                .pop_front()
+                .expect("registration count checked before install");
             let (block, original_id) = match result {
                 RegisteredBlock::Fresh(block) => {
                     let id = block.block_id();
@@ -451,6 +452,13 @@ impl<T: BlockMetadata> RequestSequence<T> {
         self.registering.len()
     }
 
+    /// Transfer every newly registered strong block to a policy owner while
+    /// retaining its physical identity and logical sequence position.
+    ///
+    /// Detached identities continue to participate in staging offsets and
+    /// [`page_indices`](Self::page_indices), but this sequence no longer keeps
+    /// their `ImmutableBlock` guards alive. The caller becomes responsible for
+    /// the returned guards' strong/weak/null lifecycle.
     pub fn detach_registered_blocks(&mut self) -> Vec<ImmutableBlock<T>> {
         let assigned = self.assignments.take_assigned();
         self.detached_assigned.extend(
@@ -1435,7 +1443,7 @@ mod tests {
     }
 
     #[test]
-    fn take_and_install_equals_register_staged() {
+    fn bounded_take_and_install_equals_register_staged() {
         let inline_manager = create_test_manager::<TestMeta>(16);
         let mut inline = staged_sequence(&inline_manager);
         inline.register_staged(&inline_manager);
@@ -1443,16 +1451,88 @@ mod tests {
         let manager = create_test_manager::<TestMeta>(16);
         let mut seq = staged_sequence(&manager);
         let before = seq.page_indices();
-        let taken = seq.take_staged_for_registration();
-        assert_eq!(taken.len(), 3);
-        assert_eq!(seq.registering_blocks(), 3);
+        let taken = seq.take_staged_for_registration(2);
+        assert_eq!(taken.len(), 2);
+        assert_eq!(seq.registering_blocks(), 2);
         assert_eq!(seq.page_indices(), before);
         let results = manager
             .register_blocks_deferred(taken)
             .unwrap_or_else(|_| panic!("same-store batch"));
         assert!(seq.install_registered(results).is_empty());
         assert_eq!(seq.registering_blocks(), 0);
+        assert_eq!(seq.assigned_blocks(), 2);
+
+        let taken = seq.take_staged_for_registration(2);
+        assert_eq!(taken.len(), 1);
+        let results = manager
+            .register_blocks_deferred(taken)
+            .unwrap_or_else(|_| panic!("same-store batch"));
+        assert!(seq.install_registered(results).is_empty());
         assert_eq!(seq.page_indices(), inline.page_indices());
+        assert_eq!(seq.assigned_blocks(), inline.assigned_blocks());
+    }
+
+    #[test]
+    fn two_registrations_in_flight_install_in_order() {
+        let manager = BlockManager::<TestMeta>::builder()
+            .block_count(16)
+            .block_size(BLOCK_SIZE as usize)
+            .registry(crate::registry::BlockRegistry::new())
+            .duplication_policy(crate::blocks::BlockDuplicationPolicy::Reject)
+            .with_lineage_backend()
+            .build()
+            .expect("build manager");
+        // Register only the third block of an equal sequence, so that only
+        // the second batch below holds a duplicate.
+        let mut other = staged_sequence(&manager);
+        drop(other.take_staged_for_registration(2));
+        let third = other.take_staged_for_registration(1);
+        let canonical = manager
+            .register_blocks_deferred(third)
+            .unwrap_or_else(|_| panic!("same-store batch"));
+        let canonical_id = match &canonical[..] {
+            [RegisteredBlock::Fresh(block)] => block.block_id(),
+            _ => panic!("expected one fresh block"),
+        };
+
+        let inline_manager = create_test_manager::<TestMeta>(16);
+        let mut inline = staged_sequence(&inline_manager);
+        inline.register_staged(&inline_manager);
+
+        let mut seq = staged_sequence(&manager);
+        let before = seq.page_indices();
+        let first = seq.take_staged_for_registration(2);
+        let second = seq.take_staged_for_registration(1);
+        assert_eq!(seq.registering_blocks(), 3);
+        assert_eq!(seq.page_indices(), before);
+        let original_id = second[0].block_id();
+        let first = manager
+            .register_blocks_deferred(first)
+            .unwrap_or_else(|_| panic!("same-store batch"));
+        let second = manager
+            .register_blocks_deferred(second)
+            .unwrap_or_else(|_| panic!("same-store batch"));
+        assert!(matches!(&second[..], [RegisteredBlock::Duplicate { .. }]));
+
+        assert!(seq.install_registered(first).is_empty());
+        assert_eq!(seq.registering_blocks(), 1);
+        assert_eq!(seq.assigned_blocks(), 2);
+        assert_eq!(seq.page_indices(), before);
+
+        let originals = seq.install_registered(second);
+        assert_eq!(
+            originals
+                .iter()
+                .map(CompleteBlock::block_id)
+                .collect::<Vec<_>>(),
+            vec![original_id]
+        );
+        assert_eq!(seq.registering_blocks(), 0);
+        let after = seq.page_indices();
+        assert_eq!(after[..2], before[..2]);
+        assert_eq!(after[2] as usize, canonical_id);
+        assert_eq!(after[3..], before[3..]);
+        assert_eq!(after.len(), inline.page_indices().len());
         assert_eq!(seq.assigned_blocks(), inline.assigned_blocks());
     }
 
@@ -1469,7 +1549,7 @@ mod tests {
         let mut first = staged_sequence(&manager);
         first.register_staged(&manager);
         let mut second = staged_sequence(&manager);
-        let taken = second.take_staged_for_registration();
+        let taken = second.take_staged_for_registration(usize::MAX);
         let original_ids: Vec<_> = taken.iter().map(CompleteBlock::block_id).collect();
         let results = manager
             .register_blocks_deferred(taken)

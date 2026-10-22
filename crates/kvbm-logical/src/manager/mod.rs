@@ -58,7 +58,8 @@ pub enum RegisteredBlock<T: BlockMetadata> {
 /// Most blocks that one store-lock hold registers. A larger batch takes the
 /// lock once for each chunk, so a long prefill cannot block allocation or
 /// match for the whole batch.
-pub const REGISTER_CHUNK_BLOCKS: usize = 1024;
+pub const REGISTER_CHUNK_BLOCKS: usize = 256;
+const RELEASE_CHUNK_BLOCKS: usize = 256;
 
 pub struct BlockManager<T: BlockMetadata> {
     pub(crate) store: Arc<BlockStore<T>>,
@@ -388,7 +389,7 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
     }
 
     /// Releases all guards of one request: the immutable blocks through
-    /// [`release_blocks`](Self::release_blocks) (one store lock), then the
+    /// [`release_blocks`](Self::release_blocks) in bounded chunks, then the
     /// staged and mutable blocks.
     pub fn release_request_blocks(
         &self,
@@ -400,7 +401,17 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
             complete,
             mutable,
         } = blocks;
-        self.release_blocks(immutable, reset_on_release);
+        let mut immutable = immutable.into_iter();
+        loop {
+            let chunk = immutable
+                .by_ref()
+                .take(RELEASE_CHUNK_BLOCKS)
+                .collect::<Vec<_>>();
+            if chunk.is_empty() {
+                break;
+            }
+            self.release_blocks(chunk, reset_on_release);
+        }
         drop(complete);
         drop(mutable);
     }
