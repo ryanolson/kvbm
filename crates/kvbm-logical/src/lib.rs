@@ -38,8 +38,9 @@ pub use blocks::{
 };
 pub use branch_tracker::{BranchOracle, BranchPointRecord, BranchPointTracker, NoOpBranchOracle};
 pub use integrations::{
-    ApplyError, DecodeOutcome, NoopDelegate, PageSwapError, RequestSequence, SchedulableSequence,
-    SchedulableSequenceBuilder, ScheduleError, SequenceDelegate, SequenceEvent, SequenceState,
+    ApplyError, DecodeOutcome, NoopDelegate, PageSwapError, RequestBlocks, RequestSequence,
+    SchedulableSequence, SchedulableSequenceBuilder, ScheduleError, SequenceDelegate,
+    SequenceEvent, SequenceState,
 };
 pub use manager::{
     BlockEvictionObserver, BlockManager, BlockRegistrationError, EvictionNotification,

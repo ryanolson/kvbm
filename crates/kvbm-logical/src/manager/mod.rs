@@ -387,6 +387,24 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
             .release_blocks(blocks, ReleaseOpts { reset_on_release });
     }
 
+    /// Releases all guards of one request: the immutable blocks through
+    /// [`release_blocks`](Self::release_blocks) (one store lock), then the
+    /// staged and mutable blocks.
+    pub fn release_request_blocks(
+        &self,
+        blocks: crate::integrations::RequestBlocks<T>,
+        reset_on_release: Option<bool>,
+    ) {
+        let crate::integrations::RequestBlocks {
+            immutable,
+            complete,
+            mutable,
+        } = blocks;
+        self.release_blocks(immutable, reset_on_release);
+        drop(complete);
+        drop(mutable);
+    }
+
     /// Mark the single-owner inactive lineage suffix ending at the leaf
     /// `seq_hash` for evict-first (compaction poison). Membership-based: a
     /// no-op unless the leaf is currently resident-inactive, and only the

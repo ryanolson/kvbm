@@ -101,7 +101,7 @@
 //! | `is_complete()`           | `generated_tokens >= max_output_tokens`         |
 //! | `new_tokens_for_prefill()`| Tokens not covered by cache hits               |
 
-use crate::blocks::{BlockMetadata, CompleteBlock, ImmutableBlock};
+use crate::blocks::{BlockMetadata, CompleteBlock, ImmutableBlock, MutableBlock};
 use crate::manager::{BlockManager, RegisteredBlock};
 use crate::sequence::{BlockSequence, LogicalBlockAssignmentError, LogicalBlockAssignments};
 use crate::{BlockId, KvbmSequenceHashProvider, SequenceHash};
@@ -160,6 +160,13 @@ pub struct RequestSequence<T: BlockMetadata> {
     max_output_tokens: usize,
     num_input_tokens: usize,
     prefix_matched_blocks: usize,
+}
+
+/// The block guards of one request, from [`RequestSequence::take_blocks`].
+pub struct RequestBlocks<T: BlockMetadata> {
+    pub(crate) immutable: Vec<ImmutableBlock<T>>,
+    pub(crate) complete: Vec<CompleteBlock<T>>,
+    pub(crate) mutable: Vec<MutableBlock<T>>,
 }
 
 impl<T: BlockMetadata> RequestSequence<T> {
@@ -495,6 +502,35 @@ impl<T: BlockMetadata> RequestSequence<T> {
     // =====================================================================
     // Release / reacquire
     // =====================================================================
+
+    /// Moves every block guard out of the sequence and leaves it empty, as
+    /// [`release`](Self::release) does, but without dropping the guards here.
+    /// Pass the result to [`BlockManager::release_request_blocks`], for
+    /// example on another thread.
+    pub fn take_blocks(&mut self) -> RequestBlocks<T> {
+        self.detached_assigned.clear();
+        self.registering.clear();
+        RequestBlocks {
+            immutable: self
+                .assignments
+                .take_assigned()
+                .into_iter()
+                .map(|(_, block)| block)
+                .collect(),
+            complete: self
+                .assignments
+                .take_staged()
+                .into_iter()
+                .map(|(_, block)| block)
+                .collect(),
+            mutable: self
+                .assignments
+                .take_unassigned()
+                .into_iter()
+                .map(|(_, block)| block)
+                .collect(),
+        }
+    }
 
     /// Releases all block assignments (RAII returns them to pools).
     pub fn release(&mut self) {
@@ -1450,5 +1486,30 @@ mod tests {
         let available = manager.available_blocks();
         drop(originals);
         assert_eq!(manager.available_blocks(), available + 3);
+    }
+
+    #[test]
+    fn take_blocks_and_release_request_blocks_equal_release() {
+        let release_manager = create_test_manager::<TestMeta>(16);
+        let mut released = staged_sequence(&release_manager);
+        released.register_staged(&release_manager);
+        released.release();
+
+        let manager = create_test_manager::<TestMeta>(16);
+        let mut seq = staged_sequence(&manager);
+        seq.register_staged(&manager);
+        let blocks = seq.take_blocks();
+        assert!(seq.page_indices().is_empty());
+        let available = manager.available_blocks();
+        manager.release_request_blocks(blocks, None);
+        assert_eq!(
+            manager.available_blocks(),
+            release_manager.available_blocks()
+        );
+        assert!(manager.available_blocks() >= available);
+        assert_eq!(
+            manager.store_for_test().debug_snapshot(),
+            release_manager.store_for_test().debug_snapshot()
+        );
     }
 }
