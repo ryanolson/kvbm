@@ -101,8 +101,8 @@
 //! | `is_complete()`           | `generated_tokens >= max_output_tokens`         |
 //! | `new_tokens_for_prefill()`| Tokens not covered by cache hits               |
 
-use crate::blocks::{BlockMetadata, ImmutableBlock};
-use crate::manager::BlockManager;
+use crate::blocks::{BlockMetadata, CompleteBlock, ImmutableBlock};
+use crate::manager::{BlockManager, RegisteredBlock};
 use crate::sequence::{BlockSequence, LogicalBlockAssignmentError, LogicalBlockAssignments};
 use crate::{BlockId, KvbmSequenceHashProvider, SequenceHash};
 
@@ -152,6 +152,10 @@ pub struct RequestSequence<T: BlockMetadata> {
     /// external policy owner. They retain sequence position and page mapping
     /// without preventing that owner from demoting or releasing the blocks.
     detached_assigned: Vec<(BlockId, SequenceHash)>,
+    /// Staged blocks that the caller took out to register elsewhere. They
+    /// keep their sequence position and page mapping, after the assigned
+    /// blocks, until [`install_registered`](Self::install_registered).
+    registering: Vec<(BlockId, SequenceHash)>,
     generated_tokens: usize,
     max_output_tokens: usize,
     num_input_tokens: usize,
@@ -198,6 +202,7 @@ impl<T: BlockMetadata> RequestSequence<T> {
             sequence,
             assignments,
             detached_assigned: Vec::new(),
+            registering: Vec::new(),
             generated_tokens: 0,
             max_output_tokens,
             num_input_tokens,
@@ -242,7 +247,9 @@ impl<T: BlockMetadata> RequestSequence<T> {
         max_blocks: usize,
     ) -> Result<usize, LogicalBlockAssignmentError<T>> {
         assert!(
-            self.assignments.is_empty() && self.detached_assigned.is_empty(),
+            self.assignments.is_empty()
+                && self.detached_assigned.is_empty()
+                && self.registering.is_empty(),
             "match_and_add_prefix called on sequence with existing assignments"
         );
         let matched = self.match_prefix(manager, max_blocks);
@@ -324,6 +331,7 @@ impl<T: BlockMetadata> RequestSequence<T> {
     pub fn stage_pending(&mut self) {
         let start = self.detached_assigned.len()
             + self.assignments.assigned_count()
+            + self.registering.len()
             + self.assignments.staged_count();
         let completed = self.sequence.blocks().len();
         if start < completed {
@@ -366,6 +374,76 @@ impl<T: BlockMetadata> RequestSequence<T> {
     /// [`page_indices`](Self::page_indices), but this sequence no longer keeps
     /// their `ImmutableBlock` guards alive. The caller becomes responsible for
     /// the returned guards' strong/weak/null lifecycle.
+    /// Takes the staged blocks out, in order, to register them elsewhere,
+    /// for example on another thread. Their block IDs stay in
+    /// [`page_indices`](Self::page_indices) until
+    /// [`install_registered`](Self::install_registered).
+    pub fn take_staged_for_registration(&mut self) -> Vec<CompleteBlock<T>> {
+        let staged = self.assignments.take_staged();
+        self.registering.extend(
+            staged
+                .iter()
+                .map(|(block_id, block)| (*block_id, block.sequence_hash())),
+        );
+        staged.into_iter().map(|(_, block)| block).collect()
+    }
+
+    /// Installs the results of
+    /// [`BlockManager::register_blocks_deferred`] for the oldest blocks that
+    /// [`take_staged_for_registration`](Self::take_staged_for_registration)
+    /// took, in order. Each block becomes assigned. A duplicate is assigned as
+    /// its canonical block, so its page index changes. Returns the original
+    /// blocks of the duplicates: the caller drops them when no reader of
+    /// their slot remains.
+    ///
+    /// # Panics
+    ///
+    /// Panics if there are more results than blocks in registration, or if a
+    /// result does not match the block at its position.
+    pub fn install_registered(
+        &mut self,
+        results: Vec<RegisteredBlock<T>>,
+    ) -> Vec<CompleteBlock<T>> {
+        assert!(
+            results.len() <= self.registering.len(),
+            "install_registered: {} results for {} blocks in registration",
+            results.len(),
+            self.registering.len()
+        );
+        let mut assigned = Vec::with_capacity(results.len());
+        let mut originals = Vec::new();
+        for ((block_id, seq_hash), result) in self.registering.drain(..results.len()).zip(results) {
+            let (block, original_id) = match result {
+                RegisteredBlock::Fresh(block) => {
+                    let id = block.block_id();
+                    (block, id)
+                }
+                RegisteredBlock::Duplicate {
+                    canonical,
+                    original,
+                } => {
+                    let id = original.block_id();
+                    originals.push(original);
+                    (canonical, id)
+                }
+            };
+            assert!(
+                original_id == block_id && block.sequence_hash() == seq_hash,
+                "install_registered: result for block {original_id} at the position of block {block_id}"
+            );
+            assigned.push(block);
+        }
+        self.assignments
+            .extend_assigned(assigned)
+            .unwrap_or_else(|_| panic!("install_registered: duplicate assigned block ID"));
+        originals
+    }
+
+    /// Number of blocks taken out for registration and not yet installed.
+    pub fn registering_blocks(&self) -> usize {
+        self.registering.len()
+    }
+
     pub fn detach_registered_blocks(&mut self) -> Vec<ImmutableBlock<T>> {
         let assigned = self.assignments.take_assigned();
         self.detached_assigned.extend(
@@ -422,6 +500,7 @@ impl<T: BlockMetadata> RequestSequence<T> {
     pub fn release(&mut self) {
         self.assignments.clear();
         self.detached_assigned.clear();
+        self.registering.clear();
     }
 
     /// Re-acquires blocks from the manager after a release/preemption.
@@ -432,7 +511,9 @@ impl<T: BlockMetadata> RequestSequence<T> {
     /// Returns `true` if all blocks were successfully acquired.
     pub fn reacquire(&mut self, manager: &BlockManager<T>) -> bool {
         assert!(
-            self.assignments.is_empty() && self.detached_assigned.is_empty(),
+            self.assignments.is_empty()
+                && self.detached_assigned.is_empty()
+                && self.registering.is_empty(),
             "reacquire called with existing assignments"
         );
 
@@ -560,14 +641,26 @@ impl<T: BlockMetadata> RequestSequence<T> {
         self.sequence.block_size()
     }
 
-    /// All block IDs in order: assigned ++ staged ++ unassigned.
+    /// All block IDs in order: detached ++ assigned ++ registering ++ staged
+    /// ++ unassigned.
     ///
     /// Block IDs identity-map to page indices in the GPU page pool.
     pub fn page_indices(&self) -> Vec<u32> {
         self.detached_assigned
             .iter()
             .map(|(block_id, _)| block_id)
-            .chain(self.assignments.all_block_ids())
+            .chain(
+                self.assignments
+                    .assigned_iter()
+                    .map(|(block_id, _)| block_id),
+            )
+            .chain(self.registering.iter().map(|(block_id, _)| block_id))
+            .chain(self.assignments.staged_iter().map(|(block_id, _)| block_id))
+            .chain(
+                self.assignments
+                    .unassigned_iter()
+                    .map(|(block_id, _)| block_id),
+            )
             .map(|&id| id as u32)
             .collect()
     }
@@ -584,7 +677,8 @@ impl<T: BlockMetadata> RequestSequence<T> {
     ) -> Result<(), PageSwapError> {
         let detached_count = self.detached_assigned.len();
         let assigned_count = self.assignments.assigned_count();
-        let total_count = detached_count + self.assignments.all_block_ids().count();
+        let total_count =
+            detached_count + self.registering.len() + self.assignments.all_block_ids().count();
         if position >= total_count {
             return Err(PageSwapError::OutOfRange { position });
         }
@@ -675,6 +769,7 @@ impl<T: BlockMetadata> std::fmt::Debug for RequestSequence<T> {
             .field("prefix_matched_blocks", &self.prefix_matched_blocks)
             .field("assigned", &self.assigned_blocks())
             .field("detached_assigned", &self.detached_assigned.len())
+            .field("registering", &self.registering.len())
             .field("staged", &self.assignments.staged_count())
             .field("unassigned", &self.assignments.unassigned_count())
             .finish()
@@ -1294,5 +1389,66 @@ mod tests {
         let debug_str = format!("{seq:?}");
         assert!(debug_str.contains("RequestSequence"));
         assert!(debug_str.contains("total_tokens"));
+    }
+
+    fn staged_sequence(manager: &BlockManager<TestMeta>) -> RequestSequence<TestMeta> {
+        let mut seq = RequestSequence::new(make_tokens(12), 4, BLOCK_SIZE);
+        assert!(seq.allocate_blocks(seq.num_blocks() + 1, manager));
+        seq.stage_pending();
+        seq
+    }
+
+    #[test]
+    fn take_and_install_equals_register_staged() {
+        let inline_manager = create_test_manager::<TestMeta>(16);
+        let mut inline = staged_sequence(&inline_manager);
+        inline.register_staged(&inline_manager);
+
+        let manager = create_test_manager::<TestMeta>(16);
+        let mut seq = staged_sequence(&manager);
+        let before = seq.page_indices();
+        let taken = seq.take_staged_for_registration();
+        assert_eq!(taken.len(), 3);
+        assert_eq!(seq.registering_blocks(), 3);
+        assert_eq!(seq.page_indices(), before);
+        let results = manager
+            .register_blocks_deferred(taken)
+            .unwrap_or_else(|_| panic!("same-store batch"));
+        assert!(seq.install_registered(results).is_empty());
+        assert_eq!(seq.registering_blocks(), 0);
+        assert_eq!(seq.page_indices(), inline.page_indices());
+        assert_eq!(seq.assigned_blocks(), inline.assigned_blocks());
+    }
+
+    #[test]
+    fn install_assigns_a_duplicate_as_its_canonical_block() {
+        let manager = BlockManager::<TestMeta>::builder()
+            .block_count(16)
+            .block_size(BLOCK_SIZE as usize)
+            .registry(crate::registry::BlockRegistry::new())
+            .duplication_policy(crate::blocks::BlockDuplicationPolicy::Reject)
+            .with_lineage_backend()
+            .build()
+            .expect("build manager");
+        let mut first = staged_sequence(&manager);
+        first.register_staged(&manager);
+        let mut second = staged_sequence(&manager);
+        let taken = second.take_staged_for_registration();
+        let original_ids: Vec<_> = taken.iter().map(CompleteBlock::block_id).collect();
+        let results = manager
+            .register_blocks_deferred(taken)
+            .unwrap_or_else(|_| panic!("same-store batch"));
+        let originals = second.install_registered(results);
+        assert_eq!(
+            originals
+                .iter()
+                .map(CompleteBlock::block_id)
+                .collect::<Vec<_>>(),
+            original_ids
+        );
+        assert_eq!(second.page_indices()[..3], first.page_indices()[..3]);
+        let available = manager.available_blocks();
+        drop(originals);
+        assert_eq!(manager.available_blocks(), available + 3);
     }
 }
