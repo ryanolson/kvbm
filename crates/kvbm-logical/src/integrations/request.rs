@@ -101,6 +101,8 @@
 //! | `is_complete()`           | `generated_tokens >= max_output_tokens`         |
 //! | `new_tokens_for_prefill()`| Tokens not covered by cache hits               |
 
+use std::collections::VecDeque;
+
 use crate::blocks::{BlockMetadata, CompleteBlock, ImmutableBlock, MutableBlock};
 use crate::manager::{BlockManager, RegisteredBlock};
 use crate::sequence::{BlockSequence, LogicalBlockAssignmentError, LogicalBlockAssignments};
@@ -155,7 +157,7 @@ pub struct RequestSequence<T: BlockMetadata> {
     /// Staged blocks that the caller took out to register elsewhere. They
     /// keep their sequence position and page mapping, after the assigned
     /// blocks, until [`install_registered`](Self::install_registered).
-    registering: Vec<(BlockId, SequenceHash)>,
+    registering: VecDeque<(BlockId, SequenceHash)>,
     generated_tokens: usize,
     max_output_tokens: usize,
     num_input_tokens: usize,
@@ -209,7 +211,7 @@ impl<T: BlockMetadata> RequestSequence<T> {
             sequence,
             assignments,
             detached_assigned: Vec::new(),
-            registering: Vec::new(),
+            registering: VecDeque::new(),
             generated_tokens: 0,
             max_output_tokens,
             num_input_tokens,
@@ -379,13 +381,15 @@ impl<T: BlockMetadata> RequestSequence<T> {
     /// [`page_indices`](Self::page_indices) until
     /// [`install_registered`](Self::install_registered).
     pub fn take_staged_for_registration(&mut self, max_blocks: usize) -> Vec<CompleteBlock<T>> {
-        let staged = self.assignments.take_staged_prefix(max_blocks);
-        self.registering.extend(
-            staged
-                .iter()
-                .map(|(block_id, block)| (*block_id, block.sequence_hash())),
-        );
-        staged.into_iter().map(|(_, block)| block).collect()
+        let count = max_blocks.min(self.assignments.staged_count());
+        let mut blocks = Vec::with_capacity(count);
+        let registering = &mut self.registering;
+        self.assignments
+            .take_staged_prefix_with(max_blocks, |block_id, block| {
+                registering.push_back((block_id, block.sequence_hash()));
+                blocks.push(block);
+            });
+        blocks
     }
 
     /// Installs the results of
@@ -412,7 +416,11 @@ impl<T: BlockMetadata> RequestSequence<T> {
         );
         let mut assigned = Vec::with_capacity(results.len());
         let mut originals = Vec::new();
-        for ((block_id, seq_hash), result) in self.registering.drain(..results.len()).zip(results) {
+        for result in results {
+            let (block_id, seq_hash) = self
+                .registering
+                .pop_front()
+                .expect("registration count checked before install");
             let (block, original_id) = match result {
                 RegisteredBlock::Fresh(block) => {
                     let id = block.block_id();

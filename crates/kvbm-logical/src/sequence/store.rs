@@ -6,13 +6,14 @@
 //! [`LogicalBlockAssignments`](super::assignments::LogicalBlockAssignments).
 
 use indexmap::IndexMap;
+use std::collections::{HashSet, VecDeque};
 
 use crate::BlockId;
 
 /// Generic three-phase lifecycle store keyed by [`BlockId`].
 ///
-/// Manages three ordered `IndexMap` collections representing the lifecycle
-/// phases: **unassigned** (`U`) → **staged** (`S`) → **assigned** (`A`).
+/// Manages ordered collections representing the lifecycle phases:
+/// **unassigned** (`U`) → **staged** (`S`) → **assigned** (`A`).
 ///
 /// Both [`ExternalBlockAssignments`](super::assignments::ExternalBlockAssignments) and
 /// [`LogicalBlockAssignments`](super::assignments::LogicalBlockAssignments) compose this
@@ -20,7 +21,8 @@ use crate::BlockId;
 pub(crate) struct BlockStore<U, S, A> {
     assigned: IndexMap<BlockId, A>,
     staged: IndexMap<BlockId, S>,
-    unassigned: IndexMap<BlockId, U>,
+    unassigned: VecDeque<(BlockId, U)>,
+    unassigned_ids: HashSet<BlockId>,
 }
 
 impl<U, S, A> BlockStore<U, S, A> {
@@ -29,7 +31,8 @@ impl<U, S, A> BlockStore<U, S, A> {
         Self {
             assigned: IndexMap::new(),
             staged: IndexMap::new(),
-            unassigned: IndexMap::new(),
+            unassigned: VecDeque::new(),
+            unassigned_ids: HashSet::new(),
         }
     }
 
@@ -61,7 +64,7 @@ impl<U, S, A> BlockStore<U, S, A> {
     pub fn contains(&self, block_id: &BlockId) -> bool {
         self.assigned.contains_key(block_id)
             || self.staged.contains_key(block_id)
-            || self.unassigned.contains_key(block_id)
+            || self.unassigned_ids.contains(block_id)
     }
 
     /// Checks whether a `BlockId` is present in the assigned collection.
@@ -79,7 +82,7 @@ impl<U, S, A> BlockStore<U, S, A> {
     /// Checks whether a `BlockId` is present in the unassigned collection.
     #[allow(dead_code)]
     pub fn contains_unassigned(&self, block_id: &BlockId) -> bool {
-        self.unassigned.contains_key(block_id)
+        self.unassigned_ids.contains(block_id)
     }
 
     // -- Index Access ---------------------------------------------------------
@@ -103,7 +106,7 @@ impl<U, S, A> BlockStore<U, S, A> {
 
     /// Returns the unassigned entry at the given index (FIFO order).
     pub fn get_unassigned(&self, index: usize) -> Option<(&BlockId, &U)> {
-        self.unassigned.get_index(index)
+        self.unassigned.get(index).map(|(id, value)| (id, value))
     }
 
     // -- Iteration ------------------------------------------------------------
@@ -120,14 +123,16 @@ impl<U, S, A> BlockStore<U, S, A> {
 
     /// Iterates over unassigned entries in FIFO order.
     pub fn unassigned_iter(&self) -> impl Iterator<Item = (&BlockId, &U)> {
-        self.unassigned.iter()
+        self.unassigned.iter().map(|(id, value)| (id, value))
     }
 
     // -- FIFO Pop -------------------------------------------------------------
 
     /// Removes and returns the first unassigned entry (FIFO).
     pub fn shift_unassigned(&mut self) -> Option<(BlockId, U)> {
-        self.unassigned.shift_remove_index(0)
+        let entry = self.unassigned.pop_front()?;
+        self.unassigned_ids.remove(&entry.0);
+        Some(entry)
     }
 
     /// Removes and returns the first staged entry (FIFO).
@@ -139,16 +144,15 @@ impl<U, S, A> BlockStore<U, S, A> {
 
     /// Removes and returns the last unassigned entry (LIFO).
     pub fn pop_unassigned(&mut self) -> Option<(BlockId, U)> {
-        self.unassigned.pop()
+        let entry = self.unassigned.pop_back()?;
+        self.unassigned_ids.remove(&entry.0);
+        Some(entry)
     }
 
     // -- Batch Drain ------------------------------------------------------------
     //
-    // These exist to avoid the O(N²) cost of driving `shift_staged`/
-    // `shift_unassigned` in a per-element loop: each `shift_remove_index(0)`
-    // is itself O(len) because it shifts every following element down, so an
-    // N-element loop is O(N²). Draining a contiguous prefix in one call is
-    // O(len) total.
+    // These avoid repeatedly shifting the staged IndexMap when removing a
+    // prefix. Unassigned entries use a VecDeque and do not need this batching.
 
     /// Drains all staged entries in staging (FIFO) order, returning them as a
     /// `Vec`. O(N) total, versus O(N²) for an N-element loop of
@@ -164,17 +168,32 @@ impl<U, S, A> BlockStore<U, S, A> {
     /// Drains the first `min(n, staged.len())` entries from staged in FIFO
     /// order, returning them as a `Vec`.
     pub fn drain_staged_prefix(&mut self, n: usize) -> Vec<(BlockId, S)> {
+        let mut drained = Vec::with_capacity(n.min(self.staged.len()));
+        self.drain_staged_prefix_into(n, |id, value| drained.push((id, value)));
+        drained
+    }
+
+    pub fn drain_staged_prefix_into(
+        &mut self,
+        n: usize,
+        mut consume: impl FnMut(BlockId, S),
+    ) -> usize {
         let n = n.min(self.staged.len());
-        self.staged.drain(..n).collect()
+        for (id, value) in self.staged.drain(..n) {
+            consume(id, value);
+        }
+        n
     }
 
     /// Drains the first `min(n, unassigned.len())` entries from unassigned in
-    /// FIFO order, returning them as a `Vec`. O(len) total (a single prefix
-    /// shift), versus O(n · len) for an n-element loop of
-    /// [`shift_unassigned`](Self::shift_unassigned).
+    /// FIFO order, returning them as a `Vec`.
     pub fn drain_unassigned_prefix(&mut self, n: usize) -> Vec<(BlockId, U)> {
         let n = n.min(self.unassigned.len());
-        self.unassigned.drain(..n).collect()
+        let drained = self.unassigned.drain(..n).collect::<Vec<_>>();
+        for (id, _) in &drained {
+            self.unassigned_ids.remove(id);
+        }
+        drained
     }
 
     /// Reinserts a batch of previously-drained unassigned entries at the
@@ -191,11 +210,10 @@ impl<U, S, A> BlockStore<U, S, A> {
         if front.is_empty() {
             return;
         }
-        let remainder: IndexMap<BlockId, U> = std::mem::take(&mut self.unassigned);
-        let mut rebuilt = IndexMap::with_capacity(front.len() + remainder.len());
-        rebuilt.extend(front);
-        rebuilt.extend(remainder);
-        self.unassigned = rebuilt;
+        for (id, value) in front.into_iter().rev() {
+            self.unassigned_ids.insert(id);
+            self.unassigned.push_front((id, value));
+        }
     }
 
     // -- Insert ---------------------------------------------------------------
@@ -212,7 +230,15 @@ impl<U, S, A> BlockStore<U, S, A> {
 
     /// Inserts into the unassigned collection.
     pub fn insert_unassigned(&mut self, id: BlockId, val: U) {
-        self.unassigned.insert(id, val);
+        if self.unassigned_ids.insert(id) {
+            self.unassigned.push_back((id, val));
+        } else if let Some((_, value)) = self
+            .unassigned
+            .iter_mut()
+            .find(|(block_id, _)| *block_id == id)
+        {
+            *value = val;
+        }
     }
 
     // -- Bulk -----------------------------------------------------------------
@@ -223,7 +249,7 @@ impl<U, S, A> BlockStore<U, S, A> {
         self.assigned
             .keys()
             .chain(self.staged.keys())
-            .chain(self.unassigned.keys())
+            .chain(self.unassigned.iter().map(|(id, _)| id))
     }
 
     /// Validates that none of the given `ids` collide with existing entries
@@ -250,6 +276,7 @@ impl<U, S, A> BlockStore<U, S, A> {
         self.assigned.clear();
         self.staged.clear();
         self.unassigned.clear();
+        self.unassigned_ids.clear();
     }
 
     /// Takes all assigned entries, returning them as a `Vec`.
@@ -264,6 +291,7 @@ impl<U, S, A> BlockStore<U, S, A> {
 
     /// Takes all unassigned entries, returning them as a `Vec`.
     pub fn take_unassigned(&mut self) -> Vec<(BlockId, U)> {
+        self.unassigned_ids.clear();
         std::mem::take(&mut self.unassigned).into_iter().collect()
     }
 }
