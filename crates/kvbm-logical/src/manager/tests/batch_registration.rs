@@ -172,3 +172,104 @@ fn empty_batch_changes_nothing() {
     );
     assert!(drain(&mut events).is_empty());
 }
+
+fn deferred_outcome(
+    policy: BlockDuplicationPolicy,
+    backend: Backend,
+    blocks: &[dynamo_tokens::TokenBlock],
+    held: usize,
+) -> (Outcome, Vec<Option<BlockId>>, usize) {
+    let (manager, mut events) = manager(policy, backend, 2 * blocks.len() + 2);
+    let _held = manager.register_block(stage(&manager, &blocks[held..=held]).remove(0));
+    let staged = stage(&manager, blocks);
+    let results = manager
+        .register_blocks_deferred(staged)
+        .unwrap_or_else(|_| panic!("same-store batch"));
+    let mut registered = Vec::new();
+    let mut originals = Vec::new();
+    let mut kept = Vec::new();
+    for result in results {
+        match result {
+            RegisteredBlock::Fresh(block) => {
+                registered.push(block);
+                originals.push(None);
+            }
+            RegisteredBlock::Duplicate {
+                canonical,
+                original,
+            } => {
+                registered.push(canonical);
+                originals.push(Some(original.block_id()));
+                kept.push(original);
+            }
+        }
+    }
+    drop(kept);
+    let outcome = Outcome {
+        registered: registered
+            .iter()
+            .map(|block| (block.block_id(), block.sequence_hash()))
+            .collect(),
+        events: drain(&mut events),
+        metrics: manager.metrics().snapshot(),
+        store: manager.store_for_test().debug_snapshot(),
+        present: registered
+            .iter()
+            .map(|block| {
+                manager
+                    .block_registry()
+                    .match_sequence_hash(block.sequence_hash(), false)
+                    .is_some_and(|handle| handle.has_block::<TestBlockData>())
+            })
+            .collect(),
+    };
+    let available = manager.available_blocks();
+    drop(registered);
+    (outcome, originals, available)
+}
+
+#[rstest]
+fn deferred_registration_matches_batch_registration_after_the_originals_drop(
+    #[values(BlockDuplicationPolicy::Allow, BlockDuplicationPolicy::Reject)]
+    policy: BlockDuplicationPolicy,
+    #[values(Backend::Lru, Backend::Lineage)] backend: Backend,
+) {
+    let blocks = token_blocks(8, &[(5, 1)]);
+    let batch = register(policy, backend, &blocks, 3, true);
+    let (deferred, originals, _) = deferred_outcome(policy, backend, &blocks, 3);
+    assert_eq!(deferred, batch);
+    let duplicates: Vec<usize> = originals
+        .iter()
+        .enumerate()
+        .filter_map(|(index, original)| original.map(|_| index))
+        .collect();
+    match policy {
+        BlockDuplicationPolicy::Allow => assert!(duplicates.is_empty()),
+        BlockDuplicationPolicy::Reject => assert_eq!(duplicates, vec![3, 5]),
+    }
+}
+
+#[test]
+fn a_rejected_duplicate_keeps_its_slot_until_the_original_drops() {
+    let (manager, _events) = manager(BlockDuplicationPolicy::Reject, Backend::Lineage, 4);
+    let blocks = token_blocks(1, &[]);
+    let primary = manager.register_block(stage(&manager, &blocks).remove(0));
+    let duplicate = stage(&manager, &blocks);
+    let original_id = duplicate[0].block_id();
+    let available = manager.available_blocks();
+    let mut results = manager
+        .register_blocks_deferred(duplicate)
+        .unwrap_or_else(|_| panic!("same-store batch"));
+    let Some(RegisteredBlock::Duplicate {
+        canonical,
+        original,
+    }) = results.pop()
+    else {
+        panic!("expected a duplicate");
+    };
+    assert_eq!(canonical.block_id(), primary.block_id());
+    assert_eq!(original.block_id(), original_id);
+    assert_eq!(manager.available_blocks(), available);
+    drop(original);
+    assert_eq!(manager.available_blocks(), available + 1);
+}
