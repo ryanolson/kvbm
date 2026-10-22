@@ -1465,6 +1465,70 @@ mod tests {
     }
 
     #[test]
+    fn two_registrations_in_flight_install_in_order() {
+        let manager = BlockManager::<TestMeta>::builder()
+            .block_count(16)
+            .block_size(BLOCK_SIZE as usize)
+            .registry(crate::registry::BlockRegistry::new())
+            .duplication_policy(crate::blocks::BlockDuplicationPolicy::Reject)
+            .with_lineage_backend()
+            .build()
+            .expect("build manager");
+        // Register only the third block of an equal sequence, so that only
+        // the second batch below holds a duplicate.
+        let mut other = staged_sequence(&manager);
+        drop(other.take_staged_for_registration(2));
+        let third = other.take_staged_for_registration(1);
+        let canonical = manager
+            .register_blocks_deferred(third)
+            .unwrap_or_else(|_| panic!("same-store batch"));
+        let canonical_id = match &canonical[..] {
+            [RegisteredBlock::Fresh(block)] => block.block_id(),
+            _ => panic!("expected one fresh block"),
+        };
+
+        let inline_manager = create_test_manager::<TestMeta>(16);
+        let mut inline = staged_sequence(&inline_manager);
+        inline.register_staged(&inline_manager);
+
+        let mut seq = staged_sequence(&manager);
+        let before = seq.page_indices();
+        let first = seq.take_staged_for_registration(2);
+        let second = seq.take_staged_for_registration(1);
+        assert_eq!(seq.registering_blocks(), 3);
+        assert_eq!(seq.page_indices(), before);
+        let original_id = second[0].block_id();
+        let first = manager
+            .register_blocks_deferred(first)
+            .unwrap_or_else(|_| panic!("same-store batch"));
+        let second = manager
+            .register_blocks_deferred(second)
+            .unwrap_or_else(|_| panic!("same-store batch"));
+        assert!(matches!(&second[..], [RegisteredBlock::Duplicate { .. }]));
+
+        assert!(seq.install_registered(first).is_empty());
+        assert_eq!(seq.registering_blocks(), 1);
+        assert_eq!(seq.assigned_blocks(), 2);
+        assert_eq!(seq.page_indices(), before);
+
+        let originals = seq.install_registered(second);
+        assert_eq!(
+            originals
+                .iter()
+                .map(CompleteBlock::block_id)
+                .collect::<Vec<_>>(),
+            vec![original_id]
+        );
+        assert_eq!(seq.registering_blocks(), 0);
+        let after = seq.page_indices();
+        assert_eq!(after[..2], before[..2]);
+        assert_eq!(after[2] as usize, canonical_id);
+        assert_eq!(after[3..], before[3..]);
+        assert_eq!(after.len(), inline.page_indices().len());
+        assert_eq!(seq.assigned_blocks(), inline.assigned_blocks());
+    }
+
+    #[test]
     fn install_assigns_a_duplicate_as_its_canonical_block() {
         let manager = BlockManager::<TestMeta>::builder()
             .block_count(16)
