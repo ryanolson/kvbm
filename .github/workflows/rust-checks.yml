@@ -51,7 +51,7 @@ jobs:
     # TODO(human): a hosted ubuntu-latest (2 vCPU / 7 GB) compiles the full
     # closure (tokio-full + velo + 4 dynamo git-deps + pyo3) but slowly. Swap
     # to a larger self-hosted CPU runner if pre-merge latency matters.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
       fail-fast: false

@@ -9,6 +9,7 @@ use crate::testing::{
 };
 use rstest::rstest;
 
+mod batch_registration;
 mod exact_inactive_allocation;
 mod exact_reclaim_allocation;
 mod exact_reclaim_by_hash;
