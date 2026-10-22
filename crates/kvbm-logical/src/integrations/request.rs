@@ -374,13 +374,6 @@ impl<T: BlockMetadata> RequestSequence<T> {
         self.register_staged(manager);
     }
 
-    /// Transfer every newly registered strong block to a policy owner while
-    /// retaining its physical identity and logical sequence position.
-    ///
-    /// Detached identities continue to participate in staging offsets and
-    /// [`page_indices`](Self::page_indices), but this sequence no longer keeps
-    /// their `ImmutableBlock` guards alive. The caller becomes responsible for
-    /// the returned guards' strong/weak/null lifecycle.
     /// Takes up to `max_blocks` staged blocks, in order, to register them
     /// elsewhere, for example on another thread. Their block IDs stay in
     /// [`page_indices`](Self::page_indices) until
@@ -451,6 +444,13 @@ impl<T: BlockMetadata> RequestSequence<T> {
         self.registering.len()
     }
 
+    /// Transfer every newly registered strong block to a policy owner while
+    /// retaining its physical identity and logical sequence position.
+    ///
+    /// Detached identities continue to participate in staging offsets and
+    /// [`page_indices`](Self::page_indices), but this sequence no longer keeps
+    /// their `ImmutableBlock` guards alive. The caller becomes responsible for
+    /// the returned guards' strong/weak/null lifecycle.
     pub fn detach_registered_blocks(&mut self) -> Vec<ImmutableBlock<T>> {
         let assigned = self.assignments.take_assigned();
         self.detached_assigned.extend(
