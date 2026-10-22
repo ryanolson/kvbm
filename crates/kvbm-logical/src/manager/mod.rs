@@ -41,6 +41,20 @@ use inactive_lineage_hold::EvictionNotifier;
 /// Manages the full block lifecycle over the unified [`BlockStore`].
 ///
 /// Construct via [`BlockManager::builder()`].
+/// The result of [`BlockManager::register_blocks_deferred`] for one block.
+pub enum RegisteredBlock<T: BlockMetadata> {
+    /// The block registered as itself: a new primary, or an `Allow`
+    /// duplicate. Its block ID did not change.
+    Fresh(ImmutableBlock<T>),
+    /// Another block was already the primary of this hash (`Reject`).
+    /// `original` still owns the input slot; dropping it returns the slot
+    /// to the reset pool.
+    Duplicate {
+        canonical: ImmutableBlock<T>,
+        original: CompleteBlock<T>,
+    },
+}
+
 /// Most blocks that one store-lock hold registers. A larger batch takes the
 /// lock once for each chunk, so a long prefill cannot block allocation or
 /// match for the whole batch.
@@ -373,6 +387,24 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
             .release_blocks(blocks, ReleaseOpts { reset_on_release });
     }
 
+    /// Releases all guards of one request: the immutable blocks through
+    /// [`release_blocks`](Self::release_blocks) (one store lock), then the
+    /// staged and mutable blocks.
+    pub fn release_request_blocks(
+        &self,
+        blocks: crate::integrations::RequestBlocks<T>,
+        reset_on_release: Option<bool>,
+    ) {
+        let crate::integrations::RequestBlocks {
+            immutable,
+            complete,
+            mutable,
+        } = blocks;
+        self.release_blocks(immutable, reset_on_release);
+        drop(complete);
+        drop(mutable);
+    }
+
     /// Mark the single-owner inactive lineage suffix ending at the leaf
     /// `seq_hash` for evict-first (compaction poison). Membership-based: a
     /// no-op unless the leaf is currently resident-inactive, and only the
@@ -430,29 +462,71 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
         Ok(self.register_verified_blocks(blocks))
     }
 
+    /// Registers like [`try_register_blocks`](Self::try_register_blocks), but
+    /// a `Reject` duplicate keeps its slot.
+    ///
+    /// Output `i` is the registration of input `i`. With `Reject`, an input
+    /// whose hash already has a primary gives
+    /// [`RegisteredBlock::Duplicate`]: the existing primary and the input
+    /// block, which still owns its slot. The caller drops the input block
+    /// when no reader of that slot remains. With `Allow`, every output is
+    /// [`RegisteredBlock::Fresh`].
+    pub fn register_blocks_deferred(
+        &self,
+        blocks: Vec<CompleteBlock<T>>,
+    ) -> Result<Vec<RegisteredBlock<T>>, BlockRegistrationError<T>> {
+        if blocks.iter().any(|block| !block.is_from_store(&self.store)) {
+            return Err(BlockRegistrationError::foreign_store(blocks));
+        }
+        let mut registered = Vec::with_capacity(blocks.len());
+        Self::for_each_chunk(blocks, |chunk| {
+            let (inners, rejected) = self.register_verified_chunk(chunk);
+            let mut rejected = rejected.into_iter().peekable();
+            for (index, inner) in inners.into_iter().enumerate() {
+                let block = ImmutableBlock::from_inner(inner);
+                match rejected.next_if(|(rejected_index, _)| *rejected_index == index) {
+                    Some((_, original)) => registered.push(RegisteredBlock::Duplicate {
+                        canonical: block,
+                        original,
+                    }),
+                    None => registered.push(RegisteredBlock::Fresh(block)),
+                }
+            }
+        });
+        Ok(registered)
+    }
+
     fn register_verified_blocks(&self, blocks: Vec<CompleteBlock<T>>) -> Vec<ImmutableBlock<T>> {
         let mut registered = Vec::with_capacity(blocks.len());
+        Self::for_each_chunk(blocks, |chunk| {
+            let (inners, rejected) = self.register_verified_chunk(chunk);
+            drop(rejected);
+            registered.extend(inners.into_iter().map(ImmutableBlock::from_inner));
+        });
+        registered
+    }
+
+    fn for_each_chunk(blocks: Vec<CompleteBlock<T>>, mut f: impl FnMut(Vec<CompleteBlock<T>>)) {
         if blocks.len() <= REGISTER_CHUNK_BLOCKS {
-            self.register_verified_chunk(blocks, &mut registered);
-            return registered;
+            f(blocks);
+            return;
         }
         let mut blocks = blocks.into_iter();
         loop {
             let chunk: Vec<_> = blocks.by_ref().take(REGISTER_CHUNK_BLOCKS).collect();
             if chunk.is_empty() {
-                return registered;
+                return;
             }
-            self.register_verified_chunk(chunk, &mut registered);
+            f(chunk);
         }
     }
 
     fn register_verified_chunk(
         &self,
         blocks: Vec<CompleteBlock<T>>,
-        registered: &mut Vec<ImmutableBlock<T>>,
-    ) {
+    ) -> crate::pools::store::RegisteredChunk<T> {
         if blocks.is_empty() {
-            return;
+            return (Vec::new(), Vec::new());
         }
         let handles: Vec<_> = blocks
             .iter()
@@ -462,12 +536,8 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
                     .register_sequence_hash(block.sequence_hash())
             })
             .collect();
-        registered.extend(
-            self.store
-                .register_blocks(blocks, handles, self.duplication_policy)
-                .into_iter()
-                .map(ImmutableBlock::from_inner),
-        );
+        self.store
+            .register_blocks(blocks, handles, self.duplication_policy)
     }
 
     fn register_verified_block(&self, block: CompleteBlock<T>) -> ImmutableBlock<T> {

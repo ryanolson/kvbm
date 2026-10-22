@@ -414,6 +414,13 @@ pub(crate) struct BlockStoreInner<T: BlockMetadata> {
 
 /// Single-mutex bookkeeping store for the reset, active, and inactive
 /// pools.
+/// Registrations of one [`BlockStore::register_blocks`] call, in input order,
+/// and the rejected inputs with their input index.
+pub(crate) type RegisteredChunk<T> = (
+    Vec<Arc<ImmutableBlockInner<T>>>,
+    Vec<(usize, CompleteBlock<T>)>,
+);
+
 pub(crate) struct BlockStore<T: BlockMetadata> {
     /// Stable, process-unique store identifier. Surfaced through
     /// `LifecyclePin::manager_id` so type-erased pins remain
@@ -1334,19 +1341,24 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
     /// sees the first's `active_by_hash` update and is registered as a
     /// duplicate (or rejected), exactly as if the two had been registered
     /// one at a time.
+    ///
+    /// The second result holds each input that `Reject` returned to its
+    /// existing primary, with its input index, re-armed: dropping it returns
+    /// the slot to the reset pool. A caller that cannot free the slot yet
+    /// keeps it.
     pub(crate) fn register_blocks(
         self: &Arc<Self>,
         mut blocks: Vec<CompleteBlock<T>>,
         handles: Vec<BlockRegistrationHandle>,
         policy: BlockDuplicationPolicy,
-    ) -> Vec<Arc<ImmutableBlockInner<T>>> {
+    ) -> RegisteredChunk<T> {
         assert_eq!(
             blocks.len(),
             handles.len(),
             "register_blocks: blocks/handles length mismatch"
         );
         if blocks.is_empty() {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
 
         // Validate every block/handle pair *before* mutating any guard
@@ -1451,17 +1463,18 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
             h.mark_present::<T>();
         }
 
-        // Guard drops here, same semantics as the single-item path:
-        // armed=false on Allow/fresh (slot already transitioned),
-        // armed=true on Reject (releases Staged → Reset).
+        // Allow/fresh guards are disarmed (the slot already transitioned)
+        // and drop here. Reject guards are re-armed and go back to the
+        // caller, whose drop releases Staged → Reset.
+        let mut rejected = Vec::new();
         for (i, mut block) in blocks.into_iter().enumerate() {
             if rearm[i] {
                 block.rearm();
+                rejected.push((i, block));
             }
-            drop(block);
         }
 
-        results
+        (results, rejected)
     }
 
     /// Transition a slot into a new inactive residency tenure.
