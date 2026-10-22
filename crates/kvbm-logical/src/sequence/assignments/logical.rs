@@ -276,6 +276,11 @@ impl<T: BlockMetadata> LogicalBlockAssignments<T> {
         self.store.take_staged()
     }
 
+    /// Takes up to `max_blocks` staged blocks, in staging order.
+    pub fn take_staged_prefix(&mut self, max_blocks: usize) -> Vec<(BlockId, CompleteBlock<T>)> {
+        self.store.drain_staged_prefix(max_blocks)
+    }
+
     /// Takes all unassigned blocks, returning them as a `Vec`.
     pub fn take_unassigned(&mut self) -> Vec<(BlockId, MutableBlock<T>)> {
         self.store.take_unassigned()

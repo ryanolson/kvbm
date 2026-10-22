@@ -161,6 +161,13 @@ impl<U, S, A> BlockStore<U, S, A> {
         self.staged.drain(..).collect()
     }
 
+    /// Drains the first `min(n, staged.len())` entries from staged in FIFO
+    /// order, returning them as a `Vec`.
+    pub fn drain_staged_prefix(&mut self, n: usize) -> Vec<(BlockId, S)> {
+        let n = n.min(self.staged.len());
+        self.staged.drain(..n).collect()
+    }
+
     /// Drains the first `min(n, unassigned.len())` entries from unassigned in
     /// FIFO order, returning them as a `Vec`. O(len) total (a single prefix
     /// shift), versus O(n · len) for an n-element loop of

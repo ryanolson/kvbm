@@ -381,12 +381,12 @@ impl<T: BlockMetadata> RequestSequence<T> {
     /// [`page_indices`](Self::page_indices), but this sequence no longer keeps
     /// their `ImmutableBlock` guards alive. The caller becomes responsible for
     /// the returned guards' strong/weak/null lifecycle.
-    /// Takes the staged blocks out, in order, to register them elsewhere,
-    /// for example on another thread. Their block IDs stay in
+    /// Takes up to `max_blocks` staged blocks, in order, to register them
+    /// elsewhere, for example on another thread. Their block IDs stay in
     /// [`page_indices`](Self::page_indices) until
     /// [`install_registered`](Self::install_registered).
-    pub fn take_staged_for_registration(&mut self) -> Vec<CompleteBlock<T>> {
-        let staged = self.assignments.take_staged();
+    pub fn take_staged_for_registration(&mut self, max_blocks: usize) -> Vec<CompleteBlock<T>> {
+        let staged = self.assignments.take_staged_prefix(max_blocks);
         self.registering.extend(
             staged
                 .iter()
@@ -1435,7 +1435,7 @@ mod tests {
     }
 
     #[test]
-    fn take_and_install_equals_register_staged() {
+    fn bounded_take_and_install_equals_register_staged() {
         let inline_manager = create_test_manager::<TestMeta>(16);
         let mut inline = staged_sequence(&inline_manager);
         inline.register_staged(&inline_manager);
@@ -1443,15 +1443,23 @@ mod tests {
         let manager = create_test_manager::<TestMeta>(16);
         let mut seq = staged_sequence(&manager);
         let before = seq.page_indices();
-        let taken = seq.take_staged_for_registration();
-        assert_eq!(taken.len(), 3);
-        assert_eq!(seq.registering_blocks(), 3);
+        let taken = seq.take_staged_for_registration(2);
+        assert_eq!(taken.len(), 2);
+        assert_eq!(seq.registering_blocks(), 2);
         assert_eq!(seq.page_indices(), before);
         let results = manager
             .register_blocks_deferred(taken)
             .unwrap_or_else(|_| panic!("same-store batch"));
         assert!(seq.install_registered(results).is_empty());
         assert_eq!(seq.registering_blocks(), 0);
+        assert_eq!(seq.assigned_blocks(), 2);
+
+        let taken = seq.take_staged_for_registration(2);
+        assert_eq!(taken.len(), 1);
+        let results = manager
+            .register_blocks_deferred(taken)
+            .unwrap_or_else(|_| panic!("same-store batch"));
+        assert!(seq.install_registered(results).is_empty());
         assert_eq!(seq.page_indices(), inline.page_indices());
         assert_eq!(seq.assigned_blocks(), inline.assigned_blocks());
     }
@@ -1469,7 +1477,7 @@ mod tests {
         let mut first = staged_sequence(&manager);
         first.register_staged(&manager);
         let mut second = staged_sequence(&manager);
-        let taken = second.take_staged_for_registration();
+        let taken = second.take_staged_for_registration(usize::MAX);
         let original_ids: Vec<_> = taken.iter().map(CompleteBlock::block_id).collect();
         let results = manager
             .register_blocks_deferred(taken)
