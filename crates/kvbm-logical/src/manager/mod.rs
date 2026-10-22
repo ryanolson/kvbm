@@ -503,14 +503,10 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
         }
     }
 
-    #[allow(clippy::type_complexity)]
     fn register_verified_chunk(
         &self,
         blocks: Vec<CompleteBlock<T>>,
-    ) -> (
-        Vec<Arc<crate::blocks::ImmutableBlockInner<T>>>,
-        Vec<(usize, CompleteBlock<T>)>,
-    ) {
+    ) -> crate::pools::store::RegisteredChunk<T> {
         if blocks.is_empty() {
             return (Vec::new(), Vec::new());
         }

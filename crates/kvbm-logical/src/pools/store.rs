@@ -414,6 +414,13 @@ pub(crate) struct BlockStoreInner<T: BlockMetadata> {
 
 /// Single-mutex bookkeeping store for the reset, active, and inactive
 /// pools.
+/// Registrations of one [`BlockStore::register_blocks`] call, in input order,
+/// and the rejected inputs with their input index.
+pub(crate) type RegisteredChunk<T> = (
+    Vec<Arc<ImmutableBlockInner<T>>>,
+    Vec<(usize, CompleteBlock<T>)>,
+);
+
 pub(crate) struct BlockStore<T: BlockMetadata> {
     /// Stable, process-unique store identifier. Surfaced through
     /// `LifecyclePin::manager_id` so type-erased pins remain
@@ -1344,10 +1351,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         mut blocks: Vec<CompleteBlock<T>>,
         handles: Vec<BlockRegistrationHandle>,
         policy: BlockDuplicationPolicy,
-    ) -> (
-        Vec<Arc<ImmutableBlockInner<T>>>,
-        Vec<(usize, CompleteBlock<T>)>,
-    ) {
+    ) -> RegisteredChunk<T> {
         assert_eq!(
             blocks.len(),
             handles.len(),
