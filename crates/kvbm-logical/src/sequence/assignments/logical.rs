@@ -238,8 +238,8 @@ impl<T: BlockMetadata> LogicalBlockAssignments<T> {
         Ok(to_stage)
     }
 
-    /// Takes all staged blocks (FIFO order), registering each with the block
-    /// manager and moving them to assigned.
+    /// Takes all staged blocks (FIFO order), registers them with the block
+    /// manager as one batch, and moves them to assigned.
     ///
     /// Returns the number of blocks registered.
     pub fn register(&mut self, manager: &BlockManager<T>) -> usize {
@@ -248,8 +248,8 @@ impl<T: BlockMetadata> LogicalBlockAssignments<T> {
         // Drain the whole batch up front (O(len) once) instead of shifting
         // one element at a time (O(count * len) — see `BlockStore`'s "Batch
         // Drain" doc comment).
-        for (block_id, complete) in self.store.drain_staged() {
-            let immutable = manager.register_block(complete);
+        let (block_ids, staged): (Vec<_>, Vec<_>) = self.store.drain_staged().into_iter().unzip();
+        for (block_id, immutable) in block_ids.into_iter().zip(manager.register_blocks(staged)) {
             self.store.insert_assigned(block_id, immutable);
         }
 
