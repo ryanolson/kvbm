@@ -39,7 +39,7 @@ fn stage(
         .expect("allocate")
         .into_iter()
         .zip(sequence.blocks())
-        .map(|(block, token_block)| block.complete(token_block).ok().expect("stage"))
+        .map(|(block, token_block)| block.complete(token_block).expect("stage"))
         .collect()
 }
 
