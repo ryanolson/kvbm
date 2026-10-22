@@ -216,7 +216,7 @@ impl BlockRegistrationHandle {
     pub(crate) fn mark_present<T: BlockMetadata>(&self) {
         let type_id = TypeId::of::<T>();
         let mut attachments = self.inner.attachments.lock();
-        *attachments.presence_markers.entry(type_id).or_insert(0) += 1;
+        attachments.presence_markers.increment(type_id);
     }
 
     /// Decrement the physical-residency marker for tier `T`. Each
@@ -227,16 +227,8 @@ impl BlockRegistrationHandle {
     pub(crate) fn mark_absent<T: BlockMetadata>(&self) {
         let type_id = TypeId::of::<T>();
         let mut attachments = self.inner.attachments.lock();
-        match attachments.presence_markers.get_mut(&type_id) {
-            Some(count) => {
-                debug_assert!(*count > 0, "mark_absent on zero-count presence marker");
-                *count -= 1;
-                if *count == 0 {
-                    attachments.presence_markers.remove(&type_id);
-                }
-            }
-            None => debug_assert!(false, "mark_absent with no presence marker present"),
-        }
+        let had_marker = attachments.presence_markers.decrement(type_id);
+        debug_assert!(had_marker, "mark_absent with no presence marker present");
     }
 
     /// Returns `true` if a physical registered slot exists for this sequence
@@ -256,12 +248,7 @@ impl BlockRegistrationHandle {
     pub fn has_block<T: BlockMetadata>(&self) -> bool {
         let type_id = TypeId::of::<T>();
         let attachments = self.inner.attachments.lock();
-        attachments
-            .presence_markers
-            .get(&type_id)
-            .copied()
-            .unwrap_or(0)
-            > 0
+        attachments.presence_markers.count(type_id) > 0
     }
 
     /// Returns `true` if physical registered residency exists for at least
@@ -269,14 +256,9 @@ impl BlockRegistrationHandle {
     /// availability.
     pub fn has_any_block(&self, type_ids: &[TypeId]) -> bool {
         let attachments = self.inner.attachments.lock();
-        type_ids.iter().any(|type_id| {
-            attachments
-                .presence_markers
-                .get(type_id)
-                .copied()
-                .unwrap_or(0)
-                > 0
-        })
+        type_ids
+            .iter()
+            .any(|type_id| attachments.presence_markers.count(*type_id) > 0)
     }
 
     /// Register a callback to be invoked when this handle is touched.

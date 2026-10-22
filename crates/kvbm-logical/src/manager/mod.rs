@@ -41,6 +41,11 @@ use inactive_lineage_hold::EvictionNotifier;
 /// Manages the full block lifecycle over the unified [`BlockStore`].
 ///
 /// Construct via [`BlockManager::builder()`].
+/// Most blocks that one store-lock hold registers. A larger batch takes the
+/// lock once for each chunk, so a long prefill cannot block allocation or
+/// match for the whole batch.
+pub const REGISTER_CHUNK_BLOCKS: usize = 1024;
+
 pub struct BlockManager<T: BlockMetadata> {
     pub(crate) store: Arc<BlockStore<T>>,
     pub(crate) block_registry: BlockRegistry,
@@ -394,16 +399,11 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
     /// [`try_register_blocks`](Self::try_register_blocks) for a recoverable
     /// foreign-store rejection.
     pub fn register_block(&self, block: CompleteBlock<T>) -> ImmutableBlock<T> {
-        self.try_register_blocks(vec![block])
-            .unwrap_or_else(|error| {
-                panic!(
-                    "BlockManager::register_block received {} block from another manager",
-                    error.block_count()
-                )
-            })
-            .into_iter()
-            .next()
-            .expect("one completed block registers to one immutable block")
+        assert!(
+            block.is_from_store(&self.store),
+            "BlockManager::register_block received 1 block from another manager"
+        );
+        self.register_verified_block(block)
     }
 
     /// Register completed blocks after an all-or-nothing store-provenance
@@ -411,8 +411,15 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
     ///
     /// If any block belongs to another manager, this method returns every
     /// input block unchanged. It does not register a hash, touch a metric, or
-    /// change either store. A successful call preserves the existing
-    /// per-block registration behavior.
+    /// change either store.
+    ///
+    /// A successful call gives the same result as [`register_block`] for each
+    /// block in input order: output `i` is the registration of input `i`, a
+    /// hash repeated in the batch sees the earlier entry, and each new
+    /// canonical hash publishes one `Create` event. The store lock is taken
+    /// once for each chunk of at most [`REGISTER_CHUNK_BLOCKS`] blocks.
+    ///
+    /// [`register_block`]: Self::register_block
     pub fn try_register_blocks(
         &self,
         blocks: Vec<CompleteBlock<T>>,
@@ -420,11 +427,47 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
         if blocks.iter().any(|block| !block.is_from_store(&self.store)) {
             return Err(BlockRegistrationError::foreign_store(blocks));
         }
+        Ok(self.register_verified_blocks(blocks))
+    }
 
-        Ok(blocks
-            .into_iter()
-            .map(|block| self.register_verified_block(block))
-            .collect())
+    fn register_verified_blocks(&self, blocks: Vec<CompleteBlock<T>>) -> Vec<ImmutableBlock<T>> {
+        let mut registered = Vec::with_capacity(blocks.len());
+        if blocks.len() <= REGISTER_CHUNK_BLOCKS {
+            self.register_verified_chunk(blocks, &mut registered);
+            return registered;
+        }
+        let mut blocks = blocks.into_iter();
+        loop {
+            let chunk: Vec<_> = blocks.by_ref().take(REGISTER_CHUNK_BLOCKS).collect();
+            if chunk.is_empty() {
+                return registered;
+            }
+            self.register_verified_chunk(chunk, &mut registered);
+        }
+    }
+
+    fn register_verified_chunk(
+        &self,
+        blocks: Vec<CompleteBlock<T>>,
+        registered: &mut Vec<ImmutableBlock<T>>,
+    ) {
+        if blocks.is_empty() {
+            return;
+        }
+        let handles: Vec<_> = blocks
+            .iter()
+            .map(|block| {
+                self.metrics.inc_registrations();
+                self.block_registry
+                    .register_sequence_hash(block.sequence_hash())
+            })
+            .collect();
+        registered.extend(
+            self.store
+                .register_blocks(blocks, handles, self.duplication_policy)
+                .into_iter()
+                .map(ImmutableBlock::from_inner),
+        );
     }
 
     fn register_verified_block(&self, block: CompleteBlock<T>) -> ImmutableBlock<T> {
