@@ -21,6 +21,7 @@ use axum::{
 };
 use dynamo_kv_router::carrier_feed::{CARRIER_FEED_TOPIC, encode_snapshot};
 use futures::future::BoxFuture;
+use kvbm_logical::events::CreateKind;
 use kvbm_protocols::cache_manifest::RegistrationEpoch;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::task::JoinHandle;
@@ -51,6 +52,7 @@ const DEFAULT_BUNDLE_LEASE_TTL_MS: u64 = 30_000;
 pub struct IndexerManager {
     indexes: Arc<ManifestIndexes>,
     bundle_directory: Arc<BundleDirectory>,
+    required_kind: Option<CreateKind>,
     /// ZMQ bind spec (e.g. `tcp://0.0.0.0:0`).
     zmq_bind: String,
     /// Carrier-feed PUB bind spec (e.g. `tcp://0.0.0.0:0`).
@@ -113,6 +115,7 @@ impl IndexerManager {
         Ok(Self {
             indexes,
             bundle_directory: Arc::new(BundleDirectory::new(DEFAULT_BUNDLE_LEASE_TTL_MS)),
+            required_kind: None,
             zmq_bind: zmq_bind.unwrap_or_else(|| "tcp://0.0.0.0:0".to_string()),
             feed_bind: "tcp://0.0.0.0:0".to_string(),
             event_plane: EventPlane::Zmq,
@@ -128,6 +131,13 @@ impl IndexerManager {
             feed_counters: Arc::new(FeedCounters::default()),
             instances,
         })
+    }
+
+    /// Accept only publishers that register with this create kind.
+    #[must_use]
+    pub fn with_required_kind(mut self, kind: CreateKind) -> Self {
+        self.required_kind = Some(kind);
+        self
     }
 
     /// Sets the carrier-feed ZMQ PUB bind spec.
@@ -301,6 +311,7 @@ impl IndexerManager {
             } else {
                 String::new()
             },
+            required_kind: self.required_kind,
             nats_subject_prefix: if self.event_plane == EventPlane::Nats {
                 self.nats_subject_prefix.clone()
             } else {
@@ -497,6 +508,14 @@ impl FeatureManager for IndexerManager {
         Box::pin(async move {
             match feature {
                 Feature::Indexer(cfg) => {
+                    if let Some(required) = self.required_kind
+                        && cfg.create_kind != required
+                    {
+                        return Err(FeatureError::InvalidConfig(format!(
+                            "indexer binding: this hub accepts {required:?} publishers only, got {:?}",
+                            cfg.create_kind
+                        )));
+                    }
                     self.indexes
                         .bind(
                             instance_id.as_u128(),

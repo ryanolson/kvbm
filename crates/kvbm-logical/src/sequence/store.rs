@@ -89,6 +89,13 @@ impl<U, S, A> BlockStore<U, S, A> {
         self.assigned.get_index(index)
     }
 
+    pub fn replace_assigned_key(&mut self, index: usize, replacement: BlockId) -> Option<BlockId> {
+        let (key, value) = self.assigned.shift_remove_index(index)?;
+        let previous = key;
+        self.assigned.shift_insert(index, replacement, value);
+        Some(previous)
+    }
+
     /// Returns the staged entry at the given index (staging order).
     pub fn get_staged(&self, index: usize) -> Option<(&BlockId, &S)> {
         self.staged.get_index(index)

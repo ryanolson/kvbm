@@ -69,6 +69,8 @@ pub(crate) enum ExactAllocationError {
     VictimCountMismatch { needed: usize, supplied: usize },
     /// The slot still exists, but its inactive hash or generation differs.
     StaleVictim { block_id: BlockId },
+    /// An exact victim is outside the current allocation ceiling.
+    FencedVictim { block_id: BlockId },
     /// The requested slot is no longer inactive.
     ActiveVictim { block_id: BlockId },
     /// The reset-pool snapshot changed before the transaction began.
@@ -114,6 +116,12 @@ impl fmt::Display for ExactAllocationError {
             }
             Self::StaleVictim { block_id } => {
                 write!(f, "victim slot {block_id} has a stale identity")
+            }
+            Self::FencedVictim { block_id } => {
+                write!(
+                    f,
+                    "victim slot {block_id} is outside the allocation ceiling"
+                )
             }
             Self::ActiveVictim { block_id } => {
                 write!(f, "victim slot {block_id} is not inactive")

@@ -33,12 +33,14 @@
 //! bounded by a watchdog.
 //!
 //! Every await after the session is parked is unblockable by session
-//! teardown: the attach is followed by a claimed-check (a release that fires
-//! before attach completes closes the session immediately after the store
-//! AND resolves any kick USAA latched in the meantime — the release itself
-//! found nothing parked and skipped the gate, so that action would otherwise
-//! never reach its terminal), the commit/availability drains end on the
-//! session close terminators, and
+//! teardown: the attach is followed by a claimed-check (an evict or
+//! re-dispatch teardown that fires before attach completes closes the session
+//! immediately after the store AND resolves any kick USAA latched in the
+//! meantime — the teardown found nothing parked and skipped the gate, so that
+//! action would otherwise never reach its terminal; the connector's RAII
+//! release instead waits for the park, so a request that finishes
+//! before the attach still delivers its output), the commit/availability
+//! drains end on the session close terminators, and
 //! an in-flight `session.pull` fails via the pending-pull drain —
 //! `VeloSession` guarantees the last two by construction and `MockSession`
 //! models them. The two pre-attach awaits (`PeerResolver::resolve_and_register`
@@ -239,6 +241,9 @@ impl LocalConnectorEngine {
                     format!("prefill pipeline failed: {e:#}"),
                 );
             }
+            if task_state.end_release_deferral() {
+                task_engine.prefill_release(&task_rid, task_state.accept_id());
+            }
         });
 
         Ok(PrefillAcceptCore::Accepted {
@@ -402,8 +407,24 @@ impl LocalConnectorEngine {
         ))
     }
 
-    /// `release_prefill_session` body — the RAII teardown target. Generation-
-    /// guarded: an `accept_id` mismatch means the map holds a FRESH lifecycle
+    /// The connector's RAII release (`release_prefill_session`). A request
+    /// can finish before its pipeline attaches, for example a one-token
+    /// prefill with no provided window. Its output must still reach the
+    /// decode peer, so the release waits for the park instead of claiming
+    /// cleanup before it.
+    pub(super) fn prefill_release_after_park(&self, request_id: &RequestId, accept_id: AcceptId) {
+        let deferred = self
+            .cd
+            .as_ref()
+            .and_then(|cd| cd.prefill.get(request_id))
+            .is_some_and(|state| state.accept_id() == accept_id && state.defer_release());
+        if !deferred {
+            self.prefill_release(request_id, accept_id);
+        }
+    }
+
+    /// The teardown body behind [`Self::prefill_release_after_park`], evict and
+    /// re-dispatch. Generation-guarded: an `accept_id` mismatch means the map holds a FRESH lifecycle
     /// a stale handle drop must not touch. The cleanup-claim CAS winner owns
     /// the session decision — close while the pipeline is incomplete (this
     /// unblocks every pipeline await) or failed; for a completed unfailed
@@ -570,6 +591,15 @@ impl LocalConnectorEngine {
 
         let expected = state.expected_hashes().to_vec();
         let expected_count = expected.len();
+        // A zero window has nothing to pull. Mark it complete before a
+        // deferred release runs, so that release finalizes after the output
+        // drain instead of closing the session.
+        if expected_count == 0 {
+            state.mark_pulls_complete();
+        }
+        if state.end_release_deferral() {
+            self.prefill_release(&request_id, state.accept_id());
+        }
         if expected_count > 0 {
             let expected_set: HashSet<SequenceHash> = expected.iter().copied().collect();
 

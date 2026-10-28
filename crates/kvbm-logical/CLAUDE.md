@@ -50,10 +50,10 @@ The type parameter `T: BlockMetadata` is a marker for the storage tier (G1=GPU, 
 - **`blocks/`** — RAII guard types for each lifecycle state. All guards auto-return blocks to the correct pool on drop.
 - **`registry/`** — `BlockRegistry`: Tracks registered blocks by `SequenceHash` in a `PositionalRadixTree`. Supports typed attachments, presence markers, and touch callbacks. Optional TinyLFU frequency tracking.
 - **`pools/`** — Three-tier pool system:
-  - `ResetPool<T>`: Free blocks (FIFO)
+  - `ResetPool<T>`: Eligible free blocks (lowest-ID first) and fenced reset blocks outside the allocation ceiling
   - `ActivePool<T>`: In-use registered blocks
   - `InactivePool<T>`: Cached evictable blocks with pluggable backends
-- **`pools/inactive/backends/`** — Eviction strategies implementing `InactivePoolBackend<T>`: `HashMapBackend`, `LruBackend`, `MultiLruBackend` (4-tier frequency-aware), `LineageBackend` (parent-chain aware).
+- **`pools/inactive/backends/`** — Eviction strategies implementing `InactiveIndex`: `HashMapBackend`, `LruBackend`, `MultiLruBackend` (4-tier frequency-aware), `LineageBackend` (parent-chain aware).
 - **`events/`** — Block event pipeline with configurable emission policies, batching, and broadcast channels.
 - **`metrics/`** — Prometheus metrics with atomic counters (`BlockPoolMetrics`) and optional periodic sampling (`StatsCollector`).
 - **`tinylfu.rs`** — Count-Min Sketch frequency tracker (4 hash functions, configurable decay).
@@ -62,6 +62,8 @@ The type parameter `T: BlockMetadata` is a marker for the storage tier (G1=GPU, 
 ### Key Design Decisions
 
 - **Synchronous core with interior mutability**: Pool operations use `parking_lot` locks, no async channels. RAII returns execute inline.
+- **Allocation ceiling and rebind**: An allocation ceiling splits reset blocks into allocatable and fenced sets. Inactive plans preserve the source eviction position. Live plans move a held primary or duplicate in place. Clones, pins, and weak references then report the destination ID.
+  Use `BlockManager::live_blocks_from` to find live tail blocks for a shrink.
 - **Registry uses weak references**: `PositionalRadixTree<Weak<BlockRegistrationHandleInner>>`. Entries auto-clean when all strong refs drop.
 - **Attachment system**: Extensible typed metadata on `BlockRegistrationHandle` via `attach_unique<T>()`/`attach<T>()` — no struct modification needed.
 - **`docs/advancements.md`** contains the detailed design doc comparing v1 vs kvbm-logical architecture.

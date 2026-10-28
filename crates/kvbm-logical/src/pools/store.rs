@@ -8,7 +8,9 @@
 //! metadata tier. The unified mutex protects:
 //!
 //! - `slots: Vec<BlockSlot<T>>` — source of truth for every slot's state.
-//! - `free: BTreeSet<BlockId>` — reset pool in ascending index order.
+//! - `free: BTreeSet<BlockId>` — allocation-eligible reset slots in ascending
+//!   index order.
+//! - `fenced: BTreeSet<BlockId>` — reset slots at or above the allocation ceiling.
 //! - `inactive: Box<dyn InactiveIndex>` — pluggable eviction-order index
 //!   over slots in `Inactive` state.
 //! - `active_by_hash: SeqHashMap<BlockId>` — primary block_id for each
@@ -23,7 +25,7 @@
 //! `BlockRegistrationHandle.attachments` (Mutex inside the registry) →
 //! `BlockStore.inner` (Mutex). Never the reverse.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::{Arc, Weak};
 
 // Under `#[cfg(test)]` use `tracing-mutex`'s parking_lot wrapper, which
@@ -54,9 +56,13 @@ use super::{ExactInactiveVictim, SeqHashMap};
 mod exact_inactive;
 mod exact_reclaim;
 mod inactive_lineage_hold;
+mod rebind;
+#[cfg(test)]
+mod rebind_proptest;
 
 pub(crate) use exact_reclaim::ExactReclaimPlanError;
 pub(crate) use inactive_lineage_hold::StoreInactiveLineageHold;
+pub use rebind::{RebindOutcome, RebindPlan, RebindPrepareError};
 
 /// Index trait for inactive-pool eviction backends. T-free: backends only
 /// need `(SequenceHash, BlockId)` pairs.
@@ -92,6 +98,10 @@ pub(crate) trait InactiveIndex: Send + Sync {
     /// Make `block_id` evictable under `seq_hash`.
     fn insert(&mut self, seq_hash: SequenceHash, block_id: BlockId);
 
+    /// Replace an inactive slot's physical id without changing its policy position.
+    /// Returns false without mutation when `(seq_hash, src)` is absent.
+    fn rebind(&mut self, seq_hash: SequenceHash, src: BlockId, dst: BlockId) -> bool;
+
     fn len(&self) -> usize;
 
     #[allow(dead_code)]
@@ -116,6 +126,22 @@ pub(crate) trait InactiveIndex: Send + Sync {
     /// Remove a specific `block_id`/`seq_hash` pair if present.
     #[allow(dead_code)]
     fn take(&mut self, seq_hash: SequenceHash, block_id: BlockId) -> bool;
+
+    /// Remove the exact pair and every real inactive descendant.
+    ///
+    /// Returned pairs are ordered leaf-to-root, with the named block last.
+    /// An empty vector means that the exact pair was absent.
+    fn take_with_descendants(
+        &mut self,
+        seq_hash: SequenceHash,
+        block_id: BlockId,
+    ) -> Vec<(SequenceHash, BlockId)> {
+        if self.take(seq_hash, block_id) {
+            vec![(seq_hash, block_id)]
+        } else {
+            Vec::new()
+        }
+    }
 
     /// Atomically remove the complete real lineage from root through the
     /// exact inactive leaf. Backends without lineage data return `None`.
@@ -348,6 +374,10 @@ pub(crate) struct BlockStoreInner<T: BlockMetadata> {
     slots: Vec<BlockSlot<T>>,
     /// Reset blocks in ascending index order.
     free: BTreeSet<BlockId>,
+    /// Reset blocks fenced off from allocation by the current ceiling.
+    fenced: BTreeSet<BlockId>,
+    /// Optional allocation ceiling, clamped to the current capacity.
+    fence: Option<usize>,
     /// Inactive eviction index (T-free).
     inactive: Box<dyn InactiveIndex>,
     /// Primary `block_id` for each currently-registered sequence hash.
@@ -384,6 +414,13 @@ pub(crate) struct BlockStoreInner<T: BlockMetadata> {
 
 /// Single-mutex bookkeeping store for the reset, active, and inactive
 /// pools.
+/// Registrations of one [`BlockStore::register_blocks`] call, in input order,
+/// and the rejected inputs with their input index.
+pub(crate) type RegisteredChunk<T> = (
+    Vec<Arc<ImmutableBlockInner<T>>>,
+    Vec<(usize, CompleteBlock<T>)>,
+);
+
 pub(crate) struct BlockStore<T: BlockMetadata> {
     /// Stable, process-unique store identifier. Surfaced through
     /// `LifecyclePin::manager_id` so type-erased pins remain
@@ -476,7 +513,6 @@ enum SlotIdentityMatch {
 /// "unresolved" — not yet released inline and not yet swept into the
 /// deferred/external set. See [`BlockStore::release_entry_at`].
 struct ReleaseEntry<T: BlockMetadata> {
-    block_id: BlockId,
     self_ptr: *const (),
     arc: Option<Arc<ImmutableBlockInner<T>>>,
 }
@@ -493,27 +529,30 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
     ) -> Arc<Self> {
         let mut slots = Vec::with_capacity(total_blocks);
         let mut free = BTreeSet::new();
-        for i in 0..total_blocks {
+        for id in 0..total_blocks {
             slots.push(BlockSlot {
                 block_size,
                 generation: 0,
                 inactive_epoch: 0,
                 state: SlotState::Reset,
             });
-            free.insert(i);
+            free.insert(id);
         }
         let reset_on_release = vec![default_reset_on_release; total_blocks];
+        let inner = BlockStoreInner {
+            capacity: total_blocks,
+            slots,
+            free,
+            fenced: BTreeSet::new(),
+            fence: None,
+            inactive,
+            active_by_hash: SeqHashMap::default(),
+            held_by_hash: SeqHashMap::default(),
+            reset_on_release,
+        };
         Arc::new(Self {
             id: crate::ManagerId::next(),
-            inner: Mutex::new(BlockStoreInner {
-                capacity: total_blocks,
-                slots,
-                free,
-                inactive,
-                active_by_hash: SeqHashMap::default(),
-                held_by_hash: SeqHashMap::default(),
-                reset_on_release,
-            }),
+            inner: Mutex::new(inner),
             block_size,
             total_blocks: maximum_blocks,
             metrics,
@@ -533,15 +572,24 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         self.default_reset_on_release
     }
 
-    /// Set the per-block "reset on last drop" override for `block_id`.
-    /// Backs [`crate::blocks::ImmutableBlock::set_evict_on_reset`].
-    ///
-    /// Acquires the store mutex so the write is published to any future
-    /// mutex acquirer through release-acquire on the mutex itself —
-    /// the per-slot value lives inside `BlockStoreInner` and is only
-    /// read under that same mutex.
     pub(crate) fn store_reset_on_release(&self, block_id: BlockId, value: bool) {
-        self.inner.lock().reset_on_release[block_id] = value;
+        let mut inner = self.inner.lock();
+        inner.reset_on_release[block_id] = value;
+    }
+
+    pub(crate) fn store_reset_on_release_inner(&self, block: &ImmutableBlockInner<T>, value: bool) {
+        let mut inner = self.inner.lock();
+        let block_id = block.block_id();
+        let self_ptr = block as *const ImmutableBlockInner<T> as *const ();
+        let matches = match &inner.slots[block_id].state {
+            SlotState::Primary { inner: weak, .. } | SlotState::Duplicate { inner: weak, .. } => {
+                weak.as_ptr() as *const () == self_ptr
+            }
+            _ => false,
+        };
+        if matches {
+            inner.reset_on_release[block_id] = value;
+        }
     }
 
     /// Stable, process-unique identifier of this store. See
@@ -584,7 +632,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
 
     pub(crate) fn occupied_blocks(&self) -> usize {
         let inner = self.inner.lock();
-        inner.capacity - inner.free.len()
+        inner.capacity - inner.free.len() - inner.fenced.len()
     }
 
     fn high_water(inner: &BlockStoreInner<T>) -> usize {
@@ -621,27 +669,61 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         let previous = inner.capacity;
         if capacity < previous {
             inner.free.retain(|id| *id < capacity);
+            inner.fenced.retain(|id| *id < capacity);
             self.metrics
                 .dec_reset_pool_size_by((previous - capacity) as i64);
-        } else {
-            if capacity > inner.slots.len() {
-                inner.slots.resize_with(capacity, || BlockSlot {
-                    block_size: self.block_size,
-                    generation: 0,
-                    inactive_epoch: 0,
-                    state: SlotState::Reset,
-                });
-                inner
-                    .reset_on_release
-                    .resize(capacity, self.default_reset_on_release);
-                inner.inactive.grow_capacity(capacity);
+        } else if capacity > previous && capacity > inner.slots.len() {
+            inner.slots.resize_with(capacity, || BlockSlot {
+                block_size: self.block_size,
+                generation: 0,
+                inactive_epoch: 0,
+                state: SlotState::Reset,
+            });
+            inner
+                .reset_on_release
+                .resize(capacity, self.default_reset_on_release);
+            inner.inactive.grow_capacity(capacity);
+        }
+        inner.capacity = capacity;
+        if capacity > previous {
+            for id in previous..capacity {
+                push_reset_id_locked(&mut inner, id);
             }
-            inner.free.extend(previous..capacity);
             self.metrics
                 .inc_reset_pool_size_by((capacity - previous) as i64);
         }
-        inner.capacity = capacity;
+        let reset_ids: Vec<_> = inner.free.union(&inner.fenced).copied().collect();
+        inner.free.clear();
+        inner.fenced.clear();
+        for id in reset_ids {
+            push_reset_id_locked(&mut inner, id);
+        }
         Ok(())
+    }
+
+    pub(crate) fn set_allocation_ceiling(&self, fence: Option<usize>) -> Result<(), String> {
+        let mut inner = self.inner.lock();
+        if let Some(fence) = fence
+            && fence > inner.capacity
+        {
+            return Err(format!(
+                "allocation ceiling {fence} exceeds block capacity {}",
+                inner.capacity
+            ));
+        }
+        inner.fence = fence;
+        let reset_ids: Vec<_> = inner.free.union(&inner.fenced).copied().collect();
+        inner.free.clear();
+        inner.fenced.clear();
+        for id in reset_ids {
+            push_reset_id_locked(&mut inner, id);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn allocation_ceiling(&self) -> usize {
+        let inner = self.inner.lock();
+        effective_ceiling(&inner)
     }
 
     pub(crate) fn metrics(&self) -> &Arc<BlockPoolMetrics> {
@@ -649,17 +731,15 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
     }
 
     pub(crate) fn reset_len(&self) -> usize {
-        self.inner.lock().free.len()
+        let inner = self.inner.lock();
+        inner.free.len() + inner.fenced.len()
     }
 
     pub(crate) fn inactive_len(&self) -> usize {
         self.inner.lock().inactive.len()
     }
 
-    /// Atomic snapshot of `reset_len + inactive_len` under a single store-lock
-    /// acquisition. Reading the two pools separately can yield a count that
-    /// never existed (e.g. a concurrent reset→inactive promotion observed
-    /// twice, inflating the total above `total_blocks`).
+    /// Number of eligible reset slots and inactive cached blocks.
     pub(crate) fn available_len(&self) -> usize {
         let inner = self.inner.lock();
         inner.free.len() + inner.inactive.len()
@@ -812,10 +892,8 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         Some(self.allocate_reset_blocks_locked(&mut inner, count))
     }
 
-    /// All-or-nothing allocation across the reset and inactive pools under a
-    /// single store-mutex acquisition. Returns `None` iff
-    /// `free.len() + inactive.len() < count`; otherwise drains `count`
-    /// blocks (reset first, then inactive) and reports the evicted hashes.
+    /// All-or-nothing allocation across the allocation-eligible reset and
+    /// inactive pools under a single store-mutex acquisition.
     /// No partial commits, no put-backs.
     pub(crate) fn allocate_atomic(
         self: &Arc<Self>,
@@ -828,32 +906,38 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         if inner.free.len() + inner.inactive.len() < count {
             return None;
         }
-
         let from_reset = std::cmp::min(count, inner.free.len());
-        let from_inactive = count - from_reset;
+        let inactive_needed = count - from_reset;
+        let ceiling = effective_ceiling(&inner);
 
         // Stage decisions on raw `BlockId`s first; only commit slot
         // transitions (and construct MutableBlock guards) once we know
-        // the inactive backend returned the requested count.
+        // enough inactive victims below the ceiling are available.
         let mut reset_ids: Vec<BlockId> = Vec::with_capacity(from_reset);
         for _ in 0..from_reset {
             reset_ids.push(inner.free.pop_first().unwrap());
         }
-        let evicted_pairs = if from_inactive > 0 {
-            inner.inactive.allocate(from_inactive)
-        } else {
-            Vec::new()
-        };
-        // Defensive runtime check: any backend that violates the
-        // `len() >= n ⇒ allocate(n).len() == n` invariant must not
-        // leave us partially committed. Roll back and return None.
-        // Restore the free index set before return.
-        if evicted_pairs.len() != from_inactive {
-            for (h, id) in evicted_pairs {
+        let mut taken_pairs = Vec::new();
+        let mut usable_pairs = Vec::with_capacity(inactive_needed);
+        while usable_pairs.len() < inactive_needed {
+            let needed = inactive_needed - usable_pairs.len();
+            let pairs = inner.inactive.allocate(needed);
+            if pairs.is_empty() {
+                break;
+            }
+            for (seq_hash, block_id) in pairs {
+                if block_id < ceiling && usable_pairs.len() < inactive_needed {
+                    usable_pairs.push((seq_hash, block_id));
+                }
+                taken_pairs.push((seq_hash, block_id));
+            }
+        }
+        if usable_pairs.len() != inactive_needed {
+            for (h, id) in taken_pairs {
                 inner.inactive.insert(h, id);
             }
             for id in reset_ids.into_iter().rev() {
-                inner.free.insert(id);
+                push_reset_id_locked(&mut inner, id);
             }
             self.metrics.inc_allocate_atomic_rollback();
             return None;
@@ -865,23 +949,37 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
             let block_size = self.allocate_mutable_slot(&mut inner, id);
             blocks.push(MutableBlock::from_store(self.clone(), id, block_size));
         }
-        let mut evicted = Vec::with_capacity(from_inactive);
-        let mut handles = Vec::with_capacity(from_inactive);
-        for (seq_hash, block_id) in evicted_pairs {
+        let usable_ids: HashSet<_> = usable_pairs.into_iter().map(|(_, id)| id).collect();
+        let mut evicted = Vec::with_capacity(usable_ids.len());
+        let mut handles = Vec::with_capacity(taken_pairs.len());
+        let mut fenced_count = 0;
+        for (seq_hash, block_id) in taken_pairs {
+            if block_id < ceiling && !usable_ids.contains(&block_id) {
+                inner.inactive.insert(seq_hash, block_id);
+                continue;
+            }
             // Eviction discards the override; the slot leaves Inactive.
             let handle = take_inactive_handle(&mut inner.slots[block_id], block_id);
-            let block_size = self.allocate_mutable_slot(&mut inner, block_id);
-            blocks.push(MutableBlock::from_store(self.clone(), block_id, block_size));
+            if block_id < ceiling {
+                let block_size = self.allocate_mutable_slot(&mut inner, block_id);
+                blocks.push(MutableBlock::from_store(self.clone(), block_id, block_size));
+            } else {
+                inner.reset_on_release[block_id] = self.default_reset_on_release;
+                self.reset_slot_locked(&mut inner, block_id);
+                fenced_count += 1;
+            }
             evicted.push(seq_hash);
             handles.push(handle);
         }
 
         self.metrics.dec_reset_pool_size_by(from_reset as i64);
-        self.metrics.dec_inactive_pool_size_by(from_inactive as i64);
+        self.metrics.dec_inactive_pool_size_by(evicted.len() as i64);
         self.metrics.inc_inflight_mutable_by(count as i64);
-        self.metrics.inc_evictions(from_inactive as u64);
+        self.metrics.inc_evictions(evicted.len() as u64);
         self.metrics.inc_allocations(count as u64);
         self.metrics.inc_allocations_from_reset(from_reset as u64);
+        debug_assert_eq!(blocks.len(), count);
+        debug_assert_eq!(fenced_count + blocks.len() - from_reset, evicted.len());
 
         drop(inner);
         // mark_absent::<T> takes the registry attachments lock — invoke
@@ -892,8 +990,8 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         Some((blocks, evicted))
     }
 
-    /// Drain the inactive pool entirely into mutable blocks and report every
-    /// lineage hash that ceased to be cached.
+    /// Drain the inactive pool, returning eligible victims as mutable blocks
+    /// and fencing over-ceiling victims in the reset pool.
     pub(crate) fn drain_inactive_to_mutable(
         self: &Arc<Self>,
     ) -> (Vec<MutableBlock<T>>, Vec<SequenceHash>) {
@@ -903,16 +1001,25 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         let mut handles = Vec::with_capacity(count);
         let mut out = Vec::with_capacity(count);
         let mut evicted = Vec::with_capacity(count);
+        let ceiling = effective_ceiling(&inner);
+        let mut fenced_count = 0;
         for (seq_hash, block_id) in drained {
             // Eviction discards the override; the slot leaves Inactive.
             let handle = take_inactive_handle(&mut inner.slots[block_id], block_id);
-            let block_size = self.allocate_mutable_slot(&mut inner, block_id);
             handles.push(handle);
-            out.push(MutableBlock::from_store(self.clone(), block_id, block_size));
+            if block_id < ceiling {
+                let block_size = self.allocate_mutable_slot(&mut inner, block_id);
+                out.push(MutableBlock::from_store(self.clone(), block_id, block_size));
+            } else {
+                inner.reset_on_release[block_id] = self.default_reset_on_release;
+                self.reset_slot_locked(&mut inner, block_id);
+                fenced_count += 1;
+            }
             evicted.push(seq_hash);
         }
         self.metrics.dec_inactive_pool_size_by(count as i64);
-        self.metrics.inc_inflight_mutable_by(count as i64);
+        self.metrics.inc_inflight_mutable_by(out.len() as i64);
+        debug_assert_eq!(fenced_count + out.len(), count);
         drop(inner);
         for h in handles {
             h.mark_absent::<T>();
@@ -920,7 +1027,8 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         (out, evicted)
     }
 
-    /// Evict cached slots above the highest live slot and the requested minimum.
+    /// Evict cached slots above the highest live slot and the requested minimum,
+    /// together with their inactive descendants.
     pub(crate) fn inactive_tail_to_mutable(
         self: &Arc<Self>,
         min_capacity: usize,
@@ -934,23 +1042,38 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         let mut handles = Vec::new();
         let mut blocks = Vec::new();
         let mut evicted = Vec::new();
+        let ceiling = effective_ceiling(&inner);
+        let mut fenced_count = 0;
         for block_id in start..inner.capacity {
             let SlotState::Inactive { seq_hash, .. } = inner.slots[block_id].state else {
                 continue;
             };
-            if !inner.inactive.take(seq_hash, block_id) {
-                continue;
+            for (evicted_hash, evicted_block_id) in
+                inner.inactive.take_with_descendants(seq_hash, block_id)
+            {
+                handles.push(take_inactive_handle(
+                    &mut inner.slots[evicted_block_id],
+                    evicted_block_id,
+                ));
+                if evicted_block_id < ceiling {
+                    let block_size = self.allocate_mutable_slot(&mut inner, evicted_block_id);
+                    blocks.push(MutableBlock::from_store(
+                        self.clone(),
+                        evicted_block_id,
+                        block_size,
+                    ));
+                } else {
+                    inner.reset_on_release[evicted_block_id] = self.default_reset_on_release;
+                    self.reset_slot_locked(&mut inner, evicted_block_id);
+                    fenced_count += 1;
+                }
+                evicted.push(evicted_hash);
             }
-            handles.push(take_inactive_handle(&mut inner.slots[block_id], block_id));
-            inner.slots[block_id].state = SlotState::Mutable;
-            inner.reset_on_release[block_id] = self.default_reset_on_release;
-            let block_size = inner.slots[block_id].block_size;
-            blocks.push(MutableBlock::from_store(self.clone(), block_id, block_size));
-            evicted.push(seq_hash);
         }
         let count = evicted.len();
         self.metrics.dec_inactive_pool_size_by(count as i64);
-        self.metrics.inc_inflight_mutable_by(count as i64);
+        self.metrics.inc_inflight_mutable_by(blocks.len() as i64);
+        debug_assert_eq!(fenced_count + blocks.len(), count);
         self.metrics.inc_evictions(count as u64);
         drop(inner);
         for handle in handles {
@@ -1218,19 +1341,24 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
     /// sees the first's `active_by_hash` update and is registered as a
     /// duplicate (or rejected), exactly as if the two had been registered
     /// one at a time.
+    ///
+    /// The second result holds each input that `Reject` returned to its
+    /// existing primary, with its input index, re-armed: dropping it returns
+    /// the slot to the reset pool. A caller that cannot free the slot yet
+    /// keeps it.
     pub(crate) fn register_blocks(
         self: &Arc<Self>,
         mut blocks: Vec<CompleteBlock<T>>,
         handles: Vec<BlockRegistrationHandle>,
         policy: BlockDuplicationPolicy,
-    ) -> Vec<Arc<ImmutableBlockInner<T>>> {
+    ) -> RegisteredChunk<T> {
         assert_eq!(
             blocks.len(),
             handles.len(),
             "register_blocks: blocks/handles length mismatch"
         );
         if blocks.is_empty() {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
 
         // Validate every block/handle pair *before* mutating any guard
@@ -1335,17 +1463,18 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
             h.mark_present::<T>();
         }
 
-        // Guard drops here, same semantics as the single-item path:
-        // armed=false on Allow/fresh (slot already transitioned),
-        // armed=true on Reject (releases Staged → Reset).
+        // Allow/fresh guards are disarmed (the slot already transitioned)
+        // and drop here. Reject guards are re-armed and go back to the
+        // caller, whose drop releases Staged → Reset.
+        let mut rejected = Vec::new();
         for (i, mut block) in blocks.into_iter().enumerate() {
             if rearm[i] {
                 block.rearm();
+                rejected.push((i, block));
             }
-            drop(block);
         }
 
-        results
+        (results, rejected)
     }
 
     /// Transition a slot into a new inactive residency tenure.
@@ -1360,6 +1489,17 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         seq_hash: SequenceHash,
         handle: BlockRegistrationHandle,
     ) {
+        self.set_inactive_tenure_state_locked(inner, block_id, seq_hash, handle);
+        inner.inactive.insert(seq_hash, block_id);
+    }
+
+    fn set_inactive_tenure_state_locked(
+        &self,
+        inner: &mut BlockStoreInner<T>,
+        block_id: BlockId,
+        seq_hash: SequenceHash,
+        handle: BlockRegistrationHandle,
+    ) {
         let slot = &mut inner.slots[block_id];
         assert_ne!(
             slot.inactive_epoch,
@@ -1368,7 +1508,6 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         );
         slot.inactive_epoch += 1;
         slot.state = SlotState::Inactive { seq_hash, handle };
-        inner.inactive.insert(seq_hash, block_id);
     }
 
     /// Internal helper: under the store lock, transition a Primary slot to
@@ -1495,7 +1634,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         let mut inner = self.inner.lock();
         debug_assert!(matches!(inner.slots[block_id].state, SlotState::Mutable));
         inner.slots[block_id].state = SlotState::Reset;
-        inner.free.insert(block_id);
+        push_reset_id_locked(&mut inner, block_id);
         self.metrics.inc_reset_pool_size();
         self.metrics.dec_inflight_mutable();
     }
@@ -1531,13 +1670,13 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
             SlotState::Staged { .. }
         ));
         inner.slots[block_id].state = SlotState::Reset;
-        inner.free.insert(block_id);
+        push_reset_id_locked(&mut inner, block_id);
         self.metrics.inc_reset_pool_size();
     }
 
     /// Drop transition for the last clone of a primary `ImmutableBlockInner`.
     ///
-    /// Identity-checked against `self_ptr`. If a concurrent
+    /// Identity-checked against the inner Arc. If a concurrent
     /// `acquire_for_hash` already eagerly transitioned the slot (or the
     /// slot has since been resurrected to a different Inner), this is a
     /// no-op.
@@ -1545,10 +1684,10 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
     /// Reads `reset_on_release[block_id]` to select the destination:
     /// - `false` (default) → `SlotState::Inactive` + insert into the
     ///   inactive index, available for cache hits and cold eviction.
-    /// - `true` → `SlotState::Reset` + push to free list +
+    /// - `true` → `SlotState::Reset` + push to the eligible or fenced reset set +
     ///   `handle.mark_absent::<T>()`. Mirrors `release_duplicate`. The
     ///   block is *not* cached and cannot be matched/resurrected later.
-    pub(crate) fn release_primary(&self, block_id: BlockId, self_ptr: *const ()) {
+    pub(crate) fn release_primary(&self, block: &ImmutableBlockInner<T>) {
         // Test-only deterministic race-window widening:
         //   1. Bump the arrival counter so a coordinating test can
         //      observe "the drop has entered release_primary" without
@@ -1564,6 +1703,8 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         let _gate = self.release_primary_gate.lock();
         let handle_to_mark_absent = {
             let mut inner = self.inner.lock();
+            let block_id = block.block_id();
+            let self_ptr = block as *const ImmutableBlockInner<T> as *const ();
             let (seq_hash, handle) = match &inner.slots[block_id].state {
                 SlotState::Primary {
                     seq_hash,
@@ -1612,9 +1753,11 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
 
     /// Drop transition for the last clone of a duplicate `ImmutableBlockInner`:
     /// `Duplicate` → `Reset` (with `mark_absent::<T>`). Identity-checked.
-    pub(crate) fn release_duplicate(&self, block_id: BlockId, self_ptr: *const ()) {
+    pub(crate) fn release_duplicate(&self, block: &ImmutableBlockInner<T>) {
         let handle = {
             let mut inner = self.inner.lock();
+            let block_id = block.block_id();
+            let self_ptr = block as *const ImmutableBlockInner<T> as *const ();
             let handle = match &inner.slots[block_id].state {
                 SlotState::Duplicate {
                     handle,
@@ -1708,11 +1851,9 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         // identity pointer while the Arc is still alive.
         let mut entries: Vec<ReleaseEntry<T>> = Vec::with_capacity(blocks.len());
         for block in blocks {
-            let block_id = block.block_id();
             let arc = block.into_inner_for_batch_release();
             let self_ptr = Arc::as_ptr(&arc) as *const ();
             entries.push(ReleaseEntry {
-                block_id,
                 self_ptr,
                 arc: Some(arc),
             });
@@ -1841,7 +1982,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         let Some(arc) = entries[idx].arc.take() else {
             return; // Already resolved.
         };
-        let block_id = entries[idx].block_id;
+        let block_id = arc.block_id();
         let self_ptr = entries[idx].self_ptr;
 
         // Applies to every entry we reach, matched or not — replaces a
@@ -1970,15 +2111,34 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
 
     /// Slot transition shared by `release_primary` (when
     /// `reset_on_release = true`) and `release_duplicate`:
-    /// `*` → `SlotState::Reset`, push to the free list, bump the
-    /// reset-pool gauge. Does **not** touch `active_by_hash` — callers
+    /// `*` → `SlotState::Reset`, classify by the allocation ceiling, and bump
+    /// the reset-pool gauge. Does **not** touch `active_by_hash` — callers
     /// that own that mapping (the primary release path) must clear it
     /// themselves. Callers must invoke `handle.mark_absent::<T>()`
     /// *after* the store lock is released.
     fn reset_slot_locked(&self, inner: &mut BlockStoreInner<T>, block_id: BlockId) {
         inner.slots[block_id].state = SlotState::Reset;
-        inner.free.insert(block_id);
+        push_reset_id_locked(inner, block_id);
         self.metrics.inc_reset_pool_size();
+    }
+}
+
+fn effective_ceiling<T: BlockMetadata>(inner: &BlockStoreInner<T>) -> usize {
+    inner.fence.unwrap_or(inner.capacity).min(inner.capacity)
+}
+
+pub(super) fn push_reset_id_locked<T: BlockMetadata>(
+    inner: &mut BlockStoreInner<T>,
+    block_id: BlockId,
+) {
+    debug_assert!(block_id < inner.capacity);
+    debug_assert!(matches!(inner.slots[block_id].state, SlotState::Reset));
+    if block_id < effective_ceiling(inner) {
+        inner.fenced.remove(&block_id);
+        inner.free.insert(block_id);
+    } else {
+        inner.free.remove(&block_id);
+        inner.fenced.insert(block_id);
     }
 }
 
@@ -2018,6 +2178,8 @@ pub(crate) struct DebugStoreSnapshot {
     /// relative position instead of being deferred to `Drop`'s arbitrary
     /// timing).
     pub(crate) free: Vec<BlockId>,
+    /// Reset blocks outside the current allocation ceiling.
+    pub(crate) fenced: Vec<BlockId>,
     /// The full `active_by_hash` map (primary `block_id` per registered
     /// hash). `HashMap` equality is set-like (order-independent), which
     /// is the right comparison for a map.
@@ -2059,6 +2221,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
             .collect();
         // Exact FIFO order — see the `free` field docs.
         let free: Vec<BlockId> = inner.free.iter().copied().collect();
+        let fenced: Vec<BlockId> = inner.fenced.iter().copied().collect();
         let active_by_hash: std::collections::HashMap<SequenceHash, BlockId> = inner
             .active_by_hash
             .iter()
@@ -2068,6 +2231,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         DebugStoreSnapshot {
             slots,
             free,
+            fenced,
             active_by_hash,
             reset_on_release,
         }

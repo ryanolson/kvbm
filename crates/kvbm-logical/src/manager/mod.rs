@@ -25,12 +25,12 @@ pub use inactive_lineage_hold::{
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::blocks::{BlockMetadata, CompleteBlock, ImmutableBlock, MutableBlock};
+use crate::blocks::{BlockId, BlockMetadata, CompleteBlock, ImmutableBlock, MutableBlock};
 use crate::metrics::BlockPoolMetrics;
 use crate::pools::{
     BlockDuplicationPolicy, BlockStore, ExactReclaimEntryPlan, ExactReclaimExecuteError,
     ExactReclaimNameError, ExactReclaimRefreshError, FreshExactReclaimPlan, InactiveCandidate,
-    InactiveFeatures, ReleaseOpts, SequenceHash,
+    InactiveFeatures, RebindPlan, RebindPrepareError, ReleaseOpts, SequenceHash,
 };
 #[cfg(test)]
 use crate::pools::{ExactAllocationError, ExactInactiveVictim};
@@ -41,6 +41,25 @@ use inactive_lineage_hold::EvictionNotifier;
 /// Manages the full block lifecycle over the unified [`BlockStore`].
 ///
 /// Construct via [`BlockManager::builder()`].
+/// The result of [`BlockManager::register_blocks_deferred`] for one block.
+pub enum RegisteredBlock<T: BlockMetadata> {
+    /// The block registered as itself: a new primary, or an `Allow`
+    /// duplicate. Its block ID did not change.
+    Fresh(ImmutableBlock<T>),
+    /// Another block was already the primary of this hash (`Reject`).
+    /// `original` still owns the input slot; dropping it returns the slot
+    /// to the reset pool.
+    Duplicate {
+        canonical: ImmutableBlock<T>,
+        original: CompleteBlock<T>,
+    },
+}
+
+/// Most blocks that one store-lock hold registers. A larger batch takes the
+/// lock once for each chunk, so a long prefill cannot block allocation or
+/// match for the whole batch.
+pub const REGISTER_CHUNK_BLOCKS: usize = 1024;
+
 pub struct BlockManager<T: BlockMetadata> {
     pub(crate) store: Arc<BlockStore<T>>,
     pub(crate) block_registry: BlockRegistry,
@@ -300,7 +319,7 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
     /// Returns the number of blocks drained.
     pub fn drain_inactive_pool(&self) -> usize {
         let (blocks, evicted) = self.store.drain_inactive_to_mutable();
-        let drained = blocks.len();
+        let drained = evicted.len();
         self.notify_evictions(&evicted);
         drop(blocks);
         drained
@@ -320,7 +339,10 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
         Ok(())
     }
 
-    /// Release inactive cached tail blocks without moving live blocks.
+    /// Release cached slots above the highest live slot and requested minimum.
+    ///
+    /// Each selected inactive block is retired together with its inactive
+    /// descendants, so no cached chain retains a block whose parent was evicted.
     /// The returned bound is a snapshot. Capacity changes still validate live slots.
     pub fn release_inactive_tail(&self, min_capacity: usize) -> usize {
         let (blocks, evicted) = self.store.inactive_tail_to_mutable(min_capacity);
@@ -365,6 +387,24 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
             .release_blocks(blocks, ReleaseOpts { reset_on_release });
     }
 
+    /// Releases all guards of one request: the immutable blocks through
+    /// [`release_blocks`](Self::release_blocks) (one store lock), then the
+    /// staged and mutable blocks.
+    pub fn release_request_blocks(
+        &self,
+        blocks: crate::integrations::RequestBlocks<T>,
+        reset_on_release: Option<bool>,
+    ) {
+        let crate::integrations::RequestBlocks {
+            immutable,
+            complete,
+            mutable,
+        } = blocks;
+        self.release_blocks(immutable, reset_on_release);
+        drop(complete);
+        drop(mutable);
+    }
+
     /// Mark the single-owner inactive lineage suffix ending at the leaf
     /// `seq_hash` for evict-first (compaction poison). Membership-based: a
     /// no-op unless the leaf is currently resident-inactive, and only the
@@ -391,16 +431,11 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
     /// [`try_register_blocks`](Self::try_register_blocks) for a recoverable
     /// foreign-store rejection.
     pub fn register_block(&self, block: CompleteBlock<T>) -> ImmutableBlock<T> {
-        self.try_register_blocks(vec![block])
-            .unwrap_or_else(|error| {
-                panic!(
-                    "BlockManager::register_block received {} block from another manager",
-                    error.block_count()
-                )
-            })
-            .into_iter()
-            .next()
-            .expect("one completed block registers to one immutable block")
+        assert!(
+            block.is_from_store(&self.store),
+            "BlockManager::register_block received 1 block from another manager"
+        );
+        self.register_verified_block(block)
     }
 
     /// Register completed blocks after an all-or-nothing store-provenance
@@ -408,8 +443,15 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
     ///
     /// If any block belongs to another manager, this method returns every
     /// input block unchanged. It does not register a hash, touch a metric, or
-    /// change either store. A successful call preserves the existing
-    /// per-block registration behavior.
+    /// change either store.
+    ///
+    /// A successful call gives the same result as [`register_block`] for each
+    /// block in input order: output `i` is the registration of input `i`, a
+    /// hash repeated in the batch sees the earlier entry, and each new
+    /// canonical hash publishes one `Create` event. The store lock is taken
+    /// once for each chunk of at most [`REGISTER_CHUNK_BLOCKS`] blocks.
+    ///
+    /// [`register_block`]: Self::register_block
     pub fn try_register_blocks(
         &self,
         blocks: Vec<CompleteBlock<T>>,
@@ -417,11 +459,85 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
         if blocks.iter().any(|block| !block.is_from_store(&self.store)) {
             return Err(BlockRegistrationError::foreign_store(blocks));
         }
+        Ok(self.register_verified_blocks(blocks))
+    }
 
-        Ok(blocks
-            .into_iter()
-            .map(|block| self.register_verified_block(block))
-            .collect())
+    /// Registers like [`try_register_blocks`](Self::try_register_blocks), but
+    /// a `Reject` duplicate keeps its slot.
+    ///
+    /// Output `i` is the registration of input `i`. With `Reject`, an input
+    /// whose hash already has a primary gives
+    /// [`RegisteredBlock::Duplicate`]: the existing primary and the input
+    /// block, which still owns its slot. The caller drops the input block
+    /// when no reader of that slot remains. With `Allow`, every output is
+    /// [`RegisteredBlock::Fresh`].
+    pub fn register_blocks_deferred(
+        &self,
+        blocks: Vec<CompleteBlock<T>>,
+    ) -> Result<Vec<RegisteredBlock<T>>, BlockRegistrationError<T>> {
+        if blocks.iter().any(|block| !block.is_from_store(&self.store)) {
+            return Err(BlockRegistrationError::foreign_store(blocks));
+        }
+        let mut registered = Vec::with_capacity(blocks.len());
+        Self::for_each_chunk(blocks, |chunk| {
+            let (inners, rejected) = self.register_verified_chunk(chunk);
+            let mut rejected = rejected.into_iter().peekable();
+            for (index, inner) in inners.into_iter().enumerate() {
+                let block = ImmutableBlock::from_inner(inner);
+                match rejected.next_if(|(rejected_index, _)| *rejected_index == index) {
+                    Some((_, original)) => registered.push(RegisteredBlock::Duplicate {
+                        canonical: block,
+                        original,
+                    }),
+                    None => registered.push(RegisteredBlock::Fresh(block)),
+                }
+            }
+        });
+        Ok(registered)
+    }
+
+    fn register_verified_blocks(&self, blocks: Vec<CompleteBlock<T>>) -> Vec<ImmutableBlock<T>> {
+        let mut registered = Vec::with_capacity(blocks.len());
+        Self::for_each_chunk(blocks, |chunk| {
+            let (inners, rejected) = self.register_verified_chunk(chunk);
+            drop(rejected);
+            registered.extend(inners.into_iter().map(ImmutableBlock::from_inner));
+        });
+        registered
+    }
+
+    fn for_each_chunk(blocks: Vec<CompleteBlock<T>>, mut f: impl FnMut(Vec<CompleteBlock<T>>)) {
+        if blocks.len() <= REGISTER_CHUNK_BLOCKS {
+            f(blocks);
+            return;
+        }
+        let mut blocks = blocks.into_iter();
+        loop {
+            let chunk: Vec<_> = blocks.by_ref().take(REGISTER_CHUNK_BLOCKS).collect();
+            if chunk.is_empty() {
+                return;
+            }
+            f(chunk);
+        }
+    }
+
+    fn register_verified_chunk(
+        &self,
+        blocks: Vec<CompleteBlock<T>>,
+    ) -> crate::pools::store::RegisteredChunk<T> {
+        if blocks.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let handles: Vec<_> = blocks
+            .iter()
+            .map(|block| {
+                self.metrics.inc_registrations();
+                self.block_registry
+                    .register_sequence_hash(block.sequence_hash())
+            })
+            .collect();
+        self.store
+            .register_blocks(blocks, handles, self.duplication_policy)
     }
 
     fn register_verified_block(&self, block: CompleteBlock<T>) -> ImmutableBlock<T> {
@@ -710,10 +826,7 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
         self.store.inactive_len()
     }
 
-    /// Number of blocks currently in the reset (free) pool. Cheap: one
-    /// store-lock acquisition. `reset_len + inactive_len` is the same quantity
-    /// as [`available_blocks`](Self::available_blocks), but that one reads both
-    /// under a *single* lock — prefer it when the sum is what matters.
+    /// Number of blocks in Reset state, including slots fenced from allocation.
     pub fn reset_len(&self) -> usize {
         self.store.reset_len()
     }
@@ -749,7 +862,40 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
         self.store.set_capacity(capacity)
     }
 
-    /// Blocks available for allocation (reset + inactive pools).
+    /// Set the optional physical allocation ceiling.
+    pub fn set_allocation_ceiling(&self, fence: Option<usize>) -> Result<(), String> {
+        self.store.set_allocation_ceiling(fence)
+    }
+
+    /// Effective physical allocation ceiling, clamped to current capacity.
+    pub fn allocation_ceiling(&self) -> usize {
+        self.store.allocation_ceiling()
+    }
+
+    /// Reserve an allocation-eligible reset slot while copying an inactive
+    /// block's physical contents out of band.
+    pub fn prepare_rebind(&self, src: BlockId) -> Result<RebindPlan<T>, RebindPrepareError> {
+        self.store.prepare_rebind(src)
+    }
+
+    /// Reserve a reset destination for a currently-held primary or duplicate.
+    ///
+    /// Copy the source data to [`RebindPlan::dst`] before committing the plan
+    /// with [`RebindPlan::commit_live`].
+    pub fn prepare_live_rebind(
+        &self,
+        block: &ImmutableBlock<T>,
+    ) -> Result<RebindPlan<T>, RebindPrepareError> {
+        self.store.prepare_live_rebind(block)
+    }
+
+    /// Strong guards for every live primary or duplicate block at or above
+    /// `first`, in block-id order. Use it to plan live rebinds for a shrink.
+    pub fn live_blocks_from(&self, first: BlockId) -> Vec<ImmutableBlock<T>> {
+        self.store.live_blocks_from(first)
+    }
+
+    /// Blocks available for allocation (eligible reset + inactive pools).
     ///
     /// Reads both pool sizes under a single store-lock acquisition so the
     /// returned value is a coherent snapshot, never an over- or under-count

@@ -33,6 +33,7 @@ pub use exact_reclaim::{
 };
 pub(crate) use inactive::backends;
 pub(crate) use store::{BlockStore, InactiveIndex, ReleaseOpts};
+pub use store::{RebindOutcome, RebindPlan, RebindPrepareError};
 
 pub(crate) use crate::SequenceHash;
 use crate::blocks::BlockId;

@@ -177,7 +177,7 @@ impl<T: BlockMetadata> BlockStore<T> {
         );
         inner.slots[victim_id].state = SlotState::Reset;
         inner.reset_on_release[victim_id] = self.default_reset_on_release;
-        inner.free.insert(victim_id);
+        super::push_reset_id_locked(&mut inner, victim_id);
 
         self.metrics
             .inc_inactive_pool_size_by(restored.restored_count as i64);
@@ -250,7 +250,7 @@ fn restore_support_blocks<T: BlockMetadata>(
         if has_newer_registered_copy(inner, seq_hash, block_id) {
             inner.slots[block_id].state = SlotState::Reset;
             inner.reset_on_release[block_id] = default_reset_on_release;
-            inner.free.insert(block_id);
+            super::push_reset_id_locked(inner, block_id);
             result.discarded_handles.push(handle);
         } else {
             inner.slots[block_id].state = SlotState::Inactive { seq_hash, handle };

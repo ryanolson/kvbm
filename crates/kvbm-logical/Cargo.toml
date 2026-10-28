@@ -75,3 +75,10 @@ required-features = ["testing"]
 name = "eviction_policy"
 harness = false
 required-features = ["testing"]
+
+# Criterion benchmark for block registration: one `register_block` call for
+# each block versus one `register_blocks` batch, LRU and lineage backends.
+[[bench]]
+name = "register_blocks"
+harness = false
+required-features = ["testing"]

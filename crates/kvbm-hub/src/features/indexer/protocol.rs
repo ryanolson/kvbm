@@ -147,6 +147,9 @@ pub struct IndexerConfigResponse {
     /// NATS subject namespace. Empty for ZMQ.
     #[serde(default)]
     pub nats_subject_prefix: String,
+    /// Create kind required by this hub, when restricted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_kind: Option<CreateKind>,
 }
 
 #[cfg(test)]
@@ -180,6 +183,7 @@ mod event_plane_tests {
             zmq_endpoint: String::new(),
             feed_endpoint: String::new(),
             nats_subject_prefix: "kvbm.hub.test".to_string(),
+            required_kind: Some(CreateKind::Carrier),
         };
         assert_eq!(
             serde_json::from_str::<IndexerConfigResponse>(&serde_json::to_string(&nats).unwrap())

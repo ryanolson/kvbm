@@ -69,7 +69,73 @@ pub(crate) struct AttachmentStore {
     /// and tier `T` contributes one count. `has_block::<T>` returns
     /// `count > 0`. The count does not prove request availability. Key is
     /// `TypeId::of::<T>()`.
-    pub(crate) presence_markers: HashMap<TypeId, u32>,
+    pub(crate) presence_markers: PresenceMarkers,
+}
+
+/// Tiers that [`PresenceMarkers`] keeps without a heap allocation.
+const INLINE_PRESENCE_TIERS: usize = 2;
+
+/// Presence counts for each metadata tier of one registration.
+///
+/// A registration is present in few tiers, so the counts live in a short
+/// inline list. The first marker does not allocate, which a hash map does.
+#[derive(Debug, Default)]
+pub(crate) struct PresenceMarkers {
+    inline: [Option<(TypeId, u32)>; INLINE_PRESENCE_TIERS],
+    overflow: Vec<(TypeId, u32)>,
+}
+
+impl PresenceMarkers {
+    fn count_mut(&mut self, type_id: TypeId) -> Option<&mut u32> {
+        self.inline
+            .iter_mut()
+            .flatten()
+            .chain(self.overflow.iter_mut())
+            .find(|(id, _)| *id == type_id)
+            .map(|(_, count)| count)
+    }
+
+    pub(crate) fn count(&self, type_id: TypeId) -> u32 {
+        self.inline
+            .iter()
+            .flatten()
+            .chain(self.overflow.iter())
+            .find(|(id, _)| *id == type_id)
+            .map_or(0, |(_, count)| *count)
+    }
+
+    pub(crate) fn increment(&mut self, type_id: TypeId) {
+        if let Some(count) = self.count_mut(type_id) {
+            *count += 1;
+        } else if let Some(slot) = self.inline.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some((type_id, 1));
+        } else {
+            self.overflow.push((type_id, 1));
+        }
+    }
+
+    /// Decrements the count of `type_id` and removes it at zero. Returns
+    /// `false` if `type_id` has no count.
+    pub(crate) fn decrement(&mut self, type_id: TypeId) -> bool {
+        let Some(count) = self.count_mut(type_id) else {
+            return false;
+        };
+        debug_assert!(*count > 0, "presence marker with a zero count");
+        *count -= 1;
+        if *count > 0 {
+            return true;
+        }
+        if let Some(slot) = self
+            .inline
+            .iter_mut()
+            .find(|slot| matches!(slot, Some((id, _)) if *id == type_id))
+        {
+            *slot = None;
+        } else if let Some(index) = self.overflow.iter().position(|(id, _)| *id == type_id) {
+            self.overflow.swap_remove(index);
+        }
+        true
+    }
 }
 
 impl AttachmentStore {
@@ -79,7 +145,7 @@ impl AttachmentStore {
             multiple_attachments: HashMap::new(),
             type_registry: HashMap::new(),
             event_release: None,
-            presence_markers: HashMap::new(),
+            presence_markers: PresenceMarkers::default(),
         }
     }
 }
@@ -195,5 +261,39 @@ impl<'a, T: Any + Send + Sync> TypedAttachments<'a, T> {
                 f(None, &mut empty_vec)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod presence_marker_tests {
+    use super::*;
+
+    struct TierA;
+    struct TierB;
+    struct TierC;
+
+    #[test]
+    fn counts_more_tiers_than_the_inline_list() {
+        let ids = [
+            TypeId::of::<TierA>(),
+            TypeId::of::<TierB>(),
+            TypeId::of::<TierC>(),
+        ];
+        let mut markers = PresenceMarkers::default();
+        for (n, id) in ids.iter().enumerate() {
+            for _ in 0..=n {
+                markers.increment(*id);
+            }
+        }
+        assert_eq!(ids.map(|id| markers.count(id)), [1, 2, 3]);
+        assert!(markers.decrement(ids[0]));
+        assert!(!markers.decrement(ids[0]));
+        markers.increment(ids[2]);
+        assert_eq!(ids.map(|id| markers.count(id)), [0, 2, 4]);
+        for _ in 0..4 {
+            assert!(markers.decrement(ids[2]));
+        }
+        assert_eq!(ids.map(|id| markers.count(id)), [0, 2, 0]);
+        assert!(markers.overflow.is_empty() || markers.inline.iter().any(Option::is_none));
     }
 }

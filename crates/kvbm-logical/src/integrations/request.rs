@@ -101,12 +101,30 @@
 //! | `is_complete()`           | `generated_tokens >= max_output_tokens`         |
 //! | `new_tokens_for_prefill()`| Tokens not covered by cache hits               |
 
-use crate::blocks::{BlockMetadata, ImmutableBlock};
-use crate::manager::BlockManager;
+use crate::blocks::{BlockMetadata, CompleteBlock, ImmutableBlock, MutableBlock};
+use crate::manager::{BlockManager, RegisteredBlock};
 use crate::sequence::{BlockSequence, LogicalBlockAssignmentError, LogicalBlockAssignments};
 use crate::{BlockId, KvbmSequenceHashProvider, SequenceHash};
 
 use dynamo_tokens::{SaltHash, Token};
+
+/// Error returned when replacing a cached page identity.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum PageSwapError {
+    /// The requested page position is outside `page_indices()`.
+    #[error("page position {position} is out of range")]
+    OutOfRange { position: usize },
+    /// The cached ID at the position differs from the expected source.
+    #[error("page ID mismatch at position {position}: expected {expected}, found {found}")]
+    Mismatch {
+        position: usize,
+        expected: BlockId,
+        found: BlockId,
+    },
+    /// The position belongs to a staged or mutable page.
+    #[error("page position {position} is not registered")]
+    NotRegistered { position: usize },
+}
 
 /// Manages a request's block lifecycle through direct RAII integration with
 /// [`BlockManager`], bypassing the `MoveBlock` signal protocol.
@@ -134,10 +152,21 @@ pub struct RequestSequence<T: BlockMetadata> {
     /// external policy owner. They retain sequence position and page mapping
     /// without preventing that owner from demoting or releasing the blocks.
     detached_assigned: Vec<(BlockId, SequenceHash)>,
+    /// Staged blocks that the caller took out to register elsewhere. They
+    /// keep their sequence position and page mapping, after the assigned
+    /// blocks, until [`install_registered`](Self::install_registered).
+    registering: Vec<(BlockId, SequenceHash)>,
     generated_tokens: usize,
     max_output_tokens: usize,
     num_input_tokens: usize,
     prefix_matched_blocks: usize,
+}
+
+/// The block guards of one request, from [`RequestSequence::take_blocks`].
+pub struct RequestBlocks<T: BlockMetadata> {
+    pub(crate) immutable: Vec<ImmutableBlock<T>>,
+    pub(crate) complete: Vec<CompleteBlock<T>>,
+    pub(crate) mutable: Vec<MutableBlock<T>>,
 }
 
 impl<T: BlockMetadata> RequestSequence<T> {
@@ -180,6 +209,7 @@ impl<T: BlockMetadata> RequestSequence<T> {
             sequence,
             assignments,
             detached_assigned: Vec::new(),
+            registering: Vec::new(),
             generated_tokens: 0,
             max_output_tokens,
             num_input_tokens,
@@ -224,7 +254,9 @@ impl<T: BlockMetadata> RequestSequence<T> {
         max_blocks: usize,
     ) -> Result<usize, LogicalBlockAssignmentError<T>> {
         assert!(
-            self.assignments.is_empty() && self.detached_assigned.is_empty(),
+            self.assignments.is_empty()
+                && self.detached_assigned.is_empty()
+                && self.registering.is_empty(),
             "match_and_add_prefix called on sequence with existing assignments"
         );
         let matched = self.match_prefix(manager, max_blocks);
@@ -306,6 +338,7 @@ impl<T: BlockMetadata> RequestSequence<T> {
     pub fn stage_pending(&mut self) {
         let start = self.detached_assigned.len()
             + self.assignments.assigned_count()
+            + self.registering.len()
             + self.assignments.staged_count();
         let completed = self.sequence.blocks().len();
         if start < completed {
@@ -348,6 +381,76 @@ impl<T: BlockMetadata> RequestSequence<T> {
     /// [`page_indices`](Self::page_indices), but this sequence no longer keeps
     /// their `ImmutableBlock` guards alive. The caller becomes responsible for
     /// the returned guards' strong/weak/null lifecycle.
+    /// Takes the staged blocks out, in order, to register them elsewhere,
+    /// for example on another thread. Their block IDs stay in
+    /// [`page_indices`](Self::page_indices) until
+    /// [`install_registered`](Self::install_registered).
+    pub fn take_staged_for_registration(&mut self) -> Vec<CompleteBlock<T>> {
+        let staged = self.assignments.take_staged();
+        self.registering.extend(
+            staged
+                .iter()
+                .map(|(block_id, block)| (*block_id, block.sequence_hash())),
+        );
+        staged.into_iter().map(|(_, block)| block).collect()
+    }
+
+    /// Installs the results of
+    /// [`BlockManager::register_blocks_deferred`] for the oldest blocks that
+    /// [`take_staged_for_registration`](Self::take_staged_for_registration)
+    /// took, in order. Each block becomes assigned. A duplicate is assigned as
+    /// its canonical block, so its page index changes. Returns the original
+    /// blocks of the duplicates: the caller drops them when no reader of
+    /// their slot remains.
+    ///
+    /// # Panics
+    ///
+    /// Panics if there are more results than blocks in registration, or if a
+    /// result does not match the block at its position.
+    pub fn install_registered(
+        &mut self,
+        results: Vec<RegisteredBlock<T>>,
+    ) -> Vec<CompleteBlock<T>> {
+        assert!(
+            results.len() <= self.registering.len(),
+            "install_registered: {} results for {} blocks in registration",
+            results.len(),
+            self.registering.len()
+        );
+        let mut assigned = Vec::with_capacity(results.len());
+        let mut originals = Vec::new();
+        for ((block_id, seq_hash), result) in self.registering.drain(..results.len()).zip(results) {
+            let (block, original_id) = match result {
+                RegisteredBlock::Fresh(block) => {
+                    let id = block.block_id();
+                    (block, id)
+                }
+                RegisteredBlock::Duplicate {
+                    canonical,
+                    original,
+                } => {
+                    let id = original.block_id();
+                    originals.push(original);
+                    (canonical, id)
+                }
+            };
+            assert!(
+                original_id == block_id && block.sequence_hash() == seq_hash,
+                "install_registered: result for block {original_id} at the position of block {block_id}"
+            );
+            assigned.push(block);
+        }
+        self.assignments
+            .extend_assigned(assigned)
+            .unwrap_or_else(|_| panic!("install_registered: duplicate assigned block ID"));
+        originals
+    }
+
+    /// Number of blocks taken out for registration and not yet installed.
+    pub fn registering_blocks(&self) -> usize {
+        self.registering.len()
+    }
+
     pub fn detach_registered_blocks(&mut self) -> Vec<ImmutableBlock<T>> {
         let assigned = self.assignments.take_assigned();
         self.detached_assigned.extend(
@@ -400,10 +503,40 @@ impl<T: BlockMetadata> RequestSequence<T> {
     // Release / reacquire
     // =====================================================================
 
+    /// Moves every block guard out of the sequence and leaves it empty, as
+    /// [`release`](Self::release) does, but without dropping the guards here.
+    /// Pass the result to [`BlockManager::release_request_blocks`], for
+    /// example on another thread.
+    pub fn take_blocks(&mut self) -> RequestBlocks<T> {
+        self.detached_assigned.clear();
+        self.registering.clear();
+        RequestBlocks {
+            immutable: self
+                .assignments
+                .take_assigned()
+                .into_iter()
+                .map(|(_, block)| block)
+                .collect(),
+            complete: self
+                .assignments
+                .take_staged()
+                .into_iter()
+                .map(|(_, block)| block)
+                .collect(),
+            mutable: self
+                .assignments
+                .take_unassigned()
+                .into_iter()
+                .map(|(_, block)| block)
+                .collect(),
+        }
+    }
+
     /// Releases all block assignments (RAII returns them to pools).
     pub fn release(&mut self) {
         self.assignments.clear();
         self.detached_assigned.clear();
+        self.registering.clear();
     }
 
     /// Re-acquires blocks from the manager after a release/preemption.
@@ -414,7 +547,9 @@ impl<T: BlockMetadata> RequestSequence<T> {
     /// Returns `true` if all blocks were successfully acquired.
     pub fn reacquire(&mut self, manager: &BlockManager<T>) -> bool {
         assert!(
-            self.assignments.is_empty() && self.detached_assigned.is_empty(),
+            self.assignments.is_empty()
+                && self.detached_assigned.is_empty()
+                && self.registering.is_empty(),
             "reacquire called with existing assignments"
         );
 
@@ -542,16 +677,85 @@ impl<T: BlockMetadata> RequestSequence<T> {
         self.sequence.block_size()
     }
 
-    /// All block IDs in order: assigned ++ staged ++ unassigned.
+    /// All block IDs in order: detached ++ assigned ++ registering ++ staged
+    /// ++ unassigned.
     ///
     /// Block IDs identity-map to page indices in the GPU page pool.
     pub fn page_indices(&self) -> Vec<u32> {
         self.detached_assigned
             .iter()
             .map(|(block_id, _)| block_id)
-            .chain(self.assignments.all_block_ids())
+            .chain(
+                self.assignments
+                    .assigned_iter()
+                    .map(|(block_id, _)| block_id),
+            )
+            .chain(self.registering.iter().map(|(block_id, _)| block_id))
+            .chain(self.assignments.staged_iter().map(|(block_id, _)| block_id))
+            .chain(
+                self.assignments
+                    .unassigned_iter()
+                    .map(|(block_id, _)| block_id),
+            )
             .map(|&id| id as u32)
             .collect()
+    }
+
+    /// Replace a cached page ID at the position used by [`Self::page_indices`].
+    ///
+    /// Reserve the replacement ID for this page.
+    /// Do not use an ID that identifies another page in this sequence.
+    pub fn swap_page(
+        &mut self,
+        position: usize,
+        expected: BlockId,
+        replacement: BlockId,
+    ) -> Result<(), PageSwapError> {
+        let detached_count = self.detached_assigned.len();
+        let assigned_count = self.assignments.assigned_count();
+        let total_count =
+            detached_count + self.registering.len() + self.assignments.all_block_ids().count();
+        if position >= total_count {
+            return Err(PageSwapError::OutOfRange { position });
+        }
+
+        if position < detached_count {
+            let found = self.detached_assigned[position].0;
+            if found != expected {
+                return Err(PageSwapError::Mismatch {
+                    position,
+                    expected,
+                    found,
+                });
+            }
+            self.detached_assigned[position].0 = replacement;
+            return Ok(());
+        }
+
+        let assigned_position = position - detached_count;
+        if assigned_position >= assigned_count {
+            return Err(PageSwapError::NotRegistered { position });
+        }
+
+        let Some((found, _)) = self.assignments.get_assigned(assigned_position) else {
+            return Err(PageSwapError::NotRegistered { position });
+        };
+        let found = *found;
+        if found != expected {
+            return Err(PageSwapError::Mismatch {
+                position,
+                expected,
+                found,
+            });
+        }
+        if self
+            .assignments
+            .replace_assigned_block_id(assigned_position, replacement)
+            .is_none()
+        {
+            return Err(PageSwapError::NotRegistered { position });
+        }
+        Ok(())
     }
 
     /// Drop excess unassigned blocks beyond `keep` count.
@@ -601,6 +805,7 @@ impl<T: BlockMetadata> std::fmt::Debug for RequestSequence<T> {
             .field("prefix_matched_blocks", &self.prefix_matched_blocks)
             .field("assigned", &self.assigned_blocks())
             .field("detached_assigned", &self.detached_assigned.len())
+            .field("registering", &self.registering.len())
             .field("staged", &self.assignments.staged_count())
             .field("unassigned", &self.assignments.unassigned_count())
             .finish()
@@ -1032,6 +1237,68 @@ mod tests {
     // =========================================================================
 
     #[test]
+    fn swap_page_updates_assigned_and_detached_ids() {
+        let manager = create_test_manager::<TestMeta>(8);
+        let mut seq = RequestSequence::<TestMeta>::new(make_tokens(8), 0, BLOCK_SIZE);
+        assert!(seq.allocate_blocks(2, &manager));
+        seq.complete_and_register_pending(&manager);
+
+        let original = seq.page_indices();
+        let replacement = 100;
+        seq.swap_page(0, original[0] as BlockId, replacement)
+            .unwrap();
+        assert_eq!(seq.page_indices(), vec![replacement as u32, original[1]]);
+
+        let detached = seq.detach_registered_blocks();
+        seq.swap_page(0, replacement, 200).unwrap();
+        assert_eq!(seq.page_indices(), vec![200, original[1]]);
+        drop(detached);
+    }
+
+    #[test]
+    fn swap_page_reports_mismatch_and_out_of_range() {
+        let manager = create_test_manager::<TestMeta>(4);
+        let mut seq = RequestSequence::<TestMeta>::new(make_tokens(4), 0, BLOCK_SIZE);
+        assert!(seq.allocate_blocks(1, &manager));
+        seq.complete_and_register_pending(&manager);
+        let page_id = seq.page_indices()[0] as BlockId;
+
+        assert_eq!(
+            seq.swap_page(0, page_id + 1, 100),
+            Err(PageSwapError::Mismatch {
+                position: 0,
+                expected: page_id + 1,
+                found: page_id,
+            })
+        );
+        assert_eq!(
+            seq.swap_page(1, page_id, 100),
+            Err(PageSwapError::OutOfRange { position: 1 })
+        );
+    }
+
+    #[test]
+    fn swap_page_rejects_staged_and_mutable_positions() {
+        let manager = create_test_manager::<TestMeta>(8);
+        let mut staged = RequestSequence::<TestMeta>::new(make_tokens(8), 0, BLOCK_SIZE);
+        assert!(staged.allocate_blocks(2, &manager));
+        staged.stage_pending();
+        let staged_id = staged.page_indices()[0] as BlockId;
+        assert_eq!(
+            staged.swap_page(0, staged_id, 100),
+            Err(PageSwapError::NotRegistered { position: 0 })
+        );
+
+        let mut mutable = RequestSequence::<TestMeta>::new(make_tokens(4), 1, BLOCK_SIZE);
+        assert!(mutable.allocate_blocks(1, &manager));
+        let mutable_id = mutable.page_indices()[0] as BlockId;
+        assert_eq!(
+            mutable.swap_page(0, mutable_id, 100),
+            Err(PageSwapError::NotRegistered { position: 0 })
+        );
+    }
+
+    #[test]
     fn test_detach_registered_blocks_preserves_identity_and_decode_offsets() {
         let manager = create_test_manager::<TestMeta>(8);
         let mut seq = RequestSequence::<TestMeta>::new(make_tokens(4), 4, BLOCK_SIZE);
@@ -1158,5 +1425,91 @@ mod tests {
         let debug_str = format!("{seq:?}");
         assert!(debug_str.contains("RequestSequence"));
         assert!(debug_str.contains("total_tokens"));
+    }
+
+    fn staged_sequence(manager: &BlockManager<TestMeta>) -> RequestSequence<TestMeta> {
+        let mut seq = RequestSequence::new(make_tokens(12), 4, BLOCK_SIZE);
+        assert!(seq.allocate_blocks(seq.num_blocks() + 1, manager));
+        seq.stage_pending();
+        seq
+    }
+
+    #[test]
+    fn take_and_install_equals_register_staged() {
+        let inline_manager = create_test_manager::<TestMeta>(16);
+        let mut inline = staged_sequence(&inline_manager);
+        inline.register_staged(&inline_manager);
+
+        let manager = create_test_manager::<TestMeta>(16);
+        let mut seq = staged_sequence(&manager);
+        let before = seq.page_indices();
+        let taken = seq.take_staged_for_registration();
+        assert_eq!(taken.len(), 3);
+        assert_eq!(seq.registering_blocks(), 3);
+        assert_eq!(seq.page_indices(), before);
+        let results = manager
+            .register_blocks_deferred(taken)
+            .unwrap_or_else(|_| panic!("same-store batch"));
+        assert!(seq.install_registered(results).is_empty());
+        assert_eq!(seq.registering_blocks(), 0);
+        assert_eq!(seq.page_indices(), inline.page_indices());
+        assert_eq!(seq.assigned_blocks(), inline.assigned_blocks());
+    }
+
+    #[test]
+    fn install_assigns_a_duplicate_as_its_canonical_block() {
+        let manager = BlockManager::<TestMeta>::builder()
+            .block_count(16)
+            .block_size(BLOCK_SIZE as usize)
+            .registry(crate::registry::BlockRegistry::new())
+            .duplication_policy(crate::blocks::BlockDuplicationPolicy::Reject)
+            .with_lineage_backend()
+            .build()
+            .expect("build manager");
+        let mut first = staged_sequence(&manager);
+        first.register_staged(&manager);
+        let mut second = staged_sequence(&manager);
+        let taken = second.take_staged_for_registration();
+        let original_ids: Vec<_> = taken.iter().map(CompleteBlock::block_id).collect();
+        let results = manager
+            .register_blocks_deferred(taken)
+            .unwrap_or_else(|_| panic!("same-store batch"));
+        let originals = second.install_registered(results);
+        assert_eq!(
+            originals
+                .iter()
+                .map(CompleteBlock::block_id)
+                .collect::<Vec<_>>(),
+            original_ids
+        );
+        assert_eq!(second.page_indices()[..3], first.page_indices()[..3]);
+        let available = manager.available_blocks();
+        drop(originals);
+        assert_eq!(manager.available_blocks(), available + 3);
+    }
+
+    #[test]
+    fn take_blocks_and_release_request_blocks_equal_release() {
+        let release_manager = create_test_manager::<TestMeta>(16);
+        let mut released = staged_sequence(&release_manager);
+        released.register_staged(&release_manager);
+        released.release();
+
+        let manager = create_test_manager::<TestMeta>(16);
+        let mut seq = staged_sequence(&manager);
+        seq.register_staged(&manager);
+        let blocks = seq.take_blocks();
+        assert!(seq.page_indices().is_empty());
+        let available = manager.available_blocks();
+        manager.release_request_blocks(blocks, None);
+        assert_eq!(
+            manager.available_blocks(),
+            release_manager.available_blocks()
+        );
+        assert!(manager.available_blocks() >= available);
+        assert_eq!(
+            manager.store_for_test().debug_snapshot(),
+            release_manager.store_for_test().debug_snapshot()
+        );
     }
 }

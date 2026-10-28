@@ -9,11 +9,13 @@ use crate::testing::{
 };
 use rstest::rstest;
 
+mod batch_registration;
 mod exact_inactive_allocation;
 mod exact_reclaim_allocation;
 mod exact_reclaim_by_hash;
 mod inactive_lineage_hold;
 mod opaque_exact_reclaim;
+mod rebind;
 mod registered_presence;
 mod registration_provenance;
 mod reset_only_allocation;
@@ -157,6 +159,65 @@ fn inactive_tail_release_preserves_low_cache_and_notifies_evictions() {
     }
     assert_eq!(manager.match_blocks(&hashes[..2]).len(), 2);
     manager.set_capacity(2).unwrap();
+}
+
+#[test]
+fn lineage_tail_release_evicts_descendants_in_lower_slots() {
+    let manager = BlockManager::<TestBlockData>::builder()
+        .block_count(4)
+        .block_size(1)
+        .registry(BlockRegistry::new())
+        .with_lineage_backend()
+        .build()
+        .unwrap();
+    let token_sequence = dynamo_tokens::TokenBlockSequence::from_slice(&[1, 2, 3], 1, Some(42));
+    let token_blocks = token_sequence.blocks();
+    let mut allocated = manager.allocate_blocks(4).unwrap().into_iter();
+    let middle = allocated.next().unwrap();
+    let leaf = allocated.next().unwrap();
+    let _live = allocated.next().unwrap();
+    let root = allocated.next().unwrap();
+    let cached = manager.register_blocks(vec![
+        leaf.complete(&token_blocks[2]).unwrap(),
+        middle.complete(&token_blocks[1]).unwrap(),
+        root.complete(&token_blocks[0]).unwrap(),
+    ]);
+    drop(cached);
+
+    assert_eq!(manager.release_inactive_tail(2), 3);
+    assert_eq!(manager.occupied_high_water(), 3);
+    assert_eq!(manager.metrics().snapshot().inactive_pool_size, 0);
+}
+
+#[test]
+fn lineage_tail_release_preserves_low_root_when_leaf_is_high() {
+    let manager = BlockManager::<TestBlockData>::builder()
+        .block_count(3)
+        .block_size(1)
+        .registry(BlockRegistry::new())
+        .with_lineage_backend()
+        .build()
+        .unwrap();
+    let token_sequence = dynamo_tokens::TokenBlockSequence::from_slice(&[4, 5], 1, Some(43));
+    let token_blocks = token_sequence.blocks();
+    let mut allocated = manager.allocate_blocks(3).unwrap().into_iter();
+    let root = allocated.next().unwrap();
+    let unused = allocated.next().unwrap();
+    let leaf = allocated.next().unwrap();
+    drop(unused);
+    let cached = manager.register_blocks(vec![
+        root.complete(&token_blocks[0]).unwrap(),
+        leaf.complete(&token_blocks[1]).unwrap(),
+    ]);
+    drop(cached);
+
+    assert_eq!(manager.release_inactive_tail(2), 2);
+    assert_eq!(
+        manager
+            .match_blocks(&[token_blocks[0].kvbm_sequence_hash()])
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -3353,6 +3414,9 @@ mod audit_counter_tests {
             fn insert(&mut self, seq_hash: SequenceHash, block_id: BlockId) {
                 self.inner.insert(seq_hash, block_id);
             }
+            fn rebind(&mut self, seq_hash: SequenceHash, src: BlockId, dst: BlockId) -> bool {
+                self.inner.rebind(seq_hash, src, dst)
+            }
             fn len(&self) -> usize {
                 self.reported_len
             }
@@ -3540,6 +3604,9 @@ mod audit_counter_tests {
             fn insert(&mut self, seq_hash: SequenceHash, block_id: BlockId) {
                 self.inner.insert(seq_hash, block_id);
             }
+            fn rebind(&mut self, seq_hash: SequenceHash, src: BlockId, dst: BlockId) -> bool {
+                self.inner.rebind(seq_hash, src, dst)
+            }
             fn len(&self) -> usize {
                 self.reported_len
             }
@@ -3556,10 +3623,10 @@ mod audit_counter_tests {
 
         let metrics = Arc::new(BlockPoolMetrics::new("test".to_string()));
         let tracker = FrequencyTrackingCapacity::default().create_tracker();
-        // Pre-populate the inner backend with 4 entries by inserting
+        // Pre-populate the inner backend with 2 entries by inserting
         // synthetic (hash, block_id) pairs.
         let mut inner = MultiLruBackend::new(NonZeroUsize::new(4).unwrap(), tracker);
-        for i in 0..4u32 {
+        for i in 0..2u32 {
             let h = create_test_token_block_from_iota(90_000 + i * 4).kvbm_sequence_hash();
             inner.insert(h, i as BlockId);
         }
