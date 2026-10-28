@@ -53,10 +53,10 @@ kvbm-service = { path = "kvbm-service" }
 # NOTE: dynamo-kv-router is intentionally featureless. The `runtime-protocols`
 # feature pulls `dynamo-runtime` (and its dynamo-core closure); kvbm-consolidator
 # only consumes `dynamo_kv_router::zmq_wire`, which is available without features.
-# Pinned to a rev on ai-dynamo/dynamo branch ryan/carrier.
-dynamo-tokens = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "144e6a68d0855cc788edf7a12b8393249098c59a" }
-dynamo-kv-router = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "144e6a68d0855cc788edf7a12b8393249098c59a" }
-dynamo-kv-hashing = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "144e6a68d0855cc788edf7a12b8393249098c59a" }
+# Pinned to a rev on the internal Dynamo fork branch carrier-on-main.
+dynamo-tokens = { git = "https://github.com/NVIDIA-dev/warnold-dynamo.git", rev = "3f8e516c24b0e016070aa281d3722d06615a913c" }
+dynamo-kv-router = { git = "https://github.com/NVIDIA-dev/warnold-dynamo.git", rev = "3f8e516c24b0e016070aa281d3722d06615a913c" }
+dynamo-kv-hashing = { git = "https://github.com/NVIDIA-dev/warnold-dynamo.git", rev = "3f8e516c24b0e016070aa281d3722d06615a913c" }
 
 # velo (registry — 0.4.1 / 0.2.0 are published on crates.io)
 velo     = { version = "0.4.1" }
@@ -103,7 +103,7 @@ serde_json = { version = "1" }
 tempfile = "3"
 thiserror = { version = "2.0.17" }
 tmq = { version = "0.5.0" }
-tokio = { version = "=1.52.4", features = ["full"] }
+tokio = { version = "=1.54.1", features = ["full"] }
 tokio-stream = { version = "0.1" }
 tokio-util = { version = "0.7.17", features = ["codec", "net", "rt", "io-util"] }
 tonic = { version = "0.13" }
