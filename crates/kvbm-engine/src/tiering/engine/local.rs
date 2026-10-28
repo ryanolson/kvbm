@@ -1146,7 +1146,7 @@ impl LeaderEngine for LocalConnectorEngine {
     }
 
     fn release_prefill_session(&self, request_id: &RequestId, accept_id: AcceptId) {
-        self.prefill_release(request_id, accept_id);
+        self.prefill_release_after_park(request_id, accept_id);
     }
 }
 
@@ -7440,7 +7440,7 @@ mod tests {
             // drop uses).
             rig.engine
                 .release_prefill_session(&"rq".to_string(), handle1.accept_id());
-            assert!(cdr.prefill.get("rq").is_none(), "gen 1 released");
+            wait_for(|| cdr.prefill.get("rq").is_none()).await;
 
             // Generation 2: same rid, fresh session + state.
             let session2 = Uuid::new_v4();
@@ -8122,6 +8122,68 @@ mod tests {
             assert!(
                 sink.loads().is_empty(),
                 "a fenced terminal fires no load_finished"
+            );
+            Ok(())
+        }
+
+        // ------------------------------------------------------------------
+        // A one-token prefill with no provided window can finish (RAII
+        // release) before its pipeline attaches. The release must wait for
+        // the pipeline: the attach parks, and the session finalizes after the
+        // output drain. It is never closed, so the decode peer does not fall
+        // back to a local prefill.
+        // ------------------------------------------------------------------
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn prefill_release_before_attach_finalizes_after_park() -> Result<()> {
+            let (holder_f, puller_f) = MockSessionFactory::make_paired();
+            let gate = Arc::new(GatedResolver::default());
+            let engine = prefill_engine_with_cfg(
+                RecordingSink::new(),
+                RecordingWorkers::new(),
+                puller_f.clone(),
+                gate.clone(),
+                prefill_cfg_with_drain(
+                    std::time::Duration::from_millis(5),
+                    std::time::Duration::from_millis(50),
+                ),
+            )
+            .await?;
+            let rid = "rq".to_string();
+            let mgr = cd_g2_manager(8);
+            let plhs = cd_block_hashes(&cd_immutables(&mgr, 3, 100));
+
+            let session_id = Uuid::new_v4();
+            holder_f.open(session_id).expect("holder open");
+            let holder = holder_f.last_opened().expect("holder recorded");
+            let (params, hashes, computed) = prefill_accept_args(
+                &plhs,
+                session_id,
+                Uuid::new_v4().into(),
+                holder.endpoint(),
+                0,
+                0,
+            );
+            let PrefillAcceptCore::Accepted { accept_id, .. } = engine
+                .clone()
+                .prefill_accept_core(&rid, &params, &hashes, computed)?
+            else {
+                anyhow::bail!("first accept must latch");
+            };
+
+            engine.prefill_release_after_park(&rid, accept_id);
+            anyhow::ensure!(puller_f.attach_calls().is_empty(), "released pre-attach");
+
+            gate.open();
+            wait_for(|| {
+                puller_f
+                    .last_attached()
+                    .is_some_and(|session| session.finished_reason().is_some())
+            })
+            .await;
+            let session = puller_f.last_attached().expect("attached");
+            anyhow::ensure!(
+                session.closed_reason().is_none(),
+                "the deferred release finalizes the parked session, it never closes it"
             );
             Ok(())
         }
@@ -10682,7 +10744,7 @@ mod tests {
             assert!(cdr.prefill.get("rq").is_some());
 
             drop(handle);
-            assert!(cdr.prefill.get("rq").is_none(), "lifecycle released");
+            wait_for(|| cdr.prefill.get("rq").is_none()).await;
             assert!(
                 rig.engine.searches.is_empty(),
                 "the bound internal search released with it"
@@ -10739,7 +10801,7 @@ mod tests {
             );
 
             drop(fresh);
-            assert!(cdr.prefill.get("rq").is_none(), "generation 2 released");
+            wait_for(|| cdr.prefill.get("rq").is_none()).await;
             Ok(())
         }
 
@@ -10780,6 +10842,8 @@ mod tests {
                 uuid::Uuid::new_v4(),
             ));
             state.bind_local_search(search_id);
+            // No pipeline runs for this synthetic lifecycle: model a parked one.
+            state.end_release_deferral();
             cdr.prefill
                 .insert("rq".to_string(), state)
                 .expect("fresh latch");
