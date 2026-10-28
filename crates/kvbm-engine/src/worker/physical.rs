@@ -109,6 +109,13 @@ pub struct PhysicalWorker {
     #[builder(default, setter(strip_option))]
     resource_handles: Option<ResourceLayoutHandles>,
 
+    /// Layouts that a peer reads by handle, outside every transfer
+    /// dispatch, such as the slots of a fixed recurrent state. They are
+    /// exported with `resource_handles`, so a peer that imports this worker
+    /// can address them, but no placement or transfer plan names them.
+    #[builder(default)]
+    exported_layouts: Vec<(LogicalResourceId, TierLayoutHandles)>,
+
     /// Remote handle mappings for peer-to-peer transfers (legacy, no rank).
     /// Key: (InstanceId, LogicalLayoutHandle) → remote LayoutHandle
     ///
@@ -410,6 +417,11 @@ impl PhysicalWorker {
             Some(resources) => {
                 let grouped = resources
                     .iter()
+                    .chain(
+                        self.exported_layouts
+                            .iter()
+                            .map(|(resource, handles)| (*resource, handles)),
+                    )
                     .map(|(resource, handles)| {
                         self.build_resource_descriptors(handles)
                             .map(|layouts| ResourceLayoutDescriptor::new(resource, layouts))
