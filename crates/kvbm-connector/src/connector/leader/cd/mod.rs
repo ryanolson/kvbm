@@ -214,6 +214,7 @@ mod tests {
     fn handshake_with(features: &[kvbm_hub::FeatureKey]) -> HubHandshake {
         HubHandshake {
             url: "http://127.0.0.1:1337".to_string(),
+            control_port: kvbm_config::DEFAULT_HUB_CONTROL_PORT,
             effective: HashSet::from_iter(features.iter().copied()),
             indexer_transport: None,
             runtime_summary: kvbm_hub::RuntimeConfigSummary::default(),

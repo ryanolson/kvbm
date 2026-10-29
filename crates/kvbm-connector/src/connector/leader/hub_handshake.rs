@@ -61,6 +61,8 @@ const AUTO_COREGISTERED_DEPS: &[(FeatureKey, FeatureKey)] =
 pub struct HubHandshake {
     /// Resolved hub base URL (from `leader.hub.url`).
     pub url: String,
+    /// Hub control port (from `leader.hub.control_port`).
+    pub control_port: u16,
     /// Effective connector-level features (a subset of [`CONNECTOR_CAPS`]).
     pub effective: HashSet<FeatureKey>,
     /// KV-index ingest transport — `Some` iff Indexer is effective and local
@@ -173,6 +175,7 @@ pub async fn resolve(
             tracing::warn!(hub = %hub.url, error = %e, "hub /v1/ext/kvbm/config unavailable; hub features disabled");
             return Ok(HubHandshake {
                 url: hub.url.clone(),
+                control_port: hub.control_port,
                 effective: HashSet::new(),
                 indexer_transport: None,
                 runtime_summary,
@@ -277,6 +280,7 @@ pub async fn resolve(
 
     Ok(HubHandshake {
         url: hub.url.clone(),
+        control_port: hub.control_port,
         effective,
         indexer_transport,
         runtime_summary,
@@ -567,6 +571,7 @@ mod tests {
         LeaderHubConfig {
             url: url.to_string(),
             features: features.iter().map(|s| s.to_string()).collect(),
+            control_port: kvbm_config::DEFAULT_HUB_CONTROL_PORT,
         }
     }
 
@@ -595,6 +600,7 @@ mod tests {
     fn handshake_with(effective: &[FeatureKey]) -> HubHandshake {
         HubHandshake {
             url: "http://hub".to_string(),
+            control_port: kvbm_config::DEFAULT_HUB_CONTROL_PORT,
             effective: effective.iter().copied().collect(),
             indexer_transport: None,
             runtime_summary: RuntimeConfigSummary {

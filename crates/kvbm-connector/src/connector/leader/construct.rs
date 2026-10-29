@@ -118,7 +118,7 @@ async fn register_indexer_only(
     let velo = runtime
         .velo()
         .ok_or_else(|| anyhow!("indexer hub registration requires a Velo runtime"))?;
-    let hub = super::build_hub_client(&handshake.url)?;
+    let hub = super::build_hub_client(&handshake.url, handshake.control_port)?;
     let max_seq_len = runtime.config().max_seq_len;
     hub.register(
         velo,

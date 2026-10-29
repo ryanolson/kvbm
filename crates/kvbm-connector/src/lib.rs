@@ -48,7 +48,7 @@ pub fn seed_leader_builder_with_hub_discovery(
     let Some(hub) = config.hub.as_ref() else {
         return Ok(builder);
     };
-    let hub_client = connector::leader::build_hub_client(&hub.url)?;
+    let hub_client = connector::leader::build_hub_client(&hub.url, hub.control_port)?;
     let discovery: std::sync::Arc<dyn velo::discovery::PeerDiscovery> =
         std::sync::Arc::new(hub_client.discovery());
     Ok(builder.with_discovery(discovery))

@@ -148,7 +148,7 @@ pub(in super::super) async fn wire_hub(
         .context("CD features require a KvbmRuntime built with a Velo (got bare Messenger only)")?
         .clone();
 
-    let hub = build_hub_client(&handshake.url)?;
+    let hub = build_hub_client(&handshake.url, handshake.control_port)?;
 
     let hub_velo_id = hub
         .register(&velo, features, Some(handshake.runtime_summary.clone()))
