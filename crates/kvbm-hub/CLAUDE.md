@@ -20,26 +20,27 @@ cargo machete
 
 ## Architecture
 
-`kvbm-hub` is a library crate targeting clients and a server executable (kvbm_hub). It provides a central HTTP coordination service for KVBM velo clients and is consumed by other crates in the workspace.
+`kvbm-hub` is a library crate targeting clients and a server executable (kvbm_hub). It runs a `velo-hub` hub and adds the KVBM extensions to it.
 
-**Dual-port design:**
-- **Discovery port** (default `1337`) — read-only `GET` endpoints implementing the `velo::discovery::PeerDiscovery` trait over HTTP. Clients hit this for peer lookups.
-- **Control port** (default `8337`) — write endpoints (register, unregister, heartbeat) plus mirrored discovery endpoints. Also the entry point for velo active messaging.
+`velo-hub` owns discovery, registration, heartbeats, lease epochs, the registration store and both HTTP listeners. Do not add a second copy of any of these here.
+
+**Dual-port design (from velo-hub):**
+- **Discovery port** (default `1337`) — read-only peer lookups (`GET /v1/peers/...`).
+- **Control port** (default `8337`) — register, unregister, heartbeat, plus the discovery routes.
 
 **Key types and their roles:**
 
 | Type | Module | Role |
 |------|--------|------|
-| `HubServerState` | `server` | `Arc<RwLock<Registry>>` — in-memory `InstanceId`↔`PeerInfo` + `WorkerId`↔`InstanceId` maps |
-| `HubServer` | `server` | Running server with two axum listeners; `CancellationToken` shutdown |
-| `HubClient` | `client` | `reqwest`-based HTTP client; implements `PeerDiscovery`; holds an `OnceLock<HubRegistrationGuard>` |
-| `HubRegistrationGuard` | `client` | RAII guard — issues HTTP `DELETE` on drop (best-effort via `handle.spawn`) |
-| `protocol` | `protocol` | Shared JSON request/response types and URL path constants |
-| `handlers` | `handlers` | Velo active-message handlers installed on the client side (currently only heartbeat) |
+| `HubServerBuilder` / `HubServer` | `server` | Builds and runs a `velo_hub::Hub` with the KVBM extensions and the aggregate KVBM config |
+| `HubClient` | `client` | Wraps `velo_hub::client::HubClient`; `register` sends the KVBM feature payloads as extensions |
+| `KvbmFeature` | `features` | The KVBM config that each `velo_hub::Extension` advertises |
+| `protocol` | `protocol` | Shared JSON types and URL path constants |
+| `handlers` | `handlers` | Velo handler names for hub → client pushes |
 
-**Two messaging planes:**
-1. **HTTP** (bootstrap + discovery) — client registers via `POST /v1/instances`, looks up peers via `GET /v1/peers/...`, heartbeats via `POST /v1/instances/{id}/heartbeat`.
-2. **Velo active messaging** (post-discovery control plane) — hub pushes heartbeats to registered clients via velo handlers (`_kvbm_hub_heartbeat`). Registered by calling `HubClient::register_handlers` before `register_instance`.
+**Routes:** each extension serves its routes under `/v1/ext/{NAME}`. The aggregate KVBM config is `GET /v1/ext/kvbm/config` (`protocol::paths::HUB_CONFIG`).
+
+**Tests:** `test_hub` registers through a real `HubServer`. Use `test_hub::attempt` to check a rejected registration, and `test_hub::register_as` for a registration that must succeed.
 
 **Integration test pattern:** tests bind both ports to `0` (OS-assigned) and extract the actual addresses from the returned `HubServer`. This avoids port conflicts across parallel test runs.
 

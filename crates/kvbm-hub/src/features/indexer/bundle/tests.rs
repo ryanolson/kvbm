@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, mpsc};
 use std::time::Duration;
 
@@ -13,13 +13,12 @@ use kvbm_protocols::cache_manifest::{
 use velo_ext::InstanceId;
 
 use super::generation::RetiredGenerations;
-use super::{BundleDirectory, BundleDirectoryError, test_registration_epoch};
+use super::{BundleDirectory, BundleDirectoryError, CredentialAuthorized, test_registration_epoch};
 use crate::features::indexer::protocol::{
     BundleAdvertisementRecord, BundleInvalidateRequest, BundlePublishRequest,
     BundleQueryMissReason, BundleQueryOutcome, BundleQueryRequest,
 };
-use crate::protocol::MutationCredential;
-use crate::registry::RegistryIncarnation;
+use velo_hub::protocol::Credential;
 
 const CSA: LogicalResourceId = LogicalResourceId(10);
 const HCA: LogicalResourceId = LogicalResourceId(11);
@@ -139,25 +138,14 @@ fn advertisement(
     }
 }
 
-fn owner_credential(owner: InstanceId) -> MutationCredential {
-    MutationCredential::for_test_owner(owner)
+fn owner_credential(owner: InstanceId) -> Credential {
+    super::test_owner_credential(owner)
 }
 
 fn register_owner(directory: &BundleDirectory, owner: InstanceId) {
     directory
-        .register_owner(owner, owner_credential(owner))
+        .commit_owner_credential(owner, owner_credential(owner))
         .unwrap();
-}
-
-fn stage_owner_registration(
-    directory: &BundleDirectory,
-    owner: InstanceId,
-    credential: MutationCredential,
-    registration_epoch: RegistrationEpoch,
-    incarnation: RegistryIncarnation,
-) -> Result<(), BundleDirectoryError> {
-    directory.stage_owner_transition(owner, Some(credential), registration_epoch)?;
-    directory.bind_owner_registration(owner, registration_epoch, incarnation)
 }
 
 fn query(
@@ -173,14 +161,15 @@ fn query(
     }
 }
 
-fn credential() -> MutationCredential {
-    MutationCredential::generate()
+fn credential() -> Credential {
+    Credential::generate()
 }
 
 fn authorize_publish(
-    credential: MutationCredential,
+    credential: Credential,
     mut request: BundlePublishRequest,
 ) -> BundlePublishRequest {
+    request.advertisement.registration_epoch = Some(super::credential_epoch(&credential));
     request.credential = credential;
     request
 }
@@ -195,19 +184,19 @@ fn publication_requires_the_registered_owner_epoch() {
     let mut missing = advertisement(owner, manifest, 8, 1, 10_000, vec![CSA, HCA, CAPSULE]);
     missing.advertisement.registration_epoch = None;
     assert_eq!(
-        directory.publish(missing),
+        directory.publish_by_credential(missing),
         Err(BundleDirectoryError::RegistrationEpochMismatch { owner })
     );
 
     let mut replacement = advertisement(owner, manifest, 8, 1, 10_000, vec![CSA, HCA, CAPSULE]);
     replacement.advertisement.registration_epoch = Some(RegistrationEpoch::new());
     assert_eq!(
-        directory.publish(replacement),
+        directory.publish_by_credential(replacement),
         Err(BundleDirectoryError::RegistrationEpochMismatch { owner })
     );
 
     directory
-        .publish(advertisement(
+        .publish_by_credential(advertisement(
             owner,
             manifest,
             8,
@@ -227,11 +216,13 @@ fn cross_owner_credential_cannot_publish_an_advertisement() {
     let victim_credential = credential();
     let manifest = CacheManifestId::from_bytes([31; 32]);
     directory
-        .register_owner(attacker, attacker_credential.clone())
+        .commit_owner_credential(attacker, attacker_credential.clone())
         .unwrap();
-    directory.register_owner(victim, victim_credential).unwrap();
+    directory
+        .commit_owner_credential(victim, victim_credential)
+        .unwrap();
 
-    let result = directory.publish(authorize_publish(
+    let result = directory.publish_by_credential(authorize_publish(
         attacker_credential,
         advertisement(victim, manifest, 8, 1, 10_000, vec![CSA, HCA, CAPSULE]),
     ));
@@ -256,19 +247,19 @@ fn cross_owner_credential_cannot_invalidate_an_advertisement() {
     let manifest = CacheManifestId::from_bytes([32; 32]);
     let bundle_key = key(manifest, 8);
     directory
-        .register_owner(attacker, attacker_credential.clone())
+        .commit_owner_credential(attacker, attacker_credential.clone())
         .unwrap();
     directory
-        .register_owner(victim, victim_credential.clone())
+        .commit_owner_credential(victim, victim_credential.clone())
         .unwrap();
     directory
-        .publish(authorize_publish(
+        .publish_by_credential(authorize_publish(
             victim_credential,
             advertisement(victim, manifest, 8, 1, 10_000, vec![CSA, HCA, CAPSULE]),
         ))
         .unwrap();
 
-    let result = directory.invalidate(BundleInvalidateRequest {
+    let result = directory.invalidate_by_credential(BundleInvalidateRequest {
         credential: attacker_credential,
         key: bundle_key,
         generation: 1,
@@ -294,158 +285,22 @@ fn stale_credential_is_rejected_after_owner_reregistration() {
     let current_credential = credential();
     let manifest = CacheManifestId::from_bytes([33; 32]);
     directory
-        .register_owner(owner, stale_credential.clone())
+        .commit_owner_credential(owner, stale_credential.clone())
         .unwrap();
     directory
-        .register_owner(owner, current_credential.clone())
+        .commit_owner_credential(owner, current_credential.clone())
         .unwrap();
 
     assert_eq!(
-        directory.publish(authorize_publish(
+        directory.publish_by_credential(authorize_publish(
             stale_credential,
             advertisement(owner, manifest, 8, 1, 10_000, vec![CSA, HCA, CAPSULE]),
         )),
         Err(BundleDirectoryError::UnauthorizedOwner { owner })
     );
     directory
-        .publish(authorize_publish(
+        .publish_by_credential(authorize_publish(
             current_credential,
-            advertisement(owner, manifest, 8, 1, 10_000, vec![CSA, HCA, CAPSULE]),
-        ))
-        .unwrap();
-}
-
-#[test]
-fn staged_owner_rotation_is_hidden_and_rollback_preserves_exact_generation_state() {
-    let directory = directory(500);
-    let owner = InstanceId::new_v4();
-    let previous_credential = credential();
-    let replacement_credential = credential();
-    let manifest = CacheManifestId::from_bytes([51; 32]);
-    let bundle_key = key(manifest, 8);
-    directory
-        .register_owner(owner, previous_credential.clone())
-        .unwrap();
-    directory
-        .publish(authorize_publish(
-            previous_credential.clone(),
-            advertisement(owner, manifest, 8, 7, 10_000, vec![CSA, HCA, CAPSULE]),
-        ))
-        .unwrap();
-    assert!(
-        directory
-            .invalidate(BundleInvalidateRequest {
-                credential: previous_credential.clone(),
-                key: bundle_key,
-                generation: 7,
-                owner,
-                retain_until_unix_ms: 10_000,
-            })
-            .unwrap()
-    );
-    directory
-        .publish(authorize_publish(
-            previous_credential.clone(),
-            advertisement(owner, manifest, 8, 9, 10_000, vec![CSA, HCA, CAPSULE]),
-        ))
-        .unwrap();
-
-    stage_owner_registration(
-        &directory,
-        owner,
-        replacement_credential,
-        test_registration_epoch(owner),
-        RegistryIncarnation::from_u64(2),
-    )
-    .unwrap();
-    assert_eq!(
-        directory.query(query(manifest, vec![bundle_key], 1_000)),
-        BundleQueryOutcome::Miss(BundleQueryMissReason::NotFound)
-    );
-    assert_eq!(
-        directory.publish(authorize_publish(
-            previous_credential.clone(),
-            advertisement(owner, manifest, 8, 10, 10_000, vec![CSA, HCA, CAPSULE]),
-        )),
-        Err(BundleDirectoryError::UnknownOwner { owner })
-    );
-
-    stage_owner_registration(
-        &directory,
-        owner,
-        previous_credential.clone(),
-        test_registration_epoch(owner),
-        RegistryIncarnation::from_u64(3),
-    )
-    .unwrap();
-    let BundleQueryOutcome::Hit(hit) = directory.query(query(manifest, vec![bundle_key], 1_000))
-    else {
-        panic!("rollback did not restore the preserved live advertisement");
-    };
-    assert_eq!(hit.advertisement.generation, 9);
-    assert_eq!(
-        directory.publish(authorize_publish(
-            previous_credential,
-            advertisement(owner, manifest, 8, 7, 10_000, vec![CSA, HCA, CAPSULE]),
-        )),
-        Err(BundleDirectoryError::StaleGeneration {
-            current: 7,
-            attempted: 7,
-        })
-    );
-}
-
-#[test]
-fn stale_finalize_cannot_commit_another_owner_incarnation() {
-    let directory = directory(500);
-    let owner = InstanceId::new_v4();
-    let previous_credential = credential();
-    let replacement_credential = credential();
-    let expected = RegistryIncarnation::from_u64(2);
-    let stale = RegistryIncarnation::from_u64(1);
-    let manifest = CacheManifestId::from_bytes([52; 32]);
-    let bundle_key = key(manifest, 8);
-    directory
-        .register_owner(owner, previous_credential.clone())
-        .unwrap();
-    directory
-        .publish(authorize_publish(
-            previous_credential,
-            advertisement(owner, manifest, 8, 9, 10_000, vec![CSA, HCA, CAPSULE]),
-        ))
-        .unwrap();
-    stage_owner_registration(
-        &directory,
-        owner,
-        replacement_credential.clone(),
-        test_registration_epoch(owner),
-        expected,
-    )
-    .unwrap();
-
-    assert_eq!(
-        directory.finalize_owner_registration(owner, stale),
-        Err(BundleDirectoryError::StaleOwnerRegistration {
-            owner,
-            expected,
-            attempted: stale,
-        })
-    );
-    assert_eq!(
-        directory.query(query(manifest, vec![bundle_key], 1_000)),
-        BundleQueryOutcome::Miss(BundleQueryMissReason::NotFound)
-    );
-
-    directory
-        .finalize_owner_registration(owner, expected)
-        .unwrap();
-    assert_eq!(
-        directory.query(query(manifest, vec![bundle_key], 1_000)),
-        BundleQueryOutcome::Miss(BundleQueryMissReason::NotFound)
-    );
-    directory
-        .publish(authorize_publish(
-            replacement_credential,
             advertisement(owner, manifest, 8, 1, 10_000, vec![CSA, HCA, CAPSULE]),
         ))
         .unwrap();
@@ -459,10 +314,10 @@ fn valid_same_owner_credential_can_publish_and_invalidate() {
     let manifest = CacheManifestId::from_bytes([34; 32]);
     let bundle_key = key(manifest, 8);
     directory
-        .register_owner(owner, owner_credential.clone())
+        .commit_owner_credential(owner, owner_credential.clone())
         .unwrap();
     directory
-        .publish(authorize_publish(
+        .publish_by_credential(authorize_publish(
             owner_credential.clone(),
             advertisement(owner, manifest, 8, 7, 10_000, vec![CSA, HCA, CAPSULE]),
         ))
@@ -474,7 +329,7 @@ fn valid_same_owner_credential_can_publish_and_invalidate() {
     ));
     assert!(
         directory
-            .invalidate(BundleInvalidateRequest {
+            .invalidate_by_credential(BundleInvalidateRequest {
                 credential: owner_credential,
                 key: bundle_key,
                 generation: 7,
@@ -497,11 +352,11 @@ fn unknown_or_removed_owner_is_never_visible() {
     let publish = advertisement(owner, manifest, 8, 1, 10_000, vec![CSA, HCA, CAPSULE]);
 
     assert!(matches!(
-        directory.publish(publish.clone()),
+        directory.publish_by_credential(publish.clone()),
         Err(BundleDirectoryError::UnknownOwner { .. })
     ));
     register_owner(&directory, owner);
-    directory.publish(publish).unwrap();
+    directory.publish_by_credential(publish).unwrap();
     assert!(matches!(
         directory.query(query(manifest, vec![key(manifest, 8)], 1_000)),
         BundleQueryOutcome::Hit(_)
@@ -520,7 +375,7 @@ fn invalid_query_manifest_mismatch_and_expired_have_distinct_miss_reasons() {
     let manifest = CacheManifestId::from_bytes([2; 32]);
     register_owner(&directory, owner);
     directory
-        .publish(advertisement(
+        .publish_by_credential(advertisement(
             owner,
             manifest,
             8,
@@ -555,7 +410,7 @@ fn duplicate_resources_are_rejected_before_visibility() {
     register_owner(&directory, owner);
     assert!(
         directory
-            .publish(advertisement(
+            .publish_by_credential(advertisement(
                 owner,
                 manifest,
                 8,
@@ -586,7 +441,7 @@ fn publish_rejects_geometry_that_violates_advertised_requirements() {
         BundleResourceLineage::new(CAPSULE, vec![bundle_key.boundary_hash()]).unwrap(),
     ];
 
-    assert!(directory.publish(publish).is_err());
+    assert!(directory.publish_by_credential(publish).is_err());
     assert_eq!(
         directory.query(query(manifest, vec![bundle_key], 1_000)),
         BundleQueryOutcome::Miss(BundleQueryMissReason::NotFound)
@@ -627,7 +482,7 @@ fn stored_malformed_lower_order_owner_cannot_mask_valid_same_key_owner() {
         .unwrap();
 
     directory
-        .publish(advertisement(
+        .publish_by_credential(advertisement(
             valid_owner,
             manifest,
             8,
@@ -675,10 +530,10 @@ fn incompatible_lower_order_owner_cannot_mask_valid_same_key_owner() {
     ];
 
     directory
-        .publish(malformed)
+        .publish_by_credential(malformed)
         .expect("the forged record is self-consistent under its advertised requirements");
     directory
-        .publish(advertisement(
+        .publish_by_credential(advertisement(
             valid_owner,
             manifest,
             8,
@@ -702,7 +557,7 @@ fn stale_generation_is_rejected_and_query_can_retry_earlier_boundary() {
     let manifest = CacheManifestId::from_bytes([4; 32]);
     register_owner(&directory, owner);
     directory
-        .publish(advertisement(
+        .publish_by_credential(advertisement(
             owner,
             manifest,
             8,
@@ -712,7 +567,7 @@ fn stale_generation_is_rejected_and_query_can_retry_earlier_boundary() {
         ))
         .unwrap();
     assert!(matches!(
-        directory.publish(advertisement(
+        directory.publish_by_credential(advertisement(
             owner,
             manifest,
             8,
@@ -743,7 +598,7 @@ fn invalidation_requires_the_exact_owner_generation() {
     let bundle_key = key(manifest, 8);
     register_owner(&directory, owner);
     directory
-        .publish(advertisement(
+        .publish_by_credential(advertisement(
             owner,
             manifest,
             8,
@@ -755,7 +610,7 @@ fn invalidation_requires_the_exact_owner_generation() {
 
     assert!(
         !directory
-            .invalidate(BundleInvalidateRequest {
+            .invalidate_by_credential(BundleInvalidateRequest {
                 credential: owner_credential(owner),
                 key: bundle_key,
                 generation: 6,
@@ -766,7 +621,7 @@ fn invalidation_requires_the_exact_owner_generation() {
     );
     assert!(
         directory
-            .invalidate(BundleInvalidateRequest {
+            .invalidate_by_credential(BundleInvalidateRequest {
                 credential: owner_credential(owner),
                 key: bundle_key,
                 generation: 7,
@@ -792,7 +647,7 @@ fn newer_invalidation_is_an_owner_local_monotonic_high_water() {
     register_owner(&directory, owner);
     register_owner(&directory, other_owner);
     directory
-        .publish(advertisement(
+        .publish_by_credential(advertisement(
             owner,
             manifest,
             8,
@@ -803,7 +658,7 @@ fn newer_invalidation_is_an_owner_local_monotonic_high_water() {
         .unwrap();
     assert!(
         !directory
-            .invalidate(BundleInvalidateRequest {
+            .invalidate_by_credential(BundleInvalidateRequest {
                 credential: owner_credential(owner),
                 key: bundle_key,
                 generation: 100,
@@ -818,7 +673,7 @@ fn newer_invalidation_is_an_owner_local_monotonic_high_water() {
         "generation 7 must not remain visible below a generation-100 invalidation"
     );
     directory
-        .publish(advertisement(
+        .publish_by_credential(advertisement(
             other_owner,
             manifest,
             8,
@@ -836,7 +691,7 @@ fn newer_invalidation_is_an_owner_local_monotonic_high_water() {
 
     for attempted in [7, 100] {
         assert_eq!(
-            directory.publish(advertisement(
+            directory.publish_by_credential(advertisement(
                 owner,
                 manifest,
                 8,
@@ -851,7 +706,7 @@ fn newer_invalidation_is_an_owner_local_monotonic_high_water() {
         );
     }
     directory
-        .publish(advertisement(
+        .publish_by_credential(advertisement(
             owner,
             manifest,
             8,
@@ -863,7 +718,7 @@ fn newer_invalidation_is_an_owner_local_monotonic_high_water() {
 
     assert!(
         !directory
-            .invalidate(BundleInvalidateRequest {
+            .invalidate_by_credential(BundleInvalidateRequest {
                 credential: owner_credential(owner),
                 key: bundle_key,
                 generation: 90,
@@ -883,7 +738,7 @@ fn newer_invalidation_is_an_owner_local_monotonic_high_water() {
     let absent_key = key(manifest, 16);
     assert!(
         !directory
-            .invalidate(BundleInvalidateRequest {
+            .invalidate_by_credential(BundleInvalidateRequest {
                 credential: owner_credential(owner),
                 key: absent_key,
                 generation: 100,
@@ -894,7 +749,7 @@ fn newer_invalidation_is_an_owner_local_monotonic_high_water() {
     );
     assert!(
         !directory
-            .invalidate(BundleInvalidateRequest {
+            .invalidate_by_credential(BundleInvalidateRequest {
                 credential: owner_credential(owner),
                 key: absent_key,
                 generation: 90,
@@ -905,7 +760,7 @@ fn newer_invalidation_is_an_owner_local_monotonic_high_water() {
     );
     now.store(401, Ordering::Release);
     assert!(matches!(
-        directory.publish(advertisement(
+        directory.publish_by_credential(advertisement(
             owner,
             manifest,
             16,
@@ -920,7 +775,7 @@ fn newer_invalidation_is_an_owner_local_monotonic_high_water() {
     ));
     now.store(451, Ordering::Release);
     directory
-        .publish(advertisement(
+        .publish_by_credential(advertisement(
             owner,
             manifest,
             16,
@@ -946,7 +801,7 @@ fn absent_retirements_are_bounded_without_evicting_delayed_replay_protection() {
     for retired in [first, second] {
         assert!(
             !directory
-                .invalidate(BundleInvalidateRequest {
+                .invalidate_by_credential(BundleInvalidateRequest {
                     credential: owner_credential(owner),
                     key: retired,
                     generation: 7,
@@ -957,7 +812,7 @@ fn absent_retirements_are_bounded_without_evicting_delayed_replay_protection() {
         );
     }
     assert_eq!(
-        directory.invalidate(BundleInvalidateRequest {
+        directory.invalidate_by_credential(BundleInvalidateRequest {
             credential: owner_credential(owner),
             key: rejected,
             generation: 7,
@@ -968,7 +823,7 @@ fn absent_retirements_are_bounded_without_evicting_delayed_replay_protection() {
     );
     assert_eq!(directory.state.read().unwrap().retired_generations.len(), 2);
     assert_eq!(
-        directory.publish(advertisement(
+        directory.publish_by_credential(advertisement(
             owner,
             manifest,
             8,
@@ -984,7 +839,7 @@ fn absent_retirements_are_bounded_without_evicting_delayed_replay_protection() {
     );
 
     directory
-        .publish(advertisement(
+        .publish_by_credential(advertisement(
             owner,
             manifest,
             24,
@@ -995,7 +850,7 @@ fn absent_retirements_are_bounded_without_evicting_delayed_replay_protection() {
         .unwrap();
     assert!(
         directory
-            .invalidate(BundleInvalidateRequest {
+            .invalidate_by_credential(BundleInvalidateRequest {
                 credential: owner_credential(owner),
                 key: live,
                 generation: 9,
@@ -1007,7 +862,7 @@ fn absent_retirements_are_bounded_without_evicting_delayed_replay_protection() {
     );
     assert_eq!(directory.state.read().unwrap().retired_generations.len(), 3);
     assert_eq!(
-        directory.publish(advertisement(
+        directory.publish_by_credential(advertisement(
             owner,
             manifest,
             24,
@@ -1023,7 +878,7 @@ fn absent_retirements_are_bounded_without_evicting_delayed_replay_protection() {
 
     now.store(11, Ordering::Release);
     directory
-        .publish(advertisement(
+        .publish_by_credential(advertisement(
             owner,
             manifest,
             8,
@@ -1044,7 +899,7 @@ fn live_advertisements_have_server_owned_lifetime_and_per_owner_capacity() {
 
     for boundary in [8, 16] {
         directory
-            .publish(advertisement(
+            .publish_by_credential(advertisement(
                 owner,
                 manifest,
                 boundary,
@@ -1055,7 +910,7 @@ fn live_advertisements_have_server_owned_lifetime_and_per_owner_capacity() {
             .unwrap();
     }
     assert_eq!(
-        directory.publish(advertisement(
+        directory.publish_by_credential(advertisement(
             owner,
             manifest,
             24,
@@ -1067,7 +922,7 @@ fn live_advertisements_have_server_owned_lifetime_and_per_owner_capacity() {
     );
 
     directory
-        .publish(advertisement(
+        .publish_by_credential(advertisement(
             owner,
             manifest,
             8,
@@ -1084,7 +939,7 @@ fn live_advertisements_have_server_owned_lifetime_and_per_owner_capacity() {
 
     now.store(21, Ordering::Release);
     directory
-        .publish(advertisement(
+        .publish_by_credential(advertisement(
             owner,
             manifest,
             24,
@@ -1107,7 +962,7 @@ fn global_capacity_rejects_new_identities_but_allows_refresh_and_exact_removal()
     }
 
     directory
-        .publish(advertisement(
+        .publish_by_credential(advertisement(
             owners[0],
             manifest,
             8,
@@ -1117,7 +972,7 @@ fn global_capacity_rejects_new_identities_but_allows_refresh_and_exact_removal()
         ))
         .unwrap();
     directory
-        .publish(advertisement(
+        .publish_by_credential(advertisement(
             owners[1],
             manifest,
             16,
@@ -1127,7 +982,7 @@ fn global_capacity_rejects_new_identities_but_allows_refresh_and_exact_removal()
         ))
         .unwrap();
     assert_eq!(
-        directory.publish(advertisement(
+        directory.publish_by_credential(advertisement(
             owners[0],
             manifest,
             24,
@@ -1138,7 +993,7 @@ fn global_capacity_rejects_new_identities_but_allows_refresh_and_exact_removal()
         Err(BundleDirectoryError::GlobalCapacity { capacity: 2 })
     );
     directory
-        .publish(advertisement(
+        .publish_by_credential(advertisement(
             owners[0],
             manifest,
             8,
@@ -1151,7 +1006,7 @@ fn global_capacity_rejects_new_identities_but_allows_refresh_and_exact_removal()
     for (owner, boundary) in [(owners[0], 24), (owners[1], 32)] {
         assert!(
             !directory
-                .invalidate(BundleInvalidateRequest {
+                .invalidate_by_credential(BundleInvalidateRequest {
                     credential: owner_credential(owner),
                     key: key(manifest, boundary),
                     generation: 7,
@@ -1162,7 +1017,7 @@ fn global_capacity_rejects_new_identities_but_allows_refresh_and_exact_removal()
         );
     }
     assert_eq!(
-        directory.invalidate(BundleInvalidateRequest {
+        directory.invalidate_by_credential(BundleInvalidateRequest {
             credential: owner_credential(owners[0]),
             key: key(manifest, 40),
             generation: 7,
@@ -1173,7 +1028,7 @@ fn global_capacity_rejects_new_identities_but_allows_refresh_and_exact_removal()
     );
     assert!(
         !directory
-            .invalidate(BundleInvalidateRequest {
+            .invalidate_by_credential(BundleInvalidateRequest {
                 credential: owner_credential(owners[0]),
                 key: key(manifest, 24),
                 generation: 8,
@@ -1185,7 +1040,7 @@ fn global_capacity_rejects_new_identities_but_allows_refresh_and_exact_removal()
     );
     assert!(
         directory
-            .invalidate(BundleInvalidateRequest {
+            .invalidate_by_credential(BundleInvalidateRequest {
                 credential: owner_credential(owners[0]),
                 key: key(manifest, 8),
                 generation: 2,
@@ -1207,7 +1062,7 @@ fn repeated_live_publish_invalidate_cycles_cannot_bypass_total_owner_capacity() 
 
     for boundary in [8, 16, 24, 32] {
         directory
-            .publish(advertisement(
+            .publish_by_credential(advertisement(
                 owner,
                 manifest,
                 boundary,
@@ -1218,7 +1073,7 @@ fn repeated_live_publish_invalidate_cycles_cannot_bypass_total_owner_capacity() 
             .unwrap();
         assert!(
             directory
-                .invalidate(BundleInvalidateRequest {
+                .invalidate_by_credential(BundleInvalidateRequest {
                     credential: owner_credential(owner),
                     key: key(manifest, boundary),
                     generation: 1,
@@ -1234,7 +1089,7 @@ fn repeated_live_publish_invalidate_cycles_cannot_bypass_total_owner_capacity() 
         "cycling beyond one live-ad capacity window must remain bounded"
     );
     assert_eq!(
-        directory.publish(advertisement(
+        directory.publish_by_credential(advertisement(
             owner,
             manifest,
             40,
@@ -1245,7 +1100,7 @@ fn repeated_live_publish_invalidate_cycles_cannot_bypass_total_owner_capacity() 
         Err(BundleDirectoryError::OwnerCapacity { owner, capacity: 4 })
     );
     assert_eq!(
-        directory.publish(advertisement(
+        directory.publish_by_credential(advertisement(
             owner,
             manifest,
             8,
@@ -1270,7 +1125,7 @@ fn exact_invalidation_leaves_live_advertisement_when_retirement_has_no_slot() {
     let bundle_key = key(manifest, 8);
     register_owner(&directory, owner);
     directory
-        .publish(advertisement(
+        .publish_by_credential(advertisement(
             owner,
             manifest,
             8,
@@ -1282,7 +1137,7 @@ fn exact_invalidation_leaves_live_advertisement_when_retirement_has_no_slot() {
     directory.state.write().unwrap().retired_generations = RetiredGenerations::new(10, 0, 0, 0, 0);
 
     assert_eq!(
-        directory.invalidate(BundleInvalidateRequest {
+        directory.invalidate_by_credential(BundleInvalidateRequest {
             credential: owner_credential(owner),
             key: bundle_key,
             generation: 7,
@@ -1308,7 +1163,7 @@ fn invalidated_generation_cannot_be_republished_before_its_original_expiry() {
     let bundle_key = key(manifest, 8);
     register_owner(&directory, owner);
     directory
-        .publish(advertisement(
+        .publish_by_credential(advertisement(
             owner,
             manifest,
             8,
@@ -1319,7 +1174,7 @@ fn invalidated_generation_cannot_be_republished_before_its_original_expiry() {
         .unwrap();
     assert!(
         directory
-            .invalidate(BundleInvalidateRequest {
+            .invalidate_by_credential(BundleInvalidateRequest {
                 credential: owner_credential(owner),
                 key: bundle_key,
                 generation: 7,
@@ -1330,7 +1185,7 @@ fn invalidated_generation_cannot_be_republished_before_its_original_expiry() {
     );
 
     assert!(matches!(
-        directory.publish(advertisement(
+        directory.publish_by_credential(advertisement(
             owner,
             manifest,
             8,
@@ -1360,7 +1215,7 @@ fn invalidation_arriving_before_delayed_publish_still_retires_generation() {
 
     assert!(
         !directory
-            .invalidate(BundleInvalidateRequest {
+            .invalidate_by_credential(BundleInvalidateRequest {
                 credential: owner_credential(owner),
                 key: bundle_key,
                 generation: 7,
@@ -1370,7 +1225,7 @@ fn invalidation_arriving_before_delayed_publish_still_retires_generation() {
             .unwrap()
     );
     assert!(matches!(
-        directory.publish(advertisement(
+        directory.publish_by_credential(advertisement(
             owner,
             manifest,
             8,
@@ -1389,7 +1244,7 @@ fn invalidation_arriving_before_delayed_publish_still_retires_generation() {
         BundleQueryOutcome::Miss(BundleQueryMissReason::NotFound)
     );
     directory
-        .publish(advertisement(
+        .publish_by_credential(advertisement(
             owner,
             manifest,
             8,
@@ -1410,7 +1265,7 @@ fn expired_absent_tombstone_is_pruned_without_a_directory_query() {
 
     assert!(
         !directory
-            .invalidate(BundleInvalidateRequest {
+            .invalidate_by_credential(BundleInvalidateRequest {
                 credential: owner_credential(owner),
                 key: bundle_key,
                 generation: 7,
@@ -1420,7 +1275,7 @@ fn expired_absent_tombstone_is_pruned_without_a_directory_query() {
             .unwrap()
     );
     directory
-        .publish(advertisement(
+        .publish_by_credential(advertisement(
             owner,
             manifest,
             8,
@@ -1440,7 +1295,7 @@ fn invalidated_generation_can_be_republished_after_its_original_expiry() {
     let bundle_key = key(manifest, 8);
     register_owner(&directory, owner);
     directory
-        .publish(advertisement(
+        .publish_by_credential(advertisement(
             owner,
             manifest,
             8,
@@ -1451,7 +1306,7 @@ fn invalidated_generation_can_be_republished_after_its_original_expiry() {
         .unwrap();
     assert!(
         directory
-            .invalidate(BundleInvalidateRequest {
+            .invalidate_by_credential(BundleInvalidateRequest {
                 credential: owner_credential(owner),
                 key: bundle_key,
                 generation: 7,
@@ -1467,7 +1322,7 @@ fn invalidated_generation_can_be_republished_after_its_original_expiry() {
         BundleQueryOutcome::Miss(BundleQueryMissReason::NotFound)
     );
     directory
-        .publish(advertisement(
+        .publish_by_credential(advertisement(
             owner,
             manifest,
             8,
@@ -1487,7 +1342,7 @@ fn newer_shorter_lived_generation_preserves_older_retirement_horizon() {
     let bundle_key = key(manifest, 8);
     register_owner(&directory, owner);
     directory
-        .publish(advertisement(
+        .publish_by_credential(advertisement(
             owner,
             manifest,
             8,
@@ -1498,7 +1353,7 @@ fn newer_shorter_lived_generation_preserves_older_retirement_horizon() {
         .unwrap();
     assert!(
         directory
-            .invalidate(BundleInvalidateRequest {
+            .invalidate_by_credential(BundleInvalidateRequest {
                 credential: owner_credential(owner),
                 key: bundle_key,
                 generation: 7,
@@ -1508,7 +1363,7 @@ fn newer_shorter_lived_generation_preserves_older_retirement_horizon() {
             .unwrap()
     );
     directory
-        .publish(advertisement(
+        .publish_by_credential(advertisement(
             owner,
             manifest,
             8,
@@ -1519,7 +1374,7 @@ fn newer_shorter_lived_generation_preserves_older_retirement_horizon() {
         .expect("a newer generation must remain publishable");
     assert!(
         directory
-            .invalidate(BundleInvalidateRequest {
+            .invalidate_by_credential(BundleInvalidateRequest {
                 credential: owner_credential(owner),
                 key: bundle_key,
                 generation: 8,
@@ -1531,7 +1386,7 @@ fn newer_shorter_lived_generation_preserves_older_retirement_horizon() {
 
     now.store(5_001, Ordering::Release);
     assert!(matches!(
-        directory.publish(advertisement(
+        directory.publish_by_credential(advertisement(
             owner,
             manifest,
             8,
@@ -1553,16 +1408,16 @@ fn reregistered_owner_does_not_inherit_retired_generations() {
     let manifest = CacheManifestId::from_bytes([10; 32]);
     let old_credential = credential();
     directory
-        .register_owner(owner, old_credential.clone())
+        .commit_owner_credential(owner, old_credential.clone())
         .unwrap();
     directory
-        .publish(authorize_publish(
+        .publish_by_credential(authorize_publish(
             old_credential.clone(),
             advertisement(owner, manifest, 8, 4, 10_000, vec![CSA, HCA, CAPSULE]),
         ))
         .unwrap();
     directory
-        .invalidate(BundleInvalidateRequest {
+        .invalidate_by_credential(BundleInvalidateRequest {
             credential: old_credential,
             key: key(manifest, 8),
             generation: 4,
@@ -1573,10 +1428,10 @@ fn reregistered_owner_does_not_inherit_retired_generations() {
 
     let replacement_credential = credential();
     directory
-        .register_owner(owner, replacement_credential.clone())
+        .commit_owner_credential(owner, replacement_credential.clone())
         .unwrap();
     directory
-        .publish(authorize_publish(
+        .publish_by_credential(authorize_publish(
             replacement_credential,
             advertisement(owner, manifest, 8, 1, 20_000, vec![CSA, HCA, CAPSULE]),
         ))
@@ -1594,7 +1449,7 @@ fn generations_are_owner_local_and_invalidation_preserves_other_owners() {
     register_owner(&directory, owner_b);
 
     directory
-        .publish(advertisement(
+        .publish_by_credential(advertisement(
             owner_a,
             manifest,
             8,
@@ -1604,7 +1459,7 @@ fn generations_are_owner_local_and_invalidation_preserves_other_owners() {
         ))
         .unwrap();
     directory
-        .publish(advertisement(
+        .publish_by_credential(advertisement(
             owner_b,
             manifest,
             8,
@@ -1616,7 +1471,7 @@ fn generations_are_owner_local_and_invalidation_preserves_other_owners() {
 
     assert!(
         directory
-            .invalidate(BundleInvalidateRequest {
+            .invalidate_by_credential(BundleInvalidateRequest {
                 credential: owner_credential(owner_a),
                 key: bundle_key,
                 generation: 100,
@@ -1652,7 +1507,7 @@ fn unregister_cannot_interleave_between_publish_validation_and_insert() {
     let publisher = {
         let directory = Arc::clone(&directory);
         std::thread::spawn(move || {
-            directory.publish(advertisement(
+            directory.publish_by_credential(advertisement(
                 owner,
                 manifest,
                 8,
@@ -1691,85 +1546,6 @@ fn unregister_cannot_interleave_between_publish_validation_and_insert() {
     );
 }
 
-#[test]
-fn owner_rotation_cannot_interleave_between_publish_authorization_and_insert() {
-    let owner_checked = Arc::new(Barrier::new(2));
-    let release_publish = Arc::new(Barrier::new(2));
-    let should_pause_publish = Arc::new(AtomicBool::new(true));
-    let directory = Arc::new(BundleDirectory::with_publish_after_owner_check(500, {
-        let owner_checked = Arc::clone(&owner_checked);
-        let release_publish = Arc::clone(&release_publish);
-        let should_pause_publish = Arc::clone(&should_pause_publish);
-        Arc::new(move || {
-            if !should_pause_publish.swap(false, Ordering::AcqRel) {
-                return;
-            }
-            owner_checked.wait();
-            release_publish.wait();
-        })
-    }));
-    let owner = InstanceId::new_v4();
-    let previous_credential = credential();
-    let replacement_credential = credential();
-    let manifest = CacheManifestId::from_bytes([53; 32]);
-    directory
-        .register_owner(owner, previous_credential.clone())
-        .unwrap();
-
-    let publisher = {
-        let directory = Arc::clone(&directory);
-        std::thread::spawn(move || {
-            directory.publish(authorize_publish(
-                previous_credential,
-                advertisement(owner, manifest, 8, 1, 10_000, vec![CSA, HCA, CAPSULE]),
-            ))
-        })
-    };
-    owner_checked.wait();
-
-    let (rotation_staged, stage_complete) = mpsc::channel();
-    let rotation = {
-        let directory = Arc::clone(&directory);
-        let replacement_credential = replacement_credential.clone();
-        std::thread::spawn(move || {
-            let result = stage_owner_registration(
-                &directory,
-                owner,
-                replacement_credential,
-                test_registration_epoch(owner),
-                RegistryIncarnation::from_u64(2),
-            );
-            rotation_staged.send(()).unwrap();
-            result
-        })
-    };
-    let rotation_finished_before_release = stage_complete
-        .recv_timeout(Duration::from_millis(100))
-        .is_ok();
-    release_publish.wait();
-
-    publisher.join().unwrap().unwrap();
-    rotation.join().unwrap().unwrap();
-    assert!(
-        !rotation_finished_before_release,
-        "owner rotation must wait for an authorized publication to finish"
-    );
-    assert_eq!(
-        directory.query(query(manifest, vec![key(manifest, 8)], 1_000)),
-        BundleQueryOutcome::Miss(BundleQueryMissReason::NotFound),
-        "the staged rotation must hide the prior lifecycle atomically"
-    );
-    directory
-        .finalize_owner_registration(owner, RegistryIncarnation::from_u64(2))
-        .unwrap();
-    directory
-        .publish(authorize_publish(
-            replacement_credential,
-            advertisement(owner, manifest, 8, 1, 10_000, vec![CSA, HCA, CAPSULE]),
-        ))
-        .unwrap();
-}
-
 /// `requirements` defines the bundle's resource set — "every listed resource is
 /// mandatory" — so a placement for a resource outside it is a claim about
 /// something this advertisement does not describe. It also feeds `ready_tier()`,
@@ -1793,7 +1569,7 @@ fn a_placement_for_an_unrequired_resource_is_refused() {
         placement: PhysicalPlacementMode::Whole,
     }];
     assert!(matches!(
-        directory.publish(request.clone()),
+        directory.publish_by_credential(request.clone()),
         Err(BundleDirectoryError::UnrequiredPlacement { resource, .. })
             if resource == LogicalResourceId(99)
     ));
@@ -1801,8 +1577,8 @@ fn a_placement_for_an_unrequired_resource_is_refused() {
     // Additive-safe in both directions: a required resource is accepted, and a
     // publisher that predates R7b sends no placements at all.
     request.advertisement.placements[0].resource = CSA;
-    directory.publish(request.clone()).unwrap();
+    directory.publish_by_credential(request.clone()).unwrap();
     request.advertisement.generation = 2;
     request.advertisement.placements.clear();
-    directory.publish(request).unwrap();
+    directory.publish_by_credential(request).unwrap();
 }

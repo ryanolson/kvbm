@@ -56,7 +56,7 @@ async fn start_hub_returning_mgr() -> (HubServer, Arc<ControlPlaneManager>) {
         .discovery_port(0)
         .control_port(0)
         .add_transport(transport as Arc<dyn velo::Transport>)
-        .add_feature_manager(mgr.clone() as Arc<dyn kvbm_hub::FeatureManager>)
+        .extension(mgr.clone())
         .heartbeat_interval(Duration::from_secs(3600))
         .heartbeat_max_failures(u32::MAX)
         .registration_ttl(Duration::from_secs(3600))
@@ -126,7 +126,7 @@ fn install_canned_describe(
 
 fn describe_url(server: &HubServer, id: velo_ext::InstanceId) -> String {
     format!(
-        "http://{}/v1/instances/{}/describe",
+        "http://{}/v1/ext/connector_control/instances/{}/describe",
         server.control_addr(),
         id
     )
@@ -146,7 +146,7 @@ async fn push_then_get_returns_cached_payload() {
 
     let _client = build_client(&server);
     _client
-        .register_instance(peer.peer_info())
+        .register(&peer, Vec::new(), None)
         .await
         .expect("register");
     let id = peer.instance_id();
@@ -187,7 +187,7 @@ async fn force_triggers_pull_fallback() {
 
     let _client = build_client(&server);
     _client
-        .register_instance(peer.peer_info())
+        .register(&peer, Vec::new(), None)
         .await
         .expect("register");
 
@@ -224,7 +224,7 @@ async fn pending_state_returns_503() {
 
     let _client = build_client(&server);
     _client
-        .register_instance(peer.peer_info())
+        .register(&peer, Vec::new(), None)
         .await
         .expect("register");
     let id = peer.instance_id();
@@ -258,7 +258,7 @@ async fn describe_drops_stale_insert_after_unregister() {
 
     let client = build_client(&server);
     client
-        .register_instance(peer.peer_info())
+        .register(&peer, Vec::new(), None)
         .await
         .expect("register");
 

@@ -54,10 +54,10 @@ function hubAppData() {
         const r = await fetch("/v1/instances");
         if (!r.ok) return;
         const body = await r.json();
-        // Body: { instances: [PeerInfo, ...] } — preserve order by id.
+        // Body: { instances: [{ peer: PeerInfo, extensions, pinned }, ...] } — preserve order by id.
         // Annotate with role from cached describe (if we have it for selected).
         this.instances = (body.instances || []).map(p => {
-          const id = (p.instance_id || p.id || "");
+          const id = ((p.peer && p.peer.instance_id) || "");
           const role = (this.selected && this.selected.instance_id === id && this.selected.role) || null;
           return { instance_id: id, role };
         });
@@ -122,7 +122,7 @@ function hubAppData() {
 
     async refreshModules() {
       try {
-        const r = await fetch(`/v1/instances/${this.selectedId}/modules`);
+        const r = await fetch(`/v1/ext/connector_control/instances/${this.selectedId}/modules`);
         if (!r.ok) { this.modules = []; return; }
         const body = await r.json();
         this.modules = body.modules || [];
@@ -133,7 +133,7 @@ function hubAppData() {
 
     async refreshDescribe() {
       try {
-        const r = await fetch(`/v1/instances/${this.selectedId}/describe`);
+        const r = await fetch(`/v1/ext/connector_control/instances/${this.selectedId}/describe`);
         if (r.status === 503) {
           const body = await r.json().catch(() => ({}));
           this.describePending = true;
@@ -166,7 +166,7 @@ function hubAppData() {
     async forceDescribe() {
       if (!this.selectedId) return;
       try {
-        const r = await fetch(`/v1/instances/${this.selectedId}/describe?force=true`);
+        const r = await fetch(`/v1/ext/connector_control/instances/${this.selectedId}/describe?force=true`);
         if (r.ok) {
           const body = await r.json();
           this.describe = body.description;
@@ -269,7 +269,7 @@ function hubAppData() {
 
     // ---------- actions ----------
     async devReset() {
-      const r = await fetch(`/v1/instances/${this.selectedId}/control/dev/reset`, {
+      const r = await fetch(`/v1/ext/connector_control/instances/${this.selectedId}/control/dev/reset`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: "{}",
@@ -282,7 +282,7 @@ function hubAppData() {
     async refreshMetrics() {
       if (!this.selectedId) return;
       try {
-        const r = await fetch(`/v1/instances/${this.selectedId}/control/metrics/snapshot`, {
+        const r = await fetch(`/v1/ext/connector_control/instances/${this.selectedId}/control/metrics/snapshot`, {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: "{}",

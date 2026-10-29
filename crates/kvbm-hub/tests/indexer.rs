@@ -3,7 +3,7 @@
 
 //! End-to-end tests for the KV indexer feature: mock `PUB` publishers push
 //! `KvbmCacheEvents` over ZMQ to the hub's `SUB` ingest socket; tests assert the
-//! index and its carrier feed through `/v1/features/indexer/...`.
+//! index and its carrier feed through `/v1/ext/indexer/...`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -14,7 +14,7 @@ use dynamo_kv_router::carrier_feed::{
 use dynamo_tokens::TokenBlockSequence;
 use futures::{SinkExt, StreamExt};
 use kvbm_hub::{
-    Feature, FeatureManager, HubServer, IndexerConfigResponse, IndexerFeatureConfig, IndexerManager,
+    Feature, HubServer, IndexerConfigResponse, IndexerFeatureConfig, IndexerManager, test_hub,
 };
 use kvbm_logical::events::{KvCacheEvents, KvbmCacheEvents};
 use kvbm_logical::{KvbmSequenceHashProvider, SequenceHash};
@@ -84,7 +84,7 @@ async fn start_hub() -> (HubServer, Arc<IndexerManager>) {
         .heartbeat_interval(Duration::from_secs(3600))
         .heartbeat_max_failures(u32::MAX)
         .registration_ttl(Duration::from_secs(3600))
-        .add_feature_manager(Arc::clone(&manager) as Arc<dyn FeatureManager>)
+        .extension(Arc::clone(&manager))
         .serve()
         .await
         .expect("start hub");
@@ -112,7 +112,7 @@ async fn start_hub_with_required_kind(
         .heartbeat_interval(Duration::from_secs(3600))
         .heartbeat_max_failures(u32::MAX)
         .registration_ttl(Duration::from_secs(3600))
-        .add_feature_manager(Arc::clone(&manager) as Arc<dyn FeatureManager>)
+        .extension(Arc::clone(&manager))
         .serve()
         .await
         .expect("start hub");
@@ -139,7 +139,7 @@ async fn start_nats_hub(
         .heartbeat_interval(Duration::from_secs(3600))
         .heartbeat_max_failures(u32::MAX)
         .registration_ttl(Duration::from_secs(3600))
-        .add_feature_manager(Arc::clone(&manager) as Arc<dyn FeatureManager>)
+        .extension(Arc::clone(&manager))
         .serve()
         .await
         .expect("start hub");
@@ -185,7 +185,7 @@ async fn send_batch(sock: &mut Publish, events: KvCacheEvents, instance_id: u128
 }
 
 async fn get_json(http: &reqwest::Client, base: &str, path: &str) -> Value {
-    http.get(format!("{base}/v1/features/indexer{path}"))
+    http.get(format!("{base}/v1/ext/indexer{path}"))
         .send()
         .await
         .expect("GET")
@@ -217,9 +217,8 @@ async fn required_create_kind_rejects_carrier_and_accepts_block() {
         create_kind: kvbm_logical::events::CreateKind::Carrier,
     });
 
-    let rejected = manager
-        .on_register(InstanceId::new_v4(), &carrier_registration)
-        .await;
+    let rejected =
+        test_hub::register_as(&server, InstanceId::new_v4(), &carrier_registration).await;
     assert!(rejected.is_err());
     assert_eq!(manager.indexes().kind(manifest_id), None);
 
@@ -228,8 +227,7 @@ async fn required_create_kind_rejects_carrier_and_accepts_block() {
         manifest,
         create_kind: kvbm_logical::events::CreateKind::Block,
     });
-    manager
-        .on_register(InstanceId::new_v4(), &block_registration)
+    let _registration = test_hub::register_as(&server, InstanceId::new_v4(), &block_registration)
         .await
         .expect("register block publisher");
     assert_eq!(
@@ -242,7 +240,7 @@ async fn required_create_kind_rejects_carrier_and_accepts_block() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_instances_publish_index_and_query() {
-    let (server, manager) = start_hub().await;
+    let (server, _) = start_hub().await;
     let base = format!("http://{}", server.discovery_addr());
     let http = reqwest::Client::new();
     let manifest = test_manifest();
@@ -275,12 +273,10 @@ async fn two_instances_publish_index_and_query() {
         manifest,
         create_kind: kvbm_logical::events::CreateKind::Block,
     });
-    manager
-        .on_register(instance_a, &indexer)
+    let _registration = test_hub::register_as(&server, instance_a, &indexer)
         .await
         .expect("bind first indexer instance");
-    manager
-        .on_register(instance_b, &indexer)
+    let _registration = test_hub::register_as(&server, instance_b, &indexer)
         .await
         .expect("bind second indexer instance");
     let registrations = get_json(&http, &base, "/instances").await;
@@ -307,7 +303,7 @@ async fn two_instances_publish_index_and_query() {
     );
     let invalid_manifest_path = http
         .get(format!(
-            "{base}/v1/features/indexer/manifests/not-hex/hashes/by_position/0"
+            "{base}/v1/ext/indexer/manifests/not-hex/hashes/by_position/0"
         ))
         .send()
         .await
@@ -353,7 +349,7 @@ async fn two_instances_publish_index_and_query() {
 
     // POST /query with the full sequence → deepest match (position 2).
     let resp: Value = http
-        .post(format!("{base}/v1/features/indexer/query"))
+        .post(format!("{base}/v1/ext/indexer/query"))
         .json(&serde_json::json!({ "manifest": manifest_id, "hashes": hashes }))
         .send()
         .await
@@ -396,7 +392,7 @@ async fn two_instances_publish_index_and_query() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn carrier_feed_publishes_frames_and_snapshots() {
-    let (server, manager) = start_hub().await;
+    let (server, _) = start_hub().await;
     let base = format!("http://{}", server.discovery_addr());
     let http = reqwest::Client::new();
     let manifest = carrier_manifest();
@@ -407,17 +403,17 @@ async fn carrier_feed_publishes_frames_and_snapshots() {
 
     let instance = InstanceId::new_v4();
     let instance_id = instance.as_u128();
-    manager
-        .on_register(
-            instance,
-            &Feature::Indexer(IndexerFeatureConfig {
-                max_seq_len: Some(MAX_SEQ_LEN),
-                manifest,
-                create_kind: kvbm_logical::events::CreateKind::Carrier,
-            }),
-        )
-        .await
-        .expect("bind carrier indexer instance");
+    let _registration = test_hub::register_as(
+        &server,
+        instance,
+        &Feature::Indexer(IndexerFeatureConfig {
+            max_seq_len: Some(MAX_SEQ_LEN),
+            manifest,
+            create_kind: kvbm_logical::events::CreateKind::Carrier,
+        }),
+    )
+    .await
+    .expect("bind carrier indexer instance");
 
     let mut feed_sub = connect_sub(&cfg.feed_endpoint);
     let mut event_pub = connect_pub(&cfg.zmq_endpoint);
@@ -457,7 +453,7 @@ async fn carrier_feed_publishes_frames_and_snapshots() {
     ));
 
     let snapshot_response = http
-        .get(format!("{base}/v1/features/indexer/feed/snapshot"))
+        .get(format!("{base}/v1/ext/indexer/feed/snapshot"))
         .send()
         .await
         .expect("GET feed snapshot");
@@ -472,7 +468,7 @@ async fn carrier_feed_publishes_frames_and_snapshots() {
         .expect("decode feed snapshot");
     let control_snapshot = http
         .get(format!(
-            "http://{}/v1/features/indexer/feed/snapshot",
+            "http://{}/v1/ext/indexer/feed/snapshot",
             server.control_addr()
         ))
         .send()
@@ -504,7 +500,7 @@ async fn nats_carrier_feed_publishes_frames_and_snapshots_when_configured() {
         return;
     };
     let subject_prefix = format!("kvbm.hub.test.{}", InstanceId::new_v4().as_u128());
-    let (server, manager) = start_nats_hub(&nats_server, &subject_prefix).await;
+    let (server, _) = start_nats_hub(&nats_server, &subject_prefix).await;
     let base = format!("http://{}", server.discovery_addr());
     let http = reqwest::Client::new();
     let cfg: IndexerConfigResponse =
@@ -526,17 +522,17 @@ async fn nats_carrier_feed_publishes_frames_and_snapshots_when_configured() {
     let manifest_id = manifest.id();
     let instance = InstanceId::new_v4();
     let instance_id = instance.as_u128();
-    manager
-        .on_register(
-            instance,
-            &Feature::Indexer(IndexerFeatureConfig {
-                max_seq_len: Some(MAX_SEQ_LEN),
-                manifest,
-                create_kind: kvbm_logical::events::CreateKind::Carrier,
-            }),
-        )
-        .await
-        .expect("bind carrier indexer instance");
+    let _registration = test_hub::register_as(
+        &server,
+        instance,
+        &Feature::Indexer(IndexerFeatureConfig {
+            max_seq_len: Some(MAX_SEQ_LEN),
+            manifest,
+            create_kind: kvbm_logical::events::CreateKind::Carrier,
+        }),
+    )
+    .await
+    .expect("bind carrier indexer instance");
 
     let hashes = plhs(2, 1337);
     let batch = KvbmCacheEvents {
@@ -569,7 +565,7 @@ async fn nats_carrier_feed_publishes_frames_and_snapshots_when_configured() {
     ));
 
     let snapshot_response = http
-        .get(format!("{base}/v1/features/indexer/feed/snapshot"))
+        .get(format!("{base}/v1/ext/indexer/feed/snapshot"))
         .send()
         .await
         .expect("GET feed snapshot");

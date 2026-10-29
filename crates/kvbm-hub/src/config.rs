@@ -54,7 +54,7 @@ pub struct HubConfig {
     #[serde(default)]
     pub primary: PrimaryConfig,
     /// Optional KV indexer feature. When set, the hub serves the index under
-    /// `/v1/features/indexer` using the fleet event plane.
+    /// `/v1/ext/indexer` using the fleet event plane.
     #[serde(default)]
     pub indexer: Option<IndexerConfig>,
 }

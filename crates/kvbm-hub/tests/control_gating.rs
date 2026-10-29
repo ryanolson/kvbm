@@ -57,7 +57,7 @@ async fn start_hub() -> HubServer {
         .discovery_port(0)
         .control_port(0)
         .add_transport(transport as Arc<dyn velo::Transport>)
-        .add_feature_manager(mgr as Arc<dyn kvbm_hub::FeatureManager>)
+        .extension(mgr)
         .heartbeat_interval(Duration::from_secs(3600))
         .heartbeat_max_failures(u32::MAX)
         .registration_ttl(Duration::from_secs(3600))
@@ -112,7 +112,7 @@ fn install_counted_reset(peer: &velo::Velo, counter: Arc<AtomicUsize>) {
 
 fn modules_url(server: &HubServer, id: velo_ext::InstanceId) -> String {
     format!(
-        "http://{}/v1/instances/{}/modules",
+        "http://{}/v1/ext/connector_control/instances/{}/modules",
         server.control_addr(),
         id
     )
@@ -120,7 +120,7 @@ fn modules_url(server: &HubServer, id: velo_ext::InstanceId) -> String {
 
 fn reset_url(server: &HubServer, id: velo_ext::InstanceId) -> String {
     format!(
-        "http://{}/v1/instances/{}/control/dev/reset",
+        "http://{}/v1/ext/connector_control/instances/{}/control/dev/reset",
         server.control_addr(),
         id
     )
@@ -164,7 +164,7 @@ async fn dev_reset_404s_when_module_absent_without_calling_velo() {
 
     let _client = build_client(&server);
     _client
-        .register_instance(peer.peer_info())
+        .register(&peer, Vec::new(), None)
         .await
         .expect("register");
     let id = peer.instance_id();
@@ -213,7 +213,7 @@ async fn dev_reset_passes_through_when_module_present() {
 
     let _client = build_client(&server);
     _client
-        .register_instance(peer.peer_info())
+        .register(&peer, Vec::new(), None)
         .await
         .expect("register");
     let id = peer.instance_id();

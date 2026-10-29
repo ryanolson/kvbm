@@ -4,9 +4,9 @@
 //! Hub-side manager for the KV indexer feature.
 //!
 //! Owns [`ManifestIndexes`], attaches the configured ingest and carrier-feed
-//! transport during [`FeatureManager::attach`], and exports its own HTTP surface
-//! under `/v1/features/indexer` (the server nests it via
-//! [`FeatureManager::route_prefix`]).
+//! transport during [`velo_hub::Extension::attach`], and exports its own HTTP surface
+//! under `/v1/ext/indexer` (the server nests it via
+//! `/v1/ext/{NAME}`).
 
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock, RwLock};
@@ -20,12 +20,13 @@ use axum::{
     routing::{get, post},
 };
 use dynamo_kv_router::carrier_feed::{CARRIER_FEED_TOPIC, encode_snapshot};
-use futures::future::BoxFuture;
 use kvbm_logical::events::CreateKind;
 use kvbm_protocols::cache_manifest::RegistrationEpoch;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::task::JoinHandle;
-use velo_ext::{InstanceId, PeerInfo};
+use velo_ext::InstanceId;
+use velo_hub::store::Removal;
+use velo_hub::{AttachContext, Committed, Extension, Rejection, Txn};
 
 use super::bundle::{BundleDirectory, BundleDirectoryError};
 use super::feed::{FeedCounters, bind_pub_socket, run_feed_publisher, run_nats_feed_publisher};
@@ -39,8 +40,7 @@ use super::tier_placement::{
     SnapshotInstall, TierPlacementProjection, TierPlacementProjectionError, VeloSnapshotRequester,
 };
 use super::zmq::{bind_sub_socket, bound_endpoint, port_of};
-use crate::features::{FeatureError, FeatureManager, HubContext};
-use crate::protocol::{Feature, FeatureKey, MutationCredential};
+use crate::features::{FeatureConfigRequirements, KvbmFeature};
 
 /// Default host advertised in `GET /config` endpoints when none is configured.
 /// Single-host / loopback deployments work out of the box; multi-host
@@ -87,6 +87,8 @@ pub struct IndexerManager {
     ingest_counters: Arc<IngestCounters>,
     /// Carrier-feed publisher counters.
     feed_counters: Arc<FeedCounters>,
+    /// The hub authority, set at attach: authenticates mutation credentials.
+    authority: OnceLock<velo_hub::Authority>,
 }
 
 impl std::fmt::Debug for IndexerManager {
@@ -129,6 +131,7 @@ impl IndexerManager {
             tier_placements: Arc::new(TierPlacementProjection::new(Arc::clone(&instances))),
             ingest_counters: Arc::new(IngestCounters::default()),
             feed_counters: Arc::new(FeedCounters::default()),
+            authority: OnceLock::new(),
             instances,
         })
     }
@@ -195,18 +198,25 @@ impl IndexerManager {
             .snapshot
             .validate()
             .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-        let authorized_epoch = self
-            .bundle_directory
-            .authorize_owner_epoch(request.snapshot.instance_id, &request.credential)
-            .map_err(|error| {
-                let status = match error {
-                    BundleDirectoryError::UnknownOwner { .. }
-                    | BundleDirectoryError::UnauthorizedOwner { .. } => StatusCode::UNAUTHORIZED,
-                    BundleDirectoryError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
-                    _ => StatusCode::CONFLICT,
-                };
-                (status, error.to_string())
-            })?;
+        let authority = self.authority.get().ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "hub authority not attached".to_owned(),
+        ))?;
+        let owner = request.snapshot.instance_id;
+        let authorized_epoch =
+            super::handlers::authorized_epoch(authority, owner, &request.credential)
+                .and_then(|epoch| self.bundle_directory.authorize_epoch(owner, epoch))
+                .map_err(|error| {
+                    let status = match error {
+                        BundleDirectoryError::UnknownOwner { .. }
+                        | BundleDirectoryError::UnauthorizedOwner { .. } => {
+                            StatusCode::UNAUTHORIZED
+                        }
+                        BundleDirectoryError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+                        _ => StatusCode::CONFLICT,
+                    };
+                    (status, error.to_string())
+                })?;
         let installed = self
             .tier_placements
             .install_snapshot(&request.snapshot, authorized_epoch)
@@ -321,329 +331,243 @@ impl IndexerManager {
     }
 }
 
-impl FeatureManager for IndexerManager {
-    fn key(&self) -> FeatureKey {
-        FeatureKey::Indexer
-    }
-
-    fn config_requirements(&self) -> crate::features::FeatureConfigRequirements {
+impl KvbmFeature for IndexerManager {
+    fn config_requirements(&self) -> FeatureConfigRequirements {
         // The publisher's page size must match the index's block size or events
         // hash/bucket wrong. `max_seq_len` is NOT a must-match: a larger value
-        // simply grows the index (see `on_register`).
-        crate::features::FeatureConfigRequirements {
+        // simply grows the index (see `prepare`).
+        FeatureConfigRequirements {
             block_size: true,
             block_layout: false,
         }
     }
 
     fn requires_runtime_summary(&self) -> bool {
-        // KV-index is new (introduced with the runtime summary): mandate it so
-        // a publisher cannot register without its block_size being checked
+        // A publisher cannot register without its block_size being checked
         // against the hub's index block size.
         true
     }
 
     fn authoritative_block_size(&self) -> Option<usize> {
-        // The index block size is the source of truth publishers must match.
-        // Reconciled into `primary` at startup so validation never depends on
-        // the operator having also set `primary` explicitly.
         Some(self.indexes.block_size())
     }
+}
 
-    fn descriptor(&self, _primary: &crate::protocol::PrimaryConfig) -> serde_json::Value {
+impl Extension for IndexerManager {
+    const NAME: &'static str = crate::protocol::INDEXER_EXTENSION;
+    type Registration = crate::protocol::IndexerFeatureConfig;
+    /// Whether the registrant participates.
+    type Staged = bool;
+
+    fn descriptor(&self) -> serde_json::Value {
         // Advertise ingest and carrier-feed endpoints with sizing so clients
         // can wire themselves from the aggregate config.
         serde_json::to_value(self.config_response()).unwrap_or(serde_json::Value::Null)
     }
 
-    fn route_prefix(&self) -> Option<&'static str> {
-        Some(protocol::ROUTE_PREFIX)
-    }
-
-    fn attach<'a>(&'a self, ctx: HubContext) -> BoxFuture<'a, Result<(), FeatureError>> {
-        Box::pin(async move {
-            let (feed_tx, feed_rx) = unbounded_channel();
-            let sinks = IngestSinks {
-                indexes: Arc::clone(&self.indexes),
-                tier_placements: Arc::clone(&self.tier_placements),
-                counters: Arc::clone(&self.ingest_counters),
-            };
-            match self.event_plane {
-                EventPlane::Zmq => {
-                    let sub = bind_sub_socket(&self.zmq_bind)
-                        .map_err(|e| FeatureError::Other(anyhow::anyhow!("indexer bind: {e}")))?;
-                    let bound = bound_endpoint(&sub).map_err(|e| {
-                        FeatureError::Other(anyhow::anyhow!("indexer endpoint: {e}"))
-                    })?;
-                    let port = port_of(&bound)
-                        .map_err(|e| FeatureError::Other(anyhow::anyhow!("indexer port: {e}")))?;
-                    let advertised = format!("tcp://{}:{}", self.advertise_host, port);
-                    let pub_socket = bind_pub_socket(&self.feed_bind).map_err(|e| {
-                        FeatureError::Other(anyhow::anyhow!("carrier feed bind: {e}"))
-                    })?;
-                    let feed_bound = bound_endpoint(&pub_socket).map_err(|e| {
-                        FeatureError::Other(anyhow::anyhow!("carrier feed endpoint: {e}"))
-                    })?;
-                    let feed_port = port_of(&feed_bound).map_err(|e| {
-                        FeatureError::Other(anyhow::anyhow!("carrier feed port: {e}"))
-                    })?;
-                    let feed_advertised = format!("tcp://{}:{}", self.advertise_host, feed_port);
-                    tracing::info!(
-                        bound = %bound,
-                        advertised = %advertised,
-                        feed_bound = %feed_bound,
-                        feed_advertised = %feed_advertised,
-                        max_seq_len = self.indexes.max_seq_len(),
-                        block_size = self.indexes.block_size(),
-                        "indexer ingest and carrier feed bound"
-                    );
-                    let _ = self.endpoint.set(advertised);
-                    let _ = self.feed_endpoint.set(feed_advertised);
-                    self.indexes.set_feed_sink(feed_tx).map_err(|_| {
-                        FeatureError::Other(anyhow::anyhow!("carrier feed sink already installed"))
-                    })?;
-                    let feed_task = tokio::spawn(run_feed_publisher(
-                        pub_socket,
-                        feed_rx,
-                        ctx.cancel.clone(),
-                        Arc::clone(&self.feed_counters),
-                    ));
-                    let _ = self.feed_task.set(feed_task);
-                    let task = tokio::spawn(run_ingest_loop(sub, sinks, ctx.cancel.clone()));
-                    let _ = self.ingest_task.set(task);
-                }
-                EventPlane::Nats => {
-                    let client = async_nats::connect(&self.nats_server)
-                        .await
-                        .map_err(|error| {
-                            FeatureError::Other(anyhow::anyhow!(
-                                "connecting indexer to NATS {}: {error}",
-                                self.nats_server
-                            ))
-                        })?;
-                    let subscriber = client
-                        .subscribe(format!("{}.>", self.nats_subject_prefix))
-                        .await
-                        .map_err(|error| {
-                            FeatureError::Other(anyhow::anyhow!(
-                                "subscribing indexer to NATS: {error}"
-                            ))
-                        })?;
-                    let feed_topic =
-                        std::str::from_utf8(CARRIER_FEED_TOPIC).expect("feed topic is valid UTF-8");
-                    let feed_subject =
-                        super::ingest::nats_subject(&self.nats_subject_prefix, feed_topic);
-                    tracing::info!(
-                        nats_server = %self.nats_server,
-                        subject_prefix = %self.nats_subject_prefix,
-                        feed_subject,
-                        max_seq_len = self.indexes.max_seq_len(),
-                        block_size = self.indexes.block_size(),
-                        "indexer NATS transport attached"
-                    );
-                    self.indexes.set_feed_sink(feed_tx).map_err(|_| {
-                        FeatureError::Other(anyhow::anyhow!("carrier feed sink already installed"))
-                    })?;
-                    let feed_task = tokio::spawn(run_nats_feed_publisher(
-                        client,
-                        feed_subject,
-                        feed_rx,
-                        ctx.cancel.clone(),
-                        Arc::clone(&self.feed_counters),
-                    ));
-                    let _ = self.feed_task.set(feed_task);
-                    let task = tokio::spawn(super::ingest::run_nats_ingest_loop(
-                        subscriber,
-                        self.nats_subject_prefix.clone(),
-                        sinks,
-                        ctx.cancel.clone(),
-                    ));
-                    let _ = self.ingest_task.set(task);
-                }
-            }
-
-            // Expose the velo-plane block lookup (`QUERY_HANDLER`) when the hub
-            // runs with a transport. Discovery-only hubs skip it — clients fall
-            // back to the HTTP `POST /query` surface.
-            if let Some(velo) = ctx.velo.as_ref() {
-                let messenger = velo.messenger();
-                messenger
-                    .register_handler(super::handlers::create_query_handler(Arc::clone(
-                        &self.indexes,
-                    )))
-                    .map_err(|e| {
-                        FeatureError::Other(anyhow::anyhow!("indexer query handler: {e}"))
-                    })?;
-                for handler in
-                    super::handlers::create_bundle_handlers(Arc::clone(&self.bundle_directory))
-                {
-                    messenger.register_handler(handler).map_err(|error| {
-                        FeatureError::Other(anyhow::anyhow!("bundle directory handler: {error}"))
-                    })?;
-                }
-                // The hub is the *caller* on the snapshot-request handler, not
-                // the callee: the responder is the publisher (CT-2, rhino side).
-                self.tier_placements
-                    .set_requester(Arc::new(VeloSnapshotRequester::new(messenger.clone())));
-            } else {
-                // A discovery-only hub can never ask for a snapshot, so a
-                // projection that loses continuity stays invalid and answers
-                // empty forever. That is the correct degradation (temporary miss
-                // semantics, indefinitely), not a reason to serve stale state.
-                tracing::warn!(
-                    "indexer attached without a transport: tier placement projections cannot \
-                     request snapshots and will answer empty after any loss"
+    async fn attach(&self, ctx: &AttachContext<'_>) -> anyhow::Result<()> {
+        let (feed_tx, feed_rx) = unbounded_channel();
+        let sinks = IngestSinks {
+            indexes: Arc::clone(&self.indexes),
+            tier_placements: Arc::clone(&self.tier_placements),
+            counters: Arc::clone(&self.ingest_counters),
+        };
+        match self.event_plane {
+            EventPlane::Zmq => {
+                let sub = bind_sub_socket(&self.zmq_bind)
+                    .map_err(|e| anyhow::anyhow!("indexer bind: {e}"))?;
+                let bound =
+                    bound_endpoint(&sub).map_err(|e| anyhow::anyhow!("indexer endpoint: {e}"))?;
+                let port = port_of(&bound).map_err(|e| anyhow::anyhow!("indexer port: {e}"))?;
+                let advertised = format!("tcp://{}:{}", self.advertise_host, port);
+                let pub_socket = bind_pub_socket(&self.feed_bind)
+                    .map_err(|e| anyhow::anyhow!("carrier feed bind: {e}"))?;
+                let feed_bound = bound_endpoint(&pub_socket)
+                    .map_err(|e| anyhow::anyhow!("carrier feed endpoint: {e}"))?;
+                let feed_port =
+                    port_of(&feed_bound).map_err(|e| anyhow::anyhow!("carrier feed port: {e}"))?;
+                let feed_advertised = format!("tcp://{}:{}", self.advertise_host, feed_port);
+                tracing::info!(
+                    bound = %bound,
+                    advertised = %advertised,
+                    feed_bound = %feed_bound,
+                    feed_advertised = %feed_advertised,
+                    max_seq_len = self.indexes.max_seq_len(),
+                    block_size = self.indexes.block_size(),
+                    "indexer ingest and carrier feed bound"
                 );
+                let _ = self.endpoint.set(advertised);
+                let _ = self.feed_endpoint.set(feed_advertised);
+                self.indexes
+                    .set_feed_sink(feed_tx)
+                    .map_err(|_| anyhow::anyhow!("carrier feed sink already installed"))?;
+                let feed_task = tokio::spawn(run_feed_publisher(
+                    pub_socket,
+                    feed_rx,
+                    ctx.cancellation().clone(),
+                    Arc::clone(&self.feed_counters),
+                ));
+                let _ = self.feed_task.set(feed_task);
+                let task = tokio::spawn(run_ingest_loop(sub, sinks, ctx.cancellation().clone()));
+                let _ = self.ingest_task.set(task);
             }
-            Ok(())
-        })
-    }
-
-    fn on_register<'a>(
-        &'a self,
-        instance_id: InstanceId,
-        feature: &'a Feature,
-    ) -> BoxFuture<'a, Result<(), FeatureError>> {
-        // Bind the cache manifest and create kind before accepting publication.
-        Box::pin(async move {
-            match feature {
-                Feature::Indexer(cfg) => {
-                    if let Some(required) = self.required_kind
-                        && cfg.create_kind != required
-                    {
-                        return Err(FeatureError::InvalidConfig(format!(
-                            "indexer binding: this hub accepts {required:?} publishers only, got {:?}",
-                            cfg.create_kind
-                        )));
-                    }
-                    self.indexes
-                        .bind(
-                            instance_id.as_u128(),
-                            &cfg.manifest,
-                            cfg.create_kind,
-                            cfg.max_seq_len,
-                        )
-                        .map_err(|error| {
-                            FeatureError::InvalidConfig(format!("indexer binding: {error}"))
-                        })?;
-                    // Track the registered (participating) instance so
-                    // `GET /instances` can report it even before it emits any
-                    // KV events.
-                    if let Ok(mut set) = self.instances.write() {
-                        set.insert(instance_id);
-                    }
-                    tracing::debug!(
-                        instance = %instance_id,
-                        max_seq_len = ?cfg.max_seq_len,
-                        num_positions = self.indexes.max_seq_len() / self.indexes.block_size(),
-                        "indexer participation registered"
-                    );
-                    Ok(())
-                }
-                _ => Err(FeatureError::KeyMismatch {
-                    manager: FeatureKey::Indexer,
-                    payload: feature.key(),
-                }),
+            EventPlane::Nats => {
+                let client = async_nats::connect(&self.nats_server)
+                    .await
+                    .map_err(|error| {
+                        anyhow::anyhow!("connecting indexer to NATS {}: {error}", self.nats_server)
+                    })?;
+                let subscriber = client
+                    .subscribe(format!("{}.>", self.nats_subject_prefix))
+                    .await
+                    .map_err(|error| anyhow::anyhow!("subscribing indexer to NATS: {error}"))?;
+                let feed_topic =
+                    std::str::from_utf8(CARRIER_FEED_TOPIC).expect("feed topic is valid UTF-8");
+                let feed_subject =
+                    super::ingest::nats_subject(&self.nats_subject_prefix, feed_topic);
+                tracing::info!(
+                    nats_server = %self.nats_server,
+                    subject_prefix = %self.nats_subject_prefix,
+                    feed_subject,
+                    max_seq_len = self.indexes.max_seq_len(),
+                    block_size = self.indexes.block_size(),
+                    "indexer NATS transport attached"
+                );
+                self.indexes
+                    .set_feed_sink(feed_tx)
+                    .map_err(|_| anyhow::anyhow!("carrier feed sink already installed"))?;
+                let feed_task = tokio::spawn(run_nats_feed_publisher(
+                    client,
+                    feed_subject,
+                    feed_rx,
+                    ctx.cancellation().clone(),
+                    Arc::clone(&self.feed_counters),
+                ));
+                let _ = self.feed_task.set(feed_task);
+                let task = tokio::spawn(super::ingest::run_nats_ingest_loop(
+                    subscriber,
+                    self.nats_subject_prefix.clone(),
+                    sinks,
+                    ctx.cancellation().clone(),
+                ));
+                let _ = self.ingest_task.set(task);
             }
-        })
-    }
+        }
 
-    fn stage_registration(
-        &self,
-        instance_id: InstanceId,
-        credential: &MutationCredential,
-        registration_epoch: RegistrationEpoch,
-        participates: bool,
-    ) -> Result<(), FeatureError> {
-        self.bundle_directory
-            .stage_owner_transition(
-                instance_id,
-                participates.then(|| credential.clone()),
-                registration_epoch,
-            )
-            .map_err(anyhow::Error::from)?;
+        // Expose the velo-plane block lookup (`QUERY_HANDLER`) when the hub
+        // runs with a transport. Discovery-only hubs skip it — clients fall
+        // back to the HTTP `POST /query` surface.
+        let _ = self.authority.set(ctx.authority().clone());
+        if let Some(velo) = ctx.velo() {
+            let messenger = velo.messenger();
+            messenger
+                .register_handler(super::handlers::create_query_handler(Arc::clone(
+                    &self.indexes,
+                )))
+                .map_err(|e| anyhow::anyhow!("indexer query handler: {e}"))?;
+            for handler in super::handlers::create_bundle_handlers(
+                Arc::clone(&self.bundle_directory),
+                ctx.authority().clone(),
+            ) {
+                messenger
+                    .register_handler(handler)
+                    .map_err(|error| anyhow::anyhow!("bundle directory handler: {error}"))?;
+            }
+            // The hub is the *caller* on the snapshot-request handler, not
+            // the callee: the responder is the publisher (CT-2, rhino side).
+            self.tier_placements
+                .set_requester(Arc::new(VeloSnapshotRequester::new(messenger.clone())));
+        } else {
+            // A discovery-only hub can never ask for a snapshot, so a
+            // projection that loses continuity stays invalid and answers
+            // empty forever. That is the correct degradation (temporary miss
+            // semantics, indefinitely), not a reason to serve stale state.
+            tracing::warn!(
+                "indexer attached without a transport: tier placement projections cannot \
+                 request snapshots and will answer empty after any loss"
+            );
+        }
         Ok(())
     }
 
-    fn commit_registration(
+    async fn prepare(
         &self,
-        instance_id: InstanceId,
-        _credential: &MutationCredential,
-        registration_epoch: RegistrationEpoch,
-        incarnation: crate::registry::RegistryIncarnation,
-        _participates: bool,
-    ) -> Result<(), FeatureError> {
-        self.bundle_directory
-            .bind_owner_registration(instance_id, registration_epoch, incarnation)
-            .map_err(anyhow::Error::from)?;
-        // Drop the advisory projection at every registration commit, not only at
-        // `on_unregister`. A publisher that restarts and re-registers under the
-        // *same* instance id with an unchanged feature set never reaches
-        // `on_unregister` (the registration transaction fires it only for
-        // features present before and absent now), so without this the previous
-        // process lifetime's Ready set would keep answering `valid` under a new
-        // `RegistrationEpoch` — an unbounded stale success across every restart
-        // that reuses its id. Self-healing on the next epoch-stamped delta is not
-        // a substitute: a publisher that has not yet emitted a placement change,
-        // or that runs with the tier stream off, would never emit one.
-        //
-        // Unconditional on purpose. A first registration has nothing to drop, a
-        // re-registration without the feature is already covered by
-        // `on_unregister`, and dropping advisory state is always safe — including
-        // on the rollback path, where the publisher will push a snapshot for
-        // whichever epoch it ends up holding.
-        //
-        // Ordering note: the epoch is bound above, so a snapshot authorized
-        // against the *new* epoch can install between the two statements and be
-        // dropped here. That is the safe direction — the projection is left
-        // empty, not stale — and it self-heals on the hub's next snapshot request
-        // or the publisher's periodic push. Dropping first would not fix it
-        // either; it would only move the window.
+        txn: &Txn<'_>,
+        payload: Option<crate::protocol::IndexerFeatureConfig>,
+    ) -> Result<bool, Rejection> {
+        // Bind the cache manifest and create kind before accepting publication.
+        let Some(cfg) = payload else {
+            return Ok(false);
+        };
+        if let Some(required) = self.required_kind
+            && cfg.create_kind != required
+        {
+            return Err(Rejection::bad_request(format!(
+                "indexer binding: this hub accepts {required:?} publishers only, got {:?}",
+                cfg.create_kind
+            )));
+        }
+        self.indexes
+            .bind(
+                txn.owner.as_u128(),
+                &cfg.manifest,
+                cfg.create_kind,
+                cfg.max_seq_len,
+            )
+            .map_err(|error| Rejection::bad_request(format!("indexer binding: {error}")))?;
+        tracing::debug!(
+            instance = %txn.owner,
+            max_seq_len = ?cfg.max_seq_len,
+            num_positions = self.indexes.max_seq_len() / self.indexes.block_size(),
+            "indexer participation staged"
+        );
+        Ok(true)
+    }
+
+    fn commit(&self, participates: bool, registration: &Committed<'_>) {
+        let instance_id = registration.owner;
+        if !participates {
+            self.remove(instance_id);
+            return;
+        }
+        let epoch = RegistrationEpoch::from_uuid(registration.epoch.as_uuid());
+        if let Err(error) = self.bundle_directory.commit_owner(instance_id, epoch) {
+            tracing::error!(instance = %instance_id, %error, "indexer owner could not be committed");
+        }
+        // A publisher that re-registers under the same id starts a new epoch:
+        // drop the advisory projection and the index state of its previous
+        // lifetime. Dropping advisory state is always safe; the publisher
+        // pushes a snapshot for the new epoch.
         self.tier_placements.remove_instance(instance_id);
         self.indexes.clear_instance(instance_id.as_u128());
-        Ok(())
+        if let Ok(mut set) = self.instances.write() {
+            set.insert(instance_id);
+        }
     }
 
-    fn on_unregister(&self, instance_id: InstanceId) {
-        // Bridge the registry's velo InstanceId to the u128 the events wire
-        // format carries (publishers stamp `velo_id.as_u128()`).
+    fn on_removed(&self, removal: Removal) {
+        self.remove(removal.id);
+    }
+
+    fn control_routes(self: Arc<Self>) -> Router {
+        read_routes().merge(control_routes()).with_state(self)
+    }
+
+    fn public_routes(self: Arc<Self>) -> Router {
+        read_routes().with_state(self)
+    }
+}
+
+impl IndexerManager {
+    fn remove(&self, instance_id: InstanceId) {
+        // Publishers stamp events with `velo_id.as_u128()`.
         self.indexes.unbind(instance_id.as_u128());
         self.bundle_directory.remove_owner(instance_id);
-        // Advisory placement state is about a process that no longer exists, so
-        // it is dropped outright rather than aged out.
+        // Advisory placement state is about a process that no longer exists.
         self.tier_placements.remove_instance(instance_id);
         if let Ok(mut set) = self.instances.write() {
             set.remove(&instance_id);
         }
-    }
-
-    fn on_register_any<'a>(
-        &'a self,
-        instance_id: InstanceId,
-        _peer: &'a PeerInfo,
-        incarnation: crate::registry::RegistryIncarnation,
-    ) -> BoxFuture<'a, ()> {
-        Box::pin(async move {
-            if let Err(error) = self
-                .bundle_directory
-                .finalize_owner_registration(instance_id, incarnation)
-            {
-                tracing::error!(
-                    instance = %instance_id,
-                    %incarnation,
-                    %error,
-                    "indexer owner registration could not be finalized"
-                );
-            }
-        })
-    }
-
-    fn control_router(self: Arc<Self>) -> Router {
-        read_routes().merge(control_routes()).with_state(self)
-    }
-
-    fn public_router(self: Arc<Self>) -> Router {
-        read_routes().with_state(self)
     }
 }
 
@@ -723,15 +647,14 @@ mod tests {
     use kvbm_common::{LogicalResourceId, SequenceHash};
     use kvbm_logical::events::KvbmCacheEvents;
     use kvbm_protocols::cache_manifest::{
-        BundleKey, BundleResourceLineage, CacheManifest, CacheManifestId, ModelIdentity,
-        ResourceRequirement, ResourceRole,
+        CacheManifest, CacheManifestId, ModelIdentity, ResourceRequirement, ResourceRole,
     };
 
     use super::*;
-    use crate::features::indexer::protocol::{
-        BundleAdvertisementRecord, BundlePublishRequest, BundleQueryMissReason, BundleQueryOutcome,
-        BundleQueryRequest,
-    };
+    use crate::protocol::Feature;
+    use crate::server::HubServer;
+    use crate::test_hub;
+    use velo_hub::protocol::Credential;
 
     fn test_indexer_feature() -> Feature {
         Feature::Indexer(crate::protocol::IndexerFeatureConfig {
@@ -750,115 +673,60 @@ mod tests {
         })
     }
 
-    #[tokio::test]
+    async fn hub(manager: &Arc<IndexerManager>) -> HubServer {
+        test_hub::serve(HubServer::builder().extension(Arc::clone(manager))).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rejected_carrier_binding_does_not_register_instance() {
-        let manager = IndexerManager::new(128, 4, None, None).unwrap();
-        let instance = InstanceId::new_v4();
+        let manager = Arc::new(IndexerManager::new(128, test_hub::BLOCK_SIZE, None, None).unwrap());
+        let server = hub(&manager).await;
         let Feature::Indexer(mut config) = test_indexer_feature() else {
             unreachable!()
         };
         config.create_kind = kvbm_logical::events::CreateKind::Carrier;
 
-        let error = manager
-            .on_register(instance, &Feature::Indexer(config))
+        let client = test_hub::client(&server);
+        test_hub::register(&client, test_hub::peer(), &[Feature::Indexer(config)])
             .await
             .unwrap_err();
-        assert!(matches!(error, FeatureError::InvalidConfig(_)));
         assert!(manager.instances_response().instances.is_empty());
         assert!(manager.indexes.bindings().is_empty());
     }
 
-    #[tokio::test]
-    async fn reregister_without_indexer_removes_owner_and_old_mutation_authority() {
-        let manager = IndexerManager::new(128, 4, None, None).unwrap();
-        #[cfg(feature = "test-support")]
-        assert_eq!(manager.bundle_advertisement_count().unwrap(), 0);
-        let owner = InstanceId::new_v4();
-        let feature = test_indexer_feature();
-        manager.on_register(owner, &feature).await.unwrap();
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reregister_without_indexer_removes_owner_and_its_authority() {
+        let manager = Arc::new(IndexerManager::new(128, test_hub::BLOCK_SIZE, None, None).unwrap());
+        let server = hub(&manager).await;
+        let client = test_hub::client(&server);
+        let peer = test_hub::peer();
+        let owner = peer.instance_id();
+        test_hub::register(&client, peer.clone(), &[test_indexer_feature()])
+            .await
+            .unwrap();
+        assert_eq!(manager.instances_response().instances.len(), 1);
 
-        let old_credential = MutationCredential::generate();
-        let registration_epoch = crate::features::indexer::bundle::test_registration_epoch(owner);
-        manager
-            .bundle_directory
-            .register_owner(owner, old_credential.clone())
-            .unwrap();
-        let resource = LogicalResourceId(1);
-        let requirements =
-            vec![ResourceRequirement::new(resource, ResourceRole::PrefixHistory, 4).unwrap()];
-        let hashes = vec![SequenceHash::root(1), SequenceHash::root(1).extend(2)];
-        let manifest = CacheManifestId::from_bytes([41; 32]);
-        let key = BundleKey::from_parts(manifest, hashes[1], 8).unwrap();
-        let publish = BundlePublishRequest {
-            credential: old_credential.clone(),
-            advertisement: BundleAdvertisementRecord {
-                key,
-                generation: 1,
-                owner,
-                registration_epoch: Some(registration_epoch),
-                requirements: requirements.clone(),
-                lineages: vec![BundleResourceLineage::new(resource, hashes).unwrap()],
-                expires_at_unix_ms: 10_000,
-                placements: Vec::new(),
-                stage_cost_hint_us: None,
-                advertised_at_unix_ms: None,
-            },
-        };
-        manager.bundle_directory.publish(publish.clone()).unwrap();
-        #[cfg(feature = "test-support")]
-        assert_eq!(manager.bundle_advertisement_count().unwrap(), 1);
+        test_hub::register(&client, peer, &[]).await.unwrap();
 
-        let replacement_epoch = RegistrationEpoch::new();
-        manager
-            .stage_registration(
-                owner,
-                &MutationCredential::generate(),
-                replacement_epoch,
-                false,
-            )
-            .unwrap();
-        manager
-            .commit_registration(
-                owner,
-                &MutationCredential::generate(),
-                replacement_epoch,
-                crate::registry::RegistryIncarnation::from_u64(2),
-                false,
-            )
-            .unwrap();
-        manager
-            .bundle_directory
-            .finalize_owner_registration(owner, crate::registry::RegistryIncarnation::from_u64(2))
-            .unwrap();
-        manager.on_unregister(owner);
-
+        assert!(manager.instances_response().instances.is_empty());
         assert!(matches!(
-            manager.bundle_directory.publish(publish),
+            manager
+                .bundle_directory
+                .authorize_epoch(owner, RegistrationEpoch::new()),
             Err(super::super::bundle::BundleDirectoryError::UnknownOwner { .. })
         ));
-        assert_eq!(
-            manager.bundle_directory.query(BundleQueryRequest {
-                manifest,
-                requirements,
-                candidates: vec![key],
-                now_unix_ms: 1_000,
-            }),
-            BundleQueryOutcome::Miss(BundleQueryMissReason::NotFound)
-        );
-        assert!(manager.instances_response().instances.is_empty());
     }
 
     /// A publisher that restarts and re-registers under the *same* instance id
-    /// with an unchanged feature set never reaches `on_unregister` — the
-    /// registration transaction fires that only for features present before and
-    /// absent now. So the advisory projection has to be dropped on the
-    /// registration commit, or the dead process lifetime's Ready set keeps
-    /// answering `valid` under a brand-new `RegistrationEpoch`: an unbounded
-    /// stale success across every restart that reuses its id.
+    /// with an unchanged feature set gets no removal, so the registration
+    /// commit must drop the advisory projection. Otherwise the dead process
+    /// lifetime's Ready set keeps answering `valid` under a brand-new
+    /// `RegistrationEpoch`: an unbounded stale success across every restart
+    /// that reuses its id.
     ///
-    /// Routed through `IndexerManager` rather than the projection directly,
-    /// because the bug was in the lifecycle wiring, not in the projection.
-    #[tokio::test]
+    /// Routed through a real hub registration rather than the projection
+    /// directly, because the bug was in the lifecycle wiring.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn re_registering_the_same_instance_drops_its_tier_placement_projection() {
         use kvbm_protocols::tier_protocol::{KeyRange, PhysicalPlacementMode};
         use kvbm_protocols::tier_protocol::{
@@ -866,10 +734,15 @@ mod tests {
             TierDepth, TierMedium, TierPlacementEntry, TierPlacementSnapshotV1,
         };
 
-        let manager = IndexerManager::new(128, 4, None, None).unwrap();
-        let owner = InstanceId::new_v4();
+        let manager = Arc::new(IndexerManager::new(128, test_hub::BLOCK_SIZE, None, None).unwrap());
+        let server = hub(&manager).await;
+        let client = test_hub::client(&server);
+        let peer = test_hub::peer();
+        let owner = peer.instance_id();
         let feature = test_indexer_feature();
-        manager.on_register(owner, &feature).await.unwrap();
+        test_hub::register(&client, peer.clone(), std::slice::from_ref(&feature))
+            .await
+            .unwrap();
         let Feature::Indexer(config) = &feature else {
             unreachable!()
         };
@@ -924,27 +797,11 @@ mod tests {
                 .is_empty()
         );
 
-        // Re-register: same id, same feature set, new epoch. `on_unregister`
-        // does not fire on this path.
-        let replacement_epoch = RegistrationEpoch::new();
-        let incarnation = crate::registry::RegistryIncarnation::from_u64(2);
-        manager
-            .stage_registration(
-                owner,
-                &MutationCredential::generate(),
-                replacement_epoch,
-                true,
-            )
+        // Re-register: same id, same feature set. No removal fires.
+        test_hub::register(&client, peer, std::slice::from_ref(&feature))
+            .await
             .unwrap();
-        manager
-            .commit_registration(
-                owner,
-                &MutationCredential::generate(),
-                replacement_epoch,
-                incarnation,
-                true,
-            )
-            .unwrap();
+
         assert!(
             manager
                 .indexes
@@ -952,12 +809,6 @@ mod tests {
                 .is_none(),
             "registration commit must clear the previous process lifetime's index entries"
         );
-        manager
-            .bundle_directory
-            .finalize_owner_registration(owner, incarnation)
-            .unwrap();
-        manager.on_register(owner, &feature).await.unwrap();
-
         assert!(
             !manager.tier_placements().is_valid(cache, owner),
             "the previous lifetime's projection must not survive a re-registration"
@@ -972,21 +823,18 @@ mod tests {
     }
 
     /// The router split is a security boundary, so it is asserted by routing a
-    /// request rather than by reading the code: before R7b both routers were the
-    /// same function, and anything added to it silently appeared on the
-    /// read-only discovery port too.
-    #[tokio::test]
-    async fn the_snapshot_mutation_is_reachable_only_on_the_control_router() {
-        use axum::body::Body;
-        use axum::http::{Request, StatusCode, header::CONTENT_TYPE};
+    /// request rather than by reading the code: anything added to a shared
+    /// router silently appears on the read-only discovery port too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_snapshot_mutation_is_reachable_only_on_the_control_port() {
         use kvbm_protocols::tier_protocol::{
             TIER_PLACEMENT_SCHEMA_VERSION, TierPlacementSnapshotV1,
         };
-        use tower::ServiceExt as _;
 
-        let manager = Arc::new(IndexerManager::new(128, 4, None, None).unwrap());
-        let body = serde_json::to_vec(&TierPlacementSnapshotRequest {
-            credential: MutationCredential::generate(),
+        let manager = Arc::new(IndexerManager::new(128, test_hub::BLOCK_SIZE, None, None).unwrap());
+        let server = hub(&manager).await;
+        let request = TierPlacementSnapshotRequest {
+            credential: Credential::generate(),
             snapshot: TierPlacementSnapshotV1 {
                 v: TIER_PLACEMENT_SCHEMA_VERSION,
                 cache: CacheManifestId::from_bytes([3; 32]),
@@ -998,30 +846,28 @@ mod tests {
                 manifests: Vec::new(),
                 entries: Vec::new(),
             },
-        })
-        .unwrap();
-        let request = || {
-            Request::builder()
-                .method("POST")
-                .uri(protocol::paths::TIER_PLACEMENT_SNAPSHOT)
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(body.clone()))
-                .unwrap()
+        };
+        let http = reqwest::Client::new();
+        let post = |addr: std::net::SocketAddr| {
+            http.post(format!(
+                "http://{addr}/v1/ext/{}{}",
+                crate::protocol::INDEXER_EXTENSION,
+                protocol::paths::TIER_PLACEMENT_SNAPSHOT
+            ))
+            .json(&request)
+            .send()
         };
 
-        let public = FeatureManager::public_router(Arc::clone(&manager));
         assert_eq!(
-            public.oneshot(request()).await.unwrap().status(),
-            StatusCode::NOT_FOUND,
+            post(server.discovery_addr()).await.unwrap().status(),
+            reqwest::StatusCode::NOT_FOUND,
             "a mutation must not exist on the read-only discovery port"
         );
-
         // On the control port the route exists and rejects on *authority* — an
         // unregistered owner — which is the failure a 404 would have hidden.
-        let control = FeatureManager::control_router(manager);
         assert_eq!(
-            control.oneshot(request()).await.unwrap().status(),
-            StatusCode::UNAUTHORIZED
+            post(server.control_addr()).await.unwrap().status(),
+            reqwest::StatusCode::UNAUTHORIZED
         );
     }
 }

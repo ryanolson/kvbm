@@ -12,7 +12,7 @@
 
 use kvbm_common::BlockLayoutMode;
 use kvbm_logical::events::CreateKind;
-use kvbm_protocols::cache_manifest::{CacheManifest, RegistrationEpoch};
+use kvbm_protocols::cache_manifest::CacheManifest;
 pub use kvbm_protocols::control::layout_compat::LayoutCompatPayload;
 use kvbm_protocols::control::{MetricsSnapshotResponse, ResetResponse};
 /// Remote-prefill request payload carried by the hub's CD queue.
@@ -22,48 +22,11 @@ use kvbm_protocols::control::{MetricsSnapshotResponse, ResetResponse};
 pub use kvbm_protocols::disagg::{DISAGG_PROTOCOL_VERSION, RemotePrefillRequest as PrefillRequest};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use velo_ext::{InstanceId, PeerInfo, WorkerId};
+use velo_ext::InstanceId;
 
 pub use crate::features::prefill_router::protocol::{
     PrefillBackendAdvertisement, PrefillRouterConfig, VllmHttpEndpoint,
 };
-
-/// Opaque bearer credential authorizing registration-scoped hub mutations.
-///
-/// The hub rotates this value on every successful registration. It is carried
-/// only by mutation requests and deliberately redacted from `Debug` output.
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(transparent)]
-pub struct MutationCredential(uuid::Uuid);
-
-impl MutationCredential {
-    pub(crate) fn generate() -> Self {
-        Self(uuid::Uuid::new_v4())
-    }
-
-    /// Encode this credential for the authenticated registration header.
-    pub fn to_header_value(&self) -> axum::http::HeaderValue {
-        let mut value = axum::http::HeaderValue::from_str(&self.0.to_string())
-            .expect("UUID credentials are valid HTTP header values");
-        value.set_sensitive(true);
-        value
-    }
-
-    pub(crate) fn from_header_value(value: &str) -> Result<Self, uuid::Error> {
-        uuid::Uuid::parse_str(value).map(Self)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_test_owner(owner: InstanceId) -> Self {
-        Self(uuid::Uuid::from_u128(owner.as_u128()))
-    }
-}
-
-impl std::fmt::Debug for MutationCredential {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("MutationCredential([REDACTED])")
-    }
-}
 
 /// Default HTTP port for peer-discovery lookups (the `PeerDiscovery` surface).
 pub const DEFAULT_DISCOVERY_PORT: u16 = 1337;
@@ -71,44 +34,21 @@ pub const DEFAULT_DISCOVERY_PORT: u16 = 1337;
 /// Default HTTP port for the control plane (registration, heartbeat).
 pub const DEFAULT_CONTROL_PORT: u16 = 8337;
 
-/// Header carrying the current registration credential for authenticated
-/// re-registration and unregister operations. Credentials never appear in
-/// request URLs.
-pub const MUTATION_CREDENTIAL_HEADER: &str = "x-kvbm-mutation-credential";
-
 /// URL path fragments for the HTTP API.
+/// Name of the core kvbm extension: aggregate config and runtime checks.
+pub const KVBM_EXTENSION: &str = "kvbm";
+/// Name of the P2P extension.
+pub const P2P_EXTENSION: &str = "p2p";
+/// Name of the conditional disaggregation extension.
+pub const DISAGG_EXTENSION: &str = "disagg";
+/// Name of the connector control extension.
+pub const CONTROL_PLANE_EXTENSION: &str = "connector_control";
+/// Name of the indexer extension.
+pub const INDEXER_EXTENSION: &str = "indexer";
+/// Name of the prefill router extension.
+pub const PREFILL_ROUTER_EXTENSION: &str = "prefill_router";
+
 pub mod paths {
-    /// Peer-discovery lookup by `InstanceId`.
-    ///
-    /// `GET /v1/peers/instance/{instance_id}` → [`super::PeerLookupResponse`]
-    pub const PEERS_BY_INSTANCE: &str = "/v1/peers/instance/{instance_id}";
-
-    /// Peer-discovery lookup by `WorkerId`.
-    ///
-    /// `GET /v1/peers/worker/{worker_id}` → [`super::PeerLookupResponse`]
-    pub const PEERS_BY_WORKER: &str = "/v1/peers/worker/{worker_id}";
-
-    /// Register an instance.
-    ///
-    /// `POST /v1/instances` with body [`super::RegisterRequest`]
-    /// → [`super::RegisterResponse`]
-    pub const INSTANCES: &str = "/v1/instances";
-
-    /// Unregister an instance.
-    ///
-    /// `DELETE /v1/instances/{instance_id}`
-    pub const INSTANCE_BY_ID: &str = "/v1/instances/{instance_id}";
-
-    /// Liveness heartbeat.
-    ///
-    /// `POST /v1/instances/{instance_id}/heartbeat` → [`super::HeartbeatResponse`]
-    pub const INSTANCE_HEARTBEAT: &str = "/v1/instances/{instance_id}/heartbeat";
-
-    /// Hub-initiated velo probe.
-    ///
-    /// `POST /v1/instances/{instance_id}/probe` → [`super::ProbeResponse`]
-    pub const INSTANCE_PROBE: &str = "/v1/instances/{instance_id}/probe";
-
     /// Hub health probe.
     ///
     /// `GET /health` → `200 OK`
@@ -118,11 +58,14 @@ pub mod paths {
     /// (or `kvbmctl`) pulls to learn the hub's shared `primary` config and its
     /// enabled feature set.
     ///
-    /// `GET /v1/config` → [`super::HubConfigResponse`]
-    pub const HUB_CONFIG: &str = "/v1/config";
+    /// `GET /v1/ext/kvbm/config` → [`super::HubConfigResponse`]
+    pub const HUB_CONFIG: &str = "/v1/ext/kvbm/config";
+
+    /// [`HUB_CONFIG`] relative to the `kvbm` extension's mount point.
+    pub const CONFIG: &str = "/config";
 
     /// `GET` connector health (one-shot velo probe + last-heartbeat info).
-    pub const CONNECTOR_HEALTH: &str = "/v1/instances/{instance_id}/health";
+    pub const CONNECTOR_HEALTH: &str = "/instances/{instance_id}/health";
 
     // -----------------------------------------------------------------------
     // Typed control-plane routes (Phase D)
@@ -144,31 +87,31 @@ pub mod paths {
     /// handler. Always-on. Updates the hub's describe cache as a side effect
     /// — shares the same code path as `GET /describe?force=true`.
     pub const CONTROL_CORE_DESCRIBE_INSTANCE: &str =
-        "/v1/instances/{instance_id}/control/core/describe_instance";
+        "/instances/{instance_id}/control/core/describe_instance";
 
     /// `POST` reset the inactive pools of the requested tiers. Module-gated
     /// on [`kvbm_protocols::control::ModuleId::Dev`]. Body: optional
     /// [`kvbm_protocols::control::ResetRequest`] (defaults to "all tiers").
-    pub const CONTROL_DEV_RESET: &str = "/v1/instances/{instance_id}/control/dev/reset";
+    pub const CONTROL_DEV_RESET: &str = "/instances/{instance_id}/control/dev/reset";
 
     /// `POST` contiguous-prefix search of the leader's G2 block manager.
     /// Served by `P2pManager` (requires the P2P feature). Body:
     /// [`kvbm_protocols::control::SearchRequest`].
     pub const CONTROL_TRANSFER_SEARCH_PREFIX: &str =
-        "/v1/instances/{instance_id}/control/transfer/search_prefix";
+        "/instances/{instance_id}/control/transfer/search_prefix";
 
     /// `POST` scatter (gather-all) search of the leader's G2 block manager.
     /// Served by `P2pManager` (requires the P2P feature). Body:
     /// [`kvbm_protocols::control::SearchRequest`].
     pub const CONTROL_TRANSFER_SEARCH_SCATTER: &str =
-        "/v1/instances/{instance_id}/control/transfer/search_scatter";
+        "/instances/{instance_id}/control/transfer/search_scatter";
 
     /// `POST` open a transfer session on the targeted (holder) leader.
     /// Served by `P2pManager` (requires the P2P feature). Body:
     /// [`kvbm_protocols::control::OpenTransferSessionRequest`].
     /// Returns [`kvbm_protocols::control::OpenTransferSessionResponse`].
     pub const CONTROL_TRANSFER_OPEN_SESSION: &str =
-        "/v1/instances/{instance_id}/control/transfer/open_session";
+        "/instances/{instance_id}/control/transfer/open_session";
 
     /// `POST` drive a pull on the targeted (puller) leader against a session
     /// living on `request.source_instance_id`. Long-poll: returns when the
@@ -176,37 +119,36 @@ pub mod paths {
     /// Body: [`kvbm_protocols::control::PullFromSessionRequest`]. Returns
     /// [`kvbm_protocols::control::PullFromSessionResponse`].
     pub const CONTROL_TRANSFER_PULL_FROM_SESSION: &str =
-        "/v1/instances/{instance_id}/control/transfer/pull_from_session";
+        "/instances/{instance_id}/control/transfer/pull_from_session";
 
     /// `POST` close a transfer session on the targeted (holder) leader.
     /// Idempotent. Served by `P2pManager` (requires the P2P feature). Body:
     /// [`kvbm_protocols::control::CloseTransferSessionRequest`].
     pub const CONTROL_TRANSFER_CLOSE_SESSION: &str =
-        "/v1/instances/{instance_id}/control/transfer/close_session";
+        "/instances/{instance_id}/control/transfer/close_session";
 
     /// `POST` on-demand runtime snapshot of the leader. Module-gated on
     /// [`kvbm_protocols::control::ModuleId::Metrics`]. Empty body is
     /// equivalent to [`kvbm_protocols::control::MetricsSnapshotRequest::default`].
     /// Returns [`kvbm_protocols::control::MetricsSnapshotResponse`] as JSON.
-    pub const CONTROL_METRICS_SNAPSHOT: &str =
-        "/v1/instances/{instance_id}/control/metrics/snapshot";
+    pub const CONTROL_METRICS_SNAPSHOT: &str = "/instances/{instance_id}/control/metrics/snapshot";
 
     /// `GET` fanout helper: collect a snapshot from every registered leader
     /// that has the metrics module enabled, in parallel, and return per-
     /// instance entries keyed by stringified `instance_id`. Slow / failing
     /// leaders surface as `{ "error": "<msg>" }` for their entry rather than
     /// failing the whole response. See [`super::MetricsFanoutResponse`].
-    pub const METRICS_FANOUT: &str = "/v1/metrics";
+    pub const METRICS_FANOUT: &str = "/metrics";
 
     /// `POST` reset to each registered leader except this hub and leaders whose
     /// cached module list lacks `dev`. The response includes one result per leader.
-    pub const RESET_FANOUT: &str = "/v1/reset";
+    pub const RESET_FANOUT: &str = "/reset";
 
     /// `GET` the set of control-plane modules enabled on this instance.
     /// Body: `{ "modules": [..], "cached": bool, "age_secs": u64 }`. Cache is
     /// populated on register and refreshed every 60s; `?force=true` triggers
     /// an inline re-fetch.
-    pub const INSTANCE_MODULES: &str = "/v1/instances/{instance_id}/modules";
+    pub const INSTANCE_MODULES: &str = "/instances/{instance_id}/modules";
 
     /// Describe an instance.
     ///
@@ -216,7 +158,7 @@ pub mod paths {
     ///   `describe_instance` handler.
     /// - `POST`: accepts an [`InstanceDescription`] body (push from the leader);
     ///   the hub stores it in its describe cache.
-    pub const INSTANCE_DESCRIBE: &str = "/v1/instances/{instance_id}/describe";
+    pub const INSTANCE_DESCRIBE: &str = "/instances/{instance_id}/describe";
 }
 
 /// Velo-queue name used by the ConditionalDisagg feature to move prefill
@@ -224,26 +166,6 @@ pub mod paths {
 /// Decode clients enqueue and Prefill clients dequeue via velo active
 /// messaging (the queue is backed by [`velo::queue`]).
 pub const CD_PREFILL_QUEUE: &str = "kvbm.cd.prefill_requests";
-
-/// Request body for `POST /v1/instances`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegisterRequest {
-    /// Full peer information (instance id + opaque worker address).
-    pub peer_info: PeerInfo,
-    /// Optional feature declarations. Each entry is dispatched to the
-    /// corresponding [`crate::features::FeatureManager`] on the hub after
-    /// base registration completes. Empty by default for
-    /// backward-compatibility with clients that predate the feature surface.
-    #[serde(default)]
-    pub features: Vec<Feature>,
-    /// Optional must-match runtime config summary. When present, the hub
-    /// validates each field required by a declared feature against its
-    /// [`PrimaryConfig`] and rejects the registration on mismatch. May be
-    /// omitted by legacy clients (P2P / CD), but features that mandate it
-    /// (e.g. KV-index) reject a registration without it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub runtime: Option<RuntimeConfigSummary>,
-}
 
 /// Feature participation declared by a client at registration time.
 ///
@@ -401,10 +323,10 @@ pub struct PrimaryConfig {
 
 /// Must-match runtime values a client reports at registration so the hub can
 /// validate consistency against its [`PrimaryConfig`]. Sent in
-/// [`RegisterRequest::runtime`].
+/// `kvbm` extension registration payload.
 ///
 /// Absent → the hub skips must-match validation, *unless* a declared feature
-/// mandates the summary (`FeatureManager::requires_runtime_summary`, e.g.
+/// mandates the summary (`KvbmFeature::requires_runtime_summary`, e.g.
 /// KV-index), in which case registration is rejected. Present → each field
 /// required by a declared feature must be `Some` and equal the hub's
 /// authoritative value.
@@ -419,7 +341,7 @@ pub struct RuntimeConfigSummary {
     pub block_layout: Option<BlockLayoutMode>,
 }
 
-/// Response body for `GET /v1/config` — the aggregate the connector and
+/// Response body for `GET /v1/ext/kvbm/config` — the aggregate the connector and
 /// `kvbmctl` consume.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HubConfigResponse {
@@ -463,7 +385,7 @@ pub struct FeatureDescriptor {
     pub dependencies: Vec<FeatureKey>,
     /// Feature keys the render path co-enables alongside this one when the hub
     /// offers them — a soft companion to `dependencies` (no co-declaration
-    /// requirement at registration). See `FeatureManager::render_implies`.
+    /// requirement at registration). See `KvbmFeature::render_implies`.
     #[serde(default)]
     pub render_implies: Vec<FeatureKey>,
     /// Must-match fields this feature requires of a registrant.
@@ -541,59 +463,7 @@ pub enum ConditionalDisaggRole {
     Decode,
 }
 
-/// Response body for `POST /v1/instances`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegisterResponse {
-    /// The registered instance id, echoed back.
-    pub instance_id: InstanceId,
-    /// The hub's own velo `InstanceId`, when the hub runs with a velo
-    /// participant. Clients can resolve the hub's `PeerInfo` via
-    /// `GET /v1/peers/instance/{id}` and wire it into their own Velo for
-    /// bidirectional active messaging. `None` when the hub has no velo.
-    #[serde(default)]
-    pub hub_instance_id: Option<InstanceId>,
-    /// Bearer credential for mutations owned by this registration. New hubs
-    /// always return one; `None` is accepted only for wire compatibility with
-    /// older discovery-only hubs.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mutation_credential: Option<MutationCredential>,
-    /// Opaque lifecycle identity for this successful registration. New hubs
-    /// always return one; absence is accepted only to decode older hubs.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub registration_epoch: Option<RegistrationEpoch>,
-}
-
-/// Response body for peer-discovery lookups.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PeerLookupResponse {
-    /// Full peer information for the requested id.
-    pub peer_info: PeerInfo,
-}
-
-/// Response body for `POST /v1/instances/{instance_id}/heartbeat`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct HeartbeatResponse {
-    /// Whether the hub considers this instance registered.
-    pub acknowledged: bool,
-}
-
-/// Response body for `POST /v1/instances/{instance_id}/probe`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProbeResponse {
-    /// Echoed sequence number from the velo heartbeat.
-    pub seq: u64,
-    /// Whether the instance reported itself healthy.
-    pub ok: bool,
-}
-
-/// Response body for `GET /v1/instances`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ListInstancesResponse {
-    /// All currently registered instances.
-    pub instances: Vec<PeerInfo>,
-}
-
-/// Response body for `GET /v1/metrics` — fanout across every leader that has
+/// Response body for `GET /v1/ext/connector_control/metrics` — fanout across every leader that has
 /// the `metrics` module enabled.
 ///
 /// Entries are always present for every leader the hub queried; a slow or
@@ -623,7 +493,7 @@ pub struct MetricsInstanceEntry {
     pub error: Option<String>,
 }
 
-/// Response body for `POST /v1/reset`.
+/// Response body for `POST /v1/ext/connector_control/reset`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResetFanoutResponse {
     /// Per-instance reset results keyed by stringified [`InstanceId`].
@@ -666,88 +536,14 @@ pub enum ErrorCode {
     Internal,
 }
 
-/// Path helper: format [`paths::PEERS_BY_INSTANCE`] with a concrete id.
-pub fn peers_by_instance(id: InstanceId) -> String {
-    format!("/v1/peers/instance/{id}")
-}
-
-/// Path helper: format [`paths::PEERS_BY_WORKER`] with a concrete id.
-pub fn peers_by_worker(id: WorkerId) -> String {
-    format!("/v1/peers/worker/{}", id.as_u64())
-}
-
-/// Path helper: format [`paths::INSTANCE_BY_ID`] with a concrete id.
-pub fn instance_by_id(id: InstanceId) -> String {
-    format!("/v1/instances/{id}")
-}
-
-/// Path helper: format [`paths::INSTANCE_HEARTBEAT`] with a concrete id.
-pub fn instance_heartbeat(id: InstanceId) -> String {
-    format!("/v1/instances/{id}/heartbeat")
-}
-
-/// Path helper: format [`paths::INSTANCE_PROBE`] with a concrete id.
-pub fn instance_probe(id: InstanceId) -> String {
-    format!("/v1/instances/{id}/probe")
-}
-
 /// Path helper: format [`paths::INSTANCE_DESCRIBE`] with a concrete id.
 pub fn instance_describe(id: InstanceId) -> String {
-    format!("/v1/instances/{id}/describe")
+    format!("/instances/{id}/describe")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use velo_ext::WorkerAddress;
-
-    fn make_peer_info() -> PeerInfo {
-        let id = InstanceId::new_v4();
-        PeerInfo::new(id, WorkerAddress::from_encoded(b"test".to_vec()))
-    }
-
-    #[test]
-    fn heartbeat_response_serde_round_trip() {
-        for acknowledged in [true, false] {
-            let orig = HeartbeatResponse { acknowledged };
-            let json = serde_json::to_string(&orig).unwrap();
-            let back: HeartbeatResponse = serde_json::from_str(&json).unwrap();
-            assert_eq!(back.acknowledged, acknowledged);
-        }
-    }
-
-    #[test]
-    fn heartbeat_response_default_is_not_acknowledged() {
-        assert!(!HeartbeatResponse::default().acknowledged);
-    }
-
-    #[test]
-    fn register_request_serde_round_trip() {
-        let peer_info = make_peer_info();
-        let orig = RegisterRequest {
-            peer_info: peer_info.clone(),
-            features: vec![Feature::ConditionalDisagg(ConditionalDisaggConfig {
-                role: ConditionalDisaggRole::Prefill,
-            })],
-            runtime: None,
-        };
-        let json = serde_json::to_string(&orig).unwrap();
-        let back: RegisterRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.peer_info.instance_id(), peer_info.instance_id());
-        assert_eq!(back.features, orig.features);
-    }
-
-    #[test]
-    fn register_request_accepts_legacy_payload_without_features() {
-        let peer_info = make_peer_info();
-        let legacy_json = format!(
-            r#"{{"peer_info":{}}}"#,
-            serde_json::to_string(&peer_info).unwrap()
-        );
-        let back: RegisterRequest = serde_json::from_str(&legacy_json).unwrap();
-        assert_eq!(back.peer_info.instance_id(), peer_info.instance_id());
-        assert!(back.features.is_empty());
-    }
 
     #[test]
     fn feature_cd_serde_round_trip() {
@@ -911,59 +707,6 @@ mod tests {
     }
 
     #[test]
-    fn register_response_serde_round_trip() {
-        let instance_id = InstanceId::new_v4();
-        let hub_instance_id = Some(InstanceId::new_v4());
-        let mutation_credential = Some(MutationCredential::generate());
-        let registration_epoch = Some(RegistrationEpoch::new());
-        let orig = RegisterResponse {
-            instance_id,
-            hub_instance_id,
-            mutation_credential: mutation_credential.clone(),
-            registration_epoch,
-        };
-        let json = serde_json::to_string(&orig).unwrap();
-        let back: RegisterResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.instance_id, instance_id);
-        assert_eq!(back.hub_instance_id, hub_instance_id);
-        assert_eq!(back.mutation_credential, mutation_credential);
-        assert_eq!(back.registration_epoch, registration_epoch);
-    }
-
-    #[test]
-    fn register_response_accepts_legacy_payload_without_hub_instance_id() {
-        let instance_id = InstanceId::new_v4();
-        let legacy_json = format!("{{\"instance_id\":\"{instance_id}\"}}");
-        let back: RegisterResponse = serde_json::from_str(&legacy_json).unwrap();
-        assert_eq!(back.instance_id, instance_id);
-        assert!(back.hub_instance_id.is_none());
-        assert!(back.mutation_credential.is_none());
-        assert!(back.registration_epoch.is_none());
-    }
-
-    #[test]
-    fn mutation_credential_debug_is_redacted_and_header_is_sensitive() {
-        let credential = MutationCredential::generate();
-        let serialized = serde_json::to_string(&credential).unwrap();
-        let header = credential.to_header_value();
-
-        assert_eq!(format!("{credential:?}"), "MutationCredential([REDACTED])");
-        assert!(header.is_sensitive());
-        assert!(!format!("{header:?}").contains(serialized.trim_matches('"')));
-    }
-
-    #[test]
-    fn peer_lookup_response_serde_round_trip() {
-        let peer_info = make_peer_info();
-        let orig = PeerLookupResponse {
-            peer_info: peer_info.clone(),
-        };
-        let json = serde_json::to_string(&orig).unwrap();
-        let back: PeerLookupResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.peer_info.instance_id(), peer_info.instance_id());
-    }
-
-    #[test]
     fn error_code_serde_all_variants() {
         for code in [
             ErrorCode::NotFound,
@@ -989,29 +732,5 @@ mod tests {
         assert_eq!(back.code, ErrorCode::NotFound);
         assert_eq!(back.message, "instance abc not found");
         assert_eq!(back.to_string(), "instance abc not found");
-    }
-
-    #[test]
-    fn path_helpers_contain_id() {
-        let id = InstanceId::new_v4();
-        let worker_id = id.worker_id();
-        let id_str = id.to_string();
-
-        assert!(peers_by_instance(id).contains(&id_str));
-        assert!(peers_by_worker(worker_id).contains(&worker_id.as_u64().to_string()));
-        assert!(instance_by_id(id).contains(&id_str));
-        assert!(instance_heartbeat(id).contains(&id_str));
-    }
-
-    #[test]
-    fn path_helpers_have_expected_prefixes() {
-        let id = InstanceId::new_v4();
-        let worker_id = id.worker_id();
-
-        assert!(peers_by_instance(id).starts_with("/v1/peers/instance/"));
-        assert!(peers_by_worker(worker_id).starts_with("/v1/peers/worker/"));
-        assert!(instance_by_id(id).starts_with("/v1/instances/"));
-        assert!(instance_heartbeat(id).starts_with("/v1/instances/"));
-        assert!(instance_heartbeat(id).ends_with("/heartbeat"));
     }
 }

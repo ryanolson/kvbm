@@ -37,8 +37,8 @@ pub use execution::{HttpExecutionBackend, PrefillExecutionBackend, VeloExecution
 pub use manager::PrefillRouterManager;
 pub use protocol::{
     PREFILL_DISPATCH_HANDLER, PrefillBackendAdvertisement, PrefillDispatchRequest,
-    PrefillDispatchResponse, PrefillRouterConfig, PrefillTargetSummary, ROUTE_PREFIX,
-    TargetsResponse, VllmHttpEndpoint,
+    PrefillDispatchResponse, PrefillRouterConfig, PrefillTargetSummary, TargetsResponse,
+    VllmHttpEndpoint,
 };
 pub use router::PrefillRouter;
 pub use selection::{Selector, SelectorConfig};

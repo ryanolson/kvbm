@@ -4,18 +4,14 @@
 //! Feature-owned wire protocol for the prefill router.
 //!
 //! All paths are **relative** — the server nests them under
-//! `/v1/features/{ROUTE_PREFIX}` (see
-//! [`FeatureManager::route_prefix`](crate::features::FeatureManager::route_prefix)).
+//! `/v1/ext/{NAME}` (see
+//! `/v1/ext/{NAME}`).
 //! Nothing here lives in the central [`crate::protocol::paths`]; the feature
 //! owns its whole namespace.
 
 use kvbm_protocols::disagg::TransferParams;
 use serde::{Deserialize, Serialize};
 use velo_ext::InstanceId;
-
-/// URL segment the server nests this feature's routers under
-/// (`/v1/features/prefill-router/...`).
-pub const ROUTE_PREFIX: &str = "prefill-router";
 
 /// Velo unary handler name the hub's [`super::execution::VeloExecutionBackend`]
 /// calls on each registered velo target. The bindings crate registers the
@@ -49,7 +45,7 @@ pub struct PrefillDispatchResponse {
     pub error: Option<String>,
 }
 
-/// Relative route paths (mounted under `/v1/features/prefill-router`).
+/// Relative route paths (mounted under `/v1/ext/prefill_router`).
 pub mod paths {
     /// `GET /targets` — registered prefill targets + their advertised
     /// execution backend.
@@ -130,7 +126,7 @@ pub struct PrefillTargetSummary {
     pub advertisement: PrefillBackendAdvertisement,
 }
 
-/// Response body for `GET /v1/features/prefill-router/targets`.
+/// Response body for `GET /v1/ext/prefill_router/targets`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct TargetsResponse {
     /// Registered prefill targets, in deterministic order
@@ -151,7 +147,7 @@ pub struct WorkerCountersSnapshot {
     pub load_net_new: u64,
 }
 
-/// Response body for `GET /v1/features/prefill-router/counters`.
+/// Response body for `GET /v1/ext/prefill_router/counters`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct CountersResponse {
     /// Per-worker counter snapshots in the same order as [`TargetsResponse`].

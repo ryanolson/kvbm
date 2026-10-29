@@ -39,7 +39,7 @@ async fn start_hub() -> HubServer {
         .discovery_port(0)
         .control_port(0)
         .add_transport(transport as Arc<dyn velo::Transport>)
-        .add_feature_manager(manager as Arc<dyn kvbm_hub::FeatureManager>)
+        .extension(manager)
         .heartbeat_interval(Duration::from_secs(3600))
         .heartbeat_max_failures(u32::MAX)
         .registration_ttl(Duration::from_secs(3600))
@@ -117,11 +117,14 @@ fn fanout_url(server: &HubServer, control: bool) -> String {
     } else {
         server.discovery_addr()
     };
-    format!("http://{addr}/v1/reset")
+    format!("http://{addr}/v1/ext/connector_control/reset")
 }
 
 fn modules_url(server: &HubServer, id: velo_ext::InstanceId) -> String {
-    format!("http://{}/v1/instances/{id}/modules", server.control_addr())
+    format!(
+        "http://{}/v1/ext/connector_control/instances/{id}/modules",
+        server.control_addr()
+    )
 }
 
 async fn wait_for_modules_cached(server: &HubServer, id: velo_ext::InstanceId, deadline: Duration) {
@@ -173,12 +176,12 @@ async fn fanout_passes_tiers_and_returns_each_reset_response() {
 
     let client_a = build_client(&server);
     client_a
-        .register_instance(peer_a.peer_info())
+        .register(&peer_a, Vec::new(), None)
         .await
         .expect("register a");
     let client_b = build_client(&server);
     client_b
-        .register_instance(peer_b.peer_info())
+        .register(&peer_b, Vec::new(), None)
         .await
         .expect("register b");
     wait_for_modules_cached(&server, peer_a.instance_id(), Duration::from_secs(2)).await;
@@ -228,12 +231,12 @@ async fn fanout_filters_leaders_without_dev_module() {
 
     let dev_client = build_client(&server);
     dev_client
-        .register_instance(peer_dev.peer_info())
+        .register(&peer_dev, Vec::new(), None)
         .await
         .expect("register dev leader");
     let other_client = build_client(&server);
     other_client
-        .register_instance(peer_without_dev.peer_info())
+        .register(&peer_without_dev, Vec::new(), None)
         .await
         .expect("register leader without dev");
     wait_for_modules_cached(&server, peer_dev.instance_id(), Duration::from_secs(2)).await;
@@ -281,12 +284,12 @@ async fn fanout_returns_leader_error_without_failing_other_results() {
 
     let ok_client = build_client(&server);
     ok_client
-        .register_instance(peer_ok.peer_info())
+        .register(&peer_ok, Vec::new(), None)
         .await
         .expect("register successful leader");
     let error_client = build_client(&server);
     error_client
-        .register_instance(peer_error.peer_info())
+        .register(&peer_error, Vec::new(), None)
         .await
         .expect("register failing leader");
     wait_for_modules_cached(&server, peer_ok.instance_id(), Duration::from_secs(2)).await;

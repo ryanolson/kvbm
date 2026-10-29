@@ -24,7 +24,7 @@ mod slot;
 mod state;
 
 // Leader-side hub/P2P infrastructure consumed by `construct` and the CD wiring:
-// the hub handshake (GET /v1/config feature resolution), the KV-index ZMQ
+// the hub handshake (GET /v1/ext/kvbm/config feature resolution), the KV-index ZMQ
 // publisher, the hub peer resolver, and the hub-client builder.
 pub(crate) mod hub_handshake;
 pub(crate) mod hub_indexer;

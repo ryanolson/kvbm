@@ -274,7 +274,6 @@ async fn build_inner(
         .map(Arc::new)
         .map_err(|e| anyhow::anyhow!("velo build: {e}"))?;
     let worker_velo_id = velo.instance_id();
-    let peer_info = velo.peer_info();
 
     let calibrating = Arc::new(AtomicBool::new(false));
     let inflight_prefill = Arc::new(AtomicUsize::new(0));
@@ -302,18 +301,16 @@ async fn build_inner(
         .map_err(|e| anyhow::anyhow!("parse hub url {hub_url}: {e}"))?
         .build()
         .map_err(|e| anyhow::anyhow!("build HubClient for {hub_url}: {e}"))?;
-    hub.register_handlers_messenger(velo.messenger())
-        .map_err(|e| anyhow::anyhow!("register hub handlers on velo: {e}"))?;
 
     let hub_velo_id = hub
-        .register_instance_with_features_and_runtime(
-            peer_info,
+        .register(
+            &velo,
             vec![Feature::PrefillRouter(PrefillRouterConfig {
                 backend: PrefillBackendAdvertisement::Velo {
                     instance_id: worker_velo_id,
                 },
             })],
-            RuntimeConfigSummary::default(),
+            Some(RuntimeConfigSummary::default()),
         )
         .await
         .map_err(|e| anyhow::anyhow!("register with hub {hub_url}: {e}"))?;

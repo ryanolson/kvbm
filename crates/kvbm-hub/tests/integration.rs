@@ -6,22 +6,19 @@ use std::time::Duration;
 
 use std::sync::Arc;
 
-use kvbm_hub::handlers::{HEARTBEAT_HANDLER, HeartbeatAck, HeartbeatRequest};
 use kvbm_hub::protocol::{
     ConditionalDisaggConfig, ConditionalDisaggRole, DISAGG_PROTOCOL_VERSION, ErrorBody, ErrorCode,
-    Feature, HeartbeatResponse, LayoutCompatPayload, ListInstancesResponse,
-    MUTATION_CREDENTIAL_HEADER, MutationCredential, P2pConfig, PeerLookupResponse, PrefillRequest,
-    ProbeResponse, RegisterRequest, RegisterResponse, instance_by_id, instance_heartbeat,
-    instance_probe, paths, peers_by_instance, peers_by_worker,
+    Feature, LayoutCompatPayload, P2pConfig, PrefillRequest,
 };
+use kvbm_hub::test_hub;
 use kvbm_hub::{
     ConditionalDisaggClient, ConditionalDisaggInstancesResponse, ConditionalDisaggManager,
-    HubClientBuilder, HubServer, InMemoryRegistry, PeerRegistry,
+    HubServer,
 };
 use velo::Transport;
-use velo::discovery::PeerDiscovery;
 use velo::transports::tcp::TcpTransportBuilder;
 use velo_ext::{InstanceId, PeerInfo, WorkerAddress};
+use velo_hub::client::ClientError;
 
 use dynamo_tokens::TokenBlockSequence;
 use kvbm_hub::IndexerManager;
@@ -111,727 +108,6 @@ fn http() -> reqwest::Client {
     reqwest::Client::new()
 }
 
-async fn register_plain_peer(
-    server: &HubServer,
-    peer: &PeerInfo,
-    current_credential: Option<&MutationCredential>,
-) -> RegisterResponse {
-    let mut request = http()
-        .post(control_url(server, paths::INSTANCES))
-        .json(&RegisterRequest {
-            peer_info: peer.clone(),
-            features: Vec::new(),
-            runtime: None,
-        });
-    if let Some(credential) = current_credential {
-        request = request.header(MUTATION_CREDENTIAL_HEADER, credential.to_header_value());
-    }
-    request.send().await.unwrap().json().await.unwrap()
-}
-
-async fn heartbeat_status(
-    server: &HubServer,
-    owner: InstanceId,
-    credential: Option<&MutationCredential>,
-) -> reqwest::StatusCode {
-    let mut request = http().post(control_url(server, &instance_heartbeat(owner)));
-    if let Some(credential) = credential {
-        request = request.header(MUTATION_CREDENTIAL_HEADER, credential.to_header_value());
-    }
-    request.send().await.unwrap().status()
-}
-
-// ---- handlers module --------------------------------------------------------
-
-#[test]
-fn heartbeat_handler_name_is_stable() {
-    assert_eq!(HEARTBEAT_HANDLER, "kvbm_hub_heartbeat");
-}
-
-#[test]
-fn heartbeat_request_default() {
-    let req = HeartbeatRequest::default();
-    assert_eq!(req.seq, 0);
-}
-
-#[test]
-fn heartbeat_ack_default() {
-    let ack = HeartbeatAck::default();
-    assert_eq!(ack.seq, 0);
-    assert!(!ack.ok);
-}
-
-#[test]
-fn heartbeat_request_serde_round_trip() {
-    let orig = HeartbeatRequest { seq: 99 };
-    let json = serde_json::to_string(&orig).unwrap();
-    let back: HeartbeatRequest = serde_json::from_str(&json).unwrap();
-    assert_eq!(back.seq, 99);
-}
-
-#[test]
-fn heartbeat_ack_serde_round_trip() {
-    let orig = HeartbeatAck { seq: 7, ok: true };
-    let json = serde_json::to_string(&orig).unwrap();
-    let back: HeartbeatAck = serde_json::from_str(&json).unwrap();
-    assert_eq!(back.seq, 7);
-    assert!(back.ok);
-}
-
-#[tokio::test]
-async fn create_heartbeat_handler_builds() {
-    let server = start_server().await;
-    let client = build_client(&server);
-    let _handler = kvbm_hub::handlers::create_heartbeat_handler(client);
-}
-
-// ---- HTTP-direct server tests -----------------------------------------------
-
-#[tokio::test]
-async fn health_check_discovery_port() {
-    let server = start_server().await;
-    let resp = http()
-        .get(discovery_url(&server, paths::HEALTH))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-}
-
-#[tokio::test]
-async fn health_check_control_port() {
-    let server = start_server().await;
-    let resp = http()
-        .get(control_url(&server, paths::HEALTH))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-}
-
-#[tokio::test]
-async fn register_success() {
-    let server = start_server().await;
-    let peer = make_peer();
-    let resp = http()
-        .post(control_url(&server, paths::INSTANCES))
-        .json(&RegisterRequest {
-            peer_info: peer.clone(),
-            features: Vec::new(),
-            runtime: None,
-        })
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let body: RegisterResponse = resp.json().await.unwrap();
-    assert_eq!(body.instance_id, peer.instance_id());
-    assert!(body.mutation_credential.is_some());
-}
-
-#[tokio::test]
-async fn active_reregister_requires_current_credential_and_rotates_it() {
-    let server = start_server().await;
-    let peer = make_peer();
-    let req = RegisterRequest {
-        peer_info: peer.clone(),
-        features: Vec::new(),
-        runtime: None,
-    };
-    let first: RegisterResponse = http()
-        .post(control_url(&server, paths::INSTANCES))
-        .json(&req)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let first_credential = first.mutation_credential.unwrap();
-
-    let unauthenticated = http()
-        .post(control_url(&server, paths::INSTANCES))
-        .json(&req)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(unauthenticated.status(), 401);
-
-    let second: RegisterResponse = http()
-        .post(control_url(&server, paths::INSTANCES))
-        .header(
-            kvbm_hub::protocol::MUTATION_CREDENTIAL_HEADER,
-            first_credential.to_header_value(),
-        )
-        .json(&req)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let second_credential = second.mutation_credential.unwrap();
-    assert_ne!(first_credential, second_credential);
-
-    let stale = http()
-        .post(control_url(&server, paths::INSTANCES))
-        .header(
-            kvbm_hub::protocol::MUTATION_CREDENTIAL_HEADER,
-            first_credential.to_header_value(),
-        )
-        .json(&req)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(stale.status(), 401);
-}
-
-#[tokio::test]
-async fn unregister_success() {
-    let server = start_server().await;
-    let peer = make_peer();
-    let registration: RegisterResponse = http()
-        .post(control_url(&server, paths::INSTANCES))
-        .json(&RegisterRequest {
-            peer_info: peer.clone(),
-            features: Vec::new(),
-            runtime: None,
-        })
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let resp = http()
-        .delete(control_url(&server, &instance_by_id(peer.instance_id())))
-        .header(
-            kvbm_hub::protocol::MUTATION_CREDENTIAL_HEADER,
-            registration.mutation_credential.unwrap().to_header_value(),
-        )
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 204);
-}
-
-#[tokio::test]
-async fn one_registration_cannot_unregister_another_owner() {
-    let server = start_server().await;
-    let attacker = make_peer();
-    let victim = make_peer();
-    let mut credentials = Vec::new();
-    for peer in [&attacker, &victim] {
-        let response: RegisterResponse = http()
-            .post(control_url(&server, paths::INSTANCES))
-            .json(&RegisterRequest {
-                peer_info: peer.clone(),
-                features: Vec::new(),
-                runtime: None,
-            })
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        credentials.push(response.mutation_credential.unwrap());
-    }
-
-    let spoof = http()
-        .delete(control_url(&server, &instance_by_id(victim.instance_id())))
-        .header(
-            kvbm_hub::protocol::MUTATION_CREDENTIAL_HEADER,
-            credentials[0].to_header_value(),
-        )
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(spoof.status(), 401);
-    assert!(server.state().registry().contains(victim.instance_id()));
-}
-
-#[tokio::test]
-async fn unregister_not_found() {
-    let server = start_server().await;
-    let resp = http()
-        .delete(control_url(&server, &instance_by_id(InstanceId::new_v4())))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 404);
-    let body: ErrorBody = resp.json().await.unwrap();
-    assert_eq!(body.code, ErrorCode::NotFound);
-}
-
-#[tokio::test]
-async fn heartbeat_with_current_credential_is_acknowledged() {
-    let server = start_server().await;
-    let peer = make_peer();
-    let registration = register_plain_peer(&server, &peer, None).await;
-    let credential = registration.mutation_credential.unwrap();
-    let resp = http()
-        .post(control_url(
-            &server,
-            &instance_heartbeat(peer.instance_id()),
-        ))
-        .header(MUTATION_CREDENTIAL_HEADER, credential.to_header_value())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let body: HeartbeatResponse = resp.json().await.unwrap();
-    assert!(body.acknowledged);
-}
-
-#[tokio::test]
-async fn heartbeat_without_credential_is_unauthorized() {
-    let server = start_server().await;
-    let peer = make_peer();
-    register_plain_peer(&server, &peer, None).await;
-
-    assert_eq!(
-        heartbeat_status(&server, peer.instance_id(), None).await,
-        reqwest::StatusCode::UNAUTHORIZED
-    );
-}
-
-#[tokio::test]
-async fn stale_and_cross_owner_credentials_cannot_heartbeat() {
-    let server = start_server().await;
-    let victim = make_peer();
-    let attacker = make_peer();
-    let first = register_plain_peer(&server, &victim, None)
-        .await
-        .mutation_credential
-        .unwrap();
-    let current = register_plain_peer(&server, &victim, Some(&first))
-        .await
-        .mutation_credential
-        .unwrap();
-    let attacker = register_plain_peer(&server, &attacker, None)
-        .await
-        .mutation_credential
-        .unwrap();
-
-    for credential in [&first, &attacker] {
-        assert_eq!(
-            heartbeat_status(&server, victim.instance_id(), Some(credential)).await,
-            reqwest::StatusCode::UNAUTHORIZED
-        );
-    }
-    assert_eq!(
-        heartbeat_status(&server, victim.instance_id(), Some(&current)).await,
-        reqwest::StatusCode::OK
-    );
-}
-
-#[tokio::test]
-async fn unauthorized_heartbeats_do_not_postpone_expiry() {
-    let registry = Arc::new(
-        InMemoryRegistry::builder()
-            .ttl(Duration::from_secs(1))
-            .prune_interval(Duration::from_secs(3600))
-            .build(),
-    );
-    let server = kvbm_hub::create_server_builder()
-        .bind_addr(IpAddr::V4(Ipv4Addr::LOCALHOST))
-        .discovery_port(0)
-        .control_port(0)
-        .registry(Arc::clone(&registry) as Arc<dyn PeerRegistry>)
-        .serve()
-        .await
-        .expect("start expiring test server");
-    let victim = make_peer();
-    let attacker = make_peer();
-    let stale = register_plain_peer(&server, &victim, None)
-        .await
-        .mutation_credential
-        .unwrap();
-    let _current = register_plain_peer(&server, &victim, Some(&stale))
-        .await
-        .mutation_credential
-        .unwrap();
-    let attacker = register_plain_peer(&server, &attacker, None)
-        .await
-        .mutation_credential
-        .unwrap();
-
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    for credential in [None, Some(&stale), Some(&attacker)] {
-        assert_eq!(
-            heartbeat_status(&server, victim.instance_id(), credential).await,
-            reqwest::StatusCode::UNAUTHORIZED
-        );
-    }
-    tokio::time::sleep(Duration::from_millis(850)).await;
-    registry.prune_stale();
-
-    assert!(
-        !server.state().registry().contains(victim.instance_id()),
-        "rejected heartbeats must not refresh the victim's registry lease"
-    );
-}
-
-#[tokio::test]
-async fn heartbeat_unregistered_instance() {
-    let server = start_server().await;
-    let resp = http()
-        .post(control_url(
-            &server,
-            &instance_heartbeat(InstanceId::new_v4()),
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 404);
-}
-
-#[tokio::test]
-async fn get_peer_by_instance_found() {
-    let server = start_server().await;
-    let peer = make_peer();
-    http()
-        .post(control_url(&server, paths::INSTANCES))
-        .json(&RegisterRequest {
-            peer_info: peer.clone(),
-            features: Vec::new(),
-            runtime: None,
-        })
-        .send()
-        .await
-        .unwrap();
-    let resp = http()
-        .get(discovery_url(
-            &server,
-            &peers_by_instance(peer.instance_id()),
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let body: PeerLookupResponse = resp.json().await.unwrap();
-    assert_eq!(body.peer_info.instance_id(), peer.instance_id());
-}
-
-#[tokio::test]
-async fn get_peer_by_instance_not_found() {
-    let server = start_server().await;
-    let resp = http()
-        .get(discovery_url(
-            &server,
-            &peers_by_instance(InstanceId::new_v4()),
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 404);
-    let body: ErrorBody = resp.json().await.unwrap();
-    assert_eq!(body.code, ErrorCode::NotFound);
-}
-
-#[tokio::test]
-async fn get_peer_by_worker_found() {
-    let server = start_server().await;
-    let peer = make_peer();
-    http()
-        .post(control_url(&server, paths::INSTANCES))
-        .json(&RegisterRequest {
-            peer_info: peer.clone(),
-            features: Vec::new(),
-            runtime: None,
-        })
-        .send()
-        .await
-        .unwrap();
-    let resp = http()
-        .get(discovery_url(&server, &peers_by_worker(peer.worker_id())))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let body: PeerLookupResponse = resp.json().await.unwrap();
-    assert_eq!(body.peer_info.instance_id(), peer.instance_id());
-}
-
-#[tokio::test]
-async fn get_peer_by_worker_not_found() {
-    let server = start_server().await;
-    let resp = http()
-        .get(discovery_url(
-            &server,
-            &peers_by_worker(InstanceId::new_v4().worker_id()),
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 404);
-    let body: ErrorBody = resp.json().await.unwrap();
-    assert_eq!(body.code, ErrorCode::NotFound);
-}
-
-#[tokio::test]
-async fn control_port_mirrors_discovery_endpoints() {
-    let server = start_server().await;
-    let peer = make_peer();
-    http()
-        .post(control_url(&server, paths::INSTANCES))
-        .json(&RegisterRequest {
-            peer_info: peer.clone(),
-            features: Vec::new(),
-            runtime: None,
-        })
-        .send()
-        .await
-        .unwrap();
-    let resp = http()
-        .get(control_url(&server, &peers_by_instance(peer.instance_id())))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-}
-
-#[tokio::test]
-async fn peers_snapshot_tracks_registrations() {
-    let server = start_server().await;
-    for _ in 0..3 {
-        http()
-            .post(control_url(&server, paths::INSTANCES))
-            .json(&RegisterRequest {
-                peer_info: make_peer(),
-                features: Vec::new(),
-                runtime: None,
-            })
-            .send()
-            .await
-            .unwrap();
-    }
-    assert_eq!(server.state().peers().len(), 3);
-}
-
-#[tokio::test]
-async fn peers_snapshot_tracks_unregistrations() {
-    let server = start_server().await;
-    let a = make_peer();
-    let b = make_peer();
-    let mut credentials = Vec::new();
-    for peer in [&a, &b] {
-        let response: RegisterResponse = http()
-            .post(control_url(&server, paths::INSTANCES))
-            .json(&RegisterRequest {
-                peer_info: peer.clone(),
-                features: Vec::new(),
-                runtime: None,
-            })
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        credentials.push(response.mutation_credential.unwrap());
-    }
-    http()
-        .delete(control_url(&server, &instance_by_id(a.instance_id())))
-        .header(
-            kvbm_hub::protocol::MUTATION_CREDENTIAL_HEADER,
-            credentials[0].to_header_value(),
-        )
-        .send()
-        .await
-        .unwrap();
-    let peers = server.state().peers();
-    assert_eq!(peers.len(), 1);
-    assert_eq!(peers[0].instance_id(), b.instance_id());
-}
-
-// ---- HubClient tests --------------------------------------------------------
-
-#[tokio::test]
-async fn client_builder_requires_host() {
-    assert!(HubClientBuilder::new().build().is_err());
-}
-
-#[tokio::test]
-async fn client_starts_unregistered() {
-    let server = start_server().await;
-    let client = build_client(&server);
-    assert!(!client.is_registered());
-}
-
-#[tokio::test]
-async fn client_register_sets_is_registered() {
-    let server = start_server().await;
-    let client = build_client(&server);
-    client.register_instance(make_peer()).await.unwrap();
-    assert!(client.is_registered());
-}
-
-#[tokio::test]
-async fn client_register_twice_errors() {
-    let server = start_server().await;
-    let client = build_client(&server);
-    client.register_instance(make_peer()).await.unwrap();
-    assert!(client.register_instance(make_peer()).await.is_err());
-}
-
-#[tokio::test]
-async fn client_heartbeat_while_registered() {
-    let server = start_server().await;
-    let client = build_client(&server);
-    client.register_instance(make_peer()).await.unwrap();
-    client.send_heartbeat().await.unwrap();
-}
-
-#[tokio::test]
-async fn client_heartbeat_before_register_errors() {
-    let server = start_server().await;
-    let client = build_client(&server);
-    assert!(client.send_heartbeat().await.is_err());
-}
-
-#[tokio::test]
-async fn client_discover_by_instance_id() {
-    let server = start_server().await;
-    let client = build_client(&server);
-    let peer = make_peer();
-    client.register_instance(peer.clone()).await.unwrap();
-    let found = client
-        .discover_by_instance_id(peer.instance_id())
-        .await
-        .unwrap();
-    assert_eq!(found.instance_id(), peer.instance_id());
-}
-
-#[tokio::test]
-async fn client_discover_by_worker_id() {
-    let server = start_server().await;
-    let client = build_client(&server);
-    let peer = make_peer();
-    client.register_instance(peer.clone()).await.unwrap();
-    let found = client
-        .discover_by_worker_id(peer.worker_id())
-        .await
-        .unwrap();
-    assert_eq!(found.instance_id(), peer.instance_id());
-}
-
-#[tokio::test]
-async fn client_unregister_removes_from_server() {
-    let server = start_server().await;
-    let client = build_client(&server);
-    let peer = make_peer();
-    client.register_instance(peer.clone()).await.unwrap();
-    client.unregister().await.unwrap();
-    let resp = http()
-        .get(discovery_url(
-            &server,
-            &peers_by_instance(peer.instance_id()),
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 404);
-}
-
-#[tokio::test]
-async fn client_unregister_noop_when_not_registered() {
-    let server = start_server().await;
-    let client = build_client(&server);
-    client.unregister().await.unwrap();
-}
-
-#[tokio::test]
-async fn client_discover_after_unregister_errors() {
-    let server = start_server().await;
-    let client = build_client(&server);
-    let peer = make_peer();
-    client.register_instance(peer.clone()).await.unwrap();
-    client.unregister().await.unwrap();
-    assert!(
-        client
-            .discover_by_instance_id(peer.instance_id())
-            .await
-            .is_err()
-    );
-}
-
-#[tokio::test]
-async fn registration_guard_drop_fires_delete() {
-    let server = start_server().await;
-    let peer = make_peer();
-    {
-        let client = build_client(&server);
-        client.register_instance(peer.clone()).await.unwrap();
-        // Arc<HubClient> drops here → HubRegistrationGuard::drop spawns DELETE
-    }
-    // Allow the background DELETE task to complete
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let resp = http()
-        .get(discovery_url(
-            &server,
-            &peers_by_instance(peer.instance_id()),
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 404);
-}
-
-#[tokio::test]
-async fn registered_client_visible_in_list_then_removed_on_drop() {
-    let server = start_server().await;
-    let http = http();
-
-    // List is initially empty
-    let resp: ListInstancesResponse = http
-        .get(control_url(&server, paths::INSTANCES))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert!(resp.instances.is_empty());
-
-    // Register a client
-    let peer = make_peer();
-    {
-        let client = build_client(&server);
-        client.register_instance(peer.clone()).await.unwrap();
-
-        // Instance is now visible via the view API
-        let resp: ListInstancesResponse = http
-            .get(control_url(&server, paths::INSTANCES))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(resp.instances.len(), 1);
-        assert_eq!(resp.instances[0].instance_id(), peer.instance_id());
-        // Arc<HubClient> drops here → HubRegistrationGuard::drop spawns DELETE
-    }
-
-    // Allow the background DELETE task to complete
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Instance is gone
-    let resp: ListInstancesResponse = http
-        .get(control_url(&server, paths::INSTANCES))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert!(resp.instances.is_empty());
-}
-
-// ---- Velo probe tests -------------------------------------------------------
-
 fn new_velo_transport() -> Arc<velo::transports::tcp::TcpTransport> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     Arc::new(
@@ -870,144 +146,13 @@ async fn wire_mutual_velo(
     client_velo: &Arc<velo::Velo>,
 ) -> Arc<kvbm_hub::HubClient> {
     let hub_client = build_client(server);
-    hub_client.register_handlers(client_velo).unwrap();
-    let hub_id = hub_client
-        .register_instance(client_velo.peer_info())
+    hub_client
+        .register(client_velo, vec![], None)
         .await
         .unwrap()
         .expect("hub should return its own instance id when running with a transport");
-    let hub_peer = hub_client.discover_by_instance_id(hub_id).await.unwrap();
-    client_velo.register_peer(hub_peer).unwrap();
     hub_client
 }
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn velo_probe_happy_path() {
-    let (server, _hub_transport) = start_server_with_transport().await;
-    let client_velo = new_velo().await;
-    let _hub_client = wire_mutual_velo(&server, &client_velo).await;
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let instance_id = client_velo.instance_id();
-    let resp = http()
-        .post(control_url(&server, &instance_probe(instance_id)))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let body: ProbeResponse = resp.json().await.unwrap();
-    assert!(body.ok);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn velo_probe_after_client_velo_shutdown_returns_bad_gateway() {
-    let (server, _hub_transport) = start_server_with_transport().await;
-
-    // Build client velo with an explicit transport handle so we can shut it down.
-    let client_transport = new_velo_transport();
-    let client_velo = velo::Velo::builder()
-        .add_transport(Arc::clone(&client_transport) as Arc<dyn Transport>)
-        .build()
-        .await
-        .map(Arc::new)
-        .unwrap();
-
-    let hub_client = wire_mutual_velo(&server, &client_velo).await;
-    let instance_id = client_velo.instance_id();
-
-    // Keep hub_client alive so the HTTP registration guard never fires and the
-    // instance stays in the registry.
-    let _keep_hub_client = Arc::clone(&hub_client);
-
-    // Explicitly shut down the transport — cancels the TCP listener and all
-    // connection tasks, making the client unreachable.
-    client_transport.shutdown();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let resp = http()
-        .post(control_url(&server, &instance_probe(instance_id)))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 502);
-}
-
-// ---- Hub self-registration + hub_instance_id tests --------------------------
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn register_response_includes_hub_instance_id_when_velo_configured() {
-    let (server, _hub_transport) = start_server_with_transport().await;
-    let client_velo = new_velo().await;
-    let client = build_client(&server);
-    let hub_id = client
-        .register_instance(client_velo.peer_info())
-        .await
-        .unwrap();
-    assert!(hub_id.is_some(), "hub_instance_id should be Some");
-    // Hub is discoverable immediately.
-    let _hub_peer = client
-        .discover_by_instance_id(hub_id.unwrap())
-        .await
-        .unwrap();
-}
-
-#[tokio::test]
-async fn register_response_hub_instance_id_none_without_transport() {
-    let server = start_server().await;
-    let client = build_client(&server);
-    let hub_id = client.register_instance(make_peer()).await.unwrap();
-    assert!(hub_id.is_none());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn hub_self_registered_in_registry() {
-    let (server, hub_transport) = start_server_with_transport().await;
-    let hub_velo_id = server.state().velo().expect("hub velo").instance_id();
-
-    // Direct HTTP lookup should resolve the hub's PeerInfo.
-    let resp = http()
-        .get(discovery_url(&server, &peers_by_instance(hub_velo_id)))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let _ = hub_transport; // keep alive
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn hub_self_entry_survives_reaper() {
-    // Short TTL; protect() must keep the hub's entry alive.
-    let transport = new_velo_transport();
-    let server = kvbm_hub::create_server_builder()
-        .bind_addr(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
-        .discovery_port(0)
-        .control_port(0)
-        .registration_ttl(Duration::from_millis(50))
-        .prune_interval(Duration::from_millis(20))
-        .add_transport(Arc::clone(&transport) as Arc<dyn Transport>)
-        .serve()
-        .await
-        .expect("start test server");
-
-    let hub_velo_id = server.state().velo().expect("hub velo").instance_id();
-
-    // Wait well past TTL + multiple prune cycles.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    let resp = http()
-        .get(discovery_url(&server, &peers_by_instance(hub_velo_id)))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        200,
-        "hub's self-entry should be protected from reaper"
-    );
-}
-
-// ---- ConditionalDisagg feature tests ---------------------------------------
 
 async fn start_server_with_cd() -> (
     HubServer,
@@ -1022,8 +167,8 @@ async fn start_server_with_cd() -> (
         .discovery_port(0)
         .control_port(0)
         .add_transport(Arc::clone(&transport) as Arc<dyn Transport>)
-        .add_feature_manager(p2p as Arc<dyn kvbm_hub::FeatureManager>)
-        .add_feature_manager(Arc::clone(&cd_manager) as Arc<dyn kvbm_hub::FeatureManager>)
+        .extension(p2p)
+        .extension(Arc::clone(&cd_manager))
         .serve()
         .await
         .expect("start test server with CD");
@@ -1041,8 +186,8 @@ async fn start_server_with_cd_no_velo() -> (HubServer, Arc<ConditionalDisaggMana
         .bind_addr(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
         .discovery_port(0)
         .control_port(0)
-        .add_feature_manager(p2p as Arc<dyn kvbm_hub::FeatureManager>)
-        .add_feature_manager(Arc::clone(&cd_manager) as Arc<dyn kvbm_hub::FeatureManager>)
+        .extension(p2p)
+        .extension(Arc::clone(&cd_manager))
         .serve()
         .await
         .expect("start test server with CD");
@@ -1056,17 +201,13 @@ async fn feature_register_without_manager_rejects() {
     // with "no manager registered for P2P".
     let server = start_server().await;
     let peer = make_peer();
-    let req = RegisterRequest {
-        peer_info: peer.clone(),
-        features: p2p_cd_features(ConditionalDisaggRole::Prefill),
-        runtime: None,
-    };
-    let resp = http()
-        .post(control_url(&server, paths::INSTANCES))
-        .json(&req)
-        .send()
-        .await
-        .unwrap();
+    let resp = test_hub::attempt(
+        &server,
+        peer.clone(),
+        &p2p_cd_features(ConditionalDisaggRole::Prefill),
+        None,
+    )
+    .await;
     assert_eq!(resp.status(), 400);
     let body: ErrorBody = resp.json().await.unwrap();
     assert_eq!(body.code, ErrorCode::BadRequest);
@@ -1075,62 +216,12 @@ async fn feature_register_without_manager_rejects() {
     let resp = http()
         .get(discovery_url(
             &server,
-            &peers_by_instance(peer.instance_id()),
+            &format!("/v1/peers/instance/{}", peer.instance_id()),
         ))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 404);
-}
-
-#[tokio::test]
-async fn failed_authorized_reregister_restores_prior_registration() {
-    let (server, cd) = start_server_with_cd_no_velo().await;
-    let peer = make_peer();
-    let initial: RegisterResponse = http()
-        .post(control_url(&server, paths::INSTANCES))
-        .json(&RegisterRequest {
-            peer_info: peer.clone(),
-            features: p2p_cd_features(ConditionalDisaggRole::Prefill),
-            runtime: None,
-        })
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let credential = initial.mutation_credential.unwrap();
-
-    let rejected = http()
-        .post(control_url(&server, paths::INSTANCES))
-        .header(
-            kvbm_hub::protocol::MUTATION_CREDENTIAL_HEADER,
-            credential.to_header_value(),
-        )
-        .json(&RegisterRequest {
-            peer_info: peer.clone(),
-            features: p2p_cd_features(ConditionalDisaggRole::Decode),
-            runtime: None,
-        })
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(rejected.status(), 400);
-    assert!(server.state().registry().contains(peer.instance_id()));
-    assert_eq!(cd.snapshot().prefill, vec![peer.instance_id()]);
-    assert!(cd.snapshot().decode.is_empty());
-
-    let removed = http()
-        .delete(control_url(&server, &instance_by_id(peer.instance_id())))
-        .header(
-            kvbm_hub::protocol::MUTATION_CREDENTIAL_HEADER,
-            credential.to_header_value(),
-        )
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(removed.status(), 204);
 }
 
 // c2: `feature_cd_register_missing_config_rejects` removed — the type
@@ -1143,8 +234,8 @@ async fn failed_authorized_reregister_restores_prior_registration() {
 async fn feature_cd_list_empty_on_both_ports() {
     let (server, _cd) = start_server_with_cd_no_velo().await;
     for url in [
-        discovery_url(&server, "/v1/features/disagg/instances"),
-        control_url(&server, "/v1/features/disagg/instances"),
+        discovery_url(&server, "/v1/ext/disagg/instances"),
+        control_url(&server, "/v1/ext/disagg/instances"),
     ] {
         let body: ConditionalDisaggInstancesResponse =
             http().get(url).send().await.unwrap().json().await.unwrap();
@@ -1154,88 +245,45 @@ async fn feature_cd_list_empty_on_both_ports() {
 }
 
 #[tokio::test]
-async fn register_without_features_field_still_works() {
-    // Proves `#[serde(default)]` on RegisterRequest.features is honored for
-    // older clients that omit the field entirely.
-    let server = start_server().await;
-    let peer = make_peer();
-    let legacy_json = format!(
-        r#"{{"peer_info":{}}}"#,
-        serde_json::to_string(&peer).unwrap()
-    );
-    let resp = http()
-        .post(control_url(&server, paths::INSTANCES))
-        .header("content-type", "application/json")
-        .body(legacy_json)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-}
-
-#[tokio::test]
 async fn feature_cd_role_conflict_on_reregister() {
     let (server, _cd) = start_server_with_cd_no_velo().await;
     let peer = make_peer();
-    let first: RegisterResponse = http()
-        .post(control_url(&server, paths::INSTANCES))
-        .json(&RegisterRequest {
-            peer_info: peer.clone(),
-            features: p2p_cd_features(ConditionalDisaggRole::Prefill),
-            runtime: None,
-        })
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let resp = http()
-        .post(control_url(&server, paths::INSTANCES))
-        .header(
-            kvbm_hub::protocol::MUTATION_CREDENTIAL_HEADER,
-            first.mutation_credential.unwrap().to_header_value(),
+    let first = test_hub::attempt(
+        &server,
+        peer.clone(),
+        &p2p_cd_features(ConditionalDisaggRole::Prefill),
+        None,
+    )
+    .await;
+    assert_eq!(first.status(), 200);
+    let err = first
+        .client
+        .register_peer(
+            peer,
+            test_hub::extensions(&p2p_cd_features(ConditionalDisaggRole::Decode), None),
         )
-        .json(&RegisterRequest {
-            peer_info: peer,
-            features: p2p_cd_features(ConditionalDisaggRole::Decode),
-            runtime: None,
-        })
-        .send()
         .await
-        .unwrap();
-    assert_eq!(resp.status(), 400);
+        .expect_err("a role change on re-register must reject");
+    assert!(
+        matches!(err, ClientError::Hub { status, .. } if status.as_u16() == 409),
+        "{err}"
+    );
 }
 
 #[tokio::test]
 async fn feature_cd_unregister_removes_from_lists() {
     let (server, cd) = start_server_with_cd_no_velo().await;
-    let peer = make_peer();
-    let req = RegisterRequest {
-        peer_info: peer.clone(),
-        features: p2p_cd_features(ConditionalDisaggRole::Prefill),
-        runtime: None,
-    };
-    let registration: RegisterResponse = http()
-        .post(control_url(&server, paths::INSTANCES))
-        .json(&req)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let registration = test_hub::attempt(
+        &server,
+        make_peer(),
+        &p2p_cd_features(ConditionalDisaggRole::Prefill),
+        None,
+    )
+    .await;
+    assert_eq!(registration.status(), 200);
     assert_eq!(cd.snapshot().prefill.len(), 1);
 
-    http()
-        .delete(control_url(&server, &instance_by_id(peer.instance_id())))
-        .header(
-            kvbm_hub::protocol::MUTATION_CREDENTIAL_HEADER,
-            registration.mutation_credential.unwrap().to_header_value(),
-        )
-        .send()
-        .await
-        .unwrap();
+    registration.client.unregister().await.unwrap();
 
     assert!(cd.snapshot().prefill.is_empty());
 }
@@ -1252,44 +300,23 @@ async fn feature_cd_reaper_evicts_from_lists() {
         .control_port(0)
         .registration_ttl(Duration::from_millis(60))
         .prune_interval(Duration::from_millis(20))
-        .add_feature_manager(p2p as Arc<dyn kvbm_hub::FeatureManager>)
-        .add_feature_manager(Arc::clone(&cd_manager) as Arc<dyn kvbm_hub::FeatureManager>)
+        .extension(p2p)
+        .extension(Arc::clone(&cd_manager))
         .serve()
         .await
         .expect("start test server");
 
-    let peer = make_peer();
-    let req = RegisterRequest {
-        peer_info: peer.clone(),
-        features: p2p_cd_features(ConditionalDisaggRole::Prefill),
-        runtime: None,
-    };
-    http()
-        .post(control_url(&server, paths::INSTANCES))
-        .json(&req)
-        .send()
-        .await
-        .unwrap();
+    let features = p2p_cd_features(ConditionalDisaggRole::Prefill);
+    let _stale = test_hub::attempt(&server, make_peer(), &features, None).await;
     assert_eq!(cd_manager.snapshot().prefill.len(), 1);
 
     // Wait well past TTL + multiple prune cycles so the reaper evicts the
-    // base entry and the eviction callback fans out to the CD manager.
+    // entry and its removal fans out to the CD manager.
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     assert!(
         cd_manager.snapshot().prefill.is_empty(),
         "reaper eviction should fan out to the feature manager"
-    );
-    let fresh = http()
-        .post(control_url(&server, paths::INSTANCES))
-        .json(&req)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        fresh.status(),
-        200,
-        "TTL eviction must also remove the stale registration credential"
     );
 }
 
@@ -1303,8 +330,6 @@ async fn feature_cd_prefill_and_decode_register_and_list() {
 
     let p_hub = build_client(&server);
     let d_hub = build_client(&server);
-    p_hub.register_handlers(&p_velo).unwrap();
-    d_hub.register_handlers(&d_velo).unwrap();
 
     let p_cd = ConditionalDisaggClient::new(
         Arc::clone(&p_hub),
@@ -1318,12 +343,12 @@ async fn feature_cd_prefill_and_decode_register_and_list() {
     );
 
     let p_hub_id = p_cd
-        .register(p_velo.peer_info(), test_layout_compat_payload())
+        .register(&p_velo, test_layout_compat_payload())
         .await
         .unwrap()
         .expect("hub velo id");
     let d_hub_id = d_cd
-        .register(d_velo.peer_info(), test_layout_compat_payload())
+        .register(&d_velo, test_layout_compat_payload())
         .await
         .unwrap()
         .expect("hub velo id");
@@ -1336,20 +361,14 @@ async fn feature_cd_prefill_and_decode_register_and_list() {
     let p_id = p_velo.instance_id();
     let d_id = d_velo.instance_id();
     for url in [
-        discovery_url(&server, "/v1/features/disagg/instances"),
-        control_url(&server, "/v1/features/disagg/instances"),
+        discovery_url(&server, "/v1/ext/disagg/instances"),
+        control_url(&server, "/v1/ext/disagg/instances"),
     ] {
         let body: ConditionalDisaggInstancesResponse =
             http().get(&url).send().await.unwrap().json().await.unwrap();
         assert_eq!(body.prefill, vec![p_id], "from {url}");
         assert_eq!(body.decode, vec![d_id], "from {url}");
     }
-
-    // Wire the hub's PeerInfo into each participant's velo (needed so velo
-    // probes initiated from the hub can route back through the TCP transport).
-    let hub_peer = p_hub.discover_by_instance_id(p_hub_id).await.unwrap();
-    p_velo.register_peer(hub_peer.clone()).unwrap();
-    d_velo.register_peer(hub_peer).unwrap();
 
     // Prefill side: await the decode peer and register it into prefill's velo.
     let d_peer = p_cd
@@ -1374,19 +393,6 @@ async fn feature_cd_prefill_and_decode_register_and_list() {
         .unwrap();
     assert_eq!(p_peer.instance_id(), p_id);
     d_velo.register_peer(p_peer).unwrap();
-
-    // Hub can now probe both instances — proves velo handshakes succeeded.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    for id in [p_id, d_id] {
-        let resp = http()
-            .post(control_url(&server, &instance_probe(id)))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200, "probe failed for {id}");
-        let body: ProbeResponse = resp.json().await.unwrap();
-        assert!(body.ok, "probe returned not-ok for {id}");
-    }
 
     // ---- Prefill queue handshake -------------------------------------------
     //
@@ -1483,8 +489,8 @@ async fn start_server_with_cd_dispatcher() -> (
         .discovery_port(0)
         .control_port(0)
         .add_transport(Arc::clone(&transport) as Arc<dyn Transport>)
-        .add_feature_manager(p2p as Arc<dyn kvbm_hub::FeatureManager>)
-        .add_feature_manager(Arc::clone(&cd_manager) as Arc<dyn kvbm_hub::FeatureManager>)
+        .extension(p2p)
+        .extension(Arc::clone(&cd_manager))
         .serve()
         .await
         .expect("start test server with CD dispatcher");
@@ -1502,19 +508,15 @@ async fn dispatcher_worker_drains_queue_and_invokes_dispatcher() {
     // Decode client + velo so the push has the messenger backing it.
     let d_velo = new_velo().await;
     let d_hub = build_client(&server);
-    d_hub.register_handlers(&d_velo).unwrap();
     let d_cd = ConditionalDisaggClient::new(
         Arc::clone(&d_hub),
         Arc::clone(&d_velo),
         ConditionalDisaggRole::Decode,
     );
-    let d_hub_id = d_cd
-        .register(d_velo.peer_info(), test_layout_compat_payload())
+    d_cd.register(&d_velo, test_layout_compat_payload())
         .await
         .unwrap()
         .expect("hub velo id");
-    let hub_peer = d_hub.discover_by_instance_id(d_hub_id).await.unwrap();
-    d_velo.register_peer(hub_peer).unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Push two requests; the worker should drain both.
@@ -1565,19 +567,15 @@ async fn no_dispatcher_does_not_spawn_worker() {
 
     let d_velo = new_velo().await;
     let d_hub = build_client(&server);
-    d_hub.register_handlers(&d_velo).unwrap();
     let d_cd = ConditionalDisaggClient::new(
         Arc::clone(&d_hub),
         Arc::clone(&d_velo),
         ConditionalDisaggRole::Decode,
     );
-    let d_hub_id = d_cd
-        .register(d_velo.peer_info(), test_layout_compat_payload())
+    d_cd.register(&d_velo, test_layout_compat_payload())
         .await
         .unwrap()
         .expect("hub velo id");
-    let hub_peer = d_hub.discover_by_instance_id(d_hub_id).await.unwrap();
-    d_velo.register_peer(hub_peer).unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let req = PrefillRequest {
@@ -1599,21 +597,17 @@ async fn no_dispatcher_does_not_spawn_worker() {
     // (prefill client) can still pull as before.
     let p_velo = new_velo().await;
     let p_hub = build_client(&server);
-    p_hub.register_handlers(&p_velo).unwrap();
     let p_cd = ConditionalDisaggClient::new(
         Arc::clone(&p_hub),
         Arc::clone(&p_velo),
         ConditionalDisaggRole::Prefill,
     );
-    let p_hub_id = p_cd
-        .register(p_velo.peer_info(), test_layout_compat_payload())
+    p_cd.register(&p_velo, test_layout_compat_payload())
         .await
         .unwrap()
         .expect("hub velo id");
     // Wire the hub's PeerInfo into prefill's velo so the queue RPC can
     // round-trip back through the TCP transport.
-    let p_hub_peer = p_hub.discover_by_instance_id(p_hub_id).await.unwrap();
-    p_velo.register_peer(p_hub_peer).unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let pulled = p_cd
@@ -1673,7 +667,7 @@ async fn start_server_with_indexer() -> (
         .discovery_port(0)
         .control_port(0)
         .add_transport(Arc::clone(&transport) as Arc<dyn Transport>)
-        .add_feature_manager(Arc::clone(&mgr) as Arc<dyn kvbm_hub::FeatureManager>)
+        .extension(Arc::clone(&mgr))
         .serve()
         .await
         .expect("start test server with indexer");
@@ -1768,7 +762,7 @@ async fn indexer_lookup_client_errs_when_hub_has_no_velo() {
         .bind_addr(IpAddr::V4(Ipv4Addr::LOCALHOST))
         .discovery_port(0)
         .control_port(0)
-        .add_feature_manager(Arc::clone(&mgr) as Arc<dyn kvbm_hub::FeatureManager>)
+        .extension(Arc::clone(&mgr))
         .serve()
         .await
         .expect("start indexer hub without transport");
@@ -1776,7 +770,7 @@ async fn indexer_lookup_client_errs_when_hub_has_no_velo() {
     let client_velo = new_velo().await;
     let hub_client = build_client(&server);
     let hub_id = hub_client
-        .register_instance(client_velo.peer_info())
+        .register(&client_velo, vec![], None)
         .await
         .unwrap();
     assert!(hub_id.is_none(), "discovery-only hub returns no velo id");
@@ -1804,25 +798,22 @@ async fn wire_indexer_participant(
     client_velo: &Arc<velo::Velo>,
 ) -> Arc<kvbm_hub::HubClient> {
     let hub_client = build_client(server);
-    hub_client.register_handlers(client_velo).unwrap();
-    let hub_id = hub_client
-        .register_instance_with_features_and_runtime(
-            client_velo.peer_info(),
+    hub_client
+        .register(
+            client_velo,
             vec![Feature::Indexer(kvbm_hub::IndexerFeatureConfig {
                 max_seq_len: None,
                 manifest: indexer_manifest(),
                 create_kind: kvbm_logical::events::CreateKind::Block,
             })],
-            kvbm_hub::protocol::RuntimeConfigSummary {
+            Some(kvbm_hub::protocol::RuntimeConfigSummary {
                 block_size: Some(IDX_BLOCK_SIZE),
                 block_layout: None,
-            },
+            }),
         )
         .await
         .unwrap()
         .expect("hub should return its own instance id when running with a transport");
-    let hub_peer = hub_client.discover_by_instance_id(hub_id).await.unwrap();
-    client_velo.register_peer(hub_peer).unwrap();
     hub_client
 }
 

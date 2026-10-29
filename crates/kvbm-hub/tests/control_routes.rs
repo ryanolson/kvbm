@@ -6,7 +6,7 @@
 //!
 //! Stands up a hub plus a fake velo leader peer that registers a
 //! `kvbm.leader.control.reset` handler returning canned [`ControlReply`]
-//! values. Drives `POST /v1/instances/{id}/control/dev/reset` against the
+//! values. Drives `POST /v1/ext/connector_control/instances/{id}/control/dev/reset` against the
 //! hub and asserts each [`ControlError`] variant lands on the correct
 //! HTTP status code.
 
@@ -51,7 +51,7 @@ async fn start_hub_with_proxy() -> HubServer {
         .discovery_port(0)
         .control_port(0)
         .add_transport(transport as Arc<dyn velo::Transport>)
-        .add_feature_manager(proxy as Arc<dyn kvbm_hub::FeatureManager>)
+        .extension(proxy)
         // Disable hub-driven heartbeat by setting an interval longer
         // than each test's runtime — these tests don't exercise the
         // liveness path, and we don't want probes overwriting our
@@ -81,7 +81,7 @@ async fn register_connector(
 ) -> (Arc<kvbm_hub::HubClient>, velo_ext::InstanceId) {
     let client = build_client(server);
     client
-        .register_instance(peer_velo.peer_info())
+        .register(peer_velo, Vec::new(), None)
         .await
         .expect("register");
     (client, peer_velo.instance_id())
@@ -109,7 +109,7 @@ fn http() -> reqwest::Client {
 
 fn proxy_reset_url(server: &HubServer, id: velo_ext::InstanceId) -> String {
     format!(
-        "http://{}/v1/instances/{}/control/dev/reset",
+        "http://{}/v1/ext/connector_control/instances/{}/control/dev/reset",
         server.control_addr(),
         id
     )
@@ -292,7 +292,7 @@ async fn proxy_discovery_only_returns_503() {
         .bind_addr(IpAddr::V4(Ipv4Addr::LOCALHOST))
         .discovery_port(0)
         .control_port(0)
-        .add_feature_manager(proxy as Arc<dyn kvbm_hub::FeatureManager>)
+        .extension(proxy)
         .serve()
         .await
         .expect("start hub");

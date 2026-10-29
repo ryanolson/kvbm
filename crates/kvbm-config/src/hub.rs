@@ -21,7 +21,7 @@ use validator::Validate;
 #[derive(Debug, Clone, Serialize, Deserialize, Validate)]
 pub struct LeaderHubConfig {
     /// Hub discovery base URL, e.g. `http://hub-host:1337`. The connector pulls
-    /// `GET {url}/v1/config` at startup to learn the hub's enabled features and
+    /// `GET {url}/v1/ext/kvbm/config` at startup to learn the hub's enabled features and
     /// shared config.
     pub url: String,
 

@@ -149,15 +149,9 @@ pub(in super::super) async fn wire_hub(
         .clone();
 
     let hub = build_hub_client(&handshake.url)?;
-    hub.register_handlers_messenger(velo.messenger())
-        .context("installing hub velo handlers for CD/P2P registration")?;
 
     let hub_velo_id = hub
-        .register_instance_with_features_and_runtime(
-            velo.peer_info(),
-            features,
-            handshake.runtime_summary.clone(),
-        )
+        .register(&velo, features, Some(handshake.runtime_summary.clone()))
         .await
         .with_context(|| {
             format!(

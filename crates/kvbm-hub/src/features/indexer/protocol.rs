@@ -4,8 +4,8 @@
 //! Feature-owned wire protocol for the KV indexer.
 //!
 //! All paths are **relative** — the server nests them under
-//! `/v1/features/{ROUTE_PREFIX}` (see
-//! [`FeatureManager::route_prefix`](crate::features::FeatureManager::route_prefix)).
+//! `/v1/ext/{NAME}` (see
+//! `/v1/ext/{NAME}`).
 //! Nothing here lives in the central [`crate::protocol::paths`]; the feature
 //! owns its whole namespace.
 
@@ -19,7 +19,7 @@ use kvbm_protocols::tier_protocol::{PhysicalPlacementMode, TierDepth, TierPlacem
 use serde::{Deserialize, Serialize};
 use velo_ext::InstanceId;
 
-use crate::protocol::MutationCredential;
+use velo_hub::protocol::Credential;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -61,10 +61,6 @@ pub fn nats_server_from_env() -> String {
         .unwrap_or_else(|| "nats://localhost:4222".to_string())
 }
 
-/// URL segment the server nests this feature's routers under
-/// (`/v1/features/indexer/...`).
-pub const ROUTE_PREFIX: &str = "indexer";
-
 /// Velo active-message handler name for the client → hub block lookup. The hub
 /// installs this handler on its own velo in
 /// [`IndexerManager::attach`](super::manager::IndexerManager); a
@@ -75,7 +71,7 @@ pub const BUNDLE_PUBLISH_HANDLER: &str = "kvbm_hub_bundle_publish";
 pub const BUNDLE_INVALIDATE_HANDLER: &str = "kvbm_hub_bundle_invalidate";
 pub const BUNDLE_QUERY_HANDLER: &str = "kvbm_hub_bundle_query";
 
-/// Relative route paths (mounted under `/v1/features/indexer`).
+/// Relative route paths (mounted under `/v1/ext/indexer`).
 pub mod paths {
     /// `GET /config` — indexer configuration + ingest/feed endpoints. A `200`
     /// also serves as the capability probe used by connectors.
@@ -102,7 +98,7 @@ pub mod paths {
     /// `control_router` and deliberately absent from the read-only discovery
     /// port. R7b §3 writes the path as `/v1/tier-placements/snapshot`; feature
     /// routers declare relative paths and own their namespace, so the effective
-    /// path is `/v1/features/indexer/tier-placements/snapshot`.
+    /// path is `/v1/ext/indexer/tier-placements/snapshot`.
     pub const TIER_PLACEMENT_SNAPSHOT: &str = "/tier-placements/snapshot";
 }
 
@@ -365,13 +361,13 @@ impl BundleAdvertisementRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BundlePublishRequest {
-    pub credential: MutationCredential,
+    pub credential: Credential,
     pub advertisement: BundleAdvertisementRecord,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BundleInvalidateRequest {
-    pub credential: MutationCredential,
+    pub credential: Credential,
     pub key: BundleKey,
     pub generation: u64,
     pub owner: InstanceId,
@@ -438,18 +434,14 @@ pub enum BundleQueryOutcome {
     Miss(BundleQueryMissReason),
 }
 
-/// Body of `POST /v1/features/indexer/tier-placements/snapshot`.
+/// Body of `POST /v1/ext/indexer/tier-placements/snapshot`.
 ///
 /// The credential travels in the body, matching this feature's existing
-/// [`BundlePublishRequest`] / [`BundleInvalidateRequest`] pattern. The
-/// header-based path (`MUTATION_CREDENTIAL_HEADER` +
-/// `HubServerState::credentials`) is not reachable from a feature router:
-/// feature routes are built `.with_state(Arc<IndexerManager>)` and never see
-/// `HubServerState`.
+/// [`BundlePublishRequest`] / [`BundleInvalidateRequest`] pattern.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TierPlacementSnapshotRequest {
     /// Owner's registration credential.
-    pub credential: MutationCredential,
+    pub credential: Credential,
     /// Full placement state to install.
     pub snapshot: TierPlacementSnapshotV1,
 }

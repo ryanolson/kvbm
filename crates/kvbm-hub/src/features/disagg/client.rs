@@ -111,20 +111,20 @@ impl ConditionalDisaggClient {
     /// `layout_compat` is mandatory — c2 removed the opt-in bypass path.
     pub async fn register(
         &self,
-        peer_info: PeerInfo,
+        velo: &velo::Velo,
         layout_compat: LayoutCompatPayload,
     ) -> Result<Option<InstanceId>> {
-        self.register_with(peer_info, layout_compat, Vec::new(), None)
+        self.register_with(velo, layout_compat, Vec::new(), None)
             .await
     }
 
     /// Like [`register`](Self::register) but additionally declares
     /// `extra_features` (e.g. `Feature::Indexer`) and an optional must-match
-    /// [`RuntimeConfigSummary`], all in a single `POST /v1/instances`. The
+    /// [`RuntimeConfigSummary`], all in one registration. The
     /// mandatory `P2P` + `ConditionalDisagg` features are always prepended.
     pub async fn register_with(
         &self,
-        peer_info: PeerInfo,
+        velo: &velo::Velo,
         layout_compat: LayoutCompatPayload,
         extra_features: Vec<Feature>,
         runtime: Option<RuntimeConfigSummary>,
@@ -134,18 +134,7 @@ impl ConditionalDisaggClient {
             Feature::ConditionalDisagg(ConditionalDisaggConfig { role: self.role }),
         ];
         features.extend(extra_features);
-        let hub_id = match runtime {
-            Some(rt) => {
-                self.hub
-                    .register_instance_with_features_and_runtime(peer_info, features, rt)
-                    .await?
-            }
-            None => {
-                self.hub
-                    .register_instance_with_features(peer_info, features)
-                    .await?
-            }
-        };
+        let hub_id = self.hub.register(velo, features, runtime).await?;
         if let Some(id) = hub_id {
             let _ = self.hub_velo_id.set(id);
         }
@@ -156,17 +145,16 @@ impl ConditionalDisaggClient {
     pub async fn list_instances(&self) -> Result<ConditionalDisaggInstancesResponse> {
         let url = self
             .hub
-            .config()
-            .discovery_url
+            .public_url()
             .join(&format!(
-                "/v1/features/{}{}",
-                super::protocol::ROUTE_PREFIX,
+                "/v1/ext/{}{}",
+                crate::protocol::DISAGG_EXTENSION,
                 super::protocol::paths::INSTANCES
             ))
             .context("joining CD list path")?;
         let resp = reqwest::get(url)
             .await
-            .context("GET /v1/features/disagg/instances")?;
+            .context("GET /v1/ext/disagg/instances")?;
         if !resp.status().is_success() {
             return Err(anyhow!("CD list endpoint returned {}", resp.status()));
         }
@@ -193,6 +181,7 @@ impl ConditionalDisaggClient {
             if let Some(first) = ids.first().copied() {
                 return self
                     .hub
+                    .discovery()
                     .discover_by_instance_id(first)
                     .await
                     .with_context(|| format!("resolving PeerInfo for {first}"));

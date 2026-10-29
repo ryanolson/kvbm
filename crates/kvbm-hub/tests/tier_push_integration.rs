@@ -139,7 +139,7 @@ async fn transition_delivers_tier_to_decode() {
 
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::default(), 100));
     let broadcaster = TierBroadcaster::new(Arc::clone(&breaker), None);
-    broadcaster.set_velo(Arc::clone(&hub));
+    broadcaster.set_velo(hub.downgrade());
     let provider: Arc<dyn DecodeSetProvider> =
         Arc::new(StaticDecodeSet(vec![decode.instance_id()]));
     broadcaster.set_decode_provider(Arc::downgrade(&provider));
@@ -173,7 +173,7 @@ async fn push_on_register_seeds_fresh_decode() {
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::default(), 100));
     assert_eq!(breaker.evaluate(0.0, 0), Some(BreakerTier::Hot));
     let broadcaster = TierBroadcaster::new(Arc::clone(&breaker), None);
-    broadcaster.set_velo(Arc::clone(&hub));
+    broadcaster.set_velo(hub.downgrade());
     // Provider not even needed for push_current_to (it targets one id).
     broadcaster.push_current_to(decode.instance_id());
 
@@ -206,7 +206,7 @@ async fn prefill_instance_is_not_pushed() {
 
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::default(), 100));
     let broadcaster = TierBroadcaster::new(Arc::clone(&breaker), None);
-    broadcaster.set_velo(Arc::clone(&hub));
+    broadcaster.set_velo(hub.downgrade());
     // The provider lists ONLY the decode — prefill is deliberately excluded
     // (the CD manager's DecodeSetProvider impl returns inner.decode only).
     let provider: Arc<dyn DecodeSetProvider> =

@@ -49,9 +49,8 @@ pub fn seed_leader_builder_with_hub_discovery(
         return Ok(builder);
     };
     let hub_client = connector::leader::build_hub_client(&hub.url)?;
-    // Coerce Arc<HubClient> → Arc<dyn PeerDiscovery>. HubClient's
-    // `impl PeerDiscovery` (in kvbm-hub) makes this an upcast.
-    let discovery: std::sync::Arc<dyn velo::discovery::PeerDiscovery> = hub_client;
+    let discovery: std::sync::Arc<dyn velo::discovery::PeerDiscovery> =
+        std::sync::Arc::new(hub_client.discovery());
     Ok(builder.with_discovery(discovery))
 }
 

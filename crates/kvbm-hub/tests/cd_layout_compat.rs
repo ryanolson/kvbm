@@ -21,12 +21,11 @@ use std::time::SystemTime;
 use kvbm_common::shape::CanonicalBlockShape;
 use kvbm_common::{BlockLayoutMode, KvBlockLayout};
 use kvbm_hub::protocol::{
-    ConditionalDisaggConfig, ConditionalDisaggRole, ErrorBody, Feature, P2pConfig, RegisterRequest,
-    RegisterResponse, instance_by_id, instance_describe, paths, peers_by_instance,
+    ConditionalDisaggConfig, ConditionalDisaggRole, ErrorBody, Feature, P2pConfig,
+    instance_describe,
 };
-use kvbm_hub::{
-    ConditionalDisaggManager, ControlPlaneManager, FeatureManager, HubServer, P2pManager,
-};
+use kvbm_hub::test_hub::{self, Attempt};
+use kvbm_hub::{ConditionalDisaggManager, ControlPlaneManager, HubServer, P2pManager};
 use kvbm_protocols::control::layout_compat::LayoutCompatPayload;
 use kvbm_protocols::control::{HostInfo, InstanceDescription, LayoutConfigDescription};
 use velo_ext::{InstanceId, PeerInfo, WorkerAddress};
@@ -40,8 +39,8 @@ async fn start_server_with_cd() -> (HubServer, Arc<ConditionalDisaggManager>) {
         .bind_addr(IpAddr::V4(Ipv4Addr::LOCALHOST))
         .discovery_port(0)
         .control_port(0)
-        .add_feature_manager(p2p as Arc<dyn FeatureManager>)
-        .add_feature_manager(Arc::clone(&cd) as Arc<dyn FeatureManager>)
+        .extension(p2p)
+        .extension(Arc::clone(&cd))
         .serve()
         .await
         .expect("start CD hub");
@@ -55,8 +54,13 @@ fn make_peer() -> PeerInfo {
     )
 }
 
-fn control_url(server: &HubServer, path: &str) -> String {
-    format!("http://{}{}", server.control_addr(), path)
+fn control_ext_url(server: &HubServer, path: &str) -> String {
+    format!(
+        "http://{}/v1/ext/{}{}",
+        server.control_addr(),
+        kvbm_hub::protocol::CONTROL_PLANE_EXTENSION,
+        path
+    )
 }
 
 fn discovery_url(server: &HubServer, path: &str) -> String {
@@ -157,18 +161,8 @@ async fn post_register(
     peer: &PeerInfo,
     role: ConditionalDisaggRole,
     layout: Option<LayoutCompatPayload>,
-) -> reqwest::Response {
-    let req = RegisterRequest {
-        peer_info: peer.clone(),
-        features: cd_features(role, layout),
-        runtime: None,
-    };
-    http()
-        .post(control_url(server, paths::INSTANCES))
-        .json(&req)
-        .send()
-        .await
-        .expect("POST /v1/instances")
+) -> Attempt {
+    test_hub::attempt(server, peer.clone(), &cd_features(role, layout), None).await
 }
 
 // ---- HTTP-level rejection tests --------------------------------------------
@@ -212,7 +206,7 @@ async fn cross_mode_rejected_at_register() {
     let resp = http()
         .get(discovery_url(
             &server,
-            &peers_by_instance(d_peer.instance_id()),
+            &format!("/v1/peers/instance/{}", d_peer.instance_id()),
         ))
         .send()
         .await
@@ -223,7 +217,7 @@ async fn cross_mode_rejected_at_register() {
     let resp = http()
         .get(discovery_url(
             &server,
-            &peers_by_instance(p_peer.instance_id()),
+            &format!("/v1/peers/instance/{}", p_peer.instance_id()),
         ))
         .send()
         .await
@@ -305,7 +299,7 @@ async fn universal_mismatch_rejected_at_register() {
 async fn legacy_payload_without_layout_compat_rejected() {
     // c2: the hub gate is mandatory — CD registers without the
     // accompanying Feature::P2P (which carries layout_compat) must
-    // be rejected at the server before any FeatureManager runs.
+    // be rejected at the server before any extension sees it.
     let (server, _cd) = start_server_with_cd().await;
     let peer = make_peer();
 
@@ -334,19 +328,15 @@ async fn cd_register_without_p2p_feature_is_rejected() {
     let peer = make_peer();
 
     // Build a request with ONLY Feature::ConditionalDisagg, no P2P.
-    let req = RegisterRequest {
-        peer_info: peer.clone(),
-        features: vec![Feature::ConditionalDisagg(ConditionalDisaggConfig {
+    let resp = test_hub::attempt(
+        &server,
+        peer.clone(),
+        &[Feature::ConditionalDisagg(ConditionalDisaggConfig {
             role: ConditionalDisaggRole::Prefill,
         })],
-        runtime: None,
-    };
-    let resp = http()
-        .post(control_url(&server, paths::INSTANCES))
-        .json(&req)
-        .send()
-        .await
-        .expect("POST /v1/instances");
+        None,
+    )
+    .await;
 
     assert_eq!(resp.status(), 400, "CD without P2P must reject");
     let body: ErrorBody = resp.json().await.unwrap();
@@ -372,17 +362,13 @@ async fn p2p_register_with_self_inconsistent_payload_is_rejected() {
     let mut bad = payload(BlockLayoutMode::Universal);
     bad.canonical = None; // Universal mode requires a canonical aggregate.
 
-    let req = RegisterRequest {
-        peer_info: peer.clone(),
-        features: vec![Feature::P2P(P2pConfig { layout_compat: bad })],
-        runtime: None,
-    };
-    let resp = http()
-        .post(control_url(&server, paths::INSTANCES))
-        .json(&req)
-        .send()
-        .await
-        .expect("POST /v1/instances");
+    let resp = test_hub::attempt(
+        &server,
+        peer.clone(),
+        &[Feature::P2P(P2pConfig { layout_compat: bad })],
+        None,
+    )
+    .await;
 
     assert_eq!(
         resp.status(),
@@ -441,39 +427,41 @@ fn p2p_feature(layout: LayoutCompatPayload) -> Feature {
 
 #[tokio::test]
 async fn same_shape_idempotent_on_manager() {
-    let mgr = P2pManager::new();
-    let p_id = InstanceId::new_v4();
-    let d_id = InstanceId::new_v4();
+    let (server, _cpm, _p2p) = start_server_with_cpm_and_p2p().await;
+    let feature = [p2p_feature(payload(BlockLayoutMode::Operational))];
 
-    mgr.on_register(p_id, &p2p_feature(payload(BlockLayoutMode::Operational)))
-        .await
-        .expect("baseline accepted");
-
-    mgr.on_register(d_id, &p2p_feature(payload(BlockLayoutMode::Operational)))
-        .await
-        .expect("matching shape on second registration accepted");
+    let p = test_hub::attempt(&server, make_peer(), &feature, None).await;
+    assert_eq!(p.status(), 200, "baseline accepted");
+    let d = test_hub::attempt(&server, make_peer(), &feature, None).await;
+    assert_eq!(
+        d.status(),
+        200,
+        "matching shape on second registration accepted"
+    );
 }
 
 #[tokio::test]
 async fn baseline_cleared_when_population_zero() {
-    let mgr = P2pManager::new();
-    let p_id = InstanceId::new_v4();
+    let (server, _cpm, p2p) = start_server_with_cpm_and_p2p().await;
 
     // First instance under Operational defines the baseline.
-    mgr.on_register(p_id, &p2p_feature(payload(BlockLayoutMode::Operational)))
-        .await
-        .expect("first register accepted");
-    assert!(mgr.has_baseline());
+    let first =
+        post_p2p_register(&server, &make_peer(), payload(BlockLayoutMode::Operational)).await;
+    assert_eq!(first.status(), 200, "first register accepted");
+    assert!(p2p.has_baseline());
 
     // Last P2P instance leaves → baseline must clear so a fresh universal
     // group can take over without bouncing the hub.
-    mgr.on_unregister(p_id);
-    assert!(!mgr.has_baseline(), "baseline must clear when empty");
+    first.client.unregister().await.expect("unregister");
+    assert!(!p2p.has_baseline(), "baseline must clear when empty");
 
-    let p2 = InstanceId::new_v4();
-    mgr.on_register(p2, &p2p_feature(payload(BlockLayoutMode::Universal)))
-        .await
-        .expect("re-register with different mode after empty should accept");
+    let second =
+        post_p2p_register(&server, &make_peer(), payload(BlockLayoutMode::Universal)).await;
+    assert_eq!(
+        second.status(),
+        200,
+        "re-register with different mode after empty should accept"
+    );
 }
 
 #[tokio::test]
@@ -758,7 +746,7 @@ async fn universal_rejects_cross_topology_with_different_aggregate() {
         400,
         "different canonical num_heads_total must reject under universal",
     );
-    let body: ErrorBody = resp_to_body(d_resp).await;
+    let body: ErrorBody = d_resp.json().await.expect("error body");
     let msg = body.message.to_lowercase();
     assert!(
         msg.contains("num_heads") || msg.contains("canonical"),
@@ -814,7 +802,7 @@ async fn resp_to_body(resp: reqwest::Response) -> ErrorBody {
 // ---- c5: describe-push layout_compat re-validation -------------------------
 //
 // `InstanceDescription` gains `Option<LayoutCompatPayload>`. The hub's
-// `POST /v1/instances/{id}/describe` re-validates a `Some(payload)` against
+// `POST /v1/ext/connector_control/instances/{id}/describe` re-validates a `Some(payload)` against
 // the stored `P2pManager` baseline. Defence-in-depth on top of the c2
 // register-time gate: catches drift between a leader's register-time
 // announcement and its describe-time announcement.
@@ -831,8 +819,8 @@ async fn start_server_with_cpm_and_p2p() -> (HubServer, Arc<ControlPlaneManager>
         .bind_addr(IpAddr::V4(Ipv4Addr::LOCALHOST))
         .discovery_port(0)
         .control_port(0)
-        .add_feature_manager(Arc::clone(&p2p) as Arc<dyn FeatureManager>)
-        .add_feature_manager(Arc::clone(&cpm) as Arc<dyn FeatureManager>)
+        .extension(Arc::clone(&p2p))
+        .extension(Arc::clone(&cpm))
         .serve()
         .await
         .expect("start hub with CPM + P2P");
@@ -867,34 +855,12 @@ async fn post_p2p_register(
     server: &HubServer,
     peer: &PeerInfo,
     layout: LayoutCompatPayload,
-) -> reqwest::Response {
-    let req = RegisterRequest {
-        peer_info: peer.clone(),
-        features: vec![Feature::P2P(P2pConfig {
-            layout_compat: layout,
-        })],
-        runtime: None,
-    };
-    http()
-        .post(control_url(server, paths::INSTANCES))
-        .json(&req)
-        .send()
-        .await
-        .expect("POST /v1/instances")
+) -> Attempt {
+    test_hub::attempt(server, peer.clone(), &[p2p_feature(layout)], None).await
 }
 
-async fn post_bare_register(server: &HubServer, peer: &PeerInfo) -> reqwest::Response {
-    let req = RegisterRequest {
-        peer_info: peer.clone(),
-        features: vec![],
-        runtime: None,
-    };
-    http()
-        .post(control_url(server, paths::INSTANCES))
-        .json(&req)
-        .send()
-        .await
-        .expect("POST /v1/instances")
+async fn post_bare_register(server: &HubServer, peer: &PeerInfo) -> Attempt {
+    test_hub::attempt(server, peer.clone(), &[], None).await
 }
 
 async fn post_describe(
@@ -903,7 +869,7 @@ async fn post_describe(
     body: &InstanceDescription,
 ) -> reqwest::Response {
     http()
-        .post(control_url(server, &instance_describe(instance_id)))
+        .post(control_ext_url(server, &instance_describe(instance_id)))
         .json(body)
         .send()
         .await
@@ -1056,7 +1022,7 @@ async fn describe_push_none_without_baseline_passes() {
 
 #[tokio::test]
 async fn describe_push_after_p2p_unregister_not_found() {
-    // Regression safety net: P2pManager::on_unregister clears the
+    // Regression safety net: P2pManager's removal clears the
     // baseline when the last P2P instance leaves. The base registry
     // entry is also evicted on DELETE. POST /describe for an
     // unregistered instance returns 404 (existing behaviour) — proves
@@ -1068,22 +1034,7 @@ async fn describe_push_after_p2p_unregister_not_found() {
 
     let resp = post_p2p_register(&server, &peer, baseline.clone()).await;
     assert_eq!(resp.status(), 200);
-    let registration: RegisterResponse = resp.json().await.unwrap();
-
-    let resp = http()
-        .delete(control_url(&server, &instance_by_id(peer.instance_id())))
-        .header(
-            kvbm_hub::protocol::MUTATION_CREDENTIAL_HEADER,
-            registration.mutation_credential.unwrap().to_header_value(),
-        )
-        .send()
-        .await
-        .expect("DELETE /v1/instances/{id}");
-    assert!(
-        resp.status().is_success(),
-        "unregister should succeed, got {}",
-        resp.status()
-    );
+    resp.client.unregister().await.expect("unregister");
 
     let descr = describe_payload(peer.instance_id(), Some(baseline));
     let resp = post_describe(&server, peer.instance_id(), &descr).await;
@@ -1099,8 +1050,8 @@ async fn describe_push_after_p2p_unregister_not_found() {
 // post_describe (the leader-push path) was the original c5 site. Two
 // velo-pull paths bypassed the gate by writing the pulled payload
 // directly to the cache:
-//   - GET /v1/instances/{id}/describe?force=true (operator refresh)
-//   - POST /v1/instances/{id}/control/core/describe_instance
+//   - GET /v1/ext/connector_control/instances/{id}/describe?force=true (operator refresh)
+//   - POST /v1/ext/connector_control/instances/{id}/control/core/describe_instance
 // Both call commit_describe_if_registered directly. A force-pull
 // returning a divergent layout_compat would slip past the c5 gate.
 //
@@ -1150,8 +1101,8 @@ async fn start_server_with_cpm_and_p2p_and_velo()
         .discovery_port(0)
         .control_port(0)
         .add_transport(transport as Arc<dyn velo::Transport>)
-        .add_feature_manager(Arc::clone(&p2p) as Arc<dyn FeatureManager>)
-        .add_feature_manager(Arc::clone(&cpm) as Arc<dyn FeatureManager>)
+        .extension(Arc::clone(&p2p))
+        .extension(Arc::clone(&cpm))
         .heartbeat_interval(Duration::from_secs(3600))
         .heartbeat_max_failures(u32::MAX)
         .registration_ttl(Duration::from_secs(3600))
@@ -1179,21 +1130,11 @@ async fn register_peer_with_p2p(
     server: &HubServer,
     peer: &velo::Velo,
     layout: LayoutCompatPayload,
-) {
-    let req = RegisterRequest {
-        peer_info: peer.peer_info(),
-        features: vec![Feature::P2P(P2pConfig {
-            layout_compat: layout,
-        })],
-        runtime: None,
-    };
-    let resp = http()
-        .post(control_url(server, paths::INSTANCES))
-        .json(&req)
-        .send()
-        .await
-        .expect("POST /v1/instances");
-    assert_eq!(resp.status(), 200, "register peer with P2P feature");
+) -> Attempt {
+    let registration =
+        test_hub::attempt(server, peer.peer_info(), &[p2p_feature(layout)], None).await;
+    assert_eq!(registration.status(), 200, "register peer with P2P feature");
+    registration
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1203,7 +1144,7 @@ async fn force_pull_describe_with_baseline_divergence_rejects() {
 
     // Baseline: register peer with P1.
     let baseline = payload_with_topology(BlockLayoutMode::Operational, 2, 1);
-    register_peer_with_p2p(&server, &peer, baseline).await;
+    let _registration = register_peer_with_p2p(&server, &peer, baseline).await;
 
     // Install velo handler returning a payload with divergent layout_compat (P2).
     let divergent = payload_with_topology(BlockLayoutMode::Operational, 4, 1);
@@ -1212,7 +1153,7 @@ async fn force_pull_describe_with_baseline_divergence_rejects() {
 
     // Force-pull. Hub fetches from peer's velo handler; the validator
     // must reject before commit.
-    let url = control_url(
+    let url = control_ext_url(
         &server,
         &format!("{}?force=true", instance_describe(peer.instance_id())),
     );
@@ -1237,19 +1178,19 @@ async fn core_describe_instance_with_baseline_divergence_rejects() {
     let peer = new_velo_peer().await;
 
     let baseline = payload(BlockLayoutMode::Universal);
-    register_peer_with_p2p(&server, &peer, baseline).await;
+    let _registration = register_peer_with_p2p(&server, &peer, baseline).await;
 
     // Divergent mode: Operational against Universal baseline.
     let divergent = payload(BlockLayoutMode::Operational);
     let pulled = describe_payload(peer.instance_id(), Some(divergent));
     install_canned_describe(&peer, pulled);
 
-    // POST /v1/instances/{id}/control/core/describe_instance — the
+    // POST /v1/ext/connector_control/instances/{id}/control/core/describe_instance — the
     // typed velo-pull endpoint. Same bypass concern as force=true.
-    let url = control_url(
+    let url = control_ext_url(
         &server,
         &format!(
-            "/v1/instances/{}/control/core/describe_instance",
+            "/instances/{}/control/core/describe_instance",
             peer.instance_id()
         ),
     );

@@ -81,7 +81,7 @@ pub trait DecodeSetProvider: Send + Sync {
 /// require an Arc cycle.
 pub struct TierBroadcaster {
     breaker: Arc<CircuitBreaker>,
-    velo: OnceLock<Arc<velo::Velo>>,
+    velo: OnceLock<velo::WeakVelo>,
     decode_provider: OnceLock<Weak<dyn DecodeSetProvider>>,
     /// Optional hub-process CD metrics. When present, the tick task records the
     /// gauge + transition counter here. `None` until a hub /metrics surface is
@@ -115,7 +115,7 @@ impl TierBroadcaster {
     }
 
     /// Bind the hub's velo handle (idempotent; first writer wins).
-    pub fn set_velo(&self, velo: Arc<velo::Velo>) {
+    pub fn set_velo(&self, velo: velo::WeakVelo) {
         let _ = self.velo.set(velo);
     }
 
@@ -181,7 +181,7 @@ impl TierBroadcaster {
     /// Spawn a detached, timeout-bounded velo push of `(tier, epoch)` to `id`.
     /// Best-effort: errors are logged and dropped. No-op without a velo handle.
     fn spawn_push(&self, id: InstanceId, tier: BreakerTier, epoch: u64) {
-        let Some(velo) = self.velo.get().cloned() else {
+        let Some(velo) = self.velo.get().and_then(velo::WeakVelo::upgrade) else {
             return;
         };
         tokio::spawn(async move {

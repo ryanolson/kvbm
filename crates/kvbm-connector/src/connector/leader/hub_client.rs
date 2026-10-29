@@ -23,7 +23,7 @@ mod tests {
     #[test]
     fn build_hub_client_accepts_explicit_port() {
         let client = build_hub_client("http://127.0.0.1:1337").unwrap();
-        assert_eq!(client.config().discovery_url.port(), Some(1337));
+        assert_eq!(client.public_url().port(), Some(1337));
     }
 
     #[test]
@@ -34,6 +34,6 @@ mod tests {
     #[test]
     fn build_hub_client_defaults_control_port() {
         let client = build_hub_client("http://127.0.0.1:1337").unwrap();
-        assert_eq!(client.config().control_url.port(), Some(8337));
+        assert_eq!(client.control_url().port(), Some(8337));
     }
 }

@@ -8,7 +8,6 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::{Json, Router, extract::State, routing::get};
-use futures::future::BoxFuture;
 use parking_lot::RwLock;
 use tokio::task::JoinHandle;
 use velo::queue::NextOptions;
@@ -19,8 +18,11 @@ use super::protocol::ConditionalDisaggInstancesResponse;
 use crate::features::prefill_router::{
     DecodeSetProvider, DispatchOutcome, PrefillRequestDispatcher, TierBroadcaster,
 };
-use crate::features::{FeatureError, FeatureManager, HubContext};
-use crate::protocol::{self, ConditionalDisaggRole, Feature, FeatureKey, PrefillRequest};
+use velo_hub::store::Removal;
+use velo_hub::{AttachContext, Committed, Extension, Rejection, Txn};
+
+use crate::features::{FeatureError, KvbmFeature};
+use crate::protocol::{self, ConditionalDisaggConfig, ConditionalDisaggRole, PrefillRequest};
 
 /// Tracks which instances participate in ConditionalDisagg and under what role.
 ///
@@ -28,15 +30,15 @@ use crate::protocol::{self, ConditionalDisaggRole, Feature, FeatureKey, PrefillR
 /// `by_instance` map, and role-filtered listings iterate the matching set.
 pub struct ConditionalDisaggManager {
     inner: RwLock<CdInner>,
-    velo: OnceLock<Arc<velo::Velo>>,
+    velo: OnceLock<velo::WeakVelo>,
     /// Hub-local queue backend owning the CD prefill queue. Lazily created
-    /// during [`FeatureManager::attach`] when the hub has a Velo instance —
+    /// during [`velo_hub::Extension::attach`] when the hub has a Velo instance —
     /// `None` when the hub is discovery-only.
     queue_backend: OnceLock<Arc<MessengerQueueBackend>>,
     /// Optional bound on the prefill queue depth. `None` = unbounded.
     queue_capacity: Option<usize>,
     /// Optional dispatcher for the prefill queue. When set,
-    /// [`FeatureManager::attach`] spawns a background worker that
+    /// [`velo_hub::Extension::attach`] spawns a background worker that
     /// drains the queue and hands each request to this dispatcher.
     dispatcher: Option<Arc<dyn PrefillRequestDispatcher>>,
     /// Worker task handle (set once spawned during `attach`).
@@ -105,7 +107,7 @@ impl ConditionalDisaggManager {
     }
 
     /// Builder: install a [`PrefillRequestDispatcher`]. When set, the
-    /// hub spawns a background worker (in [`FeatureManager::attach`])
+    /// hub spawns a background worker (in [`velo_hub::Extension::attach`])
     /// that drains the prefill queue and hands each item to the
     /// dispatcher.
     pub fn with_dispatcher(mut self, dispatcher: Arc<dyn PrefillRequestDispatcher>) -> Self {
@@ -114,7 +116,7 @@ impl ConditionalDisaggManager {
     }
 
     /// Install a [`PrefillRequestDispatcher`] AFTER
-    /// [`FeatureManager::attach`] has run. Intended for late-binding:
+    /// [`velo_hub::Extension::attach`] has run. Intended for late-binding:
     /// e.g. the binary attaches the disagg manager first, then attaches
     /// the [`PrefillRouterManager`](crate::PrefillRouterManager), then
     /// installs the router as this manager's dispatcher by calling
@@ -156,9 +158,16 @@ impl ConditionalDisaggManager {
         }
     }
 
-    /// Hub Velo handle stashed during [`FeatureManager::attach`], if any.
-    pub fn velo_handle(&self) -> Option<&Arc<velo::Velo>> {
-        self.velo.get()
+    /// Hub Velo handle stashed during [`velo_hub::Extension::attach`], if any.
+    pub fn velo_handle(&self) -> Option<velo::Velo> {
+        self.velo.get().and_then(velo::WeakVelo::upgrade)
+    }
+
+    fn remove(&self, owner: InstanceId) {
+        let mut inner = self.inner.write();
+        if let Some(role) = inner.by_instance.remove(&owner) {
+            remove_role(&mut inner, owner, role);
+        }
     }
 
     /// Hub-local queue backend for the CD prefill queue, if the hub was
@@ -199,136 +208,109 @@ fn remove_role(inner: &mut CdInner, id: InstanceId, role: ConditionalDisaggRole)
     }
 }
 
-impl FeatureManager for ConditionalDisaggManager {
-    fn key(&self) -> FeatureKey {
-        FeatureKey::ConditionalDisagg
+impl KvbmFeature for ConditionalDisaggManager {
+    fn render_implies(&self) -> &'static [&'static str] {
+        // A disagg connector should also join the prefill router, so the
+        // prefill side advertises its execution backend. A soft co-enable:
+        // a decode sends no router payload, so a hard requirement would
+        // reject it.
+        &[protocol::PREFILL_ROUTER_EXTENSION]
+    }
+}
+
+impl Extension for ConditionalDisaggManager {
+    const NAME: &'static str = protocol::DISAGG_EXTENSION;
+    type Registration = ConditionalDisaggConfig;
+    /// The role to record, and whether the owner is new to it.
+    type Staged = Option<(ConditionalDisaggRole, bool)>;
+
+    /// CD is a specialisation of P2P: `layout_compat` lives in the P2P
+    /// payload, so every CD registrant must also register P2P.
+    fn registration_requires() -> &'static [&'static str] {
+        &[protocol::P2P_EXTENSION]
     }
 
-    fn dependencies(&self) -> &'static [FeatureKey] {
-        // CD is a specialisation of P2P (layout_compat lives in the P2P
-        // payload). Every CD registration must also declare P2P.
-        &[FeatureKey::P2P]
+    async fn attach(&self, ctx: &AttachContext<'_>) -> anyhow::Result<()> {
+        let Some(velo) = ctx.velo() else {
+            // A discovery-only hub has no queue; the CD list routes still work.
+            return Ok(());
+        };
+        let backend = Arc::new(MessengerQueueBackend::new(
+            velo.messenger().clone(),
+            velo.instance_id(),
+            MessengerQueueConfig {
+                capacity: self.queue_capacity,
+            },
+        ));
+        // The first receiver registers the `velo.queue.rpc` handler on the
+        // hub's Velo. Without it, the first remote enqueue finds no handler.
+        // The queue service outlives the dropped receiver while the backend
+        // is held.
+        velo::queue::receiver::<Vec<u8>>(backend.as_ref(), protocol::CD_PREFILL_QUEUE)
+            .await
+            .map_err(|e| anyhow::anyhow!("CD queue init: {e}"))?;
+        let _ = self.queue_backend.set(Arc::clone(&backend));
+        let _ = self.velo.set(velo.downgrade());
+        if let Some(dispatcher) = self.dispatcher.clone() {
+            let task = tokio::spawn(prefill_dispatcher_loop(Arc::clone(&backend), dispatcher));
+            let _ = self.dispatcher_task.set(task);
+            tracing::info!("CD prefill dispatcher worker started");
+        }
+        Ok(())
     }
 
-    fn render_implies(&self) -> &'static [FeatureKey] {
-        // A disagg connector should also participate in the prefill router so
-        // the prefill side advertises its execution backend. This is a soft
-        // co-enable, NOT a dependency: decode declares no router payload and a
-        // prefill without an HTTP endpoint env advertises nothing, so making it
-        // a hard dependency would reject those legitimate registrations.
-        &[FeatureKey::PrefillRouter]
-    }
-
-    fn attach<'a>(&'a self, ctx: HubContext) -> BoxFuture<'a, Result<(), FeatureError>> {
-        Box::pin(async move {
-            let Some(velo) = ctx.velo else {
-                // Discovery-only hub: no Velo, so no queue surface. The CD
-                // list endpoints still work — only the queue handlers are
-                // skipped.
-                return Ok(());
-            };
-
-            let backend = Arc::new(MessengerQueueBackend::new(
-                velo.messenger().clone(),
-                velo.instance_id(),
-                MessengerQueueConfig {
-                    capacity: self.queue_capacity,
-                },
-            ));
-
-            // Eagerly instantiate a local receiver. The first `.receiver()`
-            // / `.sender()` call is what registers the `velo.queue.rpc`
-            // handler on the hub's Velo, so without this the handler is
-            // absent and remote clients get a "handler not found" error on
-            // their first enqueue. Dropping the receiver is fine — the
-            // underlying queue service stays alive as long as the backend
-            // is held.
-            velo::queue::receiver::<Vec<u8>>(backend.as_ref(), protocol::CD_PREFILL_QUEUE)
-                .await
-                .map_err(|e| FeatureError::Other(anyhow::anyhow!("CD queue init: {e}")))?;
-
-            let _ = self.queue_backend.set(Arc::clone(&backend));
-            let _ = self.velo.set(velo);
-
-            // Spawn the dispatcher worker if one is configured.
-            if let Some(dispatcher) = self.dispatcher.clone() {
-                let task = tokio::spawn(prefill_dispatcher_loop(Arc::clone(&backend), dispatcher));
-                let _ = self.dispatcher_task.set(task);
-                tracing::info!("CD prefill dispatcher worker started");
-            }
-            Ok(())
-        })
-    }
-
-    fn on_register<'a>(
-        &'a self,
-        instance_id: InstanceId,
-        feature: &'a Feature,
-    ) -> BoxFuture<'a, Result<(), FeatureError>> {
-        Box::pin(async move {
-            let Feature::ConditionalDisagg(cfg) = feature else {
-                return Err(FeatureError::KeyMismatch {
-                    manager: FeatureKey::ConditionalDisagg,
-                    payload: feature.key(),
-                });
-            };
-            let role = cfg.role;
-
-            // Layout-compat enforcement lives in `P2pManager`. The server
-            // requires `Feature::P2P` alongside any CD register, so by the
-            // time we get here the gate has already accepted the leader.
-
-            {
-                let mut inner = self.inner.write();
-                if let Some(prior) = inner.by_instance.get(&instance_id).copied() {
-                    if prior != role {
-                        return Err(FeatureError::InvalidConfig(format!(
-                            "instance {instance_id} already registered as {:?}, cannot switch to {:?}",
-                            prior, role
-                        )));
-                    }
-                    // Same-role re-registration is idempotent — no tier re-push
-                    // (the decode already had its tier seeded on first register
-                    // and stays current via transition pushes).
-                    return Ok(());
-                }
-
-                inner.by_instance.insert(instance_id, role);
-                insert_role(&mut inner, instance_id, role);
-            }
-
-            // P2: a NEWLY-registered DECODE must be seeded with the current
-            // breaker tier (it defaults to Calm locally; if the fleet is HOT a
-            // transition-only push would leave it stale until the next change).
-            // A PREFILL register is NEVER pushed to — the tier is decode-only.
-            if role == ConditionalDisaggRole::Decode
-                && let Some(b) = self.tier_broadcaster.get()
-            {
-                b.push_current_to(instance_id);
-            }
-            Ok(())
-        })
-    }
-
-    fn on_unregister(&self, instance_id: InstanceId) {
-        let mut inner = self.inner.write();
-        if let Some(role) = inner.by_instance.remove(&instance_id) {
-            remove_role(&mut inner, instance_id, role);
+    async fn prepare(
+        &self,
+        txn: &Txn<'_>,
+        payload: Option<ConditionalDisaggConfig>,
+    ) -> Result<Self::Staged, Rejection> {
+        let Some(cfg) = payload else {
+            return Ok(None);
+        };
+        let owner = txn.owner;
+        match self.inner.read().by_instance.get(&owner).copied() {
+            Some(prior) if prior != cfg.role => Err(Rejection::conflict(format!(
+                "instance {owner} already registered as {prior:?}, cannot switch to {:?}",
+                cfg.role
+            ))),
+            prior => Ok(Some((cfg.role, prior.is_none()))),
         }
     }
 
-    fn route_prefix(&self) -> Option<&'static str> {
-        // Own the `/v1/features/disagg` namespace (mirrors the indexer feature)
-        // — routes() mounts relative paths, the server nests them under the
-        // prefix.
-        Some(super::protocol::ROUTE_PREFIX)
+    fn commit(&self, staged: Self::Staged, registration: &Committed<'_>) {
+        let owner = registration.owner;
+        let Some((role, new)) = staged else {
+            if !registration.opted_in(Self::NAME) {
+                self.remove(owner);
+            }
+            return;
+        };
+        if !new {
+            return;
+        }
+        {
+            let mut inner = self.inner.write();
+            inner.by_instance.insert(owner, role);
+            insert_role(&mut inner, owner, role);
+        }
+        // A new decode starts at the Calm tier, so seed it with the current
+        // breaker tier. A prefill never gets the tier.
+        if role == ConditionalDisaggRole::Decode
+            && let Some(b) = self.tier_broadcaster.get()
+        {
+            b.push_current_to(owner);
+        }
     }
 
-    fn control_router(self: Arc<Self>) -> Router {
+    fn on_removed(&self, removal: Removal) {
+        self.remove(removal.id);
+    }
+
+    fn control_routes(self: Arc<Self>) -> Router {
         routes(self)
     }
 
-    fn public_router(self: Arc<Self>) -> Router {
+    fn public_routes(self: Arc<Self>) -> Router {
         routes(self)
     }
 }
@@ -432,89 +414,5 @@ async fn prefill_dispatcher_loop(
                 }
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::protocol::ConditionalDisaggConfig;
-
-    fn cd(role: ConditionalDisaggRole) -> Feature {
-        Feature::ConditionalDisagg(ConditionalDisaggConfig { role })
-    }
-
-    #[tokio::test]
-    async fn register_prefill_appears_in_snapshot() {
-        let mgr = ConditionalDisaggManager::new();
-        let id = InstanceId::new_v4();
-        mgr.on_register(id, &cd(ConditionalDisaggRole::Prefill))
-            .await
-            .unwrap();
-        let snap = mgr.snapshot();
-        assert_eq!(snap.prefill, vec![id]);
-        assert!(snap.decode.is_empty());
-    }
-
-    #[tokio::test]
-    async fn register_decode_appears_in_snapshot() {
-        let mgr = ConditionalDisaggManager::new();
-        let id = InstanceId::new_v4();
-        mgr.on_register(id, &cd(ConditionalDisaggRole::Decode))
-            .await
-            .unwrap();
-        let snap = mgr.snapshot();
-        assert_eq!(snap.decode, vec![id]);
-        assert!(snap.prefill.is_empty());
-    }
-
-    // c2: the "register without config" path no longer exists — the type
-    // system makes `Feature::ConditionalDisagg(...)` require a config.
-    // The cross-feature "CD without P2P is rejected" invariant is
-    // exercised at the integration layer by
-    // `cd_layout_compat::cd_register_without_p2p_feature_is_rejected`.
-
-    #[tokio::test]
-    async fn reregister_same_role_is_idempotent() {
-        let mgr = ConditionalDisaggManager::new();
-        let id = InstanceId::new_v4();
-        mgr.on_register(id, &cd(ConditionalDisaggRole::Prefill))
-            .await
-            .unwrap();
-        mgr.on_register(id, &cd(ConditionalDisaggRole::Prefill))
-            .await
-            .unwrap();
-        assert_eq!(mgr.snapshot().prefill.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn reregister_different_role_rejected() {
-        let mgr = ConditionalDisaggManager::new();
-        let id = InstanceId::new_v4();
-        mgr.on_register(id, &cd(ConditionalDisaggRole::Prefill))
-            .await
-            .unwrap();
-        let err = mgr
-            .on_register(id, &cd(ConditionalDisaggRole::Decode))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, FeatureError::InvalidConfig(_)));
-    }
-
-    #[tokio::test]
-    async fn unregister_removes_from_snapshot() {
-        let mgr = ConditionalDisaggManager::new();
-        let id = InstanceId::new_v4();
-        mgr.on_register(id, &cd(ConditionalDisaggRole::Prefill))
-            .await
-            .unwrap();
-        mgr.on_unregister(id);
-        assert!(mgr.snapshot().prefill.is_empty());
-    }
-
-    #[test]
-    fn unregister_unknown_is_noop() {
-        let mgr = ConditionalDisaggManager::new();
-        mgr.on_unregister(InstanceId::new_v4());
     }
 }
