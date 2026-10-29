@@ -473,7 +473,7 @@ async fn a_pushed_request_reaches_the_prefill_worker_without_a_poll() {
     let server = start_server_with_router(1).await;
 
     let p_velo = new_velo().await;
-    let mut inbox = kvbm_hub::register_prefill_worker(p_velo.messenger(), 8).unwrap();
+    let mut inbox = kvbm_hub::register_prefill_worker(p_velo.messenger(), 8, |_| Ok(())).unwrap();
     let p_hub = build_client(&server);
     let p_cd = ConditionalDisaggClient::new(
         Arc::clone(&p_hub),

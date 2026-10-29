@@ -36,8 +36,14 @@ pub enum DispatchOutcome {
     /// The worker took the request.
     Accepted,
     /// The request was not placed: no free worker, the worker refused it,
-    /// or the transport failed.
+    /// or the send failed before the frame went out.
     Rejected {
+        /// Human-readable reason.
+        reason: String,
+    },
+    /// The frame went out but no reply came back, so the worker may run the
+    /// request. Another worker must not get it.
+    Unknown {
         /// Human-readable reason.
         reason: String,
     },
@@ -174,6 +180,10 @@ impl PrefillExecutionBackend for HttpExecutionBackend {
     }
 }
 
+/// How long the hub waits for a worker to ack a request. The worker acks
+/// when it has queued the request, so only a stuck worker takes this long.
+const ACK_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Velo execution backend: sends a typed unary call to a worker that
 /// registered a [`PREFILL_DISPATCH_HANDLER`] handler on its own velo
 /// participant. The worker is addressed by the `instance_id` it advertised
@@ -221,26 +231,29 @@ impl PrefillExecutionBackend for VeloExecutionBackend {
     async fn execute(&self, request: &PrefillRequest) -> Result<DispatchOutcome> {
         let dispatch = PrefillDispatchRequest::from(request);
 
-        let call = self
+        let mut call = self
             .messenger
             .typed_unary::<PrefillDispatchResponse>(PREFILL_DISPATCH_HANDLER)
             .with_context(|| format!("typed_unary({PREFILL_DISPATCH_HANDLER}) builder"))?
             .payload(&dispatch)
             .context("encoding PrefillDispatchRequest")?
             .instance(self.instance_id)
+            .timeout(ACK_TIMEOUT)
             .send();
 
         // The worker acks as soon as it has taken the request, so a slow
         // reply means a slow worker; the transport failure path covers a
         // dead one.
-        let resp = match call.await {
+        let resp = match (&mut call).await {
             Ok(resp) => resp,
             Err(err) => {
-                return Ok(DispatchOutcome::Rejected {
-                    reason: format!(
-                        "velo unary to {target} failed: {err}",
-                        target = self.instance_id
-                    ),
+                let reason = format!(
+                    "velo unary to {target} failed: {err}",
+                    target = self.instance_id
+                );
+                return Ok(match call.admission_state() {
+                    velo::AdmissionState::Failed => DispatchOutcome::Rejected { reason },
+                    _ => DispatchOutcome::Unknown { reason },
                 });
             }
         };

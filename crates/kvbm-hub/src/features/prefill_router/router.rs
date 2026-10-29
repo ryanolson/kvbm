@@ -108,6 +108,17 @@ impl PrefillRouter {
             match backend.execute(&request).await {
                 Ok(DispatchOutcome::Accepted) => return DispatchOutcome::Accepted,
                 Ok(DispatchOutcome::Rejected { reason: refused }) => reason = refused,
+                // The worker may run the request, so no other worker gets it.
+                // Its charge stays until its done notice or until it leaves.
+                Ok(DispatchOutcome::Unknown { reason }) => {
+                    tracing::warn!(
+                        %instance_id,
+                        request_id = %request.request_id,
+                        %reason,
+                        "PrefillRouter: no reply from the worker"
+                    );
+                    return DispatchOutcome::Rejected { reason };
+                }
                 Err(error) => reason = format!("{error:#}"),
             }
             self.running.lock().remove(&request.request_id);
@@ -165,7 +176,8 @@ impl PrefillRouter {
                             ok: true,
                             error: None,
                         },
-                        DispatchOutcome::Rejected { reason } => PrefillDispatchResponse {
+                        DispatchOutcome::Rejected { reason }
+                        | DispatchOutcome::Unknown { reason } => PrefillDispatchResponse {
                             ok: false,
                             error: Some(reason),
                         },
@@ -199,7 +211,7 @@ fn log_terminal(label: &str, request: &PrefillRequest, outcome: Result<DispatchO
         Ok(DispatchOutcome::Accepted) => {
             tracing::debug!(backend = label, request_id, "PrefillRouter: completed");
         }
-        Ok(DispatchOutcome::Rejected { reason }) => {
+        Ok(DispatchOutcome::Rejected { reason } | DispatchOutcome::Unknown { reason }) => {
             tracing::warn!(
                 backend = label,
                 request_id,
@@ -218,6 +230,9 @@ mod tests {
     use super::*;
     use crate::features::prefill_router::execution::{
         PrefillExecutionBackend, VeloExecutionBackend,
+    };
+    use crate::features::prefill_router::protocol::{
+        PREFILL_DISPATCH_HANDLER, PrefillDispatchRequest,
     };
     use crate::features::prefill_router::selection::SelectorConfig;
     use crate::features::prefill_router::worker::{PrefillAssignment, register_prefill_worker};
@@ -318,7 +333,7 @@ mod tests {
         }
 
         fn inbox(&self, worker: usize) -> mpsc::Receiver<PrefillAssignment> {
-            register_prefill_worker(self.workers[worker].messenger(), 8).unwrap()
+            register_prefill_worker(self.workers[worker].messenger(), 8, |_| Ok(())).unwrap()
         }
     }
 
@@ -330,6 +345,37 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         check()
+    }
+
+    /// A worker that took the frame but never replied may run the request.
+    /// The router must not give it to a second worker, or two workers would
+    /// serve one session, and the silent worker keeps its charge.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_worker_that_never_replies_gets_no_retry_and_keeps_its_charge() {
+        let fleet = Fleet::new(1, 2).await;
+        let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for worker in &fleet.workers {
+            let received = Arc::clone(&received);
+            let handler = Handler::typed_unary_async::<
+                PrefillDispatchRequest,
+                PrefillDispatchResponse,
+                _,
+                _,
+            >(PREFILL_DISPATCH_HANDLER, move |_ctx| {
+                received.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move { std::future::pending().await }
+            })
+            .build();
+            worker.messenger().register_handler(handler).unwrap();
+        }
+
+        let outcome = fleet.router.submit(make_request("r1")).await;
+        assert!(
+            matches!(outcome, DispatchOutcome::Rejected { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(received.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(fleet.router.selector().available_permits(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

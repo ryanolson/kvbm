@@ -84,31 +84,46 @@ impl Drop for PrefillDoneNotice {
 pub fn register_prefill_worker(
     messenger: &Messenger,
     capacity: usize,
+    validate: impl Fn(&PrefillDispatchRequest) -> Result<()> + Send + Sync + 'static,
 ) -> Result<mpsc::Receiver<PrefillAssignment>> {
     let (tx, rx) = mpsc::channel(capacity);
     let handler =
         Handler::typed_unary_async::<PrefillDispatchRequest, PrefillDispatchResponse, _, _>(
             PREFILL_DISPATCH_HANDLER,
             move |ctx| {
-                let done = PrefillDoneNotice::new(&ctx);
-                let assignment = PrefillAssignment {
-                    request: ctx.input,
-                    done,
-                };
-                let reply = match tx.try_send(assignment) {
-                    Ok(()) => PrefillDispatchResponse {
-                        ok: true,
-                        error: None,
+                // A request that the worker cannot run is refused here, so
+                // the dispatcher never waits on a request the worker dropped.
+                let reply = match validate(&ctx.input) {
+                    Err(error) => PrefillDispatchResponse {
+                        ok: false,
+                        error: Some(format!("{error:#}")),
                     },
-                    Err(error) => {
-                        let reason = match &error {
-                            mpsc::error::TrySendError::Full(_) => "the prefill worker is full",
-                            mpsc::error::TrySendError::Closed(_) => "the prefill worker stopped",
+                    Ok(()) => {
+                        let done = PrefillDoneNotice::new(&ctx);
+                        let assignment = PrefillAssignment {
+                            request: ctx.input,
+                            done,
                         };
-                        error.into_inner().done.disarm();
-                        PrefillDispatchResponse {
-                            ok: false,
-                            error: Some(reason.to_string()),
+                        match tx.try_send(assignment) {
+                            Ok(()) => PrefillDispatchResponse {
+                                ok: true,
+                                error: None,
+                            },
+                            Err(error) => {
+                                let reason = match &error {
+                                    mpsc::error::TrySendError::Full(_) => {
+                                        "the prefill worker is full"
+                                    }
+                                    mpsc::error::TrySendError::Closed(_) => {
+                                        "the prefill worker stopped"
+                                    }
+                                };
+                                error.into_inner().done.disarm();
+                                PrefillDispatchResponse {
+                                    ok: false,
+                                    error: Some(reason.to_string()),
+                                }
+                            }
                         }
                     }
                 };
