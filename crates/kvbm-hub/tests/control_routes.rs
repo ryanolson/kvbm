@@ -39,6 +39,7 @@ async fn new_velo() -> Arc<velo::Velo> {
         .add_transport(new_velo_transport())
         .build()
         .await
+        .map(Arc::new)
         .unwrap()
 }
 

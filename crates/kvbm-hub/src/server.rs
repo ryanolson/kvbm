@@ -373,7 +373,7 @@ impl HubServerBuilder {
             for t in self.transports {
                 vb = vb.add_transport(t);
             }
-            let v = vb.build().await.context("building hub velo")?;
+            let v = Arc::new(vb.build().await.context("building hub velo")?);
             // Self-register so clients can discover the hub via
             // `GET /v1/peers/instance/{hub_id}`.
             let incarnation = registry

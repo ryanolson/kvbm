@@ -561,6 +561,7 @@ mod tests {
             })
             .build()
             .await
+            .map(Arc::new)
             .unwrap();
         let ctx = HubContext {
             velo: Some(Arc::clone(&velo)),

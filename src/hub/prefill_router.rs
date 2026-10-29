@@ -271,6 +271,7 @@ async fn build_inner(
         .add_transport(Arc::new(transport))
         .build()
         .await
+        .map(Arc::new)
         .map_err(|e| anyhow::anyhow!("velo build: {e}"))?;
     let worker_velo_id = velo.instance_id();
     let peer_info = velo.peer_info();

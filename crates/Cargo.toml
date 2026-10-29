@@ -58,9 +58,11 @@ dynamo-tokens = { git = "https://github.com/NVIDIA-dev/warnold-dynamo.git", rev 
 dynamo-kv-router = { git = "https://github.com/NVIDIA-dev/warnold-dynamo.git", rev = "3f8e516c24b0e016070aa281d3722d06615a913c" }
 dynamo-kv-hashing = { git = "https://github.com/NVIDIA-dev/warnold-dynamo.git", rev = "3f8e516c24b0e016070aa281d3722d06615a913c" }
 
-# velo (registry — 0.4.1 / 0.2.0 are published on crates.io)
-velo     = { version = "0.4.1" }
-velo-ext = { version = "0.2.0" }
+# velo, from one git tag: velo-hub is not on crates.io, and a crates.io velo
+# beside the git velo-hub would build two copies of the velo types.
+velo     = { git = "https://github.com/ai-dynamo/velo.git", tag = "v0.21.0" }
+velo-ext = { git = "https://github.com/ai-dynamo/velo.git", tag = "v0.21.0" }
+velo-hub = { git = "https://github.com/ai-dynamo/velo.git", tag = "v0.21.0" }
 
 # External dependencies (copied verbatim from dynamo root [workspace.dependencies])
 anyhow = { version = "1" }

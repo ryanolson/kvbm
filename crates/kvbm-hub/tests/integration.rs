@@ -848,6 +848,7 @@ async fn new_velo() -> Arc<velo::Velo> {
         .add_transport(new_velo_transport())
         .build()
         .await
+        .map(Arc::new)
         .unwrap()
 }
 
@@ -909,6 +910,7 @@ async fn velo_probe_after_client_velo_shutdown_returns_bad_gateway() {
         .add_transport(Arc::clone(&client_transport) as Arc<dyn Transport>)
         .build()
         .await
+        .map(Arc::new)
         .unwrap();
 
     let hub_client = wire_mutual_velo(&server, &client_velo).await;

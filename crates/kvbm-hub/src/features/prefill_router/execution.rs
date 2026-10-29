@@ -436,6 +436,7 @@ mod tests {
             .add_transport(new_velo_transport())
             .build()
             .await
+            .map(Arc::new)
             .unwrap()
     }
 

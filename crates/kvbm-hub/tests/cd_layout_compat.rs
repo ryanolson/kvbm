@@ -1130,6 +1130,7 @@ async fn new_velo_peer() -> Arc<velo::Velo> {
         .add_transport(new_velo_transport())
         .build()
         .await
+        .map(Arc::new)
         .unwrap()
 }
 

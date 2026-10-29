@@ -126,15 +126,7 @@ pub async fn build_velo_with_discovery(
 
     // 3. Build Velo
     let velo = builder.build().await.context("Failed to build Velo")?;
-    Ok(velo)
-}
-
-/// Build a [`velo::Messenger`] instance from a [`MessengerConfig`].
-///
-/// Convenience wrapper around [`build_velo`] that returns just the messenger.
-pub async fn build_messenger(cfg: &MessengerConfig) -> Result<Arc<velo::Messenger>> {
-    let velo = build_velo(cfg).await?;
-    Ok(velo.messenger().clone())
+    Ok(Arc::new(velo))
 }
 
 /// Convert a [`NixlConfig`] into a [`NixlBackendConfig`] (the kvbm-memory
