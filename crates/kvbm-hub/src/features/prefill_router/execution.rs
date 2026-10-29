@@ -15,13 +15,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use kvbm_protocols::disagg::TransferParams;
 use reqwest::StatusCode;
 use serde_json::json;
 use velo::Messenger;
 use velo_ext::InstanceId;
 
-use super::dispatcher::DispatchOutcome;
 use super::protocol::{
     PREFILL_DISPATCH_HANDLER, PrefillDispatchRequest, PrefillDispatchResponse, VllmHttpEndpoint,
 };
@@ -31,6 +29,19 @@ use crate::protocol::PrefillRequest;
 /// Once delivered, the response remains pending until the worker reports its
 /// execution terminal because there is no end-to-end cancellation protocol.
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How a worker answered a request sent to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchOutcome {
+    /// The worker took the request.
+    Accepted,
+    /// The request was not placed: no free worker, the worker refused it,
+    /// or the transport failed.
+    Rejected {
+        /// Human-readable reason.
+        reason: String,
+    },
+}
 
 /// Transport-specific delivery of a single [`PrefillRequest`].
 ///
@@ -49,8 +60,14 @@ pub trait PrefillExecutionBackend: Send + Sync {
     /// Stable label for logs / debug output (`"http"`, `"velo"`).
     fn label(&self) -> &'static str;
 
+    /// True when `execute` returns as soon as the worker takes the request,
+    /// and the worker later sends
+    /// [`super::protocol::PREFILL_DONE_HANDLER`]. False when `execute`
+    /// returns only when the request ends.
+    fn reports_done(&self) -> bool;
+
     /// Send `req` to the worker and return how the worker responded.
-    async fn execute(&self, req: PrefillRequest) -> Result<DispatchOutcome>;
+    async fn execute(&self, req: &PrefillRequest) -> Result<DispatchOutcome>;
 }
 
 /// HTTP execution backend: POSTs each [`PrefillRequest`] to a registered
@@ -121,7 +138,11 @@ impl PrefillExecutionBackend for HttpExecutionBackend {
         "http"
     }
 
-    async fn execute(&self, request: PrefillRequest) -> Result<DispatchOutcome> {
+    fn reports_done(&self) -> bool {
+        false
+    }
+
+    async fn execute(&self, request: &PrefillRequest) -> Result<DispatchOutcome> {
         let url = format!("{}/v1/completions", self.base_url);
         let transfer_params =
             kvbm_protocols::disagg::TransferParams::remote_prefill(request.remote_prefill_params());
@@ -193,15 +214,12 @@ impl PrefillExecutionBackend for VeloExecutionBackend {
         "velo"
     }
 
-    async fn execute(&self, request: PrefillRequest) -> Result<DispatchOutcome> {
-        // Pre-wrap the kv_transfer_params blob so the receiving worker can
-        // hand it straight to `sampling_params.extra_args` without
-        // re-deriving — mirrors the HTTP backend's `/v1/completions` body.
-        let dispatch = PrefillDispatchRequest {
-            request_id: request.request_id.clone(),
-            token_ids: request.token_ids.clone(),
-            kv_transfer_params: TransferParams::remote_prefill(request.remote_prefill_params()),
-        };
+    fn reports_done(&self) -> bool {
+        true
+    }
+
+    async fn execute(&self, request: &PrefillRequest) -> Result<DispatchOutcome> {
+        let dispatch = PrefillDispatchRequest::from(request);
 
         let call = self
             .messenger
@@ -212,10 +230,9 @@ impl PrefillExecutionBackend for VeloExecutionBackend {
             .instance(self.instance_id)
             .send();
 
-        // Do not impose a post-delivery timeout here. Dropping the unary call
-        // cannot cancel an already-enqueued worker request, and the router's
-        // capacity permit must remain charged until the worker terminal or a
-        // definitive transport failure.
+        // The worker acks as soon as it has taken the request, so a slow
+        // reply means a slow worker; the transport failure path covers a
+        // dead one.
         let resp = match call.await {
             Ok(resp) => resp,
             Err(err) => {
@@ -317,7 +334,7 @@ mod tests {
         .unwrap();
         assert_eq!(backend.label(), "http");
 
-        let outcome = backend.execute(make_request("r1")).await.unwrap();
+        let outcome = backend.execute(&make_request("r1")).await.unwrap();
         assert_eq!(outcome, DispatchOutcome::Accepted);
         assert_eq!(count.load(Ordering::SeqCst), 1);
 
@@ -344,7 +361,7 @@ mod tests {
             },
         )
         .unwrap();
-        let outcome = backend.execute(make_request("r1")).await.unwrap();
+        let outcome = backend.execute(&make_request("r1")).await.unwrap();
         match outcome {
             DispatchOutcome::Rejected { reason } => assert!(reason.contains("500")),
             other => panic!("expected Rejected, got {other:?}"),
@@ -364,7 +381,7 @@ mod tests {
             },
         )
         .unwrap();
-        let outcome = backend.execute(make_request("r1")).await.unwrap();
+        let outcome = backend.execute(&make_request("r1")).await.unwrap();
         assert!(matches!(outcome, DispatchOutcome::Rejected { .. }));
     }
 
@@ -394,7 +411,7 @@ mod tests {
             },
         )
         .unwrap();
-        let execution = tokio::spawn(async move { backend.execute(make_request("slow")).await });
+        let execution = tokio::spawn(async move { backend.execute(&make_request("slow")).await });
 
         started_rx.await.unwrap();
         tokio::time::pause();
@@ -473,7 +490,7 @@ mod tests {
         .await;
         let backend = VeloExecutionBackend::new(worker.instance_id(), hub.messenger().clone());
         assert_eq!(backend.label(), "velo");
-        let outcome = backend.execute(make_request("r1")).await.unwrap();
+        let outcome = backend.execute(&make_request("r1")).await.unwrap();
         assert_eq!(outcome, DispatchOutcome::Accepted);
     }
 
@@ -485,7 +502,7 @@ mod tests {
         })
         .await;
         let backend = VeloExecutionBackend::new(worker.instance_id(), hub.messenger().clone());
-        match backend.execute(make_request("r1")).await.unwrap() {
+        match backend.execute(&make_request("r1")).await.unwrap() {
             DispatchOutcome::Rejected { reason } => assert!(reason.contains("engine boom")),
             other => panic!("expected Rejected, got {other:?}"),
         }
@@ -522,7 +539,7 @@ mod tests {
         worker.messenger().register_handler(handler).unwrap();
 
         let backend = VeloExecutionBackend::new(worker.instance_id(), hub.messenger().clone());
-        backend.execute(make_request("r1")).await.unwrap();
+        backend.execute(&make_request("r1")).await.unwrap();
 
         let req = captured.lock().clone().expect("worker received request");
         assert_eq!(req.request_id, "r1");

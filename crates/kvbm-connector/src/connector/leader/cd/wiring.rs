@@ -36,7 +36,7 @@ use crate::{InstanceId, KvbmRuntime};
 pub(in super::super) struct CdFoundation {
     pub(in super::super) hub: Arc<HubClient>,
     /// Hub's velo `InstanceId` (when the hub runs a velo participant) — the
-    /// CD client targets its prefill queue at this id.
+    /// CD client sends its prefill requests to this id.
     pub(in super::super) hub_velo_id: Option<InstanceId>,
     pub(in super::super) peer_resolver: Arc<HubPeerResolver>,
     pub(in super::super) session_factory: Arc<dyn SessionFactory>,

@@ -15,10 +15,11 @@ use kvbm_logical::events::CreateKind;
 use kvbm_protocols::cache_manifest::CacheManifest;
 pub use kvbm_protocols::control::layout_compat::LayoutCompatPayload;
 use kvbm_protocols::control::{MetricsSnapshotResponse, ResetResponse};
-/// Remote-prefill request payload carried by the hub's CD queue.
+/// Remote-prefill request payload that a decode worker sends to the hub's
+/// prefill router.
 ///
 /// The payload shape is owned by `kvbm-protocols (disagg)`; the hub owns only
-/// the queue transport, queue name, and feature registration surface.
+/// the dispatch handlers and the feature registration surface.
 pub use kvbm_protocols::disagg::{DISAGG_PROTOCOL_VERSION, RemotePrefillRequest as PrefillRequest};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -160,12 +161,6 @@ pub mod paths {
     ///   the hub stores it in its describe cache.
     pub const INSTANCE_DESCRIBE: &str = "/instances/{instance_id}/describe";
 }
-
-/// Velo-queue name used by the ConditionalDisagg feature to move prefill
-/// requests from Decode workers to Prefill workers. The hub owns the queue;
-/// Decode clients enqueue and Prefill clients dequeue via velo active
-/// messaging (the queue is backed by [`velo::queue`]).
-pub const CD_PREFILL_QUEUE: &str = "kvbm.cd.prefill_requests";
 
 /// Feature participation declared by a client at registration time.
 ///
@@ -699,11 +694,6 @@ mod tests {
         let json = serde_json::to_string(&orig).unwrap();
         let back: PrefillRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(back, orig);
-    }
-
-    #[test]
-    fn cd_prefill_queue_name_is_stable() {
-        assert_eq!(CD_PREFILL_QUEUE, "kvbm.cd.prefill_requests");
     }
 
     #[test]

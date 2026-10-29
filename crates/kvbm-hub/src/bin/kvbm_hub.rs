@@ -58,10 +58,10 @@ struct Cli {
     #[arg(long)]
     heartbeat_max_failures: Option<u32>,
 
-    /// Enable the prefill-router feature. The hub spawns a load-aware
-    /// dispatcher that pops requests off the CD prefill queue and routes
-    /// them to workers that registered with the
-    /// `Feature::PrefillRouter` payload. Both HTTP and velo backends
+    /// Enable the prefill-router feature. The hub places each prefill
+    /// request that a decode worker sends on a free worker that registered
+    /// with the `Feature::PrefillRouter` payload, picked by load, or
+    /// rejects it when none is free. Both HTTP and velo backends
     /// are supported. Requires the `disagg` feature.
     #[arg(long)]
     prefill_router: bool,
@@ -194,7 +194,7 @@ struct Cli {
 /// All hub features a client can be granted via `--features` (in dependency
 /// order). `ConnectorControl` is infrastructure, always attached, not listed.
 /// `PrefillRouter` is not selectable here — it is gated by the
-/// `--prefill-router` flag so it is always paired with the disagg dispatcher.
+/// `--prefill-router` flag so it is always paired with the disagg feature.
 const SELECTABLE_FEATURES: [FeatureKey; 3] = [
     FeatureKey::P2P,
     FeatureKey::ConditionalDisagg,
@@ -516,11 +516,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ConditionalDisagg + optional prefill router. The router is its
-    // own extension (it owns the fleet selector and the
-    // /v1/ext/prefill_router/ HTTP surface). The CD manager
-    // continues to own the messenger queue; if `--prefill-router` is
-    // set we late-bind the router as the CD manager's dispatcher after
-    // both have attached.
+    // own extension: it owns the fleet selector, the velo handlers that
+    // place prefill requests, and the /v1/ext/prefill_router/ HTTP
+    // surface. With `--cd-breaker`, its tier broadcaster is wired to the
+    // CD manager's decode set after both have attached.
     let mut cd_for_late_bind: Option<Arc<kvbm_hub::ConditionalDisaggManager>> = None;
     let mut router_for_late_bind: Option<Arc<kvbm_hub::PrefillRouterManager>> = None;
     if enabled.contains(&FeatureKey::ConditionalDisagg) {
@@ -622,10 +621,6 @@ async fn main() -> anyhow::Result<()> {
         "kvbm-hub listening"
     );
 
-    // Install the prefill router as the CD manager's dispatcher AFTER
-    // both have attached. The router accepts dispatch calls right away
-    // and queues internally until a worker registers — no startup
-    // discovery window needed.
     if let (Some(cd), Some(router)) = (cd_for_late_bind, router_for_late_bind) {
         // P2 CD-breaker tier push: cross-wire the broadcaster (owned by the
         // router, sharing the breaker Arc) and the CD manager (the decode-set
@@ -639,9 +634,6 @@ async fn main() -> anyhow::Result<()> {
             cd.set_tier_broadcaster(Arc::clone(broadcaster));
             tracing::info!("CD breaker tier-push broadcaster wired to the decode set");
         }
-        cd.start_dispatcher(router.dispatcher())
-            .map_err(|e| anyhow::anyhow!("install prefill router as CD dispatcher: {e}"))?;
-        tracing::info!("prefill router installed as CD prefill dispatcher");
     }
 
     tokio::signal::ctrl_c().await?;

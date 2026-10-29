@@ -38,8 +38,8 @@ use std::time::Duration;
 use kvbm_hub::{
     CALIBRATE_HANDLER, CalibrationDefaults, CalibrationRequest, CalibrationResponse,
     CalibrationSnapshot, Feature, HubClient, PREFILL_DISPATCH_HANDLER, PrefillBackendAdvertisement,
-    PrefillDispatchRequest, PrefillDispatchResponse, PrefillRouterConfig, RawCalibrationPayload,
-    RuntimeConfigSummary, analyze_calibration,
+    PrefillDispatchRequest, PrefillDispatchResponse, PrefillDoneNotice, PrefillRouterConfig,
+    RawCalibrationPayload, RuntimeConfigSummary, analyze_calibration,
 };
 use parking_lot::{Mutex, RwLock};
 use pyo3::exceptions::PyRuntimeError;
@@ -354,7 +354,8 @@ fn register_dispatch_handler(
                         });
                     }
                     inflight.fetch_add(1, Ordering::Relaxed);
-                    let _guard = InflightGuard(Arc::clone(&inflight));
+                    let guard = InflightGuard(Arc::clone(&inflight));
+                    let done = PrefillDoneNotice::new(&ctx);
 
                     let (tx, rx) = oneshot::channel::<CompletionResult>();
                     let call_result: Result<(), String> = Python::attach(|py| {
@@ -370,26 +371,34 @@ fn register_dispatch_handler(
                     });
 
                     if let Err(msg) = call_result {
+                        done.disarm();
                         return Ok(PrefillDispatchResponse {
                             ok: false,
                             error: Some(msg),
                         });
                     }
 
-                    match rx.await {
-                        Ok(Ok(_payload)) => Ok(PrefillDispatchResponse {
-                            ok: true,
-                            error: None,
-                        }),
-                        Ok(Err(msg)) => Ok(PrefillDispatchResponse {
-                            ok: false,
-                            error: Some(msg),
-                        }),
-                        Err(_) => Ok(PrefillDispatchResponse {
-                            ok: false,
-                            error: Some("CompletionEvent dropped before signal".into()),
-                        }),
-                    }
+                    // Ack now; the done notice frees the hub's capacity when
+                    // the lambda signals the end of the request.
+                    let request_id = ctx.input.request_id.clone();
+                    tokio::spawn(async move {
+                        let _guard = guard;
+                        let _done = done;
+                        match rx.await {
+                            Ok(Ok(_payload)) => {}
+                            Ok(Err(msg)) => {
+                                tracing::warn!(%request_id, error = %msg, "prefill failed")
+                            }
+                            Err(_) => tracing::warn!(
+                                %request_id,
+                                "CompletionEvent dropped before signal"
+                            ),
+                        }
+                    });
+                    Ok(PrefillDispatchResponse {
+                        ok: true,
+                        error: None,
+                    })
                 }
             },
         )

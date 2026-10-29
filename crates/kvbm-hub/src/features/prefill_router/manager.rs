@@ -5,9 +5,9 @@
 //!
 //! Owns a [`PrefillRouter`] / [`Selector`] pair and translates
 //! `Feature::PrefillRouter` registrations into [`PrefillExecutionBackend`]
-//! instances added to the fleet at runtime. `on_unregister` removes the
-//! worker — in-flight tasks against it complete normally; new picks see
-//! it gone.
+//! instances added to the fleet at runtime, and installs the router's
+//! submit and done handlers on the hub. Removing a worker frees the charges
+//! of its running requests; new picks see it gone.
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -26,7 +26,6 @@ use velo_ext::InstanceId;
 
 use super::breaker::{BreakerConfig, CircuitBreaker};
 use super::calibration::{CALIBRATE_HANDLER, CalibrationRequest, CalibrationResponse};
-use super::dispatcher::PrefillRequestDispatcher;
 use super::execution::{HttpExecutionBackend, PrefillExecutionBackend, VeloExecutionBackend};
 use super::protocol::{
     self, CountersResponse, PrefillBackendAdvertisement, PrefillTargetSummary, TargetsResponse,
@@ -54,9 +53,7 @@ const CALIBRATE_TIMEOUT: Duration = Duration::from_secs(900);
 const BREAKER_TICK_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Hub extension for the prefill router. Owns the [`PrefillRouter`] +
-/// [`Selector`]; exposes the router via [`Self::dispatcher`] so the hub
-/// binary can install it on the disagg manager as the
-/// [`PrefillRequestDispatcher`].
+/// [`Selector`].
 pub struct PrefillRouterManager {
     router: Arc<PrefillRouter>,
     selector: Arc<Selector>,
@@ -172,10 +169,9 @@ impl PrefillRouterManager {
         self.broadcaster.as_ref()
     }
 
-    /// The [`PrefillRequestDispatcher`] the hub binary hands to the
-    /// disagg manager's `start_dispatcher`.
-    pub fn dispatcher(self: &Arc<Self>) -> Arc<dyn PrefillRequestDispatcher> {
-        Arc::clone(&self.router) as Arc<dyn PrefillRequestDispatcher>
+    /// The router that places each prefill request.
+    pub fn router(&self) -> &Arc<PrefillRouter> {
+        &self.router
     }
 
     /// Underlying selector (mainly for tests and the HTTP introspection
@@ -242,6 +238,7 @@ impl Extension for PrefillRouterManager {
             if let Some(b) = &self.broadcaster {
                 b.set_velo(velo.downgrade());
             }
+            self.router.register_handlers(velo.messenger())?;
             let _ = self.velo.set(velo.downgrade());
         }
         if let Some(breaker) = self.breaker.clone() {
@@ -324,6 +321,7 @@ impl Extension for PrefillRouterManager {
 impl PrefillRouterManager {
     fn remove(&self, owner: InstanceId) {
         self.selector.remove_worker(owner);
+        self.router.forget_worker(owner);
         if self.advertisements.write().remove(&owner).is_some() {
             tracing::info!(instance_id = %owner, "PrefillRouter: target removed");
         }

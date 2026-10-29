@@ -10,7 +10,7 @@
 //! * [`plane`] — the production [`kvbm_engine::cd::PrefillPlane`]: completes
 //!   the wire `RemotePrefillRequest` (window-truncated token ids + the
 //!   provided-prefix hash digest, which never cross the engine seam) from the
-//!   leader's slot map and enqueues it on the hub's CD prefill queue.
+//!   leader's slot map and sends it to the hub's prefill router.
 //! * [`tier`] — the velo tier-signal handler writing the engine-owned
 //!   [`kvbm_engine::cd::TierCell`].
 //! * [`wiring`] — the hub/P2P registration (feature assembly, peer resolver,

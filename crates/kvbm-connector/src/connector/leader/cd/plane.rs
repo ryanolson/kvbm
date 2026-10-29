@@ -28,12 +28,12 @@ use crate::InstanceId;
 use super::super::Leader;
 
 /// Enqueue seam for the completed wire request. The production impl wraps a
-/// hub-queue [`ConditionalDisaggClient`]; tests record.
+/// [`ConditionalDisaggClient`]; tests record.
 pub(in super::super) trait CdEnqueue: Send + Sync {
     fn push(&self, req: RemotePrefillRequest) -> BoxFuture<'static, Result<()>>;
 }
 
-/// Production enqueue: the hub's CD prefill queue
+/// Production enqueue: the hub's prefill router
 /// (`ConditionalDisaggClient::push_prefill_request`).
 ///
 /// Built with the worker's role as registered: on a Decode-role worker every

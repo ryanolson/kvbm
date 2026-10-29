@@ -77,21 +77,22 @@ pub use features::p2p::{P2pClient, P2pManager};
 pub use features::prefill_router::{
     BreakerConfig, CALIBRATE_HANDLER, CalibrationDefaults, CalibrationRequest, CalibrationResponse,
     CalibrationResults, CalibrationSnapshot, CircuitBreaker, DecodeSetProvider, DispatchOutcome,
-    HttpExecutionBackend, PREFILL_DISPATCH_HANDLER, PerformanceModel, PrefillDispatchRequest,
-    PrefillDispatchResponse, PrefillExecutionBackend, PrefillRequestDispatcher, PrefillRouter,
-    PrefillRouterManager, RawCalibrationPayload, RawTrace, RecordingDispatcher,
-    ResolvedCalibrationRequest, ScatterData, Selector, SelectorConfig, TierBroadcaster,
-    VeloExecutionBackend, analyze_calibration,
+    HttpExecutionBackend, PREFILL_DISPATCH_HANDLER, PREFILL_DONE_HANDLER, PREFILL_SUBMIT_HANDLER,
+    PerformanceModel, PrefillAssignment, PrefillDispatchRequest, PrefillDispatchResponse,
+    PrefillDone, PrefillDoneNotice, PrefillExecutionBackend, PrefillRouter, PrefillRouterManager,
+    RawCalibrationPayload, RawTrace, ResolvedCalibrationRequest, ScatterData, Selector,
+    SelectorConfig, TierBroadcaster, VeloExecutionBackend, analyze_calibration,
+    register_prefill_worker,
 };
 pub use features::{FeatureConfigRequirements, KvbmFeature};
 pub use handlers::{TIER_SIGNAL_HANDLER, TierSignal, TierSignalAck};
 pub use kvbm_common::BlockLayoutMode;
 pub use kvbm_logical::events::CreateKind;
 pub use protocol::{
-    CD_PREFILL_QUEUE, ConditionalDisaggConfig, ConditionalDisaggRole, DEFAULT_CONTROL_PORT,
-    DEFAULT_DISCOVERY_PORT, Feature, FeatureDescriptor, FeatureKey, HubConfigResponse,
-    IndexerFeatureConfig, P2pConfig, PrefillBackendAdvertisement, PrefillRequest,
-    PrefillRouterConfig, PrimaryConfig, RuntimeConfigSummary, VllmHttpEndpoint,
+    ConditionalDisaggConfig, ConditionalDisaggRole, DEFAULT_CONTROL_PORT, DEFAULT_DISCOVERY_PORT,
+    Feature, FeatureDescriptor, FeatureKey, HubConfigResponse, IndexerFeatureConfig, P2pConfig,
+    PrefillBackendAdvertisement, PrefillRequest, PrefillRouterConfig, PrimaryConfig,
+    RuntimeConfigSummary, VllmHttpEndpoint,
 };
 pub use server::{HubServer, HubServerBuilder};
 

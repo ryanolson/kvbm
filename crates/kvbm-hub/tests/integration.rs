@@ -16,6 +16,7 @@ use kvbm_hub::{
     HubServer,
 };
 use velo::Transport;
+use velo::discovery::PeerDiscovery;
 use velo::transports::tcp::TcpTransportBuilder;
 use velo_ext::{InstanceId, PeerInfo, WorkerAddress};
 use velo_hub::client::ClientError;
@@ -394,22 +395,7 @@ async fn feature_cd_prefill_and_decode_register_and_list() {
     assert_eq!(p_peer.instance_id(), p_id);
     d_velo.register_peer(p_peer).unwrap();
 
-    // ---- Prefill queue handshake -------------------------------------------
-    //
-    // Decode pushes a PrefillRequest to the hub's CD queue; Prefill pulls
-    // it back via a timed dequeue. Empty-queue pulls return None.
-
-    // First: Prefill waits on an empty queue and observes the timeout path.
-    let empty = p_cd
-        .pull_prefill_request(Duration::from_millis(150))
-        .await
-        .unwrap();
-    assert!(
-        empty.is_none(),
-        "pull on empty queue should return None, got {empty:?}"
-    );
-
-    // Decode pushes a request.
+    // Role guard: a prefill worker cannot send prefill requests.
     let req = PrefillRequest {
         protocol_version: DISAGG_PROTOCOL_VERSION,
         request_id: "req-golden-1".to_string(),
@@ -417,207 +403,166 @@ async fn feature_cd_prefill_and_decode_register_and_list() {
         initiator_instance_id: d_id,
         decode_endpoint: None,
         token_ids: vec![1, 2, 3],
-        num_provided_tokens: 48,
+        num_provided_tokens: 0,
         request: kvbm_protocols::disagg::KvHashingRequestEnvelope::default(),
         expected_hash_digest: None,
         bundle: None,
     };
-    d_cd.push_prefill_request(&req).await.unwrap();
-
-    // Prefill pulls and receives it.
-    let pulled = p_cd
-        .pull_prefill_request(Duration::from_secs(2))
-        .await
-        .unwrap()
-        .expect("prefill should dequeue the request Decode just pushed");
-    assert_eq!(pulled, req);
-
-    // Queue is drained — another pull returns None within the timeout window.
-    let empty_again = p_cd
-        .pull_prefill_request(Duration::from_millis(150))
-        .await
-        .unwrap();
-    assert!(empty_again.is_none());
-
-    // Role guard: Prefill cannot push, Decode cannot pull.
     assert!(
         p_cd.push_prefill_request(&req).await.is_err(),
         "prefill must not be allowed to push"
     );
-    assert!(
-        d_cd.pull_prefill_request(Duration::from_millis(10))
-            .await
-            .is_err(),
-        "decode must not be allowed to pull"
-    );
 }
 
-// ---- ConditionalDisagg dispatcher integration -------------------------------
+// ---- Prefill dispatch over velo --------------------------------------------
 
-fn init_tracing() {
-    use std::sync::Once;
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,kvbm_hub=debug")),
-            )
-            .with_test_writer()
-            .try_init();
+/// A hub with P2P, CD and the prefill router.
+async fn start_server_with_router(per_worker_concurrency: u32) -> HubServer {
+    let router = kvbm_hub::PrefillRouterManager::new(kvbm_hub::SelectorConfig {
+        per_worker_concurrency,
+        block_size: 16,
     });
-}
-
-/// Variant of `start_server_with_cd` that installs a `RecordingDispatcher`.
-/// Returns the server, transport, manager, and the dispatcher handle so
-/// the test can assert which requests the worker handed off.
-async fn start_server_with_cd_dispatcher() -> (
-    HubServer,
-    Arc<velo::transports::tcp::TcpTransport>,
-    Arc<ConditionalDisaggManager>,
-    Arc<kvbm_hub::RecordingDispatcher>,
-) {
-    let transport = new_velo_transport();
-    let dispatcher = kvbm_hub::RecordingDispatcher::new();
-    let cd_manager: Arc<ConditionalDisaggManager> =
-        Arc::new(ConditionalDisaggManager::new().with_dispatcher(
-            Arc::clone(&dispatcher) as Arc<dyn kvbm_hub::PrefillRequestDispatcher>
-        ));
-    let p2p: Arc<kvbm_hub::P2pManager> = Arc::new(kvbm_hub::P2pManager::new());
-    let server = kvbm_hub::create_server_builder()
+    kvbm_hub::create_server_builder()
         .bind_addr(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
         .discovery_port(0)
         .control_port(0)
-        .add_transport(Arc::clone(&transport) as Arc<dyn Transport>)
-        .extension(p2p)
-        .extension(Arc::clone(&cd_manager))
+        .add_transport(new_velo_transport() as Arc<dyn Transport>)
+        .extension(Arc::new(kvbm_hub::P2pManager::new()))
+        .extension(Arc::new(ConditionalDisaggManager::new()))
+        .extension(router)
         .serve()
         .await
-        .expect("start test server with CD dispatcher");
-    (server, transport, cd_manager, dispatcher)
+        .expect("start test server with the prefill router")
 }
 
-/// Hub-side dispatcher worker drains the prefill queue and hands each
-/// request to the configured dispatcher implementation. Decode-side
-/// `push_prefill_request` should arrive at the recorder within seconds.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn dispatcher_worker_drains_queue_and_invokes_dispatcher() {
-    init_tracing();
-    let (server, _hub_transport, _cd, dispatcher) = start_server_with_cd_dispatcher().await;
-
-    // Decode client + velo so the push has the messenger backing it.
-    let d_velo = new_velo().await;
-    let d_hub = build_client(&server);
-    let d_cd = ConditionalDisaggClient::new(
-        Arc::clone(&d_hub),
-        Arc::clone(&d_velo),
-        ConditionalDisaggRole::Decode,
-    );
-    d_cd.register(&d_velo, test_layout_compat_payload())
-        .await
-        .unwrap()
-        .expect("hub velo id");
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Push two requests; the worker should drain both.
-    let req_one = PrefillRequest {
+fn dispatch_request(id: &str, decode: InstanceId) -> PrefillRequest {
+    PrefillRequest {
         protocol_version: DISAGG_PROTOCOL_VERSION,
-        request_id: "dispatch-test-1".to_string(),
+        request_id: id.to_string(),
         session_id: uuid::Uuid::new_v4(),
-        initiator_instance_id: d_velo.instance_id(),
+        initiator_instance_id: decode,
         decode_endpoint: None,
-        token_ids: vec![10, 20, 30],
+        token_ids: vec![1, 2, 3],
         num_provided_tokens: 0,
         request: kvbm_protocols::disagg::KvHashingRequestEnvelope::default(),
         expected_hash_digest: None,
         bundle: None,
-    };
-    let req_two = PrefillRequest {
-        request_id: "dispatch-test-2".to_string(),
-        ..req_one.clone()
-    };
-    d_cd.push_prefill_request(&req_one).await.unwrap();
-    d_cd.push_prefill_request(&req_two).await.unwrap();
-
-    // Wait for the worker to drain. The pump is a spawned task on the
-    // hub's runtime; poll the recorder rather than sleeping a fixed
-    // window so the test is fast on a hot loop and still robust under
-    // load.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while dispatcher.len() < 2 && std::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let recorded = dispatcher.recorded();
-    assert_eq!(
-        recorded.len(),
-        2,
-        "dispatcher should have received both pushed requests, got {}",
-        recorded.len()
-    );
-    assert_eq!(recorded[0].request_id, "dispatch-test-1");
-    assert_eq!(recorded[1].request_id, "dispatch-test-2");
 }
 
-/// Hub configured WITHOUT a dispatcher — push must still succeed (the
-/// queue handler is still installed) but nothing drains; this is the
-/// pre-dispatcher behavior, preserved for backward compat.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn no_dispatcher_does_not_spawn_worker() {
-    let (server, _hub_transport, _cd) = start_server_with_cd().await;
-
-    let d_velo = new_velo().await;
-    let d_hub = build_client(&server);
-    let d_cd = ConditionalDisaggClient::new(
-        Arc::clone(&d_hub),
-        Arc::clone(&d_velo),
+/// A decode client registered with `server`.
+async fn decode_client(server: &HubServer) -> (Arc<velo::Velo>, Arc<ConditionalDisaggClient>) {
+    let velo = new_velo().await;
+    let client = ConditionalDisaggClient::new(
+        build_client(server),
+        Arc::clone(&velo),
         ConditionalDisaggRole::Decode,
     );
-    d_cd.register(&d_velo, test_layout_compat_payload())
+    client
+        .register(&velo, test_layout_compat_payload())
         .await
         .unwrap()
         .expect("hub velo id");
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    (velo, client)
+}
 
-    let req = PrefillRequest {
-        protocol_version: DISAGG_PROTOCOL_VERSION,
-        request_id: "no-dispatcher".to_string(),
-        session_id: uuid::Uuid::new_v4(),
-        initiator_instance_id: d_velo.instance_id(),
-        decode_endpoint: None,
-        token_ids: vec![1],
-        num_provided_tokens: 0,
-        request: kvbm_protocols::disagg::KvHashingRequestEnvelope::default(),
-        expected_hash_digest: None,
-        bundle: None,
-    };
-    // Push succeeds — queue is installed by `attach`, dispatcher absence
-    // doesn't change that.
-    d_cd.push_prefill_request(&req).await.unwrap();
-    // Without a dispatcher there's nothing to drain — a passive consumer
-    // (prefill client) can still pull as before.
+/// A decode worker's request reaches the prefill worker's channel in one
+/// trip through the hub, with no poll on either side.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pushed_request_reaches_the_prefill_worker_without_a_poll() {
+    let server = start_server_with_router(1).await;
+
     let p_velo = new_velo().await;
+    let mut inbox = kvbm_hub::register_prefill_worker(p_velo.messenger(), 8).unwrap();
     let p_hub = build_client(&server);
     let p_cd = ConditionalDisaggClient::new(
         Arc::clone(&p_hub),
         Arc::clone(&p_velo),
         ConditionalDisaggRole::Prefill,
     );
-    p_cd.register(&p_velo, test_layout_compat_payload())
+    let hub_id = p_cd
+        .register_with(
+            &p_velo,
+            test_layout_compat_payload(),
+            vec![Feature::PrefillRouter(kvbm_hub::PrefillRouterConfig {
+                backend: kvbm_hub::PrefillBackendAdvertisement::Velo {
+                    instance_id: p_velo.instance_id(),
+                },
+            })],
+            None,
+        )
         .await
         .unwrap()
         .expect("hub velo id");
-    // Wire the hub's PeerInfo into prefill's velo so the queue RPC can
-    // round-trip back through the TCP transport.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let pulled = p_cd
-        .pull_prefill_request(Duration::from_secs(2))
+    let hub_peer = p_hub
+        .discovery()
+        .discover_by_instance_id(hub_id)
         .await
         .unwrap();
+    p_velo.register_peer(hub_peer).unwrap();
+
+    let (d_velo, d_cd) = decode_client(&server).await;
+
+    let mut latencies = Vec::new();
+    for n in 0..20 {
+        let request = dispatch_request(&format!("r{n}"), d_velo.instance_id());
+        let started = std::time::Instant::now();
+        d_cd.push_prefill_request(&request).await.unwrap();
+        let assignment = tokio::time::timeout(Duration::from_secs(1), inbox.recv())
+            .await
+            .expect("the request reaches the prefill worker")
+            .unwrap();
+        latencies.push(started.elapsed());
+        assert_eq!(assignment.request.request_id, request.request_id);
+        // The done notice frees the only permit, so the next push must
+        // wait for it to reach the hub.
+        drop(assignment);
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the done notice did not free the prefill worker"
+            );
+            let counters: serde_json::Value = http()
+                .get(control_url(&server, "/v1/ext/prefill_router/counters"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if counters["available_permits"] == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+    latencies.sort();
+    let p50 = latencies[latencies.len() / 2];
     assert!(
-        pulled.is_some(),
-        "passive pull path should still receive the queued request"
+        p50 < Duration::from_millis(5),
+        "push to prefill worker p50 is {p50:?}: {latencies:?}"
     );
+}
+
+/// With no prefill worker, the hub rejects the request at once, so the
+/// decode worker can prefill locally.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_push_with_no_prefill_worker_fails_at_once() {
+    let server = start_server_with_router(1).await;
+    let (d_velo, d_cd) = decode_client(&server).await;
+
+    let started = std::time::Instant::now();
+    let error = d_cd
+        .push_prefill_request(&dispatch_request("r1", d_velo.instance_id()))
+        .await
+        .expect_err("no prefill worker is registered");
+    assert!(
+        started.elapsed() < Duration::from_millis(100),
+        "the rejection took {:?}",
+        started.elapsed()
+    );
+    assert!(format!("{error:#}").contains("free capacity"), "{error:#}");
 }
 
 // ---- KV indexer velo find_blocks lookup -------------------------------------
