@@ -49,7 +49,7 @@
 //! seq.allocate_blocks(remaining, &manager);
 //!
 //! // 4. Stage and register
-//! seq.complete_and_register_pending(&manager);
+//! seq.complete_and_register_pending(&manager, seq.total_tokens());
 //! // Now: assigned_blocks() == num_blocks()
 //! ```
 //!
@@ -65,7 +65,7 @@
 //!     let token = model.forward(&seq);
 //!     let crossed = seq.append_token(token);
 //!     if crossed.is_some() {
-//!         seq.complete_and_register_pending(&manager);
+//!         seq.complete_and_register_pending(&manager, seq.total_tokens());
 //!         seq.allocate_blocks(1, &manager);
 //!     }
 //! }
@@ -349,19 +349,27 @@ impl<T: BlockMetadata> RequestSequence<T> {
         }
     }
 
-    /// Register all staged blocks with the block manager.
+    /// Register the staged blocks that lie inside the first
+    /// `computed_tokens` tokens with the block manager.
     ///
-    /// Moves staged `CompleteBlock`s → `ImmutableBlock`s (assigned). After
-    /// registration, blocks become visible to `match_blocks()` for prefix
-    /// reuse by future requests.
+    /// Moves those staged `CompleteBlock`s → `ImmutableBlock`s (assigned).
+    /// After registration, blocks become visible to `match_blocks()` for
+    /// prefix reuse by future requests. A staged block past
+    /// `computed_tokens` has no computed KV yet, so it stays staged.
     ///
     /// Returns the number of blocks registered.
-    pub fn register_staged(&mut self, manager: &BlockManager<T>) -> usize {
-        self.assignments.register(manager)
+    pub fn register_staged(&mut self, manager: &BlockManager<T>, computed_tokens: usize) -> usize {
+        let computed_blocks = computed_tokens / self.sequence.block_size();
+        let registered = self.detached_assigned.len()
+            + self.assignments.assigned_count()
+            + self.registering.len();
+        self.assignments
+            .register(manager, computed_blocks.saturating_sub(registered))
     }
 
-    /// Stage and register all unassigned blocks that have corresponding
-    /// completed token data in the sequence.
+    /// Stage all unassigned blocks that have corresponding completed token
+    /// data in the sequence, and register those inside the first
+    /// `computed_tokens` tokens.
     ///
     /// Computes the offset from `assigned_count + staged_count` and stages
     /// all completed token blocks beyond that offset. This converts
@@ -369,9 +377,13 @@ impl<T: BlockMetadata> RequestSequence<T> {
     ///
     /// A generation block (not yet filled) remains unassigned because it has
     /// no corresponding entry in `sequence.blocks()`.
-    pub fn complete_and_register_pending(&mut self, manager: &BlockManager<T>) {
+    pub fn complete_and_register_pending(
+        &mut self,
+        manager: &BlockManager<T>,
+        computed_tokens: usize,
+    ) {
         self.stage_pending();
-        self.register_staged(manager);
+        self.register_staged(manager, computed_tokens);
     }
 
     /// Transfer every newly registered strong block to a policy owner while
@@ -587,7 +599,7 @@ impl<T: BlockMetadata> RequestSequence<T> {
                 self.assignments.clear();
                 return false;
             }
-            self.assignments.register(manager);
+            self.assignments.register(manager, remaining_complete);
         }
 
         self.prefix_matched_blocks = matched_count;
@@ -840,7 +852,7 @@ mod tests {
         if !seq.allocate_blocks(total_to_allocate, manager) {
             return None;
         }
-        seq.complete_and_register_pending(manager);
+        seq.complete_and_register_pending(manager, seq.total_tokens());
         Some(seq)
     }
 
@@ -1162,7 +1174,7 @@ mod tests {
         assert!(block_idx.is_some());
         assert!(!seq.is_complete());
 
-        seq.complete_and_register_pending(&manager);
+        seq.complete_and_register_pending(&manager, seq.total_tokens());
         assert_eq!(seq.assigned_blocks(), 2);
         assert_eq!(seq.unassigned_blocks(), 0);
         assert!(seq.allocate_blocks(1, &manager));
@@ -1175,7 +1187,7 @@ mod tests {
         assert!(seq.append_token(203).is_some());
         assert!(seq.is_complete());
 
-        seq.complete_and_register_pending(&manager);
+        seq.complete_and_register_pending(&manager, seq.total_tokens());
         assert_eq!(seq.assigned_blocks(), 3);
         seq.release();
         assert_eq!(seq.assigned_blocks(), 0);
@@ -1203,7 +1215,7 @@ mod tests {
 
         let remaining = seq.num_blocks() - matched_count;
         assert!(seq.allocate_blocks(remaining + 1, &manager));
-        seq.complete_and_register_pending(&manager);
+        seq.complete_and_register_pending(&manager, seq.total_tokens());
 
         assert_eq!(seq.assigned_blocks(), 2);
         assert_eq!(seq.unassigned_blocks(), 1);
@@ -1241,7 +1253,7 @@ mod tests {
         let manager = create_test_manager::<TestMeta>(8);
         let mut seq = RequestSequence::<TestMeta>::new(make_tokens(8), 0, BLOCK_SIZE);
         assert!(seq.allocate_blocks(2, &manager));
-        seq.complete_and_register_pending(&manager);
+        seq.complete_and_register_pending(&manager, seq.total_tokens());
 
         let original = seq.page_indices();
         let replacement = 100;
@@ -1260,7 +1272,7 @@ mod tests {
         let manager = create_test_manager::<TestMeta>(4);
         let mut seq = RequestSequence::<TestMeta>::new(make_tokens(4), 0, BLOCK_SIZE);
         assert!(seq.allocate_blocks(1, &manager));
-        seq.complete_and_register_pending(&manager);
+        seq.complete_and_register_pending(&manager, seq.total_tokens());
         let page_id = seq.page_indices()[0] as BlockId;
 
         assert_eq!(
@@ -1303,7 +1315,7 @@ mod tests {
         let manager = create_test_manager::<TestMeta>(8);
         let mut seq = RequestSequence::<TestMeta>::new(make_tokens(4), 4, BLOCK_SIZE);
         assert!(seq.allocate_blocks(2, &manager));
-        seq.complete_and_register_pending(&manager);
+        seq.complete_and_register_pending(&manager, seq.total_tokens());
         let allocated_ids = seq.page_indices();
 
         let first = seq.detach_registered_blocks();
@@ -1315,7 +1327,7 @@ mod tests {
         for token in 100..104 {
             seq.append_token(token);
         }
-        seq.complete_and_register_pending(&manager);
+        seq.complete_and_register_pending(&manager, seq.total_tokens());
         let second = seq.detach_registered_blocks();
 
         assert_eq!(second.len(), 1);
@@ -1438,7 +1450,7 @@ mod tests {
     fn take_and_install_equals_register_staged() {
         let inline_manager = create_test_manager::<TestMeta>(16);
         let mut inline = staged_sequence(&inline_manager);
-        inline.register_staged(&inline_manager);
+        inline.register_staged(&inline_manager, inline.total_tokens());
 
         let manager = create_test_manager::<TestMeta>(16);
         let mut seq = staged_sequence(&manager);
@@ -1467,7 +1479,7 @@ mod tests {
             .build()
             .expect("build manager");
         let mut first = staged_sequence(&manager);
-        first.register_staged(&manager);
+        first.register_staged(&manager, first.total_tokens());
         let mut second = staged_sequence(&manager);
         let taken = second.take_staged_for_registration();
         let original_ids: Vec<_> = taken.iter().map(CompleteBlock::block_id).collect();
@@ -1492,12 +1504,12 @@ mod tests {
     fn take_blocks_and_release_request_blocks_equal_release() {
         let release_manager = create_test_manager::<TestMeta>(16);
         let mut released = staged_sequence(&release_manager);
-        released.register_staged(&release_manager);
+        released.register_staged(&release_manager, released.total_tokens());
         released.release();
 
         let manager = create_test_manager::<TestMeta>(16);
         let mut seq = staged_sequence(&manager);
-        seq.register_staged(&manager);
+        seq.register_staged(&manager, seq.total_tokens());
         let blocks = seq.take_blocks();
         assert!(seq.page_indices().is_empty());
         let available = manager.available_blocks();

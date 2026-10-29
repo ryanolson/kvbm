@@ -140,7 +140,7 @@
 //! assert_eq!(la.unassigned_count(), 0);
 //!
 //! // Register: finalizes staged blocks through the manager.
-//! la.register(&manager);
+//! la.register(&manager, usize::MAX);
 //! assert_eq!(la.assigned_count(), 3);
 //! assert_eq!(la.staged_count(), 0);
 //!
