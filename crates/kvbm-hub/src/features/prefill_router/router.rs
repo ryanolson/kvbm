@@ -86,6 +86,9 @@ impl PrefillRouter {
                 net_new,
                 "PrefillRouter: dispatching"
             );
+            // Request IDs are local to each decode worker; the session ID
+            // is unique across them.
+            let session = request.session_id.to_string();
             if !backend.reports_done() {
                 tokio::spawn(async move {
                     let _picked = picked;
@@ -95,7 +98,7 @@ impl PrefillRouter {
             }
             {
                 let mut running = self.running.lock();
-                if running.contains_key(&request.request_id) {
+                if running.contains_key(&session) {
                     return DispatchOutcome::Rejected {
                         reason: format!(
                             "request {} is already running on a prefill worker",
@@ -103,7 +106,7 @@ impl PrefillRouter {
                         ),
                     };
                 }
-                running.insert(request.request_id.clone(), picked);
+                running.insert(session.clone(), picked);
             }
             match backend.execute(&request).await {
                 Ok(DispatchOutcome::Accepted) => return DispatchOutcome::Accepted,
@@ -121,7 +124,7 @@ impl PrefillRouter {
                 }
                 Err(error) => reason = format!("{error:#}"),
             }
-            self.running.lock().remove(&request.request_id);
+            self.running.lock().remove(&session);
             tracing::warn!(
                 %instance_id,
                 request_id = %request.request_id,
@@ -133,16 +136,16 @@ impl PrefillRouter {
         DispatchOutcome::Rejected { reason }
     }
 
-    /// Free the charge of `request_id` when the worker that runs it reports
-    /// that it ended. A notice from another sender is ignored.
-    pub fn done(&self, request_id: &str, sender: WorkerId) {
+    /// Free the charge of the session `session_id` when the worker that runs
+    /// it reports that it ended. A notice from another sender is ignored.
+    pub fn done(&self, session_id: &str, sender: WorkerId) {
         let mut running = self.running.lock();
-        match running.get(request_id) {
+        match running.get(session_id) {
             Some(picked) if picked.slot.instance_id.worker_id() == sender => {
-                running.remove(request_id);
+                running.remove(session_id);
             }
             Some(_) => tracing::warn!(
-                request_id,
+                session_id,
                 "PrefillRouter: done notice from a worker that does not run the request"
             ),
             None => {}
@@ -190,7 +193,7 @@ impl PrefillRouter {
         let done = Handler::am_handler(PREFILL_DONE_HANDLER, move |ctx: Context| {
             let done: PrefillDone = serde_json::from_slice(&ctx.payload)?;
             if let Some(router) = router.upgrade() {
-                router.done(&done.request_id, ctx.sender_worker_id());
+                router.done(&done.session_id, ctx.sender_worker_id());
             }
             Ok(())
         })
@@ -473,15 +476,16 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_request_id_runs_once() {
+    async fn a_session_runs_once() {
         let fleet = Fleet::new(2, 1).await;
         let mut inbox = fleet.inbox(0);
+        let request = make_request("r1");
         assert_eq!(
-            fleet.router.submit(make_request("r1")).await,
+            fleet.router.submit(request.clone()).await,
             DispatchOutcome::Accepted
         );
         assert!(matches!(
-            fleet.router.submit(make_request("r1")).await,
+            fleet.router.submit(request).await,
             DispatchOutcome::Rejected { .. }
         ));
         let _held = inbox.recv().await.unwrap();
@@ -505,11 +509,29 @@ mod tests {
     async fn a_done_notice_from_another_sender_is_ignored() {
         let fleet = Fleet::new(1, 1).await;
         let mut inbox = fleet.inbox(0);
-        fleet.router.submit(make_request("r1")).await;
+        let request = make_request("r1");
+        let session = request.session_id.to_string();
+        fleet.router.submit(request).await;
         let _held = inbox.recv().await.unwrap();
 
-        fleet.router.done("r1", fleet.hub.instance_id().worker_id());
+        fleet
+            .router
+            .done(&session, fleet.hub.instance_id().worker_id());
         assert_eq!(fleet.router.selector().available_permits(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_decode_workers_may_use_the_same_request_id() {
+        let fleet = Fleet::new(2, 1).await;
+        let mut inbox = fleet.inbox(0);
+        for _ in 0..2 {
+            assert_eq!(
+                fleet.router.submit(make_request("r1")).await,
+                DispatchOutcome::Accepted
+            );
+        }
+        let _first = inbox.recv().await.unwrap();
+        let _second = inbox.recv().await.unwrap();
     }
 
     #[tokio::test]

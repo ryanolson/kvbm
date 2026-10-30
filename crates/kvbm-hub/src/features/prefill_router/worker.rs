@@ -34,6 +34,7 @@ pub struct PrefillDoneNotice {
     messenger: Arc<Messenger>,
     dispatcher: Option<WorkerId>,
     request_id: String,
+    session_id: String,
 }
 
 impl PrefillDoneNotice {
@@ -43,6 +44,13 @@ impl PrefillDoneNotice {
             messenger: Arc::clone(&ctx.msg),
             dispatcher: Some(ctx.sender_worker_id()),
             request_id: ctx.input.request_id.clone(),
+            session_id: ctx
+                .input
+                .kv_transfer_params
+                .remote_prefill
+                .as_ref()
+                .map(|params| params.session_id.to_string())
+                .unwrap_or_default(),
         }
     }
 
@@ -60,6 +68,7 @@ impl Drop for PrefillDoneNotice {
         };
         let done = PrefillDone {
             request_id: std::mem::take(&mut self.request_id),
+            session_id: std::mem::take(&mut self.session_id),
         };
         match self
             .messenger

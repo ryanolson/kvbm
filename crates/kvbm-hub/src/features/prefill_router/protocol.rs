@@ -71,6 +71,8 @@ pub struct PrefillDispatchResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PrefillDone {
     pub request_id: String,
+    /// The KVBM session of the request; the router charges by it.
+    pub session_id: String,
 }
 
 /// Relative route paths (mounted under `/v1/ext/prefill_router`).
