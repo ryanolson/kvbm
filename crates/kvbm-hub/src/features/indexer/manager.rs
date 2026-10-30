@@ -356,8 +356,9 @@ impl KvbmFeature for IndexerManager {
 impl Extension for IndexerManager {
     const NAME: &'static str = crate::protocol::INDEXER_EXTENSION;
     type Registration = crate::protocol::IndexerFeatureConfig;
-    /// Whether the registrant participates.
-    type Staged = bool;
+    /// The binding of a participating registrant. It is bound at commit, so
+    /// a registration that another extension rejects changes no binding.
+    type Staged = Option<crate::protocol::IndexerFeatureConfig>;
 
     fn descriptor(&self) -> serde_json::Value {
         // Advertise ingest and carrier-feed endpoints with sizing so clients
@@ -494,10 +495,10 @@ impl Extension for IndexerManager {
         &self,
         txn: &Txn<'_>,
         payload: Option<crate::protocol::IndexerFeatureConfig>,
-    ) -> Result<bool, Rejection> {
+    ) -> Result<Option<crate::protocol::IndexerFeatureConfig>, Rejection> {
         // Bind the cache manifest and create kind before accepting publication.
         let Some(cfg) = payload else {
-            return Ok(false);
+            return Ok(None);
         };
         if let Some(required) = self.required_kind
             && cfg.create_kind != required
@@ -508,12 +509,7 @@ impl Extension for IndexerManager {
             )));
         }
         self.indexes
-            .bind(
-                txn.owner.as_u128(),
-                &cfg.manifest,
-                cfg.create_kind,
-                cfg.max_seq_len,
-            )
+            .check_bind(&cfg.manifest, cfg.create_kind)
             .map_err(|error| Rejection::bad_request(format!("indexer binding: {error}")))?;
         tracing::debug!(
             instance = %txn.owner,
@@ -521,14 +517,26 @@ impl Extension for IndexerManager {
             num_positions = self.indexes.max_seq_len() / self.indexes.block_size(),
             "indexer participation staged"
         );
-        Ok(true)
+        Ok(Some(cfg))
     }
 
-    fn commit(&self, participates: bool, registration: &Committed<'_>) {
+    fn commit(
+        &self,
+        staged: Option<crate::protocol::IndexerFeatureConfig>,
+        registration: &Committed<'_>,
+    ) {
         let instance_id = registration.owner;
-        if !participates {
+        let Some(cfg) = staged else {
             self.remove(instance_id);
             return;
+        };
+        if let Err(error) = self.indexes.bind(
+            instance_id.as_u128(),
+            &cfg.manifest,
+            cfg.create_kind,
+            cfg.max_seq_len,
+        ) {
+            tracing::error!(instance = %instance_id, %error, "indexer binding failed at commit");
         }
         let epoch = RegistrationEpoch::from_uuid(registration.epoch.as_uuid());
         if let Err(error) = self.bundle_directory.commit_owner(instance_id, epoch) {
