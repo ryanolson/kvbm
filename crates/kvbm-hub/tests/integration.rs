@@ -405,6 +405,7 @@ async fn feature_cd_prefill_and_decode_register_and_list() {
         token_ids: vec![1, 2, 3],
         num_provided_tokens: 0,
         request: kvbm_protocols::disagg::KvHashingRequestEnvelope::default(),
+        scope_salt: None,
         expected_hash_digest: None,
         bundle: None,
     };
@@ -445,6 +446,7 @@ fn dispatch_request(id: &str, decode: InstanceId) -> PrefillRequest {
         token_ids: vec![1, 2, 3],
         num_provided_tokens: 0,
         request: kvbm_protocols::disagg::KvHashingRequestEnvelope::default(),
+        scope_salt: None,
         expected_hash_digest: None,
         bundle: None,
     }

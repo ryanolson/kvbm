@@ -319,6 +319,7 @@ mod tests {
             token_ids: vec![0u32; n_tokens],
             num_provided_tokens: n_hashes * 16,
             request: KvHashingRequestEnvelope::default(),
+            scope_salt: None,
             expected_hash_digest: None,
             bundle: None,
         }

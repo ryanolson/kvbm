@@ -193,6 +193,7 @@ impl PrefillPlane for SlotPrefillPlane {
                 // Empty by the guards above: no LoRA / salt / multimodal
                 // crosses the CD wire yet.
                 request: KvHashingRequestEnvelope::default(),
+                scope_salt: None,
                 expected_hash_digest,
                 bundle,
             };

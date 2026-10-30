@@ -688,6 +688,7 @@ mod tests {
             token_ids: vec![1, 2, 3],
             num_provided_tokens: 48,
             request: KvHashingRequestEnvelope::default(),
+            scope_salt: None,
             expected_hash_digest: Some(0xABCD_EF01_2345_6789),
             bundle: None,
         };

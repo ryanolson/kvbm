@@ -290,6 +290,7 @@ mod tests {
             token_ids: vec![1, 2, 3],
             num_provided_tokens: 0,
             request: KvHashingRequestEnvelope::default(),
+            scope_salt: None,
             expected_hash_digest: None,
             bundle: None,
         }
