@@ -186,6 +186,48 @@ async fn replay_on_late_subscribe_coalesces() -> Result<()> {
 }
 
 // ============================================================================
+// Case: fixed state goes both ways and reaches the puller before Drained
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fixed_state_goes_both_ways_and_arrives_before_drained() -> Result<()> {
+    let (h, p) = paired_sides().await;
+    let session_id = uuid::Uuid::new_v4();
+
+    let h_session = h.factory.open(session_id)?;
+    let h_endpoint = h_session.endpoint().expect("holder endpoint");
+    let p_session = p
+        .factory
+        .attach(session_id, h.velo.instance_id(), h_endpoint)
+        .await?;
+    let mut avail = p_session.availability();
+
+    h_session.send_fixed_state(b"holder".to_vec())?;
+    assert!(h_session.send_fixed_state(b"again".to_vec()).is_err());
+    h_session.finish_commits()?;
+    h_session.finish_availability()?;
+
+    let next = tokio::time::timeout(Duration::from_secs(30), avail.next()).await?;
+    assert!(
+        matches!(next, Some(AvailabilityDelta::Drained)),
+        "expected Drained, got {next:?}"
+    );
+    assert_eq!(p_session.peer_fixed_state(), Some(b"holder".to_vec()));
+
+    p_session.send_fixed_state(b"puller".to_vec())?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while h_session.peer_fixed_state().is_none() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no fixed state reached the holder"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(h_session.peer_fixed_state(), Some(b"puller".to_vec()));
+    Ok(())
+}
+
+// ============================================================================
 // Case: close() from holder terminates streams + emits Detached on puller
 // ============================================================================
 
