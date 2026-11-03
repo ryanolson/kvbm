@@ -58,9 +58,9 @@ dynamo-tokens = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "b0c71d
 dynamo-kv-router = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "b0c71df0f63b65bb85f1dc9ec8d58b1899096d95" }
 dynamo-kv-hashing = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "b0c71df0f63b65bb85f1dc9ec8d58b1899096d95" }
 
-# velo (registry — 0.4.1 / 0.2.0 are published on crates.io)
-velo     = { version = "0.4.1" }
-velo-ext = { version = "0.2.0" }
+# velo (registry — 0.20.0 / 0.5.6 are published on crates.io)
+velo     = { version = "0.20.0" }
+velo-ext = { version = "0.5.6" }
 
 # External dependencies (copied verbatim from dynamo root [workspace.dependencies])
 anyhow = { version = "1" }
