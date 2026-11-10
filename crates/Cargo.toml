@@ -53,10 +53,11 @@ kvbm-service = { path = "kvbm-service" }
 # NOTE: dynamo-kv-router is intentionally featureless. The `runtime-protocols`
 # feature pulls `dynamo-runtime` (and its dynamo-core closure); kvbm-consolidator
 # only consumes `dynamo_kv_router::zmq_wire`, which is available without features.
-# Pinned to a rev on the internal Dynamo fork branch carrier-on-main.
-dynamo-tokens = { git = "https://github.com/NVIDIA-dev/warnold-dynamo.git", rev = "3f8e516c24b0e016070aa281d3722d06615a913c" }
-dynamo-kv-router = { git = "https://github.com/NVIDIA-dev/warnold-dynamo.git", rev = "3f8e516c24b0e016070aa281d3722d06615a913c" }
-dynamo-kv-hashing = { git = "https://github.com/NVIDIA-dev/warnold-dynamo.git", rev = "3f8e516c24b0e016070aa281d3722d06615a913c" }
+# Pinned to a rev on NVIDIA-dev/warnold-dynamo branch rhino/carrier-on-main-20261109.
+# Never point a dynamo dependency at upstream ai-dynamo/dynamo.
+dynamo-tokens = { git = "https://github.com/NVIDIA-dev/warnold-dynamo.git", rev = "c346b0bc04fe282bb15939d0a9f6f7d6d357d1d4" }
+dynamo-kv-router = { git = "https://github.com/NVIDIA-dev/warnold-dynamo.git", rev = "c346b0bc04fe282bb15939d0a9f6f7d6d357d1d4" }
+dynamo-kv-hashing = { git = "https://github.com/NVIDIA-dev/warnold-dynamo.git", rev = "c346b0bc04fe282bb15939d0a9f6f7d6d357d1d4" }
 
 # velo (registry — 0.4.1 / 0.2.0 are published on crates.io)
 velo     = { version = "0.4.1" }
