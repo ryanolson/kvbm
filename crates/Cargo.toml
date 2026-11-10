@@ -54,7 +54,8 @@ kvbm-service = { path = "kvbm-service" }
 # feature pulls `dynamo-runtime` (and its dynamo-core closure); kvbm-consolidator
 # only consumes `dynamo_kv_router::zmq_wire`, which is available without features.
 # Pinned to a rev on NVIDIA-dev/warnold-dynamo branch rhino/carrier-on-main-20261109.
-# Never point a dynamo dependency at upstream ai-dynamo/dynamo.
+# Keep every fork in the NVIDIA-dev GitHub org. Never point a dynamo dependency
+# at upstream ai-dynamo/dynamo.
 dynamo-tokens = { git = "https://github.com/NVIDIA-dev/warnold-dynamo.git", rev = "c346b0bc04fe282bb15939d0a9f6f7d6d357d1d4" }
 dynamo-kv-router = { git = "https://github.com/NVIDIA-dev/warnold-dynamo.git", rev = "c346b0bc04fe282bb15939d0a9f6f7d6d357d1d4" }
 dynamo-kv-hashing = { git = "https://github.com/NVIDIA-dev/warnold-dynamo.git", rev = "c346b0bc04fe282bb15939d0a9f6f7d6d357d1d4" }
@@ -85,7 +86,8 @@ hyper-util = { version = "=0.1.17" }
 indexmap = { version = "2" }
 libc = { version = "0.2" }
 libloading = "0.8.9"
-nixl-sys = { version = "=1.4.1", git = "https://github.com/Aphoh/nixl.git", rev = "9e04f3dcb56c84d5b63feb10250e657822168322" }
+# nixl-sys comes from the NVIDIA-dev/warnold-nixl fork, at the same rev as Rhino.
+nixl-sys = { version = "=1.4.1", git = "https://github.com/NVIDIA-dev/warnold-nixl.git", rev = "a08e289bf065f0bf37c774c4a5c01d9f951a571e" }
 oneshot = { version = "0.1.13", features = ["std", "async"] }
 parking_lot = "0.12.5"
 prometheus = { version = "0.14" }
