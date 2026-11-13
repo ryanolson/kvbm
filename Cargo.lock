@@ -1439,7 +1439,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 [[package]]
 name = "dynamo-kv-hashing"
 version = "1.7.0"
-source = "git+https://github.com/NVIDIA-dev/warnold-dynamo.git?rev=3f8e516c24b0e016070aa281d3722d06615a913c#3f8e516c24b0e016070aa281d3722d06615a913c"
+source = "git+https://github.com/NVIDIA-dev/warnold-dynamo.git?rev=c346b0bc04fe282bb15939d0a9f6f7d6d357d1d4#c346b0bc04fe282bb15939d0a9f6f7d6d357d1d4"
 dependencies = [
  "derive_builder",
  "dynamo-tokens",
@@ -1451,7 +1451,7 @@ dependencies = [
 [[package]]
 name = "dynamo-kv-router"
 version = "1.7.0"
-source = "git+https://github.com/NVIDIA-dev/warnold-dynamo.git?rev=3f8e516c24b0e016070aa281d3722d06615a913c#3f8e516c24b0e016070aa281d3722d06615a913c"
+source = "git+https://github.com/NVIDIA-dev/warnold-dynamo.git?rev=c346b0bc04fe282bb15939d0a9f6f7d6d357d1d4#c346b0bc04fe282bb15939d0a9f6f7d6d357d1d4"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1489,7 +1489,7 @@ dependencies = [
 [[package]]
 name = "dynamo-tokens"
 version = "1.7.0"
-source = "git+https://github.com/NVIDIA-dev/warnold-dynamo.git?rev=3f8e516c24b0e016070aa281d3722d06615a913c#3f8e516c24b0e016070aa281d3722d06615a913c"
+source = "git+https://github.com/NVIDIA-dev/warnold-dynamo.git?rev=c346b0bc04fe282bb15939d0a9f6f7d6d357d1d4#c346b0bc04fe282bb15939d0a9f6f7d6d357d1d4"
 dependencies = [
  "bs58",
  "bytemuck",
@@ -1505,7 +1505,7 @@ dependencies = [
 [[package]]
 name = "dynamo-truthy"
 version = "1.7.0"
-source = "git+https://github.com/NVIDIA-dev/warnold-dynamo.git?rev=3f8e516c24b0e016070aa281d3722d06615a913c#3f8e516c24b0e016070aa281d3722d06615a913c"
+source = "git+https://github.com/NVIDIA-dev/warnold-dynamo.git?rev=c346b0bc04fe282bb15939d0a9f6f7d6d357d1d4#c346b0bc04fe282bb15939d0a9f6f7d6d357d1d4"
 dependencies = [
  "anyhow",
 ]
@@ -2892,7 +2892,7 @@ dependencies = [
 [[package]]
 name = "nixl-sys"
 version = "1.4.1"
-source = "git+https://github.com/Aphoh/nixl.git?rev=9e04f3dcb56c84d5b63feb10250e657822168322#9e04f3dcb56c84d5b63feb10250e657822168322"
+source = "git+https://github.com/NVIDIA-dev/warnold-nixl.git?rev=a08e289bf065f0bf37c774c4a5c01d9f951a571e#a08e289bf065f0bf37c774c4a5c01d9f951a571e"
 dependencies = [
  "anyhow",
  "bincode 1.3.3",
