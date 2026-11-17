@@ -225,6 +225,11 @@ pub struct NcclCollectives {
     fatal_reason: OnceLock<String>,
 }
 
+/// The time limit of a communicator initialization that has ranks in two or
+/// more processes. The processes are on different nodes, so the bootstrap of
+/// the group takes longer than in one process.
+const NCCL_SUBGROUP_INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 impl NcclCollectives {
     // =========================================================================
     // Path A: Create from scratch (used by tests, standalone Rust apps)
@@ -404,7 +409,7 @@ impl NcclCollectives {
 
         initialize_rank_group(
             workers.len(),
-            NCCL_INIT_TIMEOUT,
+            NCCL_SUBGROUP_INIT_TIMEOUT,
             |position, cancelled, deadline| {
                 Self::from_worker_bootstrap_with_cancel(
                     bootstrap,
