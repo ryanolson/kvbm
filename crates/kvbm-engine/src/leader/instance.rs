@@ -3073,6 +3073,95 @@ mod tests {
         Ok((Arc::new(builder.build()?), g2, g3))
     }
 
+    /// A lane view sends a local transfer to the workers of its lane only.
+    /// Each lane shares the registry and the G2 managers of the instance.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lane_view_runs_a_local_transfer_on_the_workers_of_its_lane() -> Result<()> {
+        use crate::remote::search::bundle::test_support::RecordingParallelWorkers;
+
+        let build = |lanes: Vec<Vec<Arc<dyn Worker>>>, messenger| {
+            let registry = BlockRegistry::builder().build();
+            let g2 = Arc::new(
+                TestManagerBuilder::<G2>::new()
+                    .block_count(8)
+                    .block_size(4)
+                    .registry(registry.clone())
+                    .build(),
+            );
+            let mut builder = InstanceLeader::builder()
+                .messenger(messenger)
+                .registry(registry)
+                .g2_manager(g2);
+            for (lane, workers) in lanes.into_iter().enumerate() {
+                builder = if lane == 0 {
+                    builder.workers(workers)
+                } else {
+                    builder.lane_workers(workers)
+                };
+            }
+            builder.build()
+        };
+
+        let lane0 = Arc::new(RecordingParallelWorkers::default());
+        let lane1 = Arc::new(RecordingParallelWorkers::default());
+        let leader = build(
+            vec![
+                vec![lane0.clone() as Arc<dyn Worker>],
+                vec![lane1.clone() as Arc<dyn Worker>],
+            ],
+            create_messenger_tcp().await?,
+        )?;
+        assert_eq!(leader.lane(), 0);
+        assert_eq!(leader.lane_count(), 2);
+        let view = leader.lane_view(1)?;
+        assert_eq!(view.lane(), 1);
+        assert_eq!(view.lane_count(), 2);
+        assert!(Arc::ptr_eq(
+            leader.g2_manager_for(leader.primary_g2_resource()).unwrap(),
+            view.g2_manager_for(view.primary_g2_resource()).unwrap(),
+        ));
+        assert!(leader.lane_view(2).is_err());
+
+        let resource = leader.primary_g2_resource();
+        view.execute_local_transfer_for_resource(
+            resource,
+            LogicalLayoutHandle::G2,
+            LogicalLayoutHandle::G1,
+            vec![3],
+            vec![5],
+            TransferOptions::default(),
+        )?
+        .await?;
+        assert!(lane0.onboards().is_empty());
+        assert_eq!(lane1.onboards().len(), 1);
+        assert_eq!(lane1.onboards()[0].destination_block_ids, vec![5]);
+
+        leader
+            .lane_view(0)?
+            .execute_local_transfer_for_resource(
+                resource,
+                LogicalLayoutHandle::G2,
+                LogicalLayoutHandle::G1,
+                vec![1],
+                vec![2],
+                TransferOptions::default(),
+            )?
+            .await?;
+        assert_eq!(lane0.onboards().len(), 1);
+        assert_eq!(lane1.onboards().len(), 1);
+
+        // Each lane has the worker count of lane 0.
+        let unequal = build(
+            vec![
+                vec![Arc::new(RecordingParallelWorkers::default()) as Arc<dyn Worker>],
+                Vec::new(),
+            ],
+            create_messenger_tcp().await?,
+        );
+        assert!(unequal.is_err());
+        Ok(())
+    }
+
     /// Regression: `import_remote_metadata` must run `connect_remote` (and await
     /// its worker-import awaiter) even when `has_remote_metadata` already
     /// reports `true`. Pre-fix, `connect_remote` inserted the leader-side
