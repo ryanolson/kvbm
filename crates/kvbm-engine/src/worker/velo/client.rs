@@ -76,6 +76,7 @@ impl VeloWorkerClient {
             bounce_buffer_handle: None,
             bounce_buffer_block_ids: None,
             metric_route: options.metric_route,
+            copy_engine: options.copy_engine.into(),
         };
 
         // Create the message
@@ -206,6 +207,7 @@ impl WorkerTransfers for VeloWorkerClient {
             bounce_buffer_handle: None,
             bounce_buffer_block_ids: None,
             metric_route: options.metric_route,
+            copy_engine: options.copy_engine.into(),
         };
 
         let message = RemoteOnboardMessage {
@@ -261,6 +263,7 @@ impl WorkerTransfers for VeloWorkerClient {
             bounce_buffer_handle: None,
             bounce_buffer_block_ids: None,
             metric_route: options.metric_route,
+            copy_engine: options.copy_engine.into(),
         };
 
         let message = RemoteOffloadMessage {

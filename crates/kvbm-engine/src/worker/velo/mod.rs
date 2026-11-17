@@ -99,6 +99,39 @@ struct SerializableTransferOptions {
     bounce_buffer_handle: Option<LayoutHandle>,
     bounce_buffer_block_ids: Option<Vec<BlockId>>,
     metric_route: Option<KvbmTransferRoute>,
+    /// The CUDA copy primitive that the sender selected. A message without
+    /// the field lets the receiver choose.
+    #[serde(default)]
+    copy_engine: WireCopyEngine,
+}
+
+/// The wire form of [`CopyEngine`].
+#[derive(Serialize, Deserialize, Clone, Copy, Default)]
+enum WireCopyEngine {
+    #[default]
+    Auto,
+    VectorizedKernel,
+    MemcpyBatch,
+}
+
+impl From<CopyEngine> for WireCopyEngine {
+    fn from(engine: CopyEngine) -> Self {
+        match engine {
+            CopyEngine::Auto => Self::Auto,
+            CopyEngine::VectorizedKernel => Self::VectorizedKernel,
+            CopyEngine::MemcpyBatch => Self::MemcpyBatch,
+        }
+    }
+}
+
+impl From<WireCopyEngine> for CopyEngine {
+    fn from(engine: WireCopyEngine) -> Self {
+        match engine {
+            WireCopyEngine::Auto => Self::Auto,
+            WireCopyEngine::VectorizedKernel => Self::VectorizedKernel,
+            WireCopyEngine::MemcpyBatch => Self::MemcpyBatch,
+        }
+    }
 }
 
 impl From<SerializableTransferOptions> for TransferOptions {
@@ -122,9 +155,7 @@ impl From<SerializableTransferOptions> for TransferOptions {
             // cross-leader case (Universal↔Universal under c3 semantics
             // → requires_transform = false → auto-promote never fires).
             use_planner: false,
-            // copy_engine is likewise not serialized; the receiver picks
-            // its own CUDA copy primitive.
-            copy_engine: CopyEngine::Auto,
+            copy_engine: opts.copy_engine.into(),
         }
     }
 }
@@ -156,6 +187,7 @@ impl From<TransferOptions> for SerializableTransferOptions {
             bounce_buffer_handle,
             bounce_buffer_block_ids,
             metric_route: opts.metric_route,
+            copy_engine: opts.copy_engine.into(),
         }
     }
 }
@@ -201,6 +233,7 @@ mod local_transfer_message_tests {
                 bounce_buffer_handle: None,
                 bounce_buffer_block_ids: None,
                 metric_route: None,
+                copy_engine: WireCopyEngine::Auto,
             },
         }
     }

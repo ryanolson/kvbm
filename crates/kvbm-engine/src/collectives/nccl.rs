@@ -375,6 +375,51 @@ impl NcclCollectives {
         .map(|collectives| collectives.into_iter().map(Arc::new).collect())
     }
 
+    /// Initialize the communicators of the ranks that this process holds, in
+    /// a group that has ranks in other processes too.
+    ///
+    /// The leader of the group generates `bootstrap` and sends it to each
+    /// process. `ncclCommInitRankConfig` is collective, so each process must
+    /// make this call at the same point of its startup: the call returns
+    /// only after every rank of the group joined. `workers` holds one or
+    /// more ranks of the group, each rank one time.
+    pub fn from_worker_subgroup(
+        bootstrap: &NcclBootstrap,
+        workers: &[Arc<crate::worker::PhysicalWorker>],
+        runtime: &crate::KvbmRuntime,
+    ) -> Result<Vec<Arc<Self>>> {
+        ensure!(!workers.is_empty(), "NCCL subgroup has no workers");
+        let mut seen = std::collections::BTreeSet::new();
+        for (position, worker) in workers.iter().enumerate() {
+            let rank = worker
+                .rank()
+                .with_context(|| format!("NCCL worker at position {position} has no rank"))?;
+            ensure!(
+                rank < bootstrap.world_size(),
+                "NCCL worker rank {rank} is outside the bootstrap world size {}",
+                bootstrap.world_size()
+            );
+            ensure!(seen.insert(rank), "NCCL subgroup repeats rank {rank}");
+        }
+
+        initialize_rank_group(
+            workers.len(),
+            NCCL_INIT_TIMEOUT,
+            |position, cancelled, deadline| {
+                Self::from_worker_bootstrap_with_cancel(
+                    bootstrap,
+                    Arc::clone(&workers[position]),
+                    runtime,
+                    cancelled,
+                    deadline,
+                )
+                .with_context(|| format!("initialize KVBM NCCL subgroup position {position}"))
+            },
+            |collective, reason| collective.abort(reason),
+        )
+        .map(|collectives| collectives.into_iter().map(Arc::new).collect())
+    }
+
     // =========================================================================
     // Path B: Borrow existing communicator (production use with Python/C/C++)
     // =========================================================================
