@@ -35,6 +35,7 @@ impl<T: PolicyG1SourceMetadata> PolicyG1G2BoundRoute<T> {
         );
         Ok(crate::p2p::g1_source::G1SessionSource::new(
             self.core.resource,
+            self.core.lane,
             self.core.capacity.manager_id(),
             Arc::downgrade(manager),
             self,

@@ -33,6 +33,11 @@ pub struct VeloWorkerService {
     /// bounce buffers, and object operations remain owned by `worker`.
     #[builder(default)]
     transfers: Option<Arc<dyn WorkerTransfers>>,
+    /// The id of this worker in a process that serves two or more workers on
+    /// one messenger. `None` is the one worker of a process, with the plain
+    /// handler names.
+    #[builder(default)]
+    worker_id: Option<u64>,
 }
 
 impl VeloWorkerService {
@@ -41,9 +46,41 @@ impl VeloWorkerService {
             messenger,
             worker,
             transfers: None,
+            worker_id: None,
         };
         service.register_handlers()?;
         Ok(service)
+    }
+
+    /// Construct the service of worker `worker_id` in a process that serves
+    /// two or more workers on one messenger. Each worker registers its own
+    /// handlers, and
+    /// [`VeloWorkerClient::new_for_worker`](super::VeloWorkerClient::new_for_worker)
+    /// with the same id reaches this worker. `transfers` is the optional
+    /// transfer policy of [`Self::new_with_transfers`].
+    pub fn new_for_worker(
+        messenger: Arc<Messenger>,
+        worker_id: u64,
+        worker: Arc<DirectWorker>,
+        transfers: Option<Arc<dyn WorkerTransfers>>,
+    ) -> Result<Self> {
+        let service = Self {
+            messenger,
+            worker,
+            transfers,
+            worker_id: Some(worker_id),
+        };
+        service.register_handlers()?;
+        Ok(service)
+    }
+
+    /// The id of this worker, if its process serves two or more workers.
+    pub fn worker_id(&self) -> Option<u64> {
+        self.worker_id
+    }
+
+    fn handler_name(&self, name: &str) -> String {
+        handler_names::scoped(name, self.worker_id)
     }
 
     /// Construct a service with a transfer policy layered over the physical
@@ -57,6 +94,7 @@ impl VeloWorkerService {
             messenger,
             worker,
             transfers: Some(transfers),
+            worker_id: None,
         };
         service.register_handlers()?;
         Ok(service)
@@ -100,8 +138,9 @@ impl VeloWorkerService {
 
     fn register_abort_local_collectives_handler(&self) -> Result<()> {
         let transfers = self.transfers();
-        let handler =
-            Handler::unary_handler_async(handler_names::ABORT_LOCAL_COLLECTIVES, move |ctx| {
+        let handler = Handler::unary_handler_async(
+            self.handler_name(handler_names::ABORT_LOCAL_COLLECTIVES),
+            move |ctx| {
                 let transfers = Arc::clone(&transfers);
                 async move {
                     let message: AbortLocalCollectivesMessage =
@@ -109,16 +148,18 @@ impl VeloWorkerService {
                     transfers.abort_local_collectives(message.reason)?.await?;
                     Ok(Some(Bytes::new()))
                 }
-            })
-            .build();
+            },
+        )
+        .build();
         self.messenger.register_handler(handler)?;
         Ok(())
     }
 
     fn register_host_payload_digests_handler(&self) -> Result<()> {
         let worker = Arc::clone(&self.worker);
-        let handler =
-            Handler::unary_handler_async(handler_names::HOST_PAYLOAD_DIGESTS, move |ctx| {
+        let handler = Handler::unary_handler_async(
+            self.handler_name(handler_names::HOST_PAYLOAD_DIGESTS),
+            move |ctx| {
                 let worker = Arc::clone(&worker);
                 async move {
                     let message: HostPayloadDigestsMessage = serde_json::from_slice(&ctx.payload)?;
@@ -127,8 +168,9 @@ impl VeloWorkerService {
                         .await?;
                     Ok(Some(Bytes::from(serde_json::to_vec(&digests)?)))
                 }
-            })
-            .build();
+            },
+        )
+        .build();
         self.messenger.register_handler(handler)?;
         Ok(())
     }
@@ -138,47 +180,50 @@ impl VeloWorkerService {
         let physical_worker = self.worker.clone();
 
         // Use unary_handler_async for explicit response (client waits for transfer completion)
-        let handler = Handler::unary_handler_async(handler_names::LOCAL_TRANSFER, move |ctx| {
-            let transfers = transfers.clone();
-            let physical_worker = physical_worker.clone();
+        let handler = Handler::unary_handler_async(
+            self.handler_name(handler_names::LOCAL_TRANSFER),
+            move |ctx| {
+                let transfers = transfers.clone();
+                let physical_worker = physical_worker.clone();
 
-            async move {
-                // Deserialize the message
-                let message: LocalTransferMessage = serde_json::from_slice(&ctx.payload)?;
+                async move {
+                    // Deserialize the message
+                    let message: LocalTransferMessage = serde_json::from_slice(&ctx.payload)?;
 
-                // Convert options and resolve bounce buffer if present
-                let bounce_buffer_parts = message.options.bounce_buffer_parts();
-                let mut options: TransferOptions = message.options.into();
-                if let Some((handle, block_ids)) = bounce_buffer_parts {
-                    options.bounce_buffer =
-                        Some(physical_worker.create_bounce_buffer(handle, block_ids)?);
+                    // Convert options and resolve bounce buffer if present
+                    let bounce_buffer_parts = message.options.bounce_buffer_parts();
+                    let mut options: TransferOptions = message.options.into();
+                    if let Some((handle, block_ids)) = bounce_buffer_parts {
+                        options.bounce_buffer =
+                            Some(physical_worker.create_bounce_buffer(handle, block_ids)?);
+                    }
+
+                    let notification = match message.resource {
+                        Some(resource) => transfers.execute_local_transfer_for_resource(
+                            resource,
+                            message.src,
+                            message.dst,
+                            Arc::from(message.src_block_ids),
+                            Arc::from(message.dst_block_ids),
+                            options,
+                        )?,
+                        None => transfers.execute_local_transfer(
+                            message.src,
+                            message.dst,
+                            Arc::from(message.src_block_ids),
+                            Arc::from(message.dst_block_ids),
+                            options,
+                        )?,
+                    };
+
+                    // Await the transfer completion
+                    notification.await?;
+
+                    // Return empty response to signal success
+                    Ok(Some(Bytes::new()))
                 }
-
-                let notification = match message.resource {
-                    Some(resource) => transfers.execute_local_transfer_for_resource(
-                        resource,
-                        message.src,
-                        message.dst,
-                        Arc::from(message.src_block_ids),
-                        Arc::from(message.dst_block_ids),
-                        options,
-                    )?,
-                    None => transfers.execute_local_transfer(
-                        message.src,
-                        message.dst,
-                        Arc::from(message.src_block_ids),
-                        Arc::from(message.dst_block_ids),
-                        options,
-                    )?,
-                };
-
-                // Await the transfer completion
-                notification.await?;
-
-                // Return empty response to signal success
-                Ok(Some(Bytes::new()))
-            }
-        })
+            },
+        )
         .build();
 
         self.messenger.register_handler(handler)?;
@@ -190,33 +235,36 @@ impl VeloWorkerService {
         let physical_worker = self.worker.clone();
 
         // Use unary_handler_async for explicit response (works with unary client)
-        let handler = Handler::unary_handler_async(handler_names::REMOTE_ONBOARD, move |ctx| {
-            let transfers = transfers.clone();
-            let physical_worker = physical_worker.clone();
+        let handler = Handler::unary_handler_async(
+            self.handler_name(handler_names::REMOTE_ONBOARD),
+            move |ctx| {
+                let transfers = transfers.clone();
+                let physical_worker = physical_worker.clone();
 
-            async move {
-                let message: RemoteOnboardMessage = serde_json::from_slice(&ctx.payload)?;
+                async move {
+                    let message: RemoteOnboardMessage = serde_json::from_slice(&ctx.payload)?;
 
-                // Convert options and resolve bounce buffer if present
-                let bounce_buffer_parts = message.options.bounce_buffer_parts();
-                let mut options: TransferOptions = message.options.into();
-                if let Some((handle, block_ids)) = bounce_buffer_parts {
-                    options.bounce_buffer =
-                        Some(physical_worker.create_bounce_buffer(handle, block_ids)?);
+                    // Convert options and resolve bounce buffer if present
+                    let bounce_buffer_parts = message.options.bounce_buffer_parts();
+                    let mut options: TransferOptions = message.options.into();
+                    if let Some((handle, block_ids)) = bounce_buffer_parts {
+                        options.bounce_buffer =
+                            Some(physical_worker.create_bounce_buffer(handle, block_ids)?);
+                    }
+
+                    let notification = transfers.execute_remote_onboard(
+                        message.src,
+                        message.dst,
+                        Arc::from(message.dst_block_ids),
+                        options,
+                    )?;
+
+                    notification.await?;
+
+                    Ok(Some(Bytes::new()))
                 }
-
-                let notification = transfers.execute_remote_onboard(
-                    message.src,
-                    message.dst,
-                    Arc::from(message.dst_block_ids),
-                    options,
-                )?;
-
-                notification.await?;
-
-                Ok(Some(Bytes::new()))
-            }
-        })
+            },
+        )
         .build();
 
         self.messenger.register_handler(handler)?;
@@ -228,33 +276,36 @@ impl VeloWorkerService {
         let physical_worker = self.worker.clone();
 
         // Use unary_handler_async for explicit response (works with unary client)
-        let handler = Handler::unary_handler_async(handler_names::REMOTE_OFFLOAD, move |ctx| {
-            let transfers = transfers.clone();
-            let physical_worker = physical_worker.clone();
+        let handler = Handler::unary_handler_async(
+            self.handler_name(handler_names::REMOTE_OFFLOAD),
+            move |ctx| {
+                let transfers = transfers.clone();
+                let physical_worker = physical_worker.clone();
 
-            async move {
-                let message: RemoteOffloadMessage = serde_json::from_slice(&ctx.payload)?;
+                async move {
+                    let message: RemoteOffloadMessage = serde_json::from_slice(&ctx.payload)?;
 
-                // Convert options and resolve bounce buffer if present
-                let bounce_buffer_parts = message.options.bounce_buffer_parts();
-                let mut options: TransferOptions = message.options.into();
-                if let Some((handle, block_ids)) = bounce_buffer_parts {
-                    options.bounce_buffer =
-                        Some(physical_worker.create_bounce_buffer(handle, block_ids)?);
+                    // Convert options and resolve bounce buffer if present
+                    let bounce_buffer_parts = message.options.bounce_buffer_parts();
+                    let mut options: TransferOptions = message.options.into();
+                    if let Some((handle, block_ids)) = bounce_buffer_parts {
+                        options.bounce_buffer =
+                            Some(physical_worker.create_bounce_buffer(handle, block_ids)?);
+                    }
+
+                    let notification = transfers.execute_remote_offload(
+                        message.src,
+                        Arc::from(message.src_block_ids),
+                        message.dst,
+                        options,
+                    )?;
+
+                    notification.await?;
+
+                    Ok(Some(Bytes::new()))
                 }
-
-                let notification = transfers.execute_remote_offload(
-                    message.src,
-                    Arc::from(message.src_block_ids),
-                    message.dst,
-                    options,
-                )?;
-
-                notification.await?;
-
-                Ok(Some(Bytes::new()))
-            }
-        })
+            },
+        )
         .build();
 
         self.messenger.register_handler(handler)?;
@@ -264,11 +315,14 @@ impl VeloWorkerService {
     fn register_import_metadata_handler(&self) -> Result<()> {
         let worker = self.worker.clone();
 
-        let handler = Handler::unary_handler(handler_names::IMPORT_METADATA, move |ctx| {
-            let metadata = SerializedLayout::from_bytes(ctx.payload.to_vec());
-            let handles = worker.import_metadata(metadata)?;
-            Ok(Some(Bytes::from(serde_json::to_vec(&handles)?)))
-        })
+        let handler = Handler::unary_handler(
+            self.handler_name(handler_names::IMPORT_METADATA),
+            move |ctx| {
+                let metadata = SerializedLayout::from_bytes(ctx.payload.to_vec());
+                let handles = worker.import_metadata(metadata)?;
+                Ok(Some(Bytes::from(serde_json::to_vec(&handles)?)))
+            },
+        )
         .build();
 
         self.messenger.register_handler(handler)?;
@@ -278,10 +332,13 @@ impl VeloWorkerService {
     fn register_export_metadata_handler(&self) -> Result<()> {
         let worker = self.worker.clone();
 
-        let handler = Handler::unary_handler(handler_names::EXPORT_METADATA, move |_ctx| {
-            let response = worker.export_metadata()?;
-            Ok(Some(Bytes::from(response.as_bytes().to_vec())))
-        })
+        let handler = Handler::unary_handler(
+            self.handler_name(handler_names::EXPORT_METADATA),
+            move |_ctx| {
+                let response = worker.export_metadata()?;
+                Ok(Some(Bytes::from(response.as_bytes().to_vec())))
+            },
+        )
         .build();
 
         self.messenger.register_handler(handler)?;
@@ -292,22 +349,25 @@ impl VeloWorkerService {
     fn register_connect_remote_handler(&self) -> Result<()> {
         let worker = self.worker.clone();
 
-        let handler = Handler::unary_handler(handler_names::CONNECT_REMOTE, move |ctx| {
-            let message: ConnectRemoteMessage = serde_json::from_slice(&ctx.payload)?;
+        let handler = Handler::unary_handler(
+            self.handler_name(handler_names::CONNECT_REMOTE),
+            move |ctx| {
+                let message: ConnectRemoteMessage = serde_json::from_slice(&ctx.payload)?;
 
-            // Deserialize metadata (SerializedLayout stored as raw bytes)
-            let metadata: Vec<SerializedLayout> = message
-                .metadata
-                .into_iter()
-                .map(SerializedLayout::from_bytes)
-                .collect();
+                // Deserialize metadata (SerializedLayout stored as raw bytes)
+                let metadata: Vec<SerializedLayout> = message
+                    .metadata
+                    .into_iter()
+                    .map(SerializedLayout::from_bytes)
+                    .collect();
 
-            // Call DirectWorker.connect_remote()
-            worker.connect_remote(message.instance_id, metadata)?;
+                // Call DirectWorker.connect_remote()
+                worker.connect_remote(message.instance_id, metadata)?;
 
-            // Return empty response to signal success
-            Ok(Some(Bytes::new()))
-        })
+                // Return empty response to signal success
+                Ok(Some(Bytes::new()))
+            },
+        )
         .build();
 
         self.messenger.register_handler(handler)?;
@@ -319,8 +379,9 @@ impl VeloWorkerService {
         let transfers = self.transfers();
         let physical_worker = self.worker.clone();
 
-        let handler =
-            Handler::unary_handler_async(handler_names::REMOTE_ONBOARD_FOR_INSTANCE, move |ctx| {
+        let handler = Handler::unary_handler_async(
+            self.handler_name(handler_names::REMOTE_ONBOARD_FOR_INSTANCE),
+            move |ctx| {
                 let transfers = transfers.clone();
                 let physical_worker = physical_worker.clone();
                 async move {
@@ -347,8 +408,9 @@ impl VeloWorkerService {
                     notification.await?;
                     Ok(Some(Bytes::new()))
                 }
-            })
-            .build();
+            },
+        )
+        .build();
 
         self.messenger.register_handler(handler)?;
         Ok(())
@@ -361,7 +423,7 @@ impl VeloWorkerService {
         let physical_worker = self.worker.clone();
 
         let handler = Handler::unary_handler_async(
-            handler_names::REMOTE_ONBOARD_FOR_INSTANCE_RANK,
+            self.handler_name(handler_names::REMOTE_ONBOARD_FOR_INSTANCE_RANK),
             move |ctx| {
                 let transfers = transfers.clone();
                 let physical_worker = physical_worker.clone();
@@ -402,15 +464,18 @@ impl VeloWorkerService {
     fn register_execute_remote_pull_plan_handler(&self) -> Result<()> {
         let transfers = self.transfers();
 
-        let handler = Handler::unary_handler_async(handler_names::REMOTE_PULL_PLAN, move |ctx| {
-            let transfers = transfers.clone();
-            async move {
-                let message: RemotePullPlanMessage = serde_json::from_slice(&ctx.payload)?;
-                let notification = transfers.execute_remote_pull_plan(message.plan)?;
-                notification.await?;
-                Ok(Some(Bytes::new()))
-            }
-        })
+        let handler = Handler::unary_handler_async(
+            self.handler_name(handler_names::REMOTE_PULL_PLAN),
+            move |ctx| {
+                let transfers = transfers.clone();
+                async move {
+                    let message: RemotePullPlanMessage = serde_json::from_slice(&ctx.payload)?;
+                    let notification = transfers.execute_remote_pull_plan(message.plan)?;
+                    notification.await?;
+                    Ok(Some(Bytes::new()))
+                }
+            },
+        )
         .build();
 
         self.messenger.register_handler(handler)?;
@@ -425,19 +490,22 @@ impl VeloWorkerService {
     fn register_object_has_blocks_handler(&self) -> Result<()> {
         let worker = self.worker.clone();
 
-        let handler = Handler::unary_handler_async(handler_names::OBJECT_HAS_BLOCKS, move |ctx| {
-            let worker = worker.clone();
+        let handler = Handler::unary_handler_async(
+            self.handler_name(handler_names::OBJECT_HAS_BLOCKS),
+            move |ctx| {
+                let worker = worker.clone();
 
-            async move {
-                let message: ObjectHasBlocksMessage = serde_json::from_slice(&ctx.payload)?;
+                async move {
+                    let message: ObjectHasBlocksMessage = serde_json::from_slice(&ctx.payload)?;
 
-                // Call DirectWorker's ObjectBlockOps implementation
-                let results = worker.has_blocks(message.keys).await;
+                    // Call DirectWorker's ObjectBlockOps implementation
+                    let results = worker.has_blocks(message.keys).await;
 
-                let response = ObjectHasBlocksResponse { results };
-                Ok(Some(Bytes::from(serde_json::to_vec(&response)?)))
-            }
-        })
+                    let response = ObjectHasBlocksResponse { results };
+                    Ok(Some(Bytes::from(serde_json::to_vec(&response)?)))
+                }
+            },
+        )
         .build();
 
         self.messenger.register_handler(handler)?;
@@ -448,22 +516,25 @@ impl VeloWorkerService {
     fn register_object_put_blocks_handler(&self) -> Result<()> {
         let worker = self.worker.clone();
 
-        let handler = Handler::unary_handler_async(handler_names::OBJECT_PUT_BLOCKS, move |ctx| {
-            let worker = worker.clone();
+        let handler = Handler::unary_handler_async(
+            self.handler_name(handler_names::OBJECT_PUT_BLOCKS),
+            move |ctx| {
+                let worker = worker.clone();
 
-            async move {
-                let message: ObjectPutBlocksMessage = serde_json::from_slice(&ctx.payload)?;
+                async move {
+                    let message: ObjectPutBlocksMessage = serde_json::from_slice(&ctx.payload)?;
 
-                // Call DirectWorker's ObjectBlockOps implementation
-                // DirectWorker resolves logical handle to physical layout internally
-                let results = worker
-                    .put_blocks(message.keys, message.layout, message.block_ids)
-                    .await;
+                    // Call DirectWorker's ObjectBlockOps implementation
+                    // DirectWorker resolves logical handle to physical layout internally
+                    let results = worker
+                        .put_blocks(message.keys, message.layout, message.block_ids)
+                        .await;
 
-                let response = ObjectPutGetBlocksResponse::from_results(results);
-                Ok(Some(Bytes::from(serde_json::to_vec(&response)?)))
-            }
-        })
+                    let response = ObjectPutGetBlocksResponse::from_results(results);
+                    Ok(Some(Bytes::from(serde_json::to_vec(&response)?)))
+                }
+            },
+        )
         .build();
 
         self.messenger.register_handler(handler)?;
@@ -474,22 +545,25 @@ impl VeloWorkerService {
     fn register_object_get_blocks_handler(&self) -> Result<()> {
         let worker = self.worker.clone();
 
-        let handler = Handler::unary_handler_async(handler_names::OBJECT_GET_BLOCKS, move |ctx| {
-            let worker = worker.clone();
+        let handler = Handler::unary_handler_async(
+            self.handler_name(handler_names::OBJECT_GET_BLOCKS),
+            move |ctx| {
+                let worker = worker.clone();
 
-            async move {
-                let message: ObjectGetBlocksMessage = serde_json::from_slice(&ctx.payload)?;
+                async move {
+                    let message: ObjectGetBlocksMessage = serde_json::from_slice(&ctx.payload)?;
 
-                // Call DirectWorker's ObjectBlockOps implementation
-                // DirectWorker resolves logical handle to physical layout internally
-                let results = worker
-                    .get_blocks(message.keys, message.layout, message.block_ids)
-                    .await;
+                    // Call DirectWorker's ObjectBlockOps implementation
+                    // DirectWorker resolves logical handle to physical layout internally
+                    let results = worker
+                        .get_blocks(message.keys, message.layout, message.block_ids)
+                        .await;
 
-                let response = ObjectPutGetBlocksResponse::from_results(results);
-                Ok(Some(Bytes::from(serde_json::to_vec(&response)?)))
-            }
-        })
+                    let response = ObjectPutGetBlocksResponse::from_results(results);
+                    Ok(Some(Bytes::from(serde_json::to_vec(&response)?)))
+                }
+            },
+        )
         .build();
 
         self.messenger.register_handler(handler)?;

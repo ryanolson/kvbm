@@ -2243,6 +2243,106 @@ mod integration_tests {
         // Both managers should see the registered block count in shared registry
         assert!(registry.is_registered(seq_hash));
     }
+
+    /// Two managers of one tier type share a registry, as the device pools
+    /// of two data-parallel lanes do. The registry keeps the residency of
+    /// each lane apart, and a third tier (the host pool) is shared.
+    #[test]
+    fn lanes_of_one_tier_keep_their_presence_apart_on_a_shared_registry() {
+        let tracker = FrequencyTrackingCapacity::Medium.create_tracker();
+        let registry = BlockRegistry::builder().frequency_tracker(tracker).build();
+
+        #[derive(Clone, Debug)]
+        struct G1;
+
+        #[derive(Clone, Debug)]
+        struct G2;
+
+        let build_g1 = |lane: Option<u8>| {
+            let builder = BlockManager::<G1>::builder()
+                .block_count(8)
+                .block_size(4)
+                .registry(registry.clone())
+                .with_multi_lru_backend();
+            let builder = match lane {
+                Some(lane) => builder.lane(lane),
+                None => builder,
+            };
+            builder.build().expect("Should build a G1 manager")
+        };
+        let lane0 = build_g1(None);
+        let lane1 = build_g1(Some(1));
+        let g2 = BlockManager::<G2>::builder()
+            .block_count(8)
+            .block_size(4)
+            .registry(registry.clone())
+            .with_multi_lru_backend()
+            .build()
+            .expect("Should build the G2 manager");
+        assert_eq!(lane0.lane(), 0);
+        assert_eq!(lane1.lane(), 1);
+        assert_eq!(g2.lane(), 0);
+
+        let token_block = create_test_token_block_from_iota(7000);
+        let seq_hash = token_block.kvbm_sequence_hash();
+        let register_g1 = |manager: &BlockManager<G1>| {
+            let complete = manager
+                .allocate_blocks(1)
+                .expect("Should allocate")
+                .into_iter()
+                .next()
+                .unwrap()
+                .complete(&token_block)
+                .expect("Should complete");
+            manager.register_blocks(vec![complete])
+        };
+
+        // Lane 0 registers the block on its device pool.
+        let held0 = register_g1(&lane0);
+        let handle = registry
+            .match_sequence_hash(seq_hash, false)
+            .expect("the hash is registered");
+        assert!(handle.has_block_in_lane::<G1>(0));
+        assert!(!handle.has_block_in_lane::<G1>(1));
+        assert!(handle.has_block::<G1>());
+        assert_eq!(
+            registry.check_presence_in_lane::<G1>(1, &[seq_hash]),
+            vec![(seq_hash, false)]
+        );
+        // The store of lane 1 does not serve a block of lane 0.
+        assert!(lane1.match_prefix(&[seq_hash], false).is_empty());
+        assert_eq!(lane0.match_prefix(&[seq_hash], false).len(), 1);
+
+        // The host pool is one tier for both lanes.
+        let complete = g2
+            .allocate_blocks(1)
+            .expect("Should allocate")
+            .into_iter()
+            .next()
+            .unwrap()
+            .complete(&token_block)
+            .expect("Should complete");
+        let _host = g2.register_blocks(vec![complete]);
+        assert!(handle.has_block::<G2>());
+        assert_eq!(g2.match_prefix(&[seq_hash], false).len(), 1);
+
+        // Lane 1 registers the same content on its own device pool.
+        let held1 = register_g1(&lane1);
+        assert!(handle.has_block_in_lane::<G1>(1));
+        assert_eq!(lane1.match_prefix(&[seq_hash], false).len(), 1);
+
+        // The residency of one lane ends, and the other lane keeps its own.
+        drop(held0);
+        let evicted = lane0
+            .allocate_blocks(8)
+            .expect("Should evict the inactive block");
+        assert_eq!(evicted.len(), 8);
+        assert!(!handle.has_block_in_lane::<G1>(0));
+        assert!(handle.has_block_in_lane::<G1>(1));
+        assert!(handle.has_block::<G1>());
+        assert!(handle.has_block::<G2>());
+        drop(held1);
+    }
 }
 
 mod capacity_lifecycle_tests {

@@ -223,6 +223,31 @@ impl BlockRegistry {
     }
 
     /// Check presence of sequence hashes for blocks with any of the specified metadata types.
+    /// Check presence of sequence hashes for tier `T` in one execution lane.
+    ///
+    /// Managers of the same tier type on one registry report their slots in
+    /// the lane that each one was built with. [`Self::check_presence`]
+    /// answers for all lanes together. The consistency rules of
+    /// [`Self::check_presence`] apply.
+    ///
+    /// Does NOT trigger frequency tracking.
+    pub fn check_presence_in_lane<T: crate::blocks::BlockMetadata>(
+        &self,
+        lane: u8,
+        seq_hashes: &[SequenceHash],
+    ) -> Vec<(SequenceHash, bool)> {
+        seq_hashes
+            .iter()
+            .map(|&seq_hash| {
+                let present = self
+                    .match_sequence_hash(seq_hash, false)
+                    .map(|handle| handle.has_block_in_lane::<T>(lane))
+                    .unwrap_or(false);
+                (seq_hash, present)
+            })
+            .collect()
+    }
+
     /// Returns `Vec<(SequenceHash, bool)>` where `bool` is true if a block
     /// exists for at least one of the supplied tier `TypeId`s.
     ///

@@ -255,7 +255,7 @@ async fn find_phase(
     tiers: TierSelection,
 ) -> Result<FindOutcome, ControlError> {
     let mut pins = if tiers.g1 {
-        leader.g1_source(resource).and_then(|source| source.pins())
+        leader.g1_pins(resource)
     } else {
         None
     };

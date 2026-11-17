@@ -65,6 +65,20 @@ pub(crate) mod handler_names {
     pub const OBJECT_HAS_BLOCKS: &str = "kvbm.worker.object_has_blocks";
     pub const OBJECT_PUT_BLOCKS: &str = "kvbm.worker.object_put_blocks";
     pub const OBJECT_GET_BLOCKS: &str = "kvbm.worker.object_get_blocks";
+
+    /// The handler name of `name` for one worker of a process.
+    ///
+    /// A process with one worker registers the names above as they are
+    /// (`worker` is `None`). A process that serves two or more workers on one
+    /// messenger gives each worker an id, and each worker registers its own
+    /// set of handlers under `name#id`. A client selects a worker by the same
+    /// id, so no message needs a worker field.
+    pub fn scoped(name: &str, worker: Option<u64>) -> String {
+        match worker {
+            None => name.to_string(),
+            Some(id) => format!("{name}#{id}"),
+        }
+    }
 }
 
 use super::DirectWorker;
