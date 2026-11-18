@@ -363,7 +363,7 @@ fn allocate_slab(
 ) -> ServiceResult<NodeSlab> {
     let opt = MmappedPinnedOptions {
         size,
-        numa_node: node,
+        numa_node: Some(node),
         hugepage_mode: config.hugepage_mode,
         hugepage_size: config.hugepage_size_bytes,
         ctx_device_id: config.ctx_device_id,

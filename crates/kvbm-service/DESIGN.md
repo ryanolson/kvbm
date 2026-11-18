@@ -135,6 +135,12 @@ Delivered:
   - `NumaWorkerPool::allocate_mmap_pinned_on_node` — one-shot worker
     thread pinned to the target node performs the allocation; the
     existing per-GPU CUDA-path worker pool is untouched.
+  - `MmappedPinnedOptions.numa_node = None` skips the `mbind` and the
+    thread pinning. The allocation runs on the calling thread and the OS
+    places the pages. `NumaWorkerPool::allocate_mmap_pinned` also ignores
+    the node when `DYN_MEMORY_DISABLE_NUMA` disables NUMA placement.
+    `MmappedPinnedStorage::numa_policy()` reports `Bound(node)` or
+    `OsDefault`.
 
 - **Pool (`kvbm-service::pool`)**
   - `HostMemoryPool` allocates one `NodeSlab` per host-CPU NUMA node.
