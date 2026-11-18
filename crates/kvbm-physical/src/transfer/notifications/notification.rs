@@ -95,6 +95,20 @@ impl TransferCompleteNotification {
         }
     }
 
+    /// Create a notification from a future that reports its own drain outcome.
+    ///
+    /// Use this constructor when the source of the receipt knows whether the
+    /// physical work drained, for example a worker RPC reply. The returned
+    /// receipt gives that outcome from [`Self::await_drain`] without change.
+    pub fn from_drain_future<F>(outcome: F) -> Self
+    where
+        F: Future<Output = TransferDrainOutcome> + Send + 'static,
+    {
+        Self {
+            awaiter: Either::Right(TransferAwaiter::Aggregate(Box::pin(outcome))),
+        }
+    }
+
     // /// Create a notification from a synchronous active message result.
     // pub fn from_sync_result(sync: SyncResult) -> Self {
     //     Self {
@@ -286,6 +300,32 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn drain_future_preserves_its_outcome() {
+        let drained = TransferCompleteNotification::from_drain_future(async {
+            TransferDrainOutcome::DrainedWithError(anyhow!("clean failure"))
+        });
+        assert!(drained.could_yield());
+        assert!(matches!(
+            drained.await_drain().await,
+            TransferDrainOutcome::DrainedWithError(_)
+        ));
+
+        let unproven = TransferCompleteNotification::from_drain_future(async {
+            TransferDrainOutcome::Unproven(anyhow!("lost reply"))
+        });
+        assert!(matches!(
+            unproven.await_drain().await,
+            TransferDrainOutcome::Unproven(_)
+        ));
+
+        let failed = TransferCompleteNotification::from_drain_future(async {
+            TransferDrainOutcome::Unproven(anyhow!("lost reply"))
+        });
+        let error = failed.await.expect_err("an unproven outcome is a failure");
+        assert!(error.to_string().contains("lost reply"));
     }
 
     #[tokio::test]

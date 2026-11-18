@@ -64,10 +64,6 @@ impl VeloWorkerClient {
         {
             anyhow::bail!("local collective transfer group is aborted: {reason}");
         }
-        // Create a single local event for this operation
-        let event = self.messenger.events().new_event()?;
-        let awaiter = self.messenger.events().awaiter(event.handle())?;
-
         // Convert to serializable options
         // TODO: Extract bounce buffer handle if present in options.bounce_buffer
         let options = SerializableTransferOptions {
@@ -95,28 +91,49 @@ impl VeloWorkerClient {
         let velo = self.messenger.clone();
         let remote_instance = self.remote;
 
+        // The task sends the drain outcome of this operation to the receipt.
+        let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+
         // Use unary (not am_sync) to wait for transfer completion
         self.messenger.tracker().spawn_on(
             async move {
-                let result = velo
-                    .unary(&handler_names::scoped(
-                        handler_names::LOCAL_TRANSFER,
-                        worker_id,
-                    ))?
-                    .raw_payload(bytes)
-                    .instance(remote_instance)
-                    .send()
-                    .await;
-
-                match result {
-                    Ok(_) => event.trigger(),
-                    Err(e) => event.poison(e.to_string()),
-                }
+                let handler = handler_names::scoped(handler_names::LOCAL_TRANSFER, worker_id);
+                let outcome = match velo.unary(&handler) {
+                    Ok(request) => {
+                        let reply = request
+                            .raw_payload(bytes)
+                            .instance(remote_instance)
+                            .send()
+                            .await;
+                        match reply {
+                            Ok(reply) => LocalTransferReply::decode(&reply),
+                            // The request can be with the worker, and the
+                            // worker can have an active copy. The outcome is
+                            // unknown.
+                            Err(error) => TransferDrainOutcome::Unproven(anyhow::anyhow!(
+                                "local transfer RPC has an unknown outcome: {error}"
+                            )),
+                        }
+                    }
+                    // The request did not leave this process.
+                    Err(error) => TransferDrainOutcome::DrainedWithError(anyhow::anyhow!(
+                        "local transfer RPC was not sent: {error}"
+                    )),
+                };
+                let _ = outcome_tx.send(outcome);
             },
             self.messenger.runtime(),
         );
 
-        Ok(TransferCompleteNotification::from_awaiter(awaiter))
+        Ok(TransferCompleteNotification::from_drain_future(
+            async move {
+                outcome_rx.await.unwrap_or_else(|_| {
+                    TransferDrainOutcome::Unproven(anyhow::anyhow!(
+                        "local transfer RPC task stopped before it reported an outcome"
+                    ))
+                })
+            },
+        ))
     }
 }
 
@@ -1113,6 +1130,87 @@ mod tests {
         transfer(VeloWorkerClient::new(Arc::clone(&pair.messenger_a), remote))?.await?;
         assert_eq!(counts(), [1, 1, 1]);
         Ok(())
+    }
+
+    /// The outcome of a failed RPC is unknown, because the worker can have an
+    /// active copy. A reply carries the drain outcome of the worker.
+    #[tokio::test]
+    async fn a_local_transfer_receipt_separates_unknown_and_drained_failures() -> Result<()> {
+        let pair = crate::testing::messenger::create_messenger_pair_tcp().await?;
+        let rpc_error = ::velo::Handler::unary_handler_async(
+            handler_names::scoped(handler_names::LOCAL_TRANSFER, Some(1)),
+            |_ctx| async { Err::<Option<Bytes>, _>(anyhow::anyhow!("injected RPC failure")) },
+        )
+        .build();
+        pair.messenger_b.register_handler(rpc_error)?;
+        let drained = ::velo::Handler::unary_handler_async(
+            handler_names::scoped(handler_names::LOCAL_TRANSFER, Some(2)),
+            |_ctx| async {
+                let reply = LocalTransferReply::DrainedWithError {
+                    error: "injected drained failure".to_string(),
+                };
+                Ok(Some(Bytes::from(serde_json::to_vec(&reply)?)))
+            },
+        )
+        .build();
+        pair.messenger_b.register_handler(drained)?;
+        let remote = pair.messenger_b.instance_id();
+        let transfer = |worker_id| {
+            VeloWorkerClient::new_for_worker(Arc::clone(&pair.messenger_a), remote, worker_id)
+                .execute_local_transfer(
+                    LogicalLayoutHandle::G1,
+                    LogicalLayoutHandle::G2,
+                    Arc::<[BlockId]>::from(vec![0]),
+                    Arc::<[BlockId]>::from(vec![0]),
+                    TransferOptions::default(),
+                )
+        };
+
+        assert!(matches!(
+            transfer(1)?.await_drain().await,
+            TransferDrainOutcome::Unproven(_)
+        ));
+        match transfer(2)?.await_drain().await {
+            TransferDrainOutcome::DrainedWithError(error) => {
+                assert!(error.to_string().contains("injected drained failure"));
+            }
+            TransferDrainOutcome::Completed => panic!("the worker failure must reach the receipt"),
+            TransferDrainOutcome::Unproven(error) => {
+                panic!("the worker reply proved drain: {error:#}")
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_local_transfer_reply_keeps_the_drain_outcome() {
+        let round_trip = |outcome| {
+            let wire = serde_json::to_vec(&LocalTransferReply::from_outcome(outcome)).unwrap();
+            LocalTransferReply::decode(&wire)
+        };
+        assert!(matches!(
+            round_trip(TransferDrainOutcome::Completed),
+            TransferDrainOutcome::Completed
+        ));
+        assert!(matches!(
+            round_trip(TransferDrainOutcome::DrainedWithError(anyhow::anyhow!(
+                "drained"
+            ))),
+            TransferDrainOutcome::DrainedWithError(_)
+        ));
+        assert!(matches!(
+            round_trip(TransferDrainOutcome::Unproven(anyhow::anyhow!("unknown"))),
+            TransferDrainOutcome::Unproven(_)
+        ));
+        // A handler that does not send this type replies with no bytes on success.
+        assert!(matches!(
+            LocalTransferReply::decode(&[]),
+            TransferDrainOutcome::Completed
+        ));
+        assert!(matches!(
+            LocalTransferReply::decode(b"not a reply"),
+            TransferDrainOutcome::Unproven(_)
+        ));
     }
 
     #[test]

@@ -6,10 +6,11 @@ use kvbm_physical::manager::SerializedLayout;
 use super::{
     AbortLocalCollectivesMessage, Arc, ConnectRemoteMessage, DirectWorker,
     ExecuteRemoteOnboardForInstanceMessage, ExecuteRemoteOnboardForInstanceRankMessage,
-    HostPayloadDigestsMessage, LocalTransferMessage, ObjectGetBlocksMessage,
+    HostPayloadDigestsMessage, LocalTransferMessage, LocalTransferReply, ObjectGetBlocksMessage,
     ObjectHasBlocksMessage, ObjectHasBlocksResponse, ObjectPutBlocksMessage,
     ObjectPutGetBlocksResponse, RemoteOffloadMessage, RemoteOnboardMessage, RemotePullPlanMessage,
-    Result, TransferOptions, Worker, WorkerTransfers, handler_names,
+    Result, TransferCompleteNotification, TransferDrainOutcome, TransferOptions, Worker,
+    WorkerTransfers, handler_names,
 };
 use crate::object::ObjectBlockOps;
 
@@ -17,6 +18,44 @@ use bytes::Bytes;
 use derive_builder::Builder;
 
 use ::velo::{Handler, Messenger};
+
+/// Decode one `LOCAL_TRANSFER` request and dispatch it to `transfers`.
+///
+/// An error from this function occurs before the worker launches a physical
+/// operation.
+fn dispatch_local_transfer(
+    payload: &[u8],
+    physical_worker: &DirectWorker,
+    transfers: &dyn WorkerTransfers,
+) -> Result<TransferCompleteNotification> {
+    // Deserialize the message
+    let message: LocalTransferMessage = serde_json::from_slice(payload)?;
+
+    // Convert options and resolve bounce buffer if present
+    let bounce_buffer_parts = message.options.bounce_buffer_parts();
+    let mut options: TransferOptions = message.options.into();
+    if let Some((handle, block_ids)) = bounce_buffer_parts {
+        options.bounce_buffer = Some(physical_worker.create_bounce_buffer(handle, block_ids)?);
+    }
+
+    match message.resource {
+        Some(resource) => transfers.execute_local_transfer_for_resource(
+            resource,
+            message.src,
+            message.dst,
+            Arc::from(message.src_block_ids),
+            Arc::from(message.dst_block_ids),
+            options,
+        ),
+        None => transfers.execute_local_transfer(
+            message.src,
+            message.dst,
+            Arc::from(message.src_block_ids),
+            Arc::from(message.dst_block_ids),
+            options,
+        ),
+    }
+}
 
 /// Builder for VeloWorkerService - provides flexibility in construction.
 ///
@@ -187,40 +226,18 @@ impl VeloWorkerService {
                 let physical_worker = physical_worker.clone();
 
                 async move {
-                    // Deserialize the message
-                    let message: LocalTransferMessage = serde_json::from_slice(&ctx.payload)?;
-
-                    // Convert options and resolve bounce buffer if present
-                    let bounce_buffer_parts = message.options.bounce_buffer_parts();
-                    let mut options: TransferOptions = message.options.into();
-                    if let Some((handle, block_ids)) = bounce_buffer_parts {
-                        options.bounce_buffer =
-                            Some(physical_worker.create_bounce_buffer(handle, block_ids)?);
-                    }
-
-                    let notification = match message.resource {
-                        Some(resource) => transfers.execute_local_transfer_for_resource(
-                            resource,
-                            message.src,
-                            message.dst,
-                            Arc::from(message.src_block_ids),
-                            Arc::from(message.dst_block_ids),
-                            options,
-                        )?,
-                        None => transfers.execute_local_transfer(
-                            message.src,
-                            message.dst,
-                            Arc::from(message.src_block_ids),
-                            Arc::from(message.dst_block_ids),
-                            options,
-                        )?,
+                    // Await the transfer completion and keep its drain proof.
+                    let dispatched =
+                        dispatch_local_transfer(&ctx.payload, &physical_worker, &*transfers);
+                    let outcome = match dispatched {
+                        Ok(notification) => notification.await_drain().await,
+                        Err(error) => TransferDrainOutcome::DrainedWithError(error),
                     };
 
-                    // Await the transfer completion
-                    notification.await?;
-
-                    // Return empty response to signal success
-                    Ok(Some(Bytes::new()))
+                    // The reply carries the outcome. An RPC error tells the
+                    // client that the outcome is unknown.
+                    let reply = LocalTransferReply::from_outcome(outcome);
+                    Ok(Some(Bytes::from(serde_json::to_vec(&reply)?)))
                 }
             },
         )

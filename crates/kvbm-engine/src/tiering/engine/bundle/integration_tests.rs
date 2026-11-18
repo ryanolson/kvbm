@@ -586,6 +586,17 @@ impl HangingParallelWorkers {
         Ok(())
     }
 
+    /// Fail the hanging transfer without proof that its physical work drained.
+    fn fail_unproven(&self) -> Result<()> {
+        self.release
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| anyhow!("hanging transfer was not dispatched"))?
+            .poison("injected transfer failure without drain proof")?;
+        Ok(())
+    }
+
     fn dispatches(&self) -> Vec<LogicalResourceId> {
         self.dispatches.lock().unwrap().clone()
     }
@@ -1059,6 +1070,45 @@ async fn bundle_onboard_join_error_after_logical_timeout_stays_fail_closed() -> 
     assert!(
         sink.loads().is_empty(),
         "a physical JoinError must never expose failed ids for reuse"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bundle_onboard_unproven_transfer_failure_stays_fenced() -> Result<()> {
+    let (engine, hanging, sink, plan) = build_hanging_onboard(Duration::from_secs(5)).await?;
+    let request = "bundle-unproven-failure".to_owned();
+    let mut onboard = engine.clone().onboard_resources(&request, plan)?;
+    let action_id = *onboard.id();
+    let physical_drain = onboard
+        .take_physical_drain_fence()
+        .expect("bundle onboard must expose its physical drain fence");
+    hanging.wait_started().await;
+
+    // The receipt fails, but it does not prove that the worker copy drained.
+    // An RPC error after the worker accepted the request has this outcome.
+    hanging.fail_unproven()?;
+    wait_until(|| onboard.is_complete()).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert!(matches!(
+        onboard.outcome(),
+        Some(LoadOutcome::FailedPartial { .. })
+    ));
+    assert!(
+        engine
+            .actions
+            .get(&action_id)
+            .is_some_and(|record| record.physical_pending),
+        "an unproven transfer failure must retain the destination quarantine"
+    );
+    assert!(
+        !physical_drain.is_complete(),
+        "an unproven transfer failure must not report the destination as drained"
+    );
+    assert!(
+        sink.loads().is_empty(),
+        "an unproven transfer failure must never expose failed ids for reuse"
     );
     Ok(())
 }

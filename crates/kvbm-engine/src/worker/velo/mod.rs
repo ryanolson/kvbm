@@ -85,7 +85,7 @@ use super::DirectWorker;
 use super::*;
 use kvbm_common::KvbmTransferRoute;
 use kvbm_physical::layout::LayoutConfig;
-use kvbm_physical::transfer::{CopyEngine, TransferOptions};
+use kvbm_physical::transfer::{CopyEngine, TransferDrainOutcome, TransferOptions};
 
 use ::velo::Messenger;
 use bytes::Bytes;
@@ -202,6 +202,62 @@ struct LocalTransferMessage {
     src_block_ids: Vec<BlockId>,
     dst_block_ids: Vec<BlockId>,
     options: SerializableTransferOptions,
+}
+
+/// The reply to a `LOCAL_TRANSFER` request.
+///
+/// The reply carries the drain certainty of the worker, so that the client
+/// can tell a drained failure from an unproven one. An RPC error has no
+/// reply. The client then reports [`TransferDrainOutcome::Unproven`], because
+/// the worker can have an active copy.
+#[derive(Serialize, Deserialize)]
+enum LocalTransferReply {
+    /// The transfer completed.
+    Completed,
+    /// The transfer failed, and no physical operation is active.
+    DrainedWithError { error: String },
+    /// The transfer failed, and the worker did not prove that its work drained.
+    Unproven { error: String },
+}
+
+impl LocalTransferReply {
+    fn from_outcome(outcome: TransferDrainOutcome) -> Self {
+        match outcome {
+            TransferDrainOutcome::Completed => Self::Completed,
+            TransferDrainOutcome::DrainedWithError(error) => Self::DrainedWithError {
+                error: format!("{error:#}"),
+            },
+            TransferDrainOutcome::Unproven(error) => Self::Unproven {
+                error: format!("{error:#}"),
+            },
+        }
+    }
+
+    fn into_outcome(self) -> TransferDrainOutcome {
+        match self {
+            Self::Completed => TransferDrainOutcome::Completed,
+            Self::DrainedWithError { error } => {
+                TransferDrainOutcome::DrainedWithError(anyhow::anyhow!(error))
+            }
+            Self::Unproven { error } => TransferDrainOutcome::Unproven(anyhow::anyhow!(error)),
+        }
+    }
+
+    /// Decode the reply bytes of a `LOCAL_TRANSFER` request.
+    ///
+    /// An empty reply is the success reply of a handler that does not send
+    /// this type. A reply that does not decode proves nothing.
+    fn decode(bytes: &[u8]) -> TransferDrainOutcome {
+        if bytes.is_empty() {
+            return TransferDrainOutcome::Completed;
+        }
+        match serde_json::from_slice::<Self>(bytes) {
+            Ok(reply) => reply.into_outcome(),
+            Err(error) => TransferDrainOutcome::Unproven(anyhow::anyhow!(
+                "local transfer reply did not decode: {error}"
+            )),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
