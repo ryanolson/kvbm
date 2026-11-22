@@ -145,6 +145,28 @@ async fn both_unproven_workers_keep_a_recheck_each() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "the aggregate re-check sends requests to every worker"]
+async fn a_probe_for_one_worker_only_checks_that_worker() -> Result<()> {
+    let workers = tokio::time::timeout(LIMIT, TwoWorkers::start()).await??;
+    TwoWorkers::lose_and_evict(&workers.first);
+    TwoWorkers::lose_and_evict(&workers.second);
+    let mut unresolved = participants_of(workers.copy(ROUTES[1]).await?);
+    let first_checks = checks(&workers.first);
+    let second_checks = checks(&workers.second);
+
+    // The first worker's probe owns this pass. The second worker has its own probe.
+    tokio::time::timeout(
+        LIMIT,
+        unresolved.recheck(&workers.pair.messenger_a, TIMING.deadline),
+    )
+    .await?;
+
+    assert_eq!(checks(&workers.first) - first_checks, 1);
+    assert_eq!(checks(&workers.second) - second_checks, 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_completed_worker_and_an_unproven_worker_leave_only_the_unproven_one() -> Result<()> {
     let workers = TwoWorkers::start().await?;
     for route in ROUTES {
