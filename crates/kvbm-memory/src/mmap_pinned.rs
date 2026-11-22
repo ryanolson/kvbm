@@ -1079,6 +1079,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_later_query_error_does_not_erase_the_first_page() {
+        let node = NumaNode(0);
+        let page = system_page_size();
+        let mut first_reading = None;
+        let placed = map_place_register(
+            4 * page,
+            Some(node),
+            PlacementDecision::Bind(node),
+            Ok(()),
+            |_, _, _| Ok(()),
+            |addr| {
+                if first_reading.is_some() {
+                    return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+                }
+                let reading = crate::numa::page_placement(addr)?;
+                assert_eq!(reading.mode, MemPolicyMode::Default);
+                first_reading = Some(reading.node);
+                Ok(reading)
+            },
+            no_register,
+        )
+        .unwrap();
+
+        assert!(first_reading.is_some());
+        assert_eq!(
+            (placed.placement.policy, placed.placement.observed),
+            (NumaPlacementPolicy::OsDefault, first_reading)
+        );
+        assert!(matches!(
+            placed.placement.fallback,
+            Some(PlacementFallback::BindRefused { .. })
+        ));
+    }
+
     /// When the thread could not be pinned and the bind is refused, the
     /// record names both failures: first touch ran unpinned.
     #[test]
