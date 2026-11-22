@@ -25,7 +25,10 @@ pub mod notification;
 pub use cuda_event::CudaEventChecker;
 pub use nixl_events::{RegisterNixlNotification, process_nixl_notification_events};
 pub use nixl_status::NixlStatusChecker;
-pub use notification::{TransferCompleteNotification, TransferDrainOutcome};
+pub use notification::{
+    AggregateTransferFailure, TransferCompleteNotification, TransferDrainOutcome,
+    TransferPartFailure,
+};
 
 /// Trait for checking if a transfer operation has completed.
 /// Supports polling-based completion checks (NIXL status, CUDA events).

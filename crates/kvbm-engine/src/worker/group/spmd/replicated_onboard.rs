@@ -5,7 +5,10 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
 use futures::stream::{FuturesUnordered, StreamExt};
-use kvbm_physical::transfer::{TransferCompleteNotification, TransferDrainOutcome};
+use kvbm_physical::transfer::{
+    AggregateTransferFailure, TransferCompleteNotification, TransferDrainOutcome,
+    TransferPartFailure,
+};
 
 /// Serializes replicated collective onboards and permanently fails the rank
 /// group after its first divergent completion.
@@ -120,51 +123,38 @@ where
     OnFailure: FnOnce(&anyhow::Error),
 {
     let mut on_first_failure = Some(on_first_failure);
-    let mut errors = Vec::new();
-    let mut unproven = false;
+    // A synchronous dispatch error launched nothing, so it is drained.
+    let mut parts = Vec::new();
     let mut pending = FuturesUnordered::new();
     for notification in notifications {
         match notification {
             Ok(notification) => pending.push(notification.await_drain()),
-            Err(error) => errors.push(error),
+            Err(error) => parts.push(TransferPartFailure::DrainedWithError(error)),
         }
     }
-    if let Some(error) = errors.first()
+    if let Some(part) = parts.first()
         && let Some(on_first_failure) = on_first_failure.take()
     {
-        on_first_failure(error);
+        on_first_failure(part.error());
     }
     while let Some(outcome) = pending.next().await {
-        let error = match outcome {
+        let part = match outcome {
             TransferDrainOutcome::Completed => continue,
-            TransferDrainOutcome::DrainedWithError(error) => error,
-            TransferDrainOutcome::Unproven(error) => {
-                unproven = true;
-                error
+            TransferDrainOutcome::DrainedWithError(error) => {
+                TransferPartFailure::DrainedWithError(error)
             }
+            TransferDrainOutcome::Unproven(error) => TransferPartFailure::Unproven(error),
         };
         if let Some(on_first_failure) = on_first_failure.take() {
-            on_first_failure(&error);
+            on_first_failure(part.error());
         }
-        errors.push(error);
+        parts.push(part);
     }
 
-    if errors.is_empty() {
-        return TransferDrainOutcome::Completed;
-    }
-    let combined = anyhow::anyhow!(
-        "replicated onboard rank group failed: {}",
-        errors
-            .iter()
-            .map(|error| format!("{error:#}"))
-            .collect::<Vec<_>>()
-            .join("; ")
-    );
-    if unproven {
-        TransferDrainOutcome::Unproven(combined)
-    } else {
-        TransferDrainOutcome::DrainedWithError(combined)
-    }
+    AggregateTransferFailure::outcome(
+        Some("replicated onboard rank group failed".to_owned()),
+        parts,
+    )
 }
 
 pub(super) fn dispatch_collective_aborts<T, Abort>(
@@ -445,5 +435,61 @@ mod tests {
                 panic!("a lost reply does not prove drain: {error:#}")
             }
         }
+    }
+
+    /// Two ranks end unproven, each with its own typed context. The group
+    /// receipt keeps both, and its text keeps the group label.
+    #[tokio::test]
+    async fn an_unproven_group_keeps_every_rank_error_typed() {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        struct Rank(u32);
+        impl std::fmt::Display for Rank {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "rank {}", self.0)
+            }
+        }
+        let unproven = |rank| {
+            TransferCompleteNotification::from_drain_future(async move {
+                TransferDrainOutcome::Unproven(anyhow::anyhow!("lost reply").context(Rank(rank)))
+            })
+        };
+        let coordinator = ReplicatedOnboardCoordinator::new(tokio::runtime::Handle::current());
+        let completion = coordinator
+            .execute(
+                move || {
+                    vec![
+                        Ok(unproven(0)),
+                        Ok(TransferCompleteNotification::completed()),
+                        Ok(unproven(2)),
+                    ]
+                },
+                |_| {},
+            )
+            .unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), completion.await_drain())
+            .await
+            .expect("the group receipt resolves");
+        let TransferDrainOutcome::Unproven(error) = outcome else {
+            panic!("an unproven rank keeps the group unproven");
+        };
+        let failure = error
+            .downcast_ref::<kvbm_physical::transfer::AggregateTransferFailure>()
+            .expect("the group error keeps its rank errors");
+        let mut ranks: Vec<_> = failure
+            .parts()
+            .iter()
+            .map(|part| {
+                assert!(part.is_unproven());
+                part.error().downcast_ref::<Rank>().copied()
+            })
+            .collect();
+        ranks.sort_by_key(|rank| rank.map(|Rank(rank)| rank));
+        assert_eq!(ranks, vec![Some(Rank(0)), Some(Rank(2))]);
+        assert!(
+            error
+                .to_string()
+                .starts_with("replicated onboard rank group failed: rank ")
+        );
     }
 }

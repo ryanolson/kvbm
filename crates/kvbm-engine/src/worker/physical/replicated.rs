@@ -565,6 +565,62 @@ mod trait_tests {
 
         assert_eq!(actual, expected);
     }
+
+    /// The replicated worker wraps an in-process worker, so no re-check
+    /// capability can reach its receipt. Any failed onboard must therefore
+    /// end `Unproven`, never as a proven drain.
+    #[tokio::test]
+    async fn a_failed_replicated_onboard_ends_unproven() {
+        let agent = create_test_agent(&format!("replicated-unproven-{}", uuid::Uuid::new_v4()));
+        let manager = create_transfer_manager(agent, None).unwrap();
+        // No layouts: the owner copy fails.
+        let inner = Arc::new(
+            PhysicalWorker::builder()
+                .manager(manager)
+                .rank(0)
+                .build()
+                .unwrap(),
+        );
+        let messenger = create_messenger_tcp().await.unwrap();
+        let runtime = Arc::new(
+            KvbmRuntime::builder(KvbmConfig::default())
+                .with_runtime_handle(tokio::runtime::Handle::current())
+                .with_messenger(messenger)
+                .build_leader()
+                .await
+                .unwrap(),
+        );
+        let collective = Arc::new(StubCollectiveOps::single_worker(
+            runtime.event_system().as_ref().clone(),
+        ));
+        let worker = ReplicatedDataWorker::new(inner, runtime, collective).unwrap();
+
+        let receipt = worker
+            .execute_local_transfer(
+                LogicalLayoutHandle::G2,
+                LogicalLayoutHandle::G1,
+                Arc::from(vec![0]),
+                Arc::from(vec![0]),
+                kvbm_physical::transfer::TransferOptions::default(),
+            )
+            .expect("the onboard runs in a task and reports through its receipt");
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(10), receipt.await_drain())
+                .await
+                .expect("the receipt resolves");
+
+        match outcome {
+            kvbm_physical::transfer::TransferDrainOutcome::Unproven(error) => {
+                assert!(format!("{error:#}").contains("owner G2 to G1 copy"));
+            }
+            kvbm_physical::transfer::TransferDrainOutcome::Completed => {
+                panic!("the owner copy failed")
+            }
+            kvbm_physical::transfer::TransferDrainOutcome::DrainedWithError(error) => {
+                panic!("a replicated onboard failure must stay unproven: {error:#}")
+            }
+        }
+    }
 }
 
 #[cfg(test)]

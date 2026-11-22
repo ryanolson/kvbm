@@ -72,6 +72,14 @@
 //!   worker id, the bound incarnation and the transfer id.
 //!   [`LocalTransferRecheck::check`] repeats the same check, and it is the only
 //!   route that can later prove the outcome.
+//! - **A copy on several workers.** An SPMD or replicated copy folds one
+//!   receipt per worker. The folded `Unproven` error is an
+//!   `AggregateTransferFailure` that keeps every part's typed error, so each
+//!   worker's capability survives. [`UnresolvedTransfer::from_unproven`] lists
+//!   the unresolved participants, [`UnresolvedTransfer::recheck`] checks each
+//!   one again, and [`UnresolvedTransfer::into_outcome`] settles only when
+//!   every participant is resolved. A participant with no capability never
+//!   resolves.
 //! - **Records.** A worker keeps at most 65,536 records, and keeps a finished
 //!   record for 10 minutes. When full, it evicts the oldest finished record
 //!   first. An evicted record answers "unknown".
@@ -90,6 +98,7 @@ mod client;
 #[cfg(test)]
 mod lost_reply_tests;
 mod service;
+mod unresolved;
 
 pub use check::{
     DEFAULT_LOCAL_TRANSFER_CHECK_DEADLINE, DEFAULT_LOCAL_TRANSFER_CHECK_WAIT,
@@ -97,6 +106,7 @@ pub use check::{
 };
 pub use client::VeloWorkerClient;
 pub use service::{VeloWorkerService, VeloWorkerServiceBuilder};
+pub use unresolved::{UnresolvedParticipant, UnresolvedTransfer};
 
 /// Canonical handler names for the Velo RPCs this worker exposes.
 ///

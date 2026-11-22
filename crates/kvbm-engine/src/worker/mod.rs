@@ -29,8 +29,8 @@ pub use kvbm_physical::{
 };
 
 pub use velo::{
-    LocalTransferCheckTiming, LocalTransferRecheck, VeloWorkerClient, VeloWorkerService,
-    VeloWorkerServiceBuilder,
+    LocalTransferCheckTiming, LocalTransferRecheck, UnresolvedParticipant, UnresolvedTransfer,
+    VeloWorkerClient, VeloWorkerService, VeloWorkerServiceBuilder,
 };
 
 /// Boxed future for serialized layout responses - allows both typed_unary and raw unary results

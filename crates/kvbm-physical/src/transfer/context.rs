@@ -30,7 +30,10 @@ use super::TransferCapabilities;
 use notifications::RegisterPollingNotification;
 
 pub(crate) use super::notifications;
-pub use super::notifications::{TransferCompleteNotification, TransferDrainOutcome};
+pub use super::notifications::{
+    AggregateTransferFailure, TransferCompleteNotification, TransferDrainOutcome,
+    TransferPartFailure,
+};
 
 #[derive(Clone, Builder)]
 #[builder(pattern = "owned", build_fn(private, name = "build_internal"), public)]
