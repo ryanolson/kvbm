@@ -15,7 +15,8 @@
 //! wait on the handle alone could read the sink too early.
 
 use super::super::super::test_support::{
-    HangingParallelWorkers, build_leader_with_workers, wait_onboard_driver_finished,
+    DeliveredOutcome, HangingParallelWorkers, build_leader_with_workers,
+    wait_onboard_driver_finished,
 };
 use super::*;
 use kvbm_common::LogicalResourceId;
@@ -95,12 +96,15 @@ fn matched_search(onboard: &Onboard) -> Result<(FindBlocksHandle, BlockId)> {
 
 /// Take every block the G2 pool can give out now and return their ids. A
 /// block the onboard still holds is not among them; a released source is,
-/// because allocation reuses inactive blocks.
+/// because allocation reuses inactive blocks. Panics if the pool cannot give
+/// out the blocks it reports available, so the reuse checks never pass on an
+/// empty allocation.
 fn reusable_g2_ids(g2: &BlockManager<crate::G2>) -> Vec<BlockId> {
     let available = g2.available_blocks();
-    g2.allocate_blocks(available)
-        .map(|blocks| blocks.iter().map(|block| block.block_id()).collect())
-        .unwrap_or_default()
+    let blocks = g2.allocate_blocks(available).unwrap_or_else(|| {
+        panic!("the G2 pool could not allocate its {available} available blocks")
+    });
+    blocks.iter().map(|block| block.block_id()).collect()
 }
 
 /// Panic once with every primary failure, so a base run reports all of them.
@@ -245,6 +249,11 @@ async fn onboard_blocks_releases_at_once_after_a_drained_failure() -> Result<()>
     );
     fixture.hanging.fail_drained(copy)?;
     wait_onboard_driver_finished(action_id).await;
+    assert_eq!(
+        fixture.hanging.delivered(),
+        Some(DeliveredOutcome::DrainedWithError),
+        "the control must deliver a drained failure, not an unproven one"
+    );
 
     let failed = LoadOutcome::FailedPartial {
         block_ids: vec![G1_DESTINATION],

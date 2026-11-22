@@ -222,9 +222,19 @@ pub(super) struct HangingParallelWorkers {
     running: Mutex<Option<RunningCopy>>,
     /// Sees the running copy wherever it is held.
     copy: Mutex<Weak<()>>,
+    /// The outcome the worker sent for the held transfer.
+    delivered: Mutex<Option<DeliveredOutcome>>,
     panic_resource: Mutex<Option<LogicalResourceId>>,
     dispatches: Mutex<Vec<LogicalResourceId>>,
     completed: CompletedParallelWorkers,
+}
+
+/// The kind of outcome a [`HangingParallelWorkers`] sent to the leader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DeliveredOutcome {
+    Completed,
+    DrainedWithError,
+    Unproven,
 }
 
 /// The held copy. While a `RunningCopy` exists the copy may still write its
@@ -239,18 +249,26 @@ impl HangingParallelWorkers {
             reply: Mutex::new(None),
             running: Mutex::new(None),
             copy: Mutex::new(Weak::new()),
+            delivered: Mutex::new(None),
             panic_resource: Mutex::new(None),
             dispatches: Mutex::new(Vec::new()),
             completed: CompletedParallelWorkers,
         })
     }
 
+    /// Wait until the held transfer is dispatched. Panics after five seconds,
+    /// so a failure before dispatch does not hang the test.
     pub(super) async fn wait_started(&self) {
-        self.started
-            .acquire()
+        tokio::time::timeout(Duration::from_secs(5), self.started.acquire())
             .await
+            .expect("the hanging transfer was not dispatched within five seconds")
             .expect("hanging transfer semaphore closed")
             .forget();
+    }
+
+    /// The outcome the worker sent for the held transfer, if it sent one.
+    pub(super) fn delivered(&self) -> Option<DeliveredOutcome> {
+        *self.delivered.lock().unwrap()
     }
 
     /// Take the running copy, so the test owns when it ends.
@@ -268,13 +286,20 @@ impl HangingParallelWorkers {
     }
 
     fn reply(&self, outcome: TransferDrainOutcome) -> Result<()> {
+        let kind = match &outcome {
+            TransferDrainOutcome::Completed => DeliveredOutcome::Completed,
+            TransferDrainOutcome::DrainedWithError(_) => DeliveredOutcome::DrainedWithError,
+            TransferDrainOutcome::Unproven(_) => DeliveredOutcome::Unproven,
+        };
         self.reply
             .lock()
             .unwrap()
             .take()
             .ok_or_else(|| anyhow!("hanging transfer was not dispatched"))?
             .send(outcome)
-            .map_err(|_| anyhow!("the leader dropped the hanging transfer receipt"))
+            .map_err(|_| anyhow!("the leader dropped the hanging transfer receipt"))?;
+        *self.delivered.lock().unwrap() = Some(kind);
+        Ok(())
     }
 
     /// Finish the copy, then report success.
