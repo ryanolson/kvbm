@@ -234,6 +234,15 @@ async fn onboard_blocks_releases_at_once_after_a_drained_failure() -> Result<()>
 
     fixture.hanging.wait_started().await;
     let copy = fixture.hanging.take_running_copy()?;
+    // While the copy runs, the onboard must hold its source. Without this
+    // check, an onboard that dropped the source before dispatch would also
+    // pass the reuse check below.
+    let reusable = reusable_g2_ids(&fixture.g2);
+    assert!(
+        !reusable.contains(&source_id),
+        "the G2 source {source_id} was reusable while the copy was running \
+         (reusable ids {reusable:?})"
+    );
     fixture.hanging.fail_drained(copy)?;
     wait_onboard_driver_finished(action_id).await;
 
