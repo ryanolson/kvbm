@@ -147,8 +147,8 @@ impl UnresolvedTransfer {
     /// leave every other participant and every drained failure as it is.
     ///
     /// "Completed" resolves the participant. "Drained with error" resolves it
-    /// and keeps the error. Any other outcome keeps it unresolved, with the
-    /// new error. Returns `false`, and changes nothing, when no unresolved
+    /// and keeps the error, unless the error holds an unproven aggregate. Any
+    /// other outcome keeps it unresolved, with the new error. Returns `false`, and changes nothing, when no unresolved
     /// participant has this capability.
     pub fn apply(&mut self, recheck: &LocalTransferRecheck, outcome: TransferDrainOutcome) -> bool {
         let Some(index) = self
@@ -161,6 +161,15 @@ impl UnresolvedTransfer {
         match outcome {
             TransferDrainOutcome::Completed => {
                 self.unresolved.remove(index);
+            }
+            // A drained outcome that holds an unproven aggregate proves
+            // nothing.
+            TransferDrainOutcome::DrainedWithError(error)
+                if error
+                    .downcast_ref::<AggregateTransferFailure>()
+                    .is_some_and(AggregateTransferFailure::is_unproven) =>
+            {
+                self.unresolved[index].part = TransferPartFailure::Unproven(error);
             }
             TransferDrainOutcome::DrainedWithError(error) => {
                 self.unresolved.remove(index);
@@ -410,6 +419,17 @@ mod tests {
         assert_eq!(
             transfer.rechecks().cloned().collect::<Vec<_>>(),
             vec![second.clone()]
+        );
+
+        let claims_drain = aggregate(vec![TransferPartFailure::Unproven(anyhow::anyhow!("lost"))]);
+        assert!(transfer.apply(
+            &second,
+            TransferDrainOutcome::DrainedWithError(claims_drain)
+        ));
+        assert_eq!(
+            transfer.participants().len(),
+            1,
+            "a drained outcome holding an unproven aggregate proves nothing"
         );
 
         assert!(transfer.apply(&second, TransferDrainOutcome::Completed));
