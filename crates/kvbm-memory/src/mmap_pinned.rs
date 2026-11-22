@@ -34,7 +34,9 @@
 //! refuses the bind (a cpuset or seccomp profile can), the call does not
 //! fail. The same mapping is touched from the same pinned thread, so the
 //! OS's default local policy normally still puts the pages on that node.
-//! The storage records [`PlacementFallback::BindRefused`].
+//! The storage records [`PlacementFallback::BindRefused`]. If the thread
+//! could not be pinned either, first touch runs unpinned, and the
+//! `BindRefused` error names both failures.
 //! [`HostPlacement::observed`] is the node the kernel reports for the first
 //! page after the touch, so an `OsDefault` policy never hides where the
 //! pages went. That query is best-effort: if `get_mempolicy` is denied,
@@ -45,12 +47,20 @@
 //! node with too little free memory is not checked: `MPOL_BIND` has no
 //! fallback once pages fault in, so first touch can end in an OOM kill.
 //!
-//! [`HostPlacement::policy`] is what kvbm applied before registration. On
-//! GB10 with driver 610.57.04, `cuMemHostRegister` turns an `MPOL_BIND`
-//! range into `MPOL_PREFERRED_MANY` with the same node mask, and
-//! `cuMemHostUnregister` resets it to `MPOL_DEFAULT`. The pages were already
-//! faulted on the bound node and are pinned, so they stay there;
-//! [`crate::numa::page_placement`] shows the kernel's current view.
+//! [`HostPlacement::policy`] is what the kernel showed before registration:
+//! a bind counts only if `get_mempolicy` reports `MPOL_BIND` on the node for
+//! the first, middle and last page (or, if that query is denied, if `mbind`
+//! succeeded). On GB10 with driver 610.57.04, `cuMemHostRegister` itself
+//! calls `mbind(MPOL_PREFERRED_MANY)` on the range with the device's node,
+//! whether or not kvbm bound it, and `cuMemHostUnregister` resets the range
+//! to `MPOL_DEFAULT`. So after registration the kernel's policy no longer
+//! shows kvbm's bind. The pages were already faulted on the bound node and
+//! are pinned, so they stay there; [`crate::numa::page_placement`] shows the
+//! kernel's current view. The driver checks `get_mempolicy` when it
+//! starts. If that call works but `mbind` is denied, `cuMemHostRegister`
+//! fails with `CUDA_ERROR_NOT_PERMITTED`, and the entry returns that error.
+//! When both are denied (as Docker's default seccomp profile does), the
+//! driver skips its own call and registration succeeds.
 //!
 //! # Pipeline
 //!
@@ -79,7 +89,7 @@ use nix::libc;
 use serde::{Deserialize, Serialize};
 
 use crate::numa::placement::{PlacementDecision, decide_placement};
-use crate::numa::{NumaNode, PagePlacement};
+use crate::numa::{MemPolicyMode, NumaNode, PagePlacement};
 use crate::{MemoryDescriptor, Result, StorageError, StorageKind, actions, nixl::NixlDescriptor};
 
 /// Hugepage allocation policy for one allocation.
@@ -414,9 +424,11 @@ pub fn allocate_pinned_host(size: usize, device_id: u32) -> Result<MmappedPinned
         PlacementDecision::Bind(node) => crate::numa::worker_pool::run_on_node_thread(
             node,
             format!("pinned-host-node-{}", node.0),
-            move || place_pinned_host(size, ctx, requested, decision),
+            move |pinned| place_pinned_host(size, ctx, requested, decision, pinned),
         )?,
-        PlacementDecision::OsDefault(_) => place_pinned_host(size, ctx, requested, decision)?,
+        PlacementDecision::OsDefault(_) => {
+            place_pinned_host(size, ctx, requested, decision, Ok(()))?
+        }
     };
 
     let placement = storage.placement();
@@ -438,6 +450,7 @@ fn place_pinned_host(
     ctx: Arc<CudaContext>,
     requested: Option<NumaNode>,
     decision: PlacementDecision,
+    pinned: std::result::Result<(), String>,
 ) -> Result<MmappedPinnedStorage> {
     let Placed {
         registered,
@@ -447,6 +460,7 @@ fn place_pinned_host(
         size,
         requested,
         decision,
+        pinned,
         mbind_to_node,
         crate::numa::page_placement,
         |ptr, len| {
@@ -487,16 +501,21 @@ pub(crate) struct Placed<T> {
 /// Map `size` bytes on base pages, apply `decision`, first-touch from the
 /// calling thread, observe the first page, and register.
 ///
-/// Only `bind` can change the placement: its error becomes
+/// `pinned` is whether the calling thread was pinned to the node; a pin
+/// failure is named in a refused bind's error. Only `bind` can change the
+/// placement: its error, or a kernel view (read with `observe` on the first,
+/// middle and last page) that does not show `MPOL_BIND` on the node, becomes
 /// [`PlacementFallback::BindRefused`]. An `observe` error is logged and
-/// recorded as `observed = None`. A `register` error fails the call as is.
-/// The steps are parameters so tests can inject failures.
+/// recorded as `observed = None`, and the bind's own answer stands. A
+/// `register` error fails the call as is. The steps are parameters so tests
+/// can inject failures.
 pub(crate) fn map_place_register<T>(
     size: usize,
     requested: Option<NumaNode>,
     decision: PlacementDecision,
+    pinned: std::result::Result<(), String>,
     bind: impl FnOnce(usize, usize, NumaNode) -> std::result::Result<(), String>,
-    observe: impl FnOnce(usize) -> std::io::Result<PagePlacement>,
+    observe: impl FnMut(usize) -> std::io::Result<PagePlacement>,
     register: impl FnOnce(usize, usize) -> Result<T>,
 ) -> Result<Placed<T>> {
     if size == 0 {
@@ -506,15 +525,24 @@ pub(crate) fn map_place_register<T>(
     }
     let mmap = mmap_anon(size)?;
 
-    let (policy, fallback) = match decision {
+    let (mut policy, mut fallback) = match decision {
         PlacementDecision::Bind(node) => match bind(mmap.ptr, mmap.len, node) {
             Ok(()) => (NumaPlacementPolicy::Bound(node), None),
             Err(error) => {
+                let error = match &pinned {
+                    Ok(()) => error,
+                    Err(pin) => format!("{error}; thread not pinned to node {}: {pin}", node.0),
+                };
                 tracing::warn!(
-                    "mbind(MPOL_BIND) to node {} refused ({}); the OS places {} bytes",
+                    "mbind(MPOL_BIND) to node {} refused ({}); the OS places {} bytes{}",
                     node.0,
                     error,
-                    mmap.len
+                    mmap.len,
+                    if pinned.is_err() {
+                        ", and first touch runs unpinned"
+                    } else {
+                        ""
+                    }
                 );
                 (
                     NumaPlacementPolicy::OsDefault,
@@ -527,8 +555,17 @@ pub(crate) fn map_place_register<T>(
 
     first_touch(mmap.ptr, mmap.len, HugepageTier::None);
 
-    let observed = match observe(mmap.ptr) {
-        Ok(page) => Some(page.node),
+    // Read the kernel's view of the first, middle and last page before
+    // registration (the driver may change the policy when it registers).
+    let page = system_page_size();
+    let last = (mmap.len - 1) / page;
+    let mut observe = observe;
+    let readings: std::io::Result<Vec<PagePlacement>> = [0, last / 2, last]
+        .into_iter()
+        .map(|index| observe(mmap.ptr + index * page))
+        .collect();
+    let observed = match &readings {
+        Ok(readings) => Some(readings[0].node),
         Err(e) => {
             tracing::warn!(
                 "get_mempolicy on {:#x} failed ({}); the placement is not observed",
@@ -538,6 +575,22 @@ pub(crate) fn map_place_register<T>(
             None
         }
     };
+
+    // A bind counts only if the kernel shows it. A denied query keeps the
+    // bind's own answer.
+    if let (NumaPlacementPolicy::Bound(node), Ok(readings)) = (policy, &readings)
+        && let Some(wrong) = readings
+            .iter()
+            .find(|p| p.mode != MemPolicyMode::Bind || p.nodes != [node])
+    {
+        let error = format!(
+            "mbind returned success, but the kernel reports {:?} on nodes {:?}",
+            wrong.mode, wrong.nodes
+        );
+        tracing::warn!("bind to node {} did not take: {}", node.0, error);
+        policy = NumaPlacementPolicy::OsDefault;
+        fallback = Some(PlacementFallback::BindRefused { node, error });
+    }
 
     let registered = register(mmap.ptr, mmap.len)?;
     Ok(Placed {
@@ -715,6 +768,17 @@ fn do_mmap(len: usize, base_flags: libc::c_int, extra_flags: libc::c_int) -> Res
 
 /// Bind `[addr, addr+len)` to a single NUMA node via `mbind(MPOL_BIND)`.
 fn mbind_to_node(addr: usize, len: usize, node: NumaNode) -> std::result::Result<(), String> {
+    set_range_policy(addr, len, libc::MPOL_BIND, node, MPOL_MF_STRICT)
+}
+
+/// `mbind(addr, len, mode, {node}, …, flags)` with a one-word node mask.
+fn set_range_policy(
+    addr: usize,
+    len: usize,
+    mode: libc::c_int,
+    node: NumaNode,
+    flags: libc::c_uint,
+) -> std::result::Result<(), String> {
     if node.0 >= 64 {
         return Err(format!(
             "mbind nodemask supports up to 64 nodes; got node id {}",
@@ -722,17 +786,17 @@ fn mbind_to_node(addr: usize, len: usize, node: NumaNode) -> std::result::Result
         ));
     }
     let nodemask: u64 = 1u64 << node.0;
-    // maxnode is the bit count the kernel reads from nodemask. 64 covers a
-    // single u64 mask.
+    // The kernel reads `maxnode - 1` bits of the mask, so a full 64-bit mask
+    // needs 65 (as libnuma passes). With 64, bit 63 is silently dropped.
     let r = unsafe {
         libc::syscall(
             libc::SYS_mbind,
             addr,
             len,
-            libc::MPOL_BIND as usize,
+            mode as usize,
             &nodemask as *const u64 as usize,
-            64usize,
-            MPOL_MF_STRICT as usize,
+            65usize,
+            flags as usize,
         )
     };
     if r != 0 {
@@ -916,6 +980,7 @@ mod tests {
             1 << 16,
             Some(node),
             PlacementDecision::Bind(node),
+            Ok(()),
             mbind_to_node,
             crate::numa::page_placement,
             no_register,
@@ -952,6 +1017,7 @@ mod tests {
             1 << 16,
             Some(node),
             PlacementDecision::Bind(node),
+            Ok(()),
             mbind_to_node,
             crate::numa::page_placement,
             no_register,
@@ -971,6 +1037,80 @@ mod tests {
         assert_eq!(placed.placement.observed, Some(node));
     }
 
+    /// The policy helper hands the kernel every bit of its one-word mask.
+    /// `MPOL_PREFERRED` with an empty mask becomes `MPOL_LOCAL`, so a dropped
+    /// bit 63 shows as `MPOL_LOCAL`. Node 63 is absent on most hosts; then
+    /// the kernel sees the bit and refuses it.
+    #[test]
+    fn a_policy_mask_reaches_the_highest_node_bit() {
+        let g = mmap_anon(system_page_size()).unwrap();
+        match set_range_policy(g.ptr, g.len, libc::MPOL_PREFERRED, NumaNode(63), 0) {
+            Err(e) => assert!(e.contains("Invalid argument"), "mbind error: {e}"),
+            Ok(()) => {
+                let p = crate::numa::page_placement(g.ptr).unwrap();
+                assert_eq!(p.mode, crate::numa::MemPolicyMode::Preferred);
+                assert_eq!(p.nodes, vec![NumaNode(63)]);
+            }
+        }
+    }
+
+    /// A bind step that reports success but leaves no policy in the kernel
+    /// is not recorded as bound. The record follows the kernel's view before
+    /// registration.
+    #[test]
+    fn a_bind_the_kernel_does_not_show_is_not_recorded_as_bound() {
+        let placed = map_place_register(
+            1 << 16,
+            Some(NumaNode(0)),
+            PlacementDecision::Bind(NumaNode(0)),
+            Ok(()),
+            |_, _, _| Ok(()),
+            crate::numa::page_placement,
+            no_register,
+        )
+        .unwrap();
+        assert_eq!(placed.placement.policy, NumaPlacementPolicy::OsDefault);
+        match &placed.placement.fallback {
+            Some(PlacementFallback::BindRefused { node, error }) => {
+                assert_eq!(*node, NumaNode(0));
+                assert!(error.contains("kernel reports"), "error: {error}");
+            }
+            other => panic!("expected BindRefused, got {other:?}"),
+        }
+    }
+
+    /// When the thread could not be pinned and the bind is refused, the
+    /// record names both failures: first touch ran unpinned.
+    #[test]
+    fn a_refused_bind_on_an_unpinned_thread_names_both_failures() {
+        let placed = map_place_register(
+            1 << 16,
+            Some(NumaNode(0)),
+            PlacementDecision::Bind(NumaNode(0)),
+            Err("Failed to set CPU affinity: Operation not permitted".into()),
+            |_, _, _| Err("mbind: Operation not permitted (os error 1)".into()),
+            crate::numa::page_placement,
+            no_register,
+        )
+        .unwrap();
+        assert_eq!(placed.placement.policy, NumaPlacementPolicy::OsDefault);
+        match &placed.placement.fallback {
+            Some(PlacementFallback::BindRefused { node, error }) => {
+                assert_eq!(*node, NumaNode(0));
+                assert!(
+                    error.contains("mbind: Operation not permitted"),
+                    "error: {error}"
+                );
+                assert!(error.contains("not pinned"), "error: {error}");
+                assert!(
+                    error.contains("Failed to set CPU affinity"),
+                    "error: {error}"
+                );
+            }
+            other => panic!("expected BindRefused, got {other:?}"),
+        }
+    }
+
     /// A registration error comes back as is. It is not relabeled as a
     /// placement fallback, and nothing is retried.
     #[test]
@@ -981,6 +1121,7 @@ mod tests {
             1 << 16,
             Some(NumaNode(0)),
             PlacementDecision::Bind(NumaNode(0)),
+            Ok(()),
             |_, _, _| {
                 binds.set(binds.get() + 1);
                 Ok(())
@@ -1009,6 +1150,7 @@ mod tests {
             1 << 16,
             Some(NumaNode(0)),
             PlacementDecision::Bind(NumaNode(0)),
+            Ok(()),
             |_, _, _| {
                 Err(format!(
                     "mbind: {}",
@@ -1042,6 +1184,7 @@ mod tests {
             1 << 16,
             None,
             PlacementDecision::OsDefault(PlacementFallback::NodeUnknown),
+            Ok(()),
             |_, _, _| panic!("no bind for an OS-placement decision"),
             crate::numa::page_placement,
             no_register,
@@ -1163,21 +1306,9 @@ mod tests {
     #[cfg(feature = "testing-cuda")]
     #[test]
     fn the_first_allocation_in_a_fresh_process_binds() {
-        const CHILD: &str = "KVBM_MEMORY_FRESH_PROCESS_CHILD";
-        const NAME: &str = "mmap_pinned::tests::the_first_allocation_in_a_fresh_process_binds";
-
-        if std::env::var_os(CHILD).is_none() {
-            let out = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([NAME, "--exact", "--nocapture", "--test-threads=1"])
-                .env(CHILD, "1")
-                .output()
-                .expect("run the child test process");
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            assert!(
-                out.status.success() && stdout.contains("1 passed"),
-                "child failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
-            );
+        if !rerun_alone_in_a_child(
+            "mmap_pinned::tests::the_first_allocation_in_a_fresh_process_binds",
+        ) {
             return;
         }
 
@@ -1198,6 +1329,166 @@ mod tests {
         );
         assert_eq!(page.nodes, vec![n]);
         assert_eq!(page.node, n);
+    }
+
+    /// Rerun the test `name` alone in a child process. Returns `true` in the
+    /// child, which then runs the test body. In the parent, asserts that the
+    /// child passed and returns `false`.
+    #[cfg(feature = "testing-cuda")]
+    fn rerun_alone_in_a_child(name: &str) -> bool {
+        const CHILD: &str = "KVBM_MEMORY_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            return true;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([name, "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .expect("run the child test process");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "child failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        false
+    }
+
+    /// Install a seccomp filter on this thread (inherited by the threads it
+    /// starts) that fails each syscall in `denied` with `EPERM`, as a
+    /// container's seccomp profile can. Filters stack. Only for a child test
+    /// process.
+    #[cfg(feature = "testing-cuda")]
+    fn deny_syscalls(denied: &[libc::c_long]) {
+        fn stmt(code: u32, k: u32) -> libc::sock_filter {
+            libc::sock_filter {
+                code: code as u16,
+                jt: 0,
+                jf: 0,
+                k,
+            }
+        }
+        fn jeq(k: u32, jt: u8, jf: u8) -> libc::sock_filter {
+            libc::sock_filter {
+                code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+                jt,
+                jf,
+                k,
+            }
+        }
+        // seccomp_data.nr is at offset 0.
+        let mut prog = vec![stmt(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, 0)];
+        for &nr in denied {
+            prog.push(jeq(nr as u32, 0, 1));
+            prog.push(stmt(
+                libc::BPF_RET | libc::BPF_K,
+                libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+            ));
+        }
+        prog.push(stmt(libc::BPF_RET | libc::BPF_K, libc::SECCOMP_RET_ALLOW));
+        let fprog = libc::sock_fprog {
+            len: prog.len() as u16,
+            filter: prog.as_mut_ptr(),
+        };
+        // SAFETY: `fprog` and `prog` outlive the calls.
+        unsafe {
+            assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0);
+            assert_eq!(
+                libc::prctl(
+                    libc::PR_SET_SECCOMP,
+                    libc::SECCOMP_MODE_FILTER,
+                    &fprog as *const libc::sock_fprog
+                ),
+                0,
+                "install seccomp filter: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+
+    /// Through the public entry: with `mbind` and `get_mempolicy` denied (as
+    /// Docker's default seccomp profile can), the region still registers,
+    /// and the record says the bind was refused and nothing was observed.
+    #[cfg(feature = "testing-cuda")]
+    #[test]
+    fn a_denied_bind_and_query_through_the_entry_still_register() {
+        if !rerun_alone_in_a_child(
+            "mmap_pinned::tests::a_denied_bind_and_query_through_the_entry_still_register",
+        ) {
+            return;
+        }
+        deny_syscalls(&[libc::SYS_mbind, libc::SYS_get_mempolicy]);
+        assert!(
+            crate::numa::page_placement(0).is_err_and(|e| e.raw_os_error() == Some(libc::EPERM))
+        );
+
+        let region = allocate_pinned_host(1 << 16, 0).expect("allocate");
+        let n = crate::numa::get_device_numa_node(0).expect("GPU 0's NUMA node");
+        let placement = region.placement();
+        assert_eq!(placement.requested, Some(n));
+        assert_eq!(placement.policy, NumaPlacementPolicy::OsDefault);
+        match &placement.fallback {
+            Some(PlacementFallback::BindRefused { node, error }) => {
+                assert_eq!(*node, n);
+                assert!(error.contains("Operation not permitted"), "error: {error}");
+            }
+            other => panic!("expected BindRefused, got {other:?}"),
+        }
+        assert_eq!(placement.observed, None);
+
+        region.ctx().bind_to_thread().unwrap();
+        let addr = MemoryDescriptor::addr(&region);
+        for byte in [addr, addr + region.mapped_len() - 1] {
+            assert_eq!(
+                driver_memory_type(byte),
+                cudarc::driver::sys::CUmemorytype::CU_MEMORYTYPE_HOST
+            );
+        }
+    }
+
+    /// Through the public entry: with the thread pin and the bind both
+    /// refused, the region still registers, and the record names both
+    /// failures.
+    #[cfg(feature = "testing-cuda")]
+    #[test]
+    fn a_denied_pin_and_bind_through_the_entry_record_both() {
+        if !rerun_alone_in_a_child(
+            "mmap_pinned::tests::a_denied_pin_and_bind_through_the_entry_record_both",
+        ) {
+            return;
+        }
+        // The filters go in a fixed order, so the run is deterministic.
+        // `mbind` and `get_mempolicy` are denied from the start, together, as
+        // Docker's default profile does; the driver then skips its own `mbind`
+        // at registration. The driver sets thread affinity while it creates a
+        // context, so `sched_setaffinity` is denied after that, standing in
+        // for a cpuset that excludes the node.
+        deny_syscalls(&[libc::SYS_mbind, libc::SYS_get_mempolicy]);
+        crate::device::cuda_context(0).expect("GPU 0 must be visible for this test");
+        let n = crate::numa::get_device_numa_node(0).expect("GPU 0's NUMA node");
+        deny_syscalls(&[libc::SYS_sched_setaffinity]);
+
+        let region = allocate_pinned_host(1 << 16, 0).expect("allocate");
+        let placement = region.placement();
+        assert_eq!(placement.policy, NumaPlacementPolicy::OsDefault);
+        match &placement.fallback {
+            Some(PlacementFallback::BindRefused { node, error }) => {
+                assert_eq!(*node, n);
+                assert!(
+                    error.contains("mbind: Operation not permitted"),
+                    "error: {error}"
+                );
+                assert!(error.contains("not pinned"), "error: {error}");
+            }
+            other => panic!("expected BindRefused, got {other:?}"),
+        }
+        assert_eq!(placement.observed, None);
+
+        region.ctx().bind_to_thread().unwrap();
+        assert_eq!(
+            driver_memory_type(MemoryDescriptor::addr(&region)),
+            cudarc::driver::sys::CUmemorytype::CU_MEMORYTYPE_HOST
+        );
     }
 
     /// Wall time of one 8 GiB pinned host allocation. Information only.

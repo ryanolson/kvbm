@@ -408,7 +408,7 @@ impl NumaWorkerPool {
         let Some(node) = opt.numa_node else {
             return MmappedPinnedStorage::allocate(opt);
         };
-        run_on_node_thread(node, format!("mmap-pinned-node-{}", node.0), move || {
+        run_on_node_thread(node, format!("mmap-pinned-node-{}", node.0), move |_| {
             MmappedPinnedStorage::allocate(opt)
         })
     }
@@ -461,7 +461,8 @@ impl NumaWorkerPool {
 }
 
 /// Run `f` on a new thread pinned to the CPUs of `node`, and return its
-/// result. Used so first touch lands pages on `node`.
+/// result. Used so first touch lands pages on `node`. `f` gets the result of
+/// the pin.
 ///
 /// If pinning fails (for example, a cpuset excludes the node), the thread
 /// logs a warning and runs `f` unpinned: an `mbind` in `f` still constrains
@@ -473,12 +474,13 @@ pub(crate) fn run_on_node_thread<T, F>(
 ) -> Result<T, StorageError>
 where
     T: Send + 'static,
-    F: FnOnce() -> Result<T, StorageError> + Send + 'static,
+    F: FnOnce(Result<(), String>) -> Result<T, StorageError> + Send + 'static,
 {
     let handle = thread::Builder::new()
         .name(name)
         .spawn(move || {
-            if let Err(e) = pin_thread_to_numa_node(node) {
+            let pinned = pin_thread_to_numa_node(node);
+            if let Err(e) = &pinned {
                 tracing::warn!(
                     "pin to node {}: {} — first-touch may be misplaced",
                     node.0,
@@ -489,7 +491,7 @@ where
                 // before we start faulting pages.
                 thread::yield_now();
             }
-            f()
+            f(pinned)
         })
         .map_err(|e| StorageError::AllocationFailed(format!("spawn node worker: {}", e)))?;
     handle
