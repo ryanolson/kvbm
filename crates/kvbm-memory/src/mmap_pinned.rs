@@ -51,11 +51,12 @@
 //! first touch the entry reads the policy of the first, middle and last page.
 //! Any reading that is not `MPOL_BIND` on the node turns the bind into
 //! [`PlacementFallback::BindRefused`]. A bind with no reading against it
-//! stays `Bound(n)`. If the first page's policy was read back, the bind is
-//! kernel-confirmed and [`HostPlacement::observed`] is `Some`. If that query
-//! was denied, `observed` is `None`: `mbind` returned success under
-//! `MPOL_MF_STRICT`, but the kernel's policy was not read back, so the bind
-//! is not kernel-confirmed. On GB10 with driver 610.57.04, `cuMemHostRegister` itself
+//! stays `Bound(n)`. [`HostPlacement::observed`] is `Some` on a bound region
+//! only if both first-page queries answered: the policy showed `MPOL_BIND`
+//! on the node, and the node query gave the page's node. Then the bind is
+//! kernel-confirmed on the first page. If either query failed, `observed` is
+//! `None`, and the record does not claim a confirmation: `mbind` returned
+//! success under `MPOL_MF_STRICT`, and no policy reading contradicted it. On GB10 with driver 610.57.04, `cuMemHostRegister` itself
 //! calls `mbind(MPOL_PREFERRED_MANY)` on the range with the device's node,
 //! whether or not kvbm bound it, and `cuMemHostUnregister` resets the range
 //! to `MPOL_DEFAULT`. So after registration the kernel's policy no longer
@@ -175,10 +176,13 @@ pub struct HostPlacement {
     ///
     /// From [`allocate_pinned_host`], `Bound(n)` means `mbind(MPOL_BIND,
     /// MPOL_MF_STRICT)` to `n` returned success and no policy reading
-    /// contradicted it. Whether the kernel confirmed it shows in
-    /// [`Self::observed`]: `Some` means the first page's policy was read back
-    /// and showed `MPOL_BIND` on `n`; `None` means it was not read back (the
-    /// query failed), so the bind rests on `mbind`'s answer alone.
+    /// contradicted it. [`Self::observed`] then says whether the kernel's
+    /// view of the first page was read in full. `Some` requires both a
+    /// first-page policy reading that showed `MPOL_BIND` on `n` and a
+    /// successful first-page node query. `None` means at least one of those
+    /// two queries failed. The bind may then rest on `mbind`'s answer alone
+    /// (no policy reading at all), or on policy readings of the middle and
+    /// last page; the record does not say which.
     pub policy: NumaPlacementPolicy,
     /// Why the pages were not bound. `None` when they were bound, or when the
     /// caller asked for OS placement.
@@ -186,8 +190,8 @@ pub struct HostPlacement {
     /// The node the kernel reports for the first page after first touch.
     /// `None` when the query failed (for example, denied by seccomp) or was
     /// not made. For a bound region, also `None` when the first page's policy
-    /// could not be read back, so `Some` always means the bind was confirmed
-    /// by the kernel.
+    /// query failed, so `Some` on a bound region always means the first
+    /// page's policy showed the bind and its node was read.
     pub observed: Option<NumaNode>,
 }
 
@@ -1240,6 +1244,40 @@ mod tests {
             no_register,
         )
         .unwrap();
+        assert_eq!(
+            placed.placement.policy,
+            NumaPlacementPolicy::Bound(NumaNode(0))
+        );
+        assert_eq!(placed.placement.fallback, None);
+        assert_eq!(placed.placement.observed, None);
+    }
+
+    /// A bound region whose first-page node query failed reports no
+    /// observation, even when every policy reading showed the bind.
+    #[test]
+    fn a_bound_region_without_the_first_node_answer_reports_no_observation() {
+        let mut calls = 0;
+        let placed = map_place_register(
+            1 << 16,
+            Some(NumaNode(0)),
+            PlacementDecision::Bind(NumaNode(0)),
+            Ok(()),
+            |_, _, _| Ok(()),
+            |_| {
+                calls += 1;
+                PageReading {
+                    policy: Ok((MemPolicyMode::Bind, vec![NumaNode(0)])),
+                    node: if calls == 1 {
+                        Err(std::io::Error::from_raw_os_error(libc::EPERM))
+                    } else {
+                        Ok(NumaNode(0))
+                    },
+                }
+            },
+            no_register,
+        )
+        .unwrap();
+        assert_eq!(calls, 3);
         assert_eq!(
             placed.placement.policy,
             NumaPlacementPolicy::Bound(NumaNode(0))
