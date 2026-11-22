@@ -47,6 +47,38 @@ impl UnresolvedParticipant {
     }
 }
 
+/// Bind the new error of an unresolved participant to its capability.
+///
+/// A re-fold reads a participant's identity from the outermost
+/// [`LocalTransferRecheck`] of its error, and walks any
+/// [`AggregateTransferFailure`] it finds. An error whose outermost capability
+/// is `recheck` and that holds no aggregate already has the right identity,
+/// so it is kept as it is: that is the usual answer of a check. Any other
+/// error is wrapped in an opaque [`RecheckDiagnostic`] under `recheck`.
+fn bind(recheck: &LocalTransferRecheck, error: anyhow::Error) -> anyhow::Error {
+    let same_identity = error.downcast_ref::<LocalTransferRecheck>() == Some(recheck)
+        && error.downcast_ref::<AggregateTransferFailure>().is_none();
+    if same_identity {
+        error
+    } else {
+        anyhow::Error::new(RecheckDiagnostic(error)).context(recheck.clone())
+    }
+}
+
+/// The new error of an unresolved participant, opaque to classification: a
+/// downcast cannot reach a capability or an aggregate inside it. Its text is
+/// the full text of that error.
+#[derive(Debug)]
+struct RecheckDiagnostic(anyhow::Error);
+
+impl std::fmt::Display for RecheckDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.0)
+    }
+}
+
+impl std::error::Error for RecheckDiagnostic {}
+
 /// The parts of an [`TransferDrainOutcome::Unproven`] transfer, split into the
 /// parts that are still unresolved and the failures already proven drained.
 ///
@@ -148,7 +180,11 @@ impl UnresolvedTransfer {
     ///
     /// "Completed" resolves the participant. "Drained with error" resolves it
     /// and keeps the error, unless the error holds an unproven aggregate. Any
-    /// other outcome keeps it unresolved, with the new error. Returns `false`, and changes nothing, when no unresolved
+    /// other outcome keeps it unresolved, with the new error as its
+    /// diagnostic. The capability stays the participant's identity: the new
+    /// error is bound to it, and any capability or aggregate inside the new
+    /// error is hidden, so a re-fold of [`Self::into_outcome`] finds this
+    /// participant with this capability and nothing else. Returns `false`, and changes nothing, when no unresolved
     /// participant has this capability.
     pub fn apply(&mut self, recheck: &LocalTransferRecheck, outcome: TransferDrainOutcome) -> bool {
         let Some(index) = self
@@ -169,14 +205,14 @@ impl UnresolvedTransfer {
                     .downcast_ref::<AggregateTransferFailure>()
                     .is_some_and(AggregateTransferFailure::is_unproven) =>
             {
-                self.unresolved[index].part = TransferPartFailure::Unproven(error);
+                self.unresolved[index].part = TransferPartFailure::Unproven(bind(recheck, error));
             }
             TransferDrainOutcome::DrainedWithError(error) => {
                 self.unresolved.remove(index);
                 self.drained.push(error);
             }
             TransferDrainOutcome::Unproven(error) => {
-                self.unresolved[index].part = TransferPartFailure::Unproven(error);
+                self.unresolved[index].part = TransferPartFailure::Unproven(bind(recheck, error));
             }
         }
         true
@@ -446,7 +482,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "re-folding drops the capability when the replacement error has none"]
     fn a_contradictory_drain_update_keeps_the_original_capability_after_refolding() {
         let worker = capability(1);
         let mut transfer = UnresolvedTransfer::from_unproven(unproven_on(&worker));
@@ -468,7 +503,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "re-folding can recover a different transfer's capability"]
     fn a_failed_update_cannot_change_which_transfer_resolves_the_participant() {
         let original = capability(1);
         let mut different_transfer = original.clone();
@@ -488,5 +522,41 @@ mod tests {
         assert!(!transfer.apply(&different_transfer, TransferDrainOutcome::Completed));
         assert!(transfer.apply(&original, TransferDrainOutcome::Completed));
         assert!(!transfer.apply(&original, TransferDrainOutcome::Completed));
+    }
+
+    /// A new error that holds other capabilities, inside an aggregate, stays
+    /// one participant with the original capability after a re-fold.
+    #[test]
+    fn a_replacement_holding_other_capabilities_keeps_the_original_identity() {
+        let (original, other_a, other_b) = (capability(1), capability(2), capability(3));
+        let mut transfer = UnresolvedTransfer::from_unproven(unproven_on(&original));
+        let replacement = aggregate(vec![
+            TransferPartFailure::Unproven(unproven_on(&other_a)),
+            TransferPartFailure::Unproven(unproven_on(&other_b)),
+        ]);
+
+        assert!(transfer.apply(&original, TransferDrainOutcome::Unproven(replacement)));
+
+        let TransferDrainOutcome::Unproven(error) = transfer.into_outcome() else {
+            panic!("the update did not prove drain");
+        };
+        let text = format!("{error:#}");
+        assert!(text.contains("lost reply"), "{text}");
+        let transfer = UnresolvedTransfer::from_unproven(error);
+        assert_eq!(transfer.participants().len(), 1);
+        assert_eq!(transfer.rechecks().collect::<Vec<_>>(), vec![&original]);
+    }
+
+    /// The usual answer of a check already carries the capability, so it is
+    /// kept as it is, and its text names the capability once.
+    #[test]
+    fn a_check_answer_keeps_its_own_error() {
+        let original = capability(1);
+        let mut transfer = UnresolvedTransfer::from_unproven(unproven_on(&original));
+
+        assert!(transfer.apply(&original, original.unproven("still unknown")));
+
+        let text = format!("{:#}", transfer.participants()[0].error());
+        assert_eq!(text, format!("{original}: still unknown"));
     }
 }
