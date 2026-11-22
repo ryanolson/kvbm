@@ -105,12 +105,7 @@ impl NumaTopology {
 
     /// Build a topology directly from a node-to-CPUs map. Test-only;
     /// production code always reads from sysfs via [`Self::from_sysfs`].
-    ///
-    /// Only called from `resources`'s test module, which is gated behind the
-    /// `host-pools` feature; `allow(dead_code)` avoids a false-positive
-    /// unused-fn warning under `--all-targets` with `host-pools` off.
     #[cfg(test)]
-    #[cfg_attr(not(feature = "host-pools"), allow(dead_code))]
     pub(crate) fn from_node_cpus(node_to_cpus: HashMap<u32, Vec<usize>>) -> Self {
         let mut cpu_to_node = HashMap::new();
         for (node, cpus) in &node_to_cpus {

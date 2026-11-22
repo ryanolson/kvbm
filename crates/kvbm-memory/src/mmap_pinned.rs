@@ -36,7 +36,8 @@ use cudarc::driver::CudaContext;
 use nix::libc;
 use serde::{Deserialize, Serialize};
 
-use crate::numa::NumaNode;
+use crate::numa::placement::PlacementDecision;
+use crate::numa::{NumaNode, PagePlacement};
 use crate::{MemoryDescriptor, Result, StorageError, StorageKind, actions, nixl::NixlDescriptor};
 
 /// Hugepage allocation policy for one allocation.
@@ -75,6 +76,53 @@ pub enum NumaPlacementPolicy {
     Bound(NumaNode),
     /// No `mbind`. The OS placed the pages with its default policy.
     OsDefault,
+}
+
+/// Why pinned host memory was placed by the OS instead of bound to the
+/// device's NUMA node. Recorded in [`HostPlacement::fallback`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum PlacementFallback {
+    /// The device's NUMA node could not be determined.
+    NodeUnknown,
+    /// NUMA placement is disabled (`DYN_MEMORY_DISABLE_NUMA`).
+    NumaDisabled,
+    /// The CPU topology under `/sys/devices/system/node` could not be read.
+    TopologyUnavailable,
+    /// The device's node has no CPUs (a memory-only node), so no thread can
+    /// first-touch the pages there.
+    NodeHasNoCpus(NumaNode),
+    /// `mbind(MPOL_BIND)` to the node was refused, for example by a cpuset
+    /// or a seccomp profile. The pages stay on the same mapping and are
+    /// touched from the same thread; the OS places them.
+    BindRefused {
+        /// The node the bind asked for.
+        node: NumaNode,
+        /// The error `mbind` returned.
+        error: String,
+    },
+}
+
+/// Where one slab of pinned host memory was placed, and why.
+///
+/// [`allocate_pinned_host`] fills every field. The strict
+/// [`MmappedPinnedStorage::allocate`] records the node it was given in
+/// `requested`, has no fallback (it fails instead), and does not observe the
+/// pages, so `observed` is `None`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostPlacement {
+    /// The device's NUMA node, as [`crate::numa::get_device_numa_node`]
+    /// reported it. `None` when it is unknown.
+    pub requested: Option<NumaNode>,
+    /// The policy the pages got: bound to a node, or placed by the OS.
+    pub policy: NumaPlacementPolicy,
+    /// Why the pages were not bound. `None` when they were bound, or when the
+    /// caller asked for OS placement.
+    pub fallback: Option<PlacementFallback>,
+    /// The node the kernel reports for the first page after first touch.
+    /// `None` when the query failed (for example, denied by seccomp) or was
+    /// not made.
+    pub observed: Option<NumaNode>,
 }
 
 /// Options for [`MmappedPinnedStorage::allocate`].
@@ -116,7 +164,7 @@ pub struct MmappedPinnedStorage {
     register_guard: HostRegisterGuard,
     mmap_guard: MmapGuard,
     hugepage_tier: HugepageTier,
-    numa_policy: NumaPlacementPolicy,
+    placement: HostPlacement,
     ctx: Arc<CudaContext>,
 }
 
@@ -171,7 +219,12 @@ impl MmappedPinnedStorage {
             register_guard,
             mmap_guard,
             hugepage_tier,
-            numa_policy,
+            placement: HostPlacement {
+                requested: numa_node,
+                policy: numa_policy,
+                fallback: None,
+                observed: None,
+            },
             ctx,
         })
     }
@@ -198,13 +251,19 @@ impl MmappedPinnedStorage {
 
     /// NUMA placement policy that this slab used.
     pub fn numa_policy(&self) -> NumaPlacementPolicy {
-        self.numa_policy
+        self.placement.policy
+    }
+
+    /// Where this slab was placed, why, and where the kernel put its first
+    /// page. [`Self::numa_policy`] and [`Self::numa_node`] agree with it.
+    pub fn placement(&self) -> &HostPlacement {
+        &self.placement
     }
 
     /// NUMA node the pages were bound to via `mbind(MPOL_BIND)`. `None` when
     /// the OS placed the pages.
     pub fn numa_node(&self) -> Option<NumaNode> {
-        match self.numa_policy {
+        match self.placement.policy {
             NumaPlacementPolicy::Bound(node) => Some(node),
             NumaPlacementPolicy::OsDefault => None,
         }
@@ -273,6 +332,68 @@ impl actions::Memset for MmappedPinnedStorage {
         }
         Ok(())
     }
+}
+
+// =============================================================================
+// the pinned host entry: decide, map, bind, touch, observe, register
+// =============================================================================
+
+/// Allocate one region of pinned host memory for `device_id`.
+///
+/// Registered `mmap` on base pages ([`HugepageTier::None`]). The pages are
+/// bound with `mbind(MPOL_BIND)` to the device's NUMA node only when that
+/// node is known and has CPUs; the mapping, bind, first touch and
+/// `cuMemHostRegister` then run on a thread pinned to that node. Otherwise
+/// the OS places the pages, and [`HostPlacement::fallback`] says why.
+///
+/// A refused `mbind` is not an error: the same mapping is touched from the
+/// same pinned thread and the OS places it, recorded as
+/// [`PlacementFallback::BindRefused`]. Any other failure (`mmap`, CUDA
+/// context, `cuMemHostRegister`) fails the call. Logs one `info` line with
+/// the placement.
+pub fn allocate_pinned_host(size: usize, device_id: u32) -> Result<MmappedPinnedStorage> {
+    let _ = (size, device_id);
+    todo!("allocate_pinned_host")
+}
+
+/// Allocate one region of pinned host memory per entry of `sizes`, in order,
+/// each as [`allocate_pinned_host`] does. Stops at the first error; regions
+/// already allocated are freed.
+pub fn allocate_pinned_host_regions(
+    sizes: &[usize],
+    device_id: u32,
+) -> Result<Vec<MmappedPinnedStorage>> {
+    sizes
+        .iter()
+        .map(|&size| allocate_pinned_host(size, device_id))
+        .collect()
+}
+
+/// A mapping that went through [`map_place_register`]. `registered` is
+/// declared first so it drops (unregisters) before `mmap` unmaps.
+pub(crate) struct Placed<T> {
+    pub(crate) registered: T,
+    pub(crate) mmap: MmapGuard,
+    pub(crate) placement: HostPlacement,
+}
+
+/// Map `size` bytes on base pages, apply `decision`, first-touch from the
+/// calling thread, observe the first page, and register.
+///
+/// Only `bind` can change the placement: its error becomes
+/// [`PlacementFallback::BindRefused`]. An `observe` error is logged and
+/// recorded as `observed = None`. A `register` error fails the call as is.
+/// The steps are parameters so tests can inject failures.
+pub(crate) fn map_place_register<T>(
+    size: usize,
+    requested: Option<NumaNode>,
+    decision: PlacementDecision,
+    bind: impl FnOnce(usize, usize, NumaNode) -> std::result::Result<(), String>,
+    observe: impl FnOnce(usize) -> std::io::Result<PagePlacement>,
+    register: impl FnOnce(usize, usize) -> Result<T>,
+) -> Result<Placed<T>> {
+    let _ = (size, requested, decision, bind, observe, register);
+    todo!("map_place_register")
 }
 
 // =============================================================================
@@ -616,5 +737,231 @@ mod tests {
             std::ptr::write_volatile(ptr, 0xA5);
             assert_eq!(std::ptr::read_volatile(ptr), 0xA5);
         }
+    }
+
+    /// The first node id below 64 that this host does not have.
+    fn absent_node() -> NumaNode {
+        (0..64u32)
+            .find(|n| !std::path::Path::new(&format!("/sys/devices/system/node/node{n}")).exists())
+            .map(NumaNode)
+            .expect("a node id below 64 that the host lacks")
+    }
+
+    fn no_register(_: usize, _: usize) -> Result<()> {
+        Ok(())
+    }
+
+    /// A real `mbind` to a node the host lacks is refused. The entry keeps the
+    /// mapping, records `BindRefused`, and the kernel reports no policy on it.
+    #[test]
+    fn a_refused_bind_falls_back_to_os_placement() {
+        let node = absent_node();
+        let placed = map_place_register(
+            1 << 16,
+            Some(node),
+            PlacementDecision::Bind(node),
+            mbind_to_node,
+            crate::numa::page_placement,
+            no_register,
+        )
+        .expect("a refused bind is not an error");
+
+        match &placed.placement.fallback {
+            Some(PlacementFallback::BindRefused { node: n, error }) => {
+                assert_eq!(*n, node);
+                assert!(error.contains("mbind"), "error: {error}");
+            }
+            other => panic!("expected BindRefused, got {other:?}"),
+        }
+        assert_eq!(placed.placement.policy, NumaPlacementPolicy::OsDefault);
+        assert_eq!(placed.placement.requested, Some(node));
+
+        let page = crate::numa::page_placement(placed.mmap.ptr).unwrap();
+        assert_eq!(page.mode, crate::numa::MemPolicyMode::Default);
+        assert!(page.nodes.is_empty(), "nodes: {:?}", page.nodes);
+        // The pages were touched, so the kernel reports where they went.
+        assert_eq!(placed.placement.observed, Some(page.node));
+    }
+
+    /// A registration error comes back as is. It is not relabeled as a
+    /// placement fallback, and nothing is retried.
+    #[test]
+    fn a_registration_error_is_not_a_placement_fallback() {
+        let binds = std::cell::Cell::new(0);
+        let registers = std::cell::Cell::new(0);
+        let result = map_place_register(
+            1 << 16,
+            Some(NumaNode(0)),
+            PlacementDecision::Bind(NumaNode(0)),
+            |_, _, _| {
+                binds.set(binds.get() + 1);
+                Ok(())
+            },
+            crate::numa::page_placement,
+            |_, _| -> Result<()> {
+                registers.set(registers.get() + 1);
+                Err(StorageError::RegistrationFailed("injected".into()))
+            },
+        );
+        match result {
+            Err(StorageError::RegistrationFailed(msg)) => assert_eq!(msg, "injected"),
+            Err(other) => panic!("expected the injected error, got {other:?}"),
+            Ok(_) => panic!("expected the injected error, got Ok"),
+        }
+        assert_eq!(binds.get(), 1);
+        assert_eq!(registers.get(), 1);
+    }
+
+    /// A denied bind and a denied `get_mempolicy` (as Docker's default
+    /// seccomp profile can do) still register the mapping.
+    #[test]
+    fn a_denied_bind_and_denied_query_still_register() {
+        let registered = std::cell::Cell::new(false);
+        let placed = map_place_register(
+            1 << 16,
+            Some(NumaNode(0)),
+            PlacementDecision::Bind(NumaNode(0)),
+            |_, _, _| Err(format!("mbind: {}", std::io::Error::from_raw_os_error(libc::EPERM))),
+            |_| Err(std::io::Error::from_raw_os_error(libc::EPERM)),
+            |_, _| -> Result<()> {
+                registered.set(true);
+                Ok(())
+            },
+        )
+        .expect("a denied bind and query still register");
+
+        assert!(registered.get());
+        assert!(matches!(
+            placed.placement.fallback,
+            Some(PlacementFallback::BindRefused { node: NumaNode(0), .. })
+        ));
+        assert_eq!(placed.placement.policy, NumaPlacementPolicy::OsDefault);
+        assert_eq!(placed.placement.observed, None);
+    }
+
+    /// An OS-placement decision does no bind and keeps its reason.
+    #[test]
+    fn an_os_default_decision_skips_the_bind() {
+        let placed = map_place_register(
+            1 << 16,
+            None,
+            PlacementDecision::OsDefault(PlacementFallback::NodeUnknown),
+            |_, _, _| panic!("no bind for an OS-placement decision"),
+            crate::numa::page_placement,
+            no_register,
+        )
+        .unwrap();
+        assert_eq!(
+            placed.placement,
+            HostPlacement {
+                requested: None,
+                policy: NumaPlacementPolicy::OsDefault,
+                fallback: Some(PlacementFallback::NodeUnknown),
+                observed: Some(crate::numa::page_placement(placed.mmap.ptr).unwrap().node),
+            }
+        );
+    }
+
+    #[test]
+    fn host_placement_serializes() {
+        let p = HostPlacement {
+            requested: Some(NumaNode(1)),
+            policy: NumaPlacementPolicy::OsDefault,
+            fallback: Some(PlacementFallback::NodeHasNoCpus(NumaNode(1))),
+            observed: Some(NumaNode(0)),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        assert_eq!(serde_json::from_str::<HostPlacement>(&json).unwrap(), p);
+    }
+
+    /// The memory type the driver reports for a host address.
+    #[cfg(feature = "testing-cuda")]
+    fn driver_memory_type(addr: usize) -> cudarc::driver::sys::CUmemorytype {
+        use cudarc::driver::sys;
+        let mut ty: u32 = 0;
+        let r = unsafe {
+            sys::cuPointerGetAttribute(
+                &mut ty as *mut u32 as *mut std::ffi::c_void,
+                sys::CUpointer_attribute::CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
+                addr as sys::CUdeviceptr,
+            )
+        };
+        r.result().expect("cuPointerGetAttribute(MEMORY_TYPE)");
+        match ty {
+            1 => sys::CUmemorytype::CU_MEMORYTYPE_HOST,
+            2 => sys::CUmemorytype::CU_MEMORYTYPE_DEVICE,
+            3 => sys::CUmemorytype::CU_MEMORYTYPE_ARRAY,
+            4 => sys::CUmemorytype::CU_MEMORYTYPE_UNIFIED,
+            other => panic!("unknown CUmemorytype {other}"),
+        }
+    }
+
+    /// Each region is registered (the driver says so) and bound to the
+    /// device's node (the kernel says so). Reads the facts from the driver
+    /// and the kernel, not from the returned object. A missing GPU fails.
+    #[cfg(feature = "testing-cuda")]
+    #[test]
+    fn pinned_host_regions_are_registered_and_bound() {
+        use crate::numa::MemPolicyMode;
+
+        let n = crate::numa::get_device_numa_node(0)
+            .expect("GPU 0 and its NUMA node must be visible for this test");
+        let sizes: Vec<usize> = [3usize << 16, 1 << 16].repeat(5);
+        let regions = allocate_pinned_host_regions(&sizes, 0).expect("allocate regions");
+        assert_eq!(regions.len(), sizes.len());
+
+        let ctx = crate::device::cuda_context(0).unwrap();
+        ctx.bind_to_thread().unwrap();
+        let page = system_page_size();
+
+        for (region, &size) in regions.iter().zip(&sizes) {
+            let addr = MemoryDescriptor::addr(region);
+            let len = region.mapped_len();
+            assert!(len >= size);
+
+            for byte in [addr, addr + len - 1] {
+                assert_eq!(
+                    driver_memory_type(byte),
+                    cudarc::driver::sys::CUmemorytype::CU_MEMORYTYPE_HOST,
+                    "byte {byte:#x} of a {len}-byte region"
+                );
+            }
+
+            let pages = len / page;
+            for index in [0, pages / 2, pages - 1] {
+                let p = crate::numa::page_placement(addr + index * page).unwrap();
+                assert_eq!(p.mode, MemPolicyMode::Bind, "page {index}");
+                assert_eq!(p.nodes, vec![n], "page {index}");
+                assert_eq!(p.node, n, "page {index}");
+            }
+
+            assert_eq!(region.hugepage_tier(), HugepageTier::None);
+            assert_eq!(
+                region.placement(),
+                &HostPlacement {
+                    requested: Some(n),
+                    policy: NumaPlacementPolicy::Bound(n),
+                    fallback: None,
+                    observed: Some(n),
+                }
+            );
+            assert_eq!(region.numa_policy(), NumaPlacementPolicy::Bound(n));
+            assert_eq!(region.numa_node(), Some(n));
+        }
+    }
+
+    /// Wall time of one 8 GiB pinned host allocation. Information only.
+    #[cfg(feature = "testing-cuda")]
+    #[test]
+    #[ignore = "allocates 8 GiB; run by hand"]
+    fn time_an_8_gib_pinned_host_allocation() {
+        let start = std::time::Instant::now();
+        let region = allocate_pinned_host(8 << 30, 0).expect("allocate 8 GiB");
+        let elapsed = start.elapsed();
+        println!(
+            "8 GiB pinned host allocation: {:.3} s, placement {:?}",
+            elapsed.as_secs_f64(),
+            region.placement()
+        );
     }
 }

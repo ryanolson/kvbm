@@ -12,6 +12,7 @@
 //! - [`NumaNode`]: Represents a NUMA node ID
 //! - [`topology`]: Reads CPU-to-NUMA mapping from `/sys/devices/system/node`
 //! - [`worker_pool`]: Dedicated worker threads pinned to specific NUMA nodes
+//! - [`page_placement`]: The policy and node the kernel reports for a page
 //!
 //! ## Usage
 //!
@@ -26,8 +27,11 @@
 //! determined, allocation falls back to the non-NUMA path transparently.
 
 pub(crate) mod nvml;
+pub(crate) mod placement;
 pub mod topology;
 pub mod worker_pool;
+
+pub use placement::{MemPolicyMode, PagePlacement, page_placement};
 
 use cudarc::driver::{result::device as cuda_device, sys as cuda_sys};
 use nix::libc;
