@@ -11,7 +11,7 @@
 
 use std::time::Duration;
 
-use ::velo::Messenger;
+use ::velo::{InstanceId, Messenger};
 use kvbm_physical::transfer::{
     AggregateTransferFailure, TransferDrainOutcome, TransferPartFailure,
 };
@@ -22,20 +22,28 @@ use super::check::LocalTransferRecheck;
 #[derive(Debug)]
 pub struct UnresolvedParticipant {
     recheck: Option<LocalTransferRecheck>,
-    error: anyhow::Error,
+    /// [`TransferPartFailure::Unproven`], or a kind this crate does not know,
+    /// kept whole so a re-fold gives it back unchanged.
+    part: TransferPartFailure,
 }
 
 impl UnresolvedParticipant {
     /// The capability to check this part again. `None` when no check can
-    /// resolve it, for example an in-process worker whose own drain proof
-    /// failed.
+    /// resolve it: an in-process worker whose own drain proof failed, or a
+    /// part of a kind this crate does not know.
     pub fn recheck(&self) -> Option<&LocalTransferRecheck> {
         self.recheck.as_ref()
     }
 
     /// The error of the last outcome of this part.
     pub fn error(&self) -> &anyhow::Error {
-        &self.error
+        self.part.error()
+    }
+
+    fn on_worker(&self, instance: InstanceId, worker_id: Option<u64>) -> bool {
+        self.recheck
+            .as_ref()
+            .is_some_and(|recheck| recheck.instance == instance && recheck.worker_id == worker_id)
     }
 }
 
@@ -47,6 +55,8 @@ impl UnresolvedParticipant {
 /// stays `Unproven`.
 #[derive(Debug)]
 pub struct UnresolvedTransfer {
+    /// The label of the top aggregate, kept for the text of a re-fold.
+    label: Option<String>,
     unresolved: Vec<UnresolvedParticipant>,
     drained: Vec<anyhow::Error>,
 }
@@ -54,43 +64,64 @@ pub struct UnresolvedTransfer {
 impl UnresolvedTransfer {
     /// Split the error of an `Unproven` outcome into its participants.
     ///
-    /// Nested aggregate failures are walked to their leaves. A leaf is one
-    /// participant, with the [`LocalTransferRecheck`] its error carries, if
-    /// any.
+    /// Nested aggregate failures are walked to their leaves, including those
+    /// inside a part marked drained. A leaf is proven only when it is an
+    /// explicit drained error that holds no unproven aggregate. Every other
+    /// leaf is one participant, with the [`LocalTransferRecheck`] its error
+    /// carries, if any. A part of a kind this crate does not know is one
+    /// participant with no capability, kept whole.
     pub fn from_unproven(error: anyhow::Error) -> Self {
+        let label = error
+            .downcast_ref::<AggregateTransferFailure>()
+            .filter(|aggregate| aggregate.is_unproven())
+            .and_then(|aggregate| aggregate.label().map(str::to_owned));
         let mut transfer = Self {
+            label,
             unresolved: Vec::new(),
             drained: Vec::new(),
         };
-        transfer.collect(error);
+        transfer.collect_unproven(error);
         transfer
     }
 
-    fn collect(&mut self, error: anyhow::Error) {
+    /// Collect an error the caller reported as unproven.
+    fn collect_unproven(&mut self, error: anyhow::Error) {
         match error.downcast::<AggregateTransferFailure>() {
-            Ok(aggregate) if aggregate.is_unproven() => {
-                for part in aggregate.into_parts() {
-                    match part {
-                        TransferPartFailure::DrainedWithError(error) => self.drained.push(error),
-                        TransferPartFailure::Unproven(error) => self.collect(error),
-                        // A part of an unknown kind has no proof.
-                        other => self.unresolved.push(UnresolvedParticipant {
-                            recheck: None,
-                            error: other.into_error(),
-                        }),
-                    }
-                }
-            }
-            // An unproven part whose aggregate claims every part drained is
+            Ok(aggregate) if aggregate.is_unproven() => self.collect_parts(aggregate),
+            // An unproven error whose aggregate proves every part drained is
             // inconsistent. Keep it unresolved, with nothing to check.
             Ok(aggregate) => self.unresolved.push(UnresolvedParticipant {
                 recheck: None,
-                error: anyhow::Error::new(aggregate),
+                part: TransferPartFailure::Unproven(anyhow::Error::new(aggregate)),
             }),
             Err(error) => {
                 let recheck = error.downcast_ref::<LocalTransferRecheck>().cloned();
-                self.unresolved
-                    .push(UnresolvedParticipant { recheck, error });
+                self.unresolved.push(UnresolvedParticipant {
+                    recheck,
+                    part: TransferPartFailure::Unproven(error),
+                });
+            }
+        }
+    }
+
+    fn collect_parts(&mut self, aggregate: AggregateTransferFailure) {
+        for part in aggregate.into_parts() {
+            match part {
+                // `is_unproven` looks inside for a nested unproven aggregate.
+                TransferPartFailure::DrainedWithError(error)
+                    if error
+                        .downcast_ref::<AggregateTransferFailure>()
+                        .is_some_and(AggregateTransferFailure::is_unproven) =>
+                {
+                    self.collect_unproven(error);
+                }
+                TransferPartFailure::DrainedWithError(error) => self.drained.push(error),
+                TransferPartFailure::Unproven(error) => self.collect_unproven(error),
+                // A kind this crate does not know is opaque and unproven.
+                other => self.unresolved.push(UnresolvedParticipant {
+                    recheck: None,
+                    part: other,
+                }),
             }
         }
     }
@@ -112,48 +143,99 @@ impl UnresolvedTransfer {
         self.unresolved.is_empty()
     }
 
-    /// Check every unresolved participant that has a capability once, at the
-    /// same time, each under `deadline`, and record the answers.
+    /// Apply the outcome of one check of `recheck` to its participant, and
+    /// leave every other participant and every drained failure as it is.
     ///
-    /// A participant leaves the unresolved list only on a proof from its
-    /// worker: "completed", or "drained with error", which is kept.
+    /// "Completed" resolves the participant. "Drained with error" resolves it
+    /// and keeps the error. Any other outcome keeps it unresolved, with the
+    /// new error. Returns `false`, and changes nothing, when no unresolved
+    /// participant has this capability.
+    pub fn apply(&mut self, recheck: &LocalTransferRecheck, outcome: TransferDrainOutcome) -> bool {
+        let Some(index) = self
+            .unresolved
+            .iter()
+            .position(|participant| participant.recheck.as_ref() == Some(recheck))
+        else {
+            return false;
+        };
+        match outcome {
+            TransferDrainOutcome::Completed => {
+                self.unresolved.remove(index);
+            }
+            TransferDrainOutcome::DrainedWithError(error) => {
+                self.unresolved.remove(index);
+                self.drained.push(error);
+            }
+            TransferDrainOutcome::Unproven(error) => {
+                self.unresolved[index].part = TransferPartFailure::Unproven(error);
+            }
+        }
+        true
+    }
+
+    /// Check every unresolved participant that has a capability once, at the
+    /// same time, each under `deadline`, and apply the answers.
     pub async fn recheck(&mut self, messenger: &Messenger, deadline: Duration) {
-        let outcomes = futures::future::join_all(self.unresolved.iter().map(|participant| {
-            let recheck = participant.recheck.clone();
-            async move {
-                match recheck {
-                    Some(recheck) => Some(recheck.check(messenger, deadline).await),
-                    None => None,
-                }
-            }
-        }))
+        let targets: Vec<_> = self.rechecks().cloned().collect();
+        self.check_and_apply(targets, messenger, deadline).await;
+    }
+
+    /// Check, once each, only the unresolved participants on one worker:
+    /// velo instance `instance` and worker id `worker_id`. No other worker
+    /// is asked, and no other participant changes.
+    pub async fn recheck_worker(
+        &mut self,
+        messenger: &Messenger,
+        instance: InstanceId,
+        worker_id: Option<u64>,
+        deadline: Duration,
+    ) {
+        let targets: Vec<_> = self
+            .unresolved
+            .iter()
+            .filter(|participant| participant.on_worker(instance, worker_id))
+            .filter_map(|participant| participant.recheck.clone())
+            .collect();
+        self.check_and_apply(targets, messenger, deadline).await;
+    }
+
+    async fn check_and_apply(
+        &mut self,
+        targets: Vec<LocalTransferRecheck>,
+        messenger: &Messenger,
+        deadline: Duration,
+    ) {
+        let outcomes = futures::future::join_all(
+            targets
+                .iter()
+                .map(|recheck| recheck.check(messenger, deadline)),
+        )
         .await;
-        let participants = std::mem::take(&mut self.unresolved);
-        for (mut participant, outcome) in participants.into_iter().zip(outcomes) {
-            match outcome {
-                Some(TransferDrainOutcome::Completed) => {}
-                Some(TransferDrainOutcome::DrainedWithError(error)) => self.drained.push(error),
-                Some(TransferDrainOutcome::Unproven(error)) => {
-                    participant.error = error;
-                    self.unresolved.push(participant);
-                }
-                None => self.unresolved.push(participant),
-            }
+        for (recheck, outcome) in targets.iter().zip(outcomes) {
+            self.apply(recheck, outcome);
         }
     }
 
     /// The outcome of the transfer now.
     ///
     /// `Unproven` while any participant is unresolved; its error keeps every
-    /// unresolved participant's capability. Otherwise `DrainedWithError` if
-    /// any part failed, and `Completed` if none did.
+    /// unresolved participant's capability, and the top label. Otherwise
+    /// `DrainedWithError` if any part failed, and `Completed` if none did.
     pub fn into_outcome(mut self) -> TransferDrainOutcome {
-        // One part keeps its own error, so its capability stays at the top.
-        match (self.drained.len(), self.unresolved.len()) {
-            (0, 0) => return TransferDrainOutcome::Completed,
-            (1, 0) => return TransferDrainOutcome::DrainedWithError(self.drained.remove(0)),
-            (0, 1) => return TransferDrainOutcome::Unproven(self.unresolved.remove(0).error),
-            _ => {}
+        // One unlabelled part keeps its own error, so its capability stays at
+        // the top. A part of an unknown kind stays inside an aggregate, so a
+        // re-fold still sees its kind.
+        if self.label.is_none() {
+            match (self.drained.len(), self.unresolved.len()) {
+                (0, 0) => return TransferDrainOutcome::Completed,
+                (1, 0) => return TransferDrainOutcome::DrainedWithError(self.drained.remove(0)),
+                (0, 1) if matches!(self.unresolved[0].part, TransferPartFailure::Unproven(_)) => {
+                    return TransferDrainOutcome::Unproven(
+                        self.unresolved.remove(0).part.into_error(),
+                    );
+                }
+                _ => {}
+            }
         }
         let parts = self
             .drained
@@ -162,10 +244,10 @@ impl UnresolvedTransfer {
             .chain(
                 self.unresolved
                     .into_iter()
-                    .map(|participant| TransferPartFailure::Unproven(participant.error)),
+                    .map(|participant| participant.part),
             )
             .collect();
-        AggregateTransferFailure::outcome(None, parts)
+        AggregateTransferFailure::outcome(self.label, parts)
     }
 }
 
@@ -245,6 +327,7 @@ mod tests {
     #[test]
     fn a_settled_transfer_keeps_its_drained_failures() {
         let transfer = UnresolvedTransfer {
+            label: None,
             unresolved: Vec::new(),
             drained: vec![anyhow::anyhow!("first"), anyhow::anyhow!("second")],
         };
@@ -254,6 +337,91 @@ mod tests {
             }
             TransferDrainOutcome::Completed => panic!("two parts failed"),
             TransferDrainOutcome::Unproven(error) => panic!("no part is unresolved: {error:#}"),
+        }
+    }
+
+    /// A child labelled drained still holds an unproven leaf. The leaf stays
+    /// unresolved whatever label its parent carries.
+    #[test]
+    fn an_unproven_leaf_under_a_drained_labelled_child_stays_unresolved() {
+        let recheck = capability(1);
+        let grandchild = aggregate(vec![TransferPartFailure::Unproven(unproven_on(&recheck))]);
+        let child = aggregate(vec![
+            TransferPartFailure::DrainedWithError(grandchild),
+            TransferPartFailure::DrainedWithError(anyhow::anyhow!("a drained part")),
+        ]);
+        let outer = aggregate(vec![TransferPartFailure::DrainedWithError(child)]);
+
+        let transfer = UnresolvedTransfer::from_unproven(outer);
+
+        assert!(!transfer.is_resolved());
+        assert_eq!(
+            transfer.rechecks().cloned().collect::<Vec<_>>(),
+            vec![recheck]
+        );
+        assert!(matches!(
+            transfer.into_outcome(),
+            TransferDrainOutcome::Unproven(_)
+        ));
+    }
+
+    /// The top label survives a re-fold, so the text matches the fold's.
+    #[test]
+    fn a_refold_keeps_the_top_label() {
+        let (first, second) = (capability(1), capability(2));
+        let labelled = anyhow::Error::new(AggregateTransferFailure::new(
+            Some("replicated onboard rank group failed".to_owned()),
+            vec![
+                TransferPartFailure::Unproven(unproven_on(&first)),
+                TransferPartFailure::Unproven(unproven_on(&second)),
+            ],
+        ));
+        let text = labelled.to_string();
+
+        let transfer = UnresolvedTransfer::from_unproven(labelled);
+        let TransferDrainOutcome::Unproven(error) = transfer.into_outcome() else {
+            panic!("both participants are unresolved");
+        };
+        assert_eq!(error.to_string(), text);
+    }
+
+    /// One worker's proof resolves only its own participant. The others and
+    /// the drained failures stay, and a capability not in the transfer
+    /// changes nothing.
+    #[test]
+    fn one_proof_resolves_only_its_participant() {
+        let (first, second, stranger) = (capability(1), capability(2), capability(3));
+        let mut transfer = UnresolvedTransfer::from_unproven(aggregate(vec![
+            TransferPartFailure::DrainedWithError(anyhow::anyhow!("a drained part")),
+            TransferPartFailure::Unproven(unproven_on(&first)),
+            TransferPartFailure::Unproven(unproven_on(&second)),
+        ]));
+
+        assert!(!transfer.apply(&stranger, TransferDrainOutcome::Completed));
+        assert_eq!(transfer.participants().len(), 2);
+
+        assert!(transfer.apply(&first, TransferDrainOutcome::Completed));
+        assert_eq!(
+            transfer.rechecks().cloned().collect::<Vec<_>>(),
+            vec![second.clone()]
+        );
+
+        assert!(transfer.apply(&second, second.unproven("still unknown")));
+        assert_eq!(
+            transfer.rechecks().cloned().collect::<Vec<_>>(),
+            vec![second.clone()]
+        );
+
+        assert!(transfer.apply(&second, TransferDrainOutcome::Completed));
+        assert!(transfer.is_resolved());
+        match transfer.into_outcome() {
+            TransferDrainOutcome::DrainedWithError(error) => {
+                assert_eq!(error.to_string(), "a drained part");
+            }
+            TransferDrainOutcome::Completed => panic!("the drained failure must be kept"),
+            TransferDrainOutcome::Unproven(error) => {
+                panic!("every participant resolved: {error:#}")
+            }
         }
     }
 }

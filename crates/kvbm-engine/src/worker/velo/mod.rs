@@ -76,10 +76,15 @@
 //!   receipt per worker. The folded `Unproven` error is an
 //!   `AggregateTransferFailure` that keeps every part's typed error, so each
 //!   worker's capability survives. [`UnresolvedTransfer::from_unproven`] lists
-//!   the unresolved participants, [`UnresolvedTransfer::recheck`] checks each
-//!   one again, and [`UnresolvedTransfer::into_outcome`] settles only when
-//!   every participant is resolved. A participant with no capability never
-//!   resolves.
+//!   the unresolved participants, walking nested aggregates, including those
+//!   inside a part marked drained. Only an explicit drained leaf is proven.
+//!   [`UnresolvedTransfer::recheck_worker`] checks one worker's participants,
+//!   [`UnresolvedTransfer::apply`] applies one check's outcome, and
+//!   [`UnresolvedTransfer::recheck`] checks them all. Each leaves the other
+//!   participants and the drained failures as they are.
+//!   [`UnresolvedTransfer::into_outcome`] settles only when every participant
+//!   is resolved. A participant with no capability, or of a kind kvbm-engine
+//!   does not know, never resolves.
 //! - **Records.** A worker keeps at most 65,536 records, and keeps a finished
 //!   record for 10 minutes. When full, it evicts the oldest finished record
 //!   first. An evicted record answers "unknown".

@@ -40,8 +40,9 @@ impl TransferDrainOutcome {
 
 /// One failed part of an aggregate receipt, with its drain certainty.
 ///
-/// A caller that meets a variant it does not know must treat the part as
-/// unproven.
+/// Only [`Self::DrainedWithError`] is a drain proof. A caller that meets a
+/// variant it does not know must treat the part as unproven and opaque: keep
+/// it whole, and never look inside it for a proof or a capability.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum TransferPartFailure {
@@ -49,6 +50,10 @@ pub enum TransferPartFailure {
     DrainedWithError(Error),
     /// The part did not prove that its work drained.
     Unproven(Error),
+    /// A kind this crate's own tests use to stand for a future variant.
+    #[cfg(test)]
+    #[doc(hidden)]
+    UnknownForTest(Error),
 }
 
 impl TransferPartFailure {
@@ -56,6 +61,8 @@ impl TransferPartFailure {
     pub fn error(&self) -> &Error {
         match self {
             Self::DrainedWithError(error) | Self::Unproven(error) => error,
+            #[cfg(test)]
+            Self::UnknownForTest(error) => error,
         }
     }
 
@@ -63,12 +70,24 @@ impl TransferPartFailure {
     pub fn into_error(self) -> Error {
         match self {
             Self::DrainedWithError(error) | Self::Unproven(error) => error,
+            #[cfg(test)]
+            Self::UnknownForTest(error) => error,
         }
     }
 
     /// Whether this part has no drain proof.
+    ///
+    /// Every kind except [`Self::DrainedWithError`] is unproven. A part marked
+    /// drained is unproven too when its error holds an unproven
+    /// [`AggregateTransferFailure`]: a nested part keeps its own certainty
+    /// whatever its parent claims.
     pub fn is_unproven(&self) -> bool {
-        matches!(self, Self::Unproven(_))
+        match self {
+            Self::DrainedWithError(error) => error
+                .downcast_ref::<AggregateTransferFailure>()
+                .is_some_and(AggregateTransferFailure::is_unproven),
+            _ => true,
+        }
     }
 }
 
@@ -97,12 +116,18 @@ impl AggregateTransferFailure {
         &self.parts
     }
 
+    /// The label before the part errors, if any.
+    pub fn label(&self) -> Option<&str> {
+        self.label.as_deref()
+    }
+
     /// Take the failed parts, in order.
     pub fn into_parts(self) -> Vec<TransferPartFailure> {
         self.parts
     }
 
-    /// Whether any part has no drain proof.
+    /// Whether any part has no drain proof, nested parts included (see
+    /// [`TransferPartFailure::is_unproven`]).
     pub fn is_unproven(&self) -> bool {
         self.parts.iter().any(TransferPartFailure::is_unproven)
     }
@@ -124,17 +149,21 @@ impl AggregateTransferFailure {
 }
 
 impl std::fmt::Display for AggregateTransferFailure {
+    /// The text is built first and then padded, so width, fill, alignment and
+    /// precision apply to it as they did to the joined `String` before.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use std::fmt::Write as _;
+        let mut text = String::new();
         if let Some(label) = &self.label {
-            write!(f, "{label}: ")?;
+            write!(text, "{label}: ")?;
         }
         for (index, part) in self.parts.iter().enumerate() {
             if index > 0 {
-                f.write_str("; ")?;
+                text.push_str("; ");
             }
-            write!(f, "{:#}", part.error())?;
+            write!(text, "{:#}", part.error())?;
         }
-        Ok(())
+        f.pad(&text)
     }
 }
 
@@ -642,7 +671,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "the typed aggregate does not honor width or precision"]
     async fn aggregate_error_display_preserves_width_and_precision() {
         let result = TransferCompleteNotification::aggregate_results(
             vec![Err(anyhow!("worker failed"))],
@@ -658,5 +686,50 @@ mod tests {
             format!("{error:>20.6}"),
             format!("{:>20.6}", "worker failed")
         );
+    }
+
+    /// Only an explicitly drained part is a proof. A kind the fold does not
+    /// know keeps the aggregate unproven.
+    #[test]
+    fn an_unknown_part_kind_is_unproven() {
+        let unknown = TransferPartFailure::UnknownForTest(anyhow!("a future kind"));
+        assert!(unknown.is_unproven());
+
+        let only_unknown = AggregateTransferFailure::outcome(None, vec![unknown]);
+        assert!(matches!(only_unknown, TransferDrainOutcome::Unproven(_)));
+
+        let mixed = AggregateTransferFailure::outcome(
+            None,
+            vec![
+                TransferPartFailure::DrainedWithError(anyhow!("drained")),
+                TransferPartFailure::UnknownForTest(anyhow!("a future kind")),
+            ],
+        );
+        assert!(matches!(mixed, TransferDrainOutcome::Unproven(_)));
+    }
+
+    /// A part marked drained that holds an unproven aggregate keeps the
+    /// outer aggregate unproven.
+    #[test]
+    fn a_drained_part_holding_an_unproven_aggregate_is_unproven() {
+        let inner = anyhow::Error::new(AggregateTransferFailure::new(
+            None,
+            vec![TransferPartFailure::Unproven(anyhow!("lost reply"))],
+        ))
+        .context("a nested group");
+        let part = TransferPartFailure::DrainedWithError(inner);
+        assert!(part.is_unproven());
+        assert!(matches!(
+            AggregateTransferFailure::outcome(None, vec![part]),
+            TransferDrainOutcome::Unproven(_)
+        ));
+
+        let drained = TransferPartFailure::DrainedWithError(anyhow::Error::new(
+            AggregateTransferFailure::new(
+                None,
+                vec![TransferPartFailure::DrainedWithError(anyhow!("drained"))],
+            ),
+        ));
+        assert!(!drained.is_unproven());
     }
 }

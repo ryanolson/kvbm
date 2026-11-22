@@ -145,7 +145,6 @@ async fn both_unproven_workers_keep_a_recheck_each() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "the aggregate re-check sends requests to every worker"]
 async fn a_probe_for_one_worker_only_checks_that_worker() -> Result<()> {
     let workers = tokio::time::timeout(LIMIT, TwoWorkers::start()).await??;
     TwoWorkers::lose_and_evict(&workers.first);
@@ -157,12 +156,25 @@ async fn a_probe_for_one_worker_only_checks_that_worker() -> Result<()> {
     // The first worker's probe owns this pass. The second worker has its own probe.
     tokio::time::timeout(
         LIMIT,
-        unresolved.recheck(&workers.pair.messenger_a, TIMING.deadline),
+        unresolved.recheck_worker(
+            &workers.pair.messenger_a,
+            workers.pair.messenger_b.instance_id(),
+            Some(WORKER),
+            TIMING.deadline,
+        ),
     )
     .await?;
 
     assert_eq!(checks(&workers.first) - first_checks, 1);
     assert_eq!(checks(&workers.second) - second_checks, 0);
+    assert_eq!(
+        named_workers(&unresolved),
+        vec![
+            (Some(WORKER), Some(workers.first.incarnation())),
+            (Some(OTHER), Some(workers.second.incarnation())),
+        ],
+        "an evicted record proves nothing, and the other worker is untouched"
+    );
     Ok(())
 }
 
