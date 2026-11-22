@@ -8,7 +8,7 @@
 
 //! Integration test for the `kvbmctl` render path against a live hub.
 //!
-//! Stands up a real `HubServer`, fetches `GET /v1/config` through `HubClient`
+//! Stands up a real `HubServer`, fetches `GET /v1/ext/kvbm/config` through `HubClient`
 //! (built from a URL the same way the binary does), and renders the vLLM CLI
 //! fragment. The render's own validation round-trips the emitted
 //! `kv_connector_extra_config` through the connector parser, so a green test
@@ -21,8 +21,8 @@ use kvbm_hub::features::disagg::cli::DisaggCli;
 use kvbm_hub::features::indexer::cli::IndexerCli;
 use kvbm_hub::render::{VllmRenderOptions, render_vllm_cli};
 use kvbm_hub::{
-    BlockLayoutMode, ConditionalDisaggManager, FeatureCli, FeatureManager, HubClientBuilder,
-    HubServer, IndexerManager, P2pManager, PrefillRouterManager, PrimaryConfig, SelectorConfig,
+    BlockLayoutMode, ConditionalDisaggManager, FeatureCli, HubClientBuilder, HubServer,
+    IndexerManager, P2pManager, PrefillRouterManager, PrimaryConfig, SelectorConfig,
 };
 
 const BLOCK_SIZE: usize = 16;
@@ -52,13 +52,13 @@ async fn start_hub() -> HubServer {
             g2_blocks: None,
             advertise_host: Some("127.0.0.1".to_string()),
         })
-        .add_feature_manager(Arc::new(P2pManager::new()) as Arc<dyn FeatureManager>)
-        .add_feature_manager(Arc::new(ConditionalDisaggManager::new()) as Arc<dyn FeatureManager>)
-        .add_feature_manager(PrefillRouterManager::new(SelectorConfig {
+        .extension(Arc::new(P2pManager::new()))
+        .extension(Arc::new(ConditionalDisaggManager::new()))
+        .extension(PrefillRouterManager::new(SelectorConfig {
             per_worker_concurrency: 4,
             block_size: BLOCK_SIZE,
-        }) as Arc<dyn FeatureManager>)
-        .add_feature_manager(Arc::new(kv) as Arc<dyn FeatureManager>)
+        }))
+        .extension(Arc::new(kv))
         .serve()
         .await
         .expect("start hub")

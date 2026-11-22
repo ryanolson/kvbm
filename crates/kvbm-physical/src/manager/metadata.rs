@@ -210,9 +210,11 @@ fn validate_resource_parallelism(
             .iter()
             .map(|entry| entry.resource)
             .collect::<Vec<_>>();
+        // A layout with no parallelism entry is an exported layout that a
+        // peer reads by handle; no transfer dispatch plans it.
         anyhow::ensure!(
-            layout_ids == parallelism_ids,
-            "resource layout and parallelism metadata describe different resources"
+            parallelism_ids.iter().all(|id| layout_ids.contains(id)),
+            "parallelism metadata names a resource with no physical layout"
         );
     }
     Ok(())

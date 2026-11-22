@@ -39,14 +39,14 @@ use super::protocol::{
     BundlePublishRequest, BundleQueryOutcome, BundleQueryRequest, FindBlocksHit, QUERY_HANDLER,
     QueryRequest, TierPlacementSnapshotRequest, TierPlacementSnapshotResponse,
 };
-use crate::protocol::MutationCredential;
+use velo_hub::protocol::Credential;
 
 /// Velo-plane lookup client for the hub's KV block index.
 pub struct IndexerLookupClient {
     messenger: Arc<Messenger>,
     /// Hub's velo `InstanceId` — the target of the lookup unary RPC.
     hub_velo_id: InstanceId,
-    mutation_credential: MutationCredential,
+    mutation_credential: Credential,
     registration_epoch: RegistrationEpoch,
     /// Shared with the owning [`HubClient`](crate::HubClient) — one connection
     /// pool, one set of timeouts.
@@ -70,7 +70,7 @@ impl IndexerLookupClient {
     pub(crate) fn new(
         messenger: Arc<Messenger>,
         hub_velo_id: InstanceId,
-        mutation_credential: MutationCredential,
+        mutation_credential: Credential,
         registration_epoch: RegistrationEpoch,
         http: reqwest::Client,
         tier_placement_snapshot_url: Url,
@@ -161,7 +161,7 @@ impl IndexerLookupClient {
     }
 
     /// Install this publisher's full tier-placement state on the hub
-    /// (`POST /v1/features/indexer/tier-placements/snapshot`).
+    /// (`POST /v1/ext/indexer/tier-placements/snapshot`).
     ///
     /// This is the reliable, authenticated half of R7b §3: deltas ride the
     /// lossy ZMQ plane and can only *update* a projection, while the hub's map
@@ -200,7 +200,7 @@ impl IndexerLookupClient {
             .send()
             .await
             .with_context(|| format!("POST {}", self.tier_placement_snapshot_url))?;
-        crate::client::parse_json(resp).await
+        crate::client::parse_json(resp, "tier placement snapshot").await
     }
 
     pub async fn find_bundle(&self, request: BundleQueryRequest) -> Result<BundleQueryOutcome> {

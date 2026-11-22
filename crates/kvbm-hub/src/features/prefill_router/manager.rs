@@ -5,9 +5,9 @@
 //!
 //! Owns a [`PrefillRouter`] / [`Selector`] pair and translates
 //! `Feature::PrefillRouter` registrations into [`PrefillExecutionBackend`]
-//! instances added to the fleet at runtime. `on_unregister` removes the
-//! worker — in-flight tasks against it complete normally; new picks see
-//! it gone.
+//! instances added to the fleet at runtime, and installs the router's
+//! submit and done handlers on the hub. Removing a worker frees the charges
+//! of its running requests; new picks see it gone.
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -19,7 +19,6 @@ use axum::{
     http::StatusCode,
     routing::{get, post},
 };
-use futures::future::BoxFuture;
 use parking_lot::RwLock;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
@@ -27,7 +26,6 @@ use velo_ext::InstanceId;
 
 use super::breaker::{BreakerConfig, CircuitBreaker};
 use super::calibration::{CALIBRATE_HANDLER, CalibrationRequest, CalibrationResponse};
-use super::dispatcher::PrefillRequestDispatcher;
 use super::execution::{HttpExecutionBackend, PrefillExecutionBackend, VeloExecutionBackend};
 use super::protocol::{
     self, CountersResponse, PrefillBackendAdvertisement, PrefillTargetSummary, TargetsResponse,
@@ -36,8 +34,11 @@ use super::protocol::{
 use super::router::PrefillRouter;
 use super::selection::{Selector, SelectorConfig};
 use super::tier_push::TierBroadcaster;
-use crate::features::{FeatureError, FeatureManager, HubContext};
-use crate::protocol::{Feature, FeatureKey};
+use crate::protocol::PrefillRouterConfig;
+use velo_hub::store::Removal;
+use velo_hub::{AttachContext, Committed, Extension, Rejection, Txn};
+
+use crate::features::KvbmFeature;
 
 /// Wall-clock guard on a single calibration unary call. Generous because
 /// a full sweep up to 32k tokens can take several minutes; the worker
@@ -51,10 +52,8 @@ const CALIBRATE_TIMEOUT: Duration = Duration::from_secs(900);
 /// the tier never recomputes). ~250ms balances responsiveness against load.
 const BREAKER_TICK_INTERVAL: Duration = Duration::from_millis(250);
 
-/// FeatureManager for the prefill router. Owns the [`PrefillRouter`] +
-/// [`Selector`]; exposes the router via [`Self::dispatcher`] so the hub
-/// binary can install it on the disagg manager as the
-/// [`PrefillRequestDispatcher`].
+/// Hub extension for the prefill router. Owns the [`PrefillRouter`] +
+/// [`Selector`].
 pub struct PrefillRouterManager {
     router: Arc<PrefillRouter>,
     selector: Arc<Selector>,
@@ -68,7 +67,7 @@ pub struct PrefillRouterManager {
     /// configured with a transport. Required to build velo execution
     /// backends — `on_register` rejects velo advertisements when this is
     /// unset (discovery-only hub).
-    velo: OnceLock<Arc<velo::Velo>>,
+    velo: OnceLock<velo::WeakVelo>,
     /// CD prefill-overload circuit breaker. `Some` ONLY when the operator
     /// opted in (`cd_breaker_enabled = true`); `None` (default) means the
     /// hub never constructs the breaker and [`Self::attach`] spawns no tick
@@ -170,10 +169,9 @@ impl PrefillRouterManager {
         self.broadcaster.as_ref()
     }
 
-    /// The [`PrefillRequestDispatcher`] the hub binary hands to the
-    /// disagg manager's `start_dispatcher`.
-    pub fn dispatcher(self: &Arc<Self>) -> Arc<dyn PrefillRequestDispatcher> {
-        Arc::clone(&self.router) as Arc<dyn PrefillRequestDispatcher>
+    /// The router that places each prefill request.
+    pub fn router(&self) -> &Arc<PrefillRouter> {
+        &self.router
     }
 
     /// Underlying selector (mainly for tests and the HTTP introspection
@@ -224,108 +222,109 @@ impl PrefillRouterManager {
     }
 }
 
-impl FeatureManager for PrefillRouterManager {
-    fn key(&self) -> FeatureKey {
-        FeatureKey::PrefillRouter
+impl KvbmFeature for PrefillRouterManager {}
+
+impl Extension for PrefillRouterManager {
+    const NAME: &'static str = crate::protocol::PREFILL_ROUTER_EXTENSION;
+    type Registration = PrefillRouterConfig;
+    /// The target's backend and the advertisement it was built from.
+    type Staged = Option<(
+        Arc<dyn PrefillExecutionBackend>,
+        PrefillBackendAdvertisement,
+    )>;
+
+    async fn attach(&self, ctx: &AttachContext<'_>) -> anyhow::Result<()> {
+        if let Some(velo) = ctx.velo() {
+            if let Some(b) = &self.broadcaster {
+                b.set_velo(velo.downgrade());
+            }
+            self.router.register_handlers(velo.messenger())?;
+            let _ = self.velo.set(velo.downgrade());
+        }
+        if let Some(breaker) = self.breaker.clone() {
+            spawn_breaker_tick_task(
+                breaker,
+                Arc::clone(&self.selector),
+                self.broadcaster.clone(),
+                ctx.cancellation().clone(),
+            );
+            tracing::info!(
+                interval_ms = BREAKER_TICK_INTERVAL.as_millis() as u64,
+                "prefill-router circuit breaker enabled; breaker-tick task started"
+            );
+        }
+        Ok(())
     }
 
-    fn attach<'a>(&'a self, ctx: HubContext) -> BoxFuture<'a, Result<(), FeatureError>> {
-        Box::pin(async move {
-            // Stash the hub's velo handle (if any) so on_register can build
-            // velo execution backends. A discovery-only hub leaves `velo`
-            // unset and velo advertisements are rejected at register time.
-            // The same handle backs the P2 tier-push broadcaster.
-            if let Some(velo) = ctx.velo {
-                if let Some(b) = &self.broadcaster {
-                    b.set_velo(Arc::clone(&velo));
-                }
-                let _ = self.velo.set(velo);
+    async fn prepare(
+        &self,
+        txn: &Txn<'_>,
+        payload: Option<PrefillRouterConfig>,
+    ) -> Result<Self::Staged, Rejection> {
+        let Some(cfg) = payload else {
+            return Ok(None);
+        };
+        let backend: Arc<dyn PrefillExecutionBackend> = match &cfg.backend {
+            PrefillBackendAdvertisement::Http(endpoint) => {
+                HttpExecutionBackend::new(txn.owner, endpoint.clone()).map_err(|e| {
+                    Rejection::bad_request(format!("HTTP backend build failed: {e}"))
+                })?
             }
-            // Spawn the dedicated circuit-breaker tick task ONLY when the
-            // breaker was constructed (operator opted in). Default-OFF ⇒ no
-            // task, no behavior change. The task is the SOLE writer of the
-            // breaker tier and is where the recovery (clear) logic runs,
-            // decoupled from dispatch traffic (event-driven would latch HOT).
-            if let Some(breaker) = self.breaker.clone() {
-                spawn_breaker_tick_task(
-                    breaker,
-                    Arc::clone(&self.selector),
-                    self.broadcaster.clone(),
-                    ctx.cancel.clone(),
-                );
-                tracing::info!(
-                    interval_ms = BREAKER_TICK_INTERVAL.as_millis() as u64,
-                    "prefill-router circuit breaker enabled; breaker-tick task started"
-                );
-            }
-            Ok(())
-        })
-    }
-
-    fn on_register<'a>(
-        &'a self,
-        instance_id: InstanceId,
-        feature: &'a Feature,
-    ) -> BoxFuture<'a, Result<(), FeatureError>> {
-        Box::pin(async move {
-            let Feature::PrefillRouter(cfg) = feature else {
-                return Err(FeatureError::KeyMismatch {
-                    manager: FeatureKey::PrefillRouter,
-                    payload: feature.key(),
-                });
-            };
-            let backend: Arc<dyn PrefillExecutionBackend> = match &cfg.backend {
-                PrefillBackendAdvertisement::Http(endpoint) => {
-                    HttpExecutionBackend::new(instance_id, endpoint.clone()).map_err(|e| {
-                        FeatureError::InvalidConfig(format!("HTTP backend build failed: {e}"))
-                    })?
-                }
-                PrefillBackendAdvertisement::Velo {
-                    instance_id: target,
-                } => {
-                    let velo = self.velo.get().ok_or_else(|| {
-                        FeatureError::InvalidConfig(
+            PrefillBackendAdvertisement::Velo {
+                instance_id: target,
+            } => {
+                let velo = self
+                    .velo
+                    .get()
+                    .and_then(velo::WeakVelo::upgrade)
+                    .ok_or_else(|| {
+                        Rejection::bad_request(
                             "velo prefill backend requires the hub to have a velo transport \
-                             (start kvbm_hub with --velo-port)"
-                                .to_string(),
+                             (start kvbm_hub with --velo-port)",
                         )
                     })?;
-                    VeloExecutionBackend::new(*target, velo.messenger().clone())
-                }
-            };
-            let newly_added = self.selector.add_worker(instance_id, backend);
-            self.advertisements
-                .write()
-                .insert(instance_id, cfg.backend.clone());
-            tracing::info!(
-                instance_id = %instance_id,
-                backend = cfg.backend.label(),
-                newly_added,
-                "PrefillRouter: target registered"
-            );
-            Ok(())
-        })
+                VeloExecutionBackend::new(*target, velo.messenger().clone())
+            }
+        };
+        Ok(Some((backend, cfg.backend)))
     }
 
-    fn on_unregister(&self, instance_id: InstanceId) {
-        self.selector.remove_worker(instance_id);
-        self.advertisements.write().remove(&instance_id);
+    fn commit(&self, staged: Self::Staged, registration: &Committed<'_>) {
+        let owner = registration.owner;
+        let Some((backend, advertisement)) = staged else {
+            self.remove(owner);
+            return;
+        };
+        let newly_added = self.selector.add_worker(owner, backend);
         tracing::info!(
-            instance_id = %instance_id,
-            "PrefillRouter: target removed"
+            instance_id = %owner,
+            backend = advertisement.label(),
+            newly_added,
+            "PrefillRouter: target registered"
         );
+        self.advertisements.write().insert(owner, advertisement);
     }
 
-    fn route_prefix(&self) -> Option<&'static str> {
-        Some(protocol::ROUTE_PREFIX)
+    fn on_removed(&self, removal: Removal) {
+        self.remove(removal.id);
     }
 
-    fn control_router(self: Arc<Self>) -> Router {
+    fn control_routes(self: Arc<Self>) -> Router {
         routes(self)
     }
 
-    fn public_router(self: Arc<Self>) -> Router {
+    fn public_routes(self: Arc<Self>) -> Router {
         routes(self)
+    }
+}
+
+impl PrefillRouterManager {
+    fn remove(&self, owner: InstanceId) {
+        self.selector.remove_worker(owner);
+        self.router.forget_worker(owner);
+        if self.advertisements.write().remove(&owner).is_some() {
+            tracing::info!(instance_id = %owner, "PrefillRouter: target removed");
+        }
     }
 }
 
@@ -457,14 +456,18 @@ async fn post_calibrate(
         body.force = force;
     }
 
-    let velo = mgr.velo.get().ok_or_else(|| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "hub has no velo transport; calibrate proxy requires a velo-equipped hub \
+    let velo = mgr
+        .velo
+        .get()
+        .and_then(velo::WeakVelo::upgrade)
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "hub has no velo transport; calibrate proxy requires a velo-equipped hub \
              (start kvbm_hub with --velo-port)"
-                .to_string(),
-        )
-    })?;
+                    .to_string(),
+            )
+        })?;
 
     let call = velo
         .messenger()
@@ -507,6 +510,9 @@ async fn post_calibrate(
 mod tests {
     use super::*;
     use crate::protocol::{Feature, PrefillRouterConfig};
+    use crate::server::HubServer;
+    use crate::test_hub;
+    use velo_hub::client::HubClient;
 
     fn cfg() -> SelectorConfig {
         SelectorConfig {
@@ -532,13 +538,43 @@ mod tests {
         })
     }
 
-    #[tokio::test]
-    async fn on_register_http_adds_to_fleet() {
+    async fn hub(mgr: &Arc<PrefillRouterManager>) -> HubServer {
+        test_hub::serve(HubServer::builder().extension(Arc::clone(mgr))).await
+    }
+
+    fn tcp_transport() -> Arc<velo::transports::tcp::TcpTransport> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        Arc::new(
+            velo::transports::tcp::TcpTransportBuilder::new()
+                .from_listener(listener)
+                .unwrap()
+                .build()
+                .unwrap(),
+        )
+    }
+
+    async fn hub_with_velo(mgr: &Arc<PrefillRouterManager>) -> HubServer {
+        test_hub::serve(
+            HubServer::builder()
+                .add_transport(tcp_transport())
+                .extension(Arc::clone(mgr)),
+        )
+        .await
+    }
+
+    async fn register(server: &HubServer, feature: Feature) -> (HubClient, InstanceId) {
+        let client = test_hub::client(server);
+        let peer = test_hub::peer();
+        let id = peer.instance_id();
+        test_hub::register(&client, peer, &[feature]).await.unwrap();
+        (client, id)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn register_http_adds_to_fleet() {
         let mgr = PrefillRouterManager::new(cfg());
-        let id = InstanceId::new_v4();
-        mgr.on_register(id, &http_feature("http://x:8000", "m"))
-            .await
-            .unwrap();
+        let server = hub(&mgr).await;
+        let (_client, id) = register(&server, http_feature("http://x:8000", "m")).await;
         assert_eq!(mgr.selector.worker_count(), 1);
         let targets = mgr.targets();
         assert_eq!(targets.targets.len(), 1);
@@ -546,38 +582,21 @@ mod tests {
         assert_eq!(targets.targets[0].backend, "http");
     }
 
-    async fn attached_mgr_with_velo() -> (Arc<PrefillRouterManager>, Arc<velo::Velo>) {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn register_velo_adds_to_fleet() {
         let mgr = PrefillRouterManager::new(cfg());
-        let velo = velo::Velo::builder()
-            .add_transport({
-                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-                Arc::new(
-                    velo::transports::tcp::TcpTransportBuilder::new()
-                        .from_listener(listener)
-                        .unwrap()
-                        .build()
-                        .unwrap(),
-                )
-            })
+        let server = hub_with_velo(&mgr).await;
+        let target = InstanceId::new_v4();
+        // A hub with velo decodes the peer's address, so the peer is a real velo.
+        let peer_velo = velo::Velo::builder()
+            .add_transport(tcp_transport())
             .build()
             .await
             .unwrap();
-        let ctx = HubContext {
-            velo: Some(Arc::clone(&velo)),
-            registry: Arc::new(crate::registry::InMemoryRegistry::builder().build())
-                as Arc<dyn crate::registry::PeerRegistry>,
-            cancel: tokio_util::sync::CancellationToken::new(),
-        };
-        mgr.attach(ctx).await.unwrap();
-        (mgr, velo)
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn on_register_velo_adds_to_fleet() {
-        let (mgr, _velo) = attached_mgr_with_velo().await;
-        let id = InstanceId::new_v4();
-        let target = InstanceId::new_v4();
-        mgr.on_register(id, &velo_feature(target)).await.unwrap();
+        let client = test_hub::client(&server);
+        test_hub::register(&client, peer_velo.peer_info(), &[velo_feature(target)])
+            .await
+            .unwrap();
         let targets = mgr.targets();
         assert_eq!(targets.targets[0].backend, "velo");
         match &targets.targets[0].advertisement {
@@ -586,98 +605,53 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn velo_on_register_without_attached_velo_fails() {
-        // Discovery-only hub: attach with no velo. Registering a velo
-        // backend must hard-fail with a clear reason.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn velo_register_without_hub_velo_fails() {
+        // A discovery-only hub has no velo, so a velo backend cannot work.
         let mgr = PrefillRouterManager::new(cfg());
-        let ctx = HubContext {
-            velo: None,
-            registry: Arc::new(crate::registry::InMemoryRegistry::builder().build())
-                as Arc<dyn crate::registry::PeerRegistry>,
-            cancel: tokio_util::sync::CancellationToken::new(),
-        };
-        mgr.attach(ctx).await.unwrap();
-        let err = mgr
-            .on_register(InstanceId::new_v4(), &velo_feature(InstanceId::new_v4()))
-            .await
-            .unwrap_err();
-        match err {
-            FeatureError::InvalidConfig(msg) => {
-                assert!(msg.contains("velo"), "expected velo error, got: {msg}");
-            }
-            other => panic!("expected InvalidConfig, got {other:?}"),
-        }
+        let server = hub(&mgr).await;
+        let client = test_hub::client(&server);
+        let err = test_hub::register(
+            &client,
+            test_hub::peer(),
+            &[velo_feature(InstanceId::new_v4())],
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("velo"),
+            "expected velo error, got: {err}"
+        );
+        assert_eq!(mgr.selector.worker_count(), 0);
     }
 
-    #[tokio::test]
-    async fn on_unregister_drains_from_fleet() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unregister_drains_from_fleet() {
         let mgr = PrefillRouterManager::new(cfg());
-        let id = InstanceId::new_v4();
-        mgr.on_register(id, &http_feature("http://x:8000", "m"))
-            .await
-            .unwrap();
-        mgr.on_unregister(id);
+        let server = hub(&mgr).await;
+        let (client, _id) = register(&server, http_feature("http://x:8000", "m")).await;
+        client.unregister().await.unwrap();
         assert_eq!(mgr.selector.worker_count(), 0);
         assert!(mgr.targets().targets.is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn re_register_replaces_advertisement() {
         let mgr = PrefillRouterManager::new(cfg());
-        let id = InstanceId::new_v4();
-        mgr.on_register(id, &http_feature("http://old:8000", "m"))
-            .await
-            .unwrap();
-        mgr.on_register(id, &http_feature("http://new:8000", "m"))
-            .await
-            .unwrap();
+        let server = hub(&mgr).await;
+        let client = test_hub::client(&server);
+        let peer = test_hub::peer();
+        for url in ["http://old:8000", "http://new:8000"] {
+            test_hub::register(&client, peer.clone(), &[http_feature(url, "m")])
+                .await
+                .unwrap();
+        }
         assert_eq!(mgr.selector.worker_count(), 1);
         let targets = mgr.targets();
         assert_eq!(targets.targets.len(), 1);
         match &targets.targets[0].advertisement {
             PrefillBackendAdvertisement::Http(ep) => assert_eq!(ep.base_url, "http://new:8000"),
             other => panic!("expected http, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn on_register_rejects_wrong_feature() {
-        use crate::protocol::IndexerFeatureConfig;
-        use kvbm_protocols::cache_manifest::{
-            CacheManifest, ModelIdentity, ResourceRequirement, ResourceRole,
-        };
-        let mgr = PrefillRouterManager::new(cfg());
-        let id = InstanceId::new_v4();
-        let err = mgr
-            .on_register(
-                id,
-                &Feature::Indexer(IndexerFeatureConfig {
-                    max_seq_len: None,
-                    manifest: CacheManifest::new(
-                        ModelIdentity::new("test-architecture", "test-revision", [1; 32]).unwrap(),
-                        "test-cache-abi",
-                        vec![
-                            ResourceRequirement::new(
-                                kvbm_common::LogicalResourceId(1),
-                                ResourceRole::PrefixHistory,
-                                4,
-                            )
-                            .unwrap(),
-                        ],
-                        std::collections::BTreeMap::new(),
-                    )
-                    .unwrap(),
-                    create_kind: kvbm_logical::events::CreateKind::Block,
-                }),
-            )
-            .await
-            .unwrap_err();
-        match err {
-            FeatureError::KeyMismatch { manager, .. } => {
-                assert_eq!(manager, FeatureKey::PrefillRouter);
-            }
-            other => panic!("expected KeyMismatch, got {other:?}"),
         }
     }
 
@@ -702,17 +676,10 @@ mod tests {
     async fn breaker_tick_task_trips_on_empty_fleet() {
         use kvbm_protocols::disagg::BreakerTier;
         // An empty fleet reads as fully saturated (free_frac 0.0) ⇒ the tick
-        // task must drive the breaker to HOT. This proves the task is spawned,
-        // wired to the selector, and ticking (the critical-fix path).
+        // task must drive the breaker to HOT. This proves attach spawns the
+        // task, wired to the selector and ticking.
         let mgr = PrefillRouterManager::with_breaker(cfg(), BreakerConfig::default());
-        let cancel = CancellationToken::new();
-        let ctx = HubContext {
-            velo: None,
-            registry: Arc::new(crate::registry::InMemoryRegistry::builder().build())
-                as Arc<dyn crate::registry::PeerRegistry>,
-            cancel: cancel.clone(),
-        };
-        mgr.attach(ctx).await.unwrap();
+        let server = hub(&mgr).await;
 
         let breaker = Arc::clone(mgr.breaker().unwrap());
         // Poll up to ~2s for the tick task (250ms interval) to reach HOT.
@@ -725,16 +692,14 @@ mod tests {
             BreakerTier::Hot,
             "tick task should trip HOT on an empty (saturated) fleet"
         );
-        cancel.cancel();
+        server.shutdown().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn counters_snapshot_reflects_workers() {
         let mgr = PrefillRouterManager::new(cfg());
-        let id = InstanceId::new_v4();
-        mgr.on_register(id, &http_feature("http://x:8000", "m"))
-            .await
-            .unwrap();
+        let server = hub(&mgr).await;
+        let (_client, _id) = register(&server, http_feature("http://x:8000", "m")).await;
         let snap = mgr.counters();
         assert_eq!(snap.workers.len(), 1);
         assert_eq!(snap.workers[0].inflight, 0);

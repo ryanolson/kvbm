@@ -50,7 +50,7 @@ pub use discovery::{
     DiscoveryConfig, EtcdDiscoveryConfig, FilesystemDiscoveryConfig, P2pDiscoveryConfig,
 };
 pub use events::{BatchingConfig as EventsBatchingConfig, EventPolicyConfig, EventsConfig};
-pub use hub::LeaderHubConfig;
+pub use hub::{DEFAULT_HUB_CONTROL_PORT, LeaderHubConfig};
 pub use kvbm_common::BlockLayoutMode;
 pub use messenger::{MessengerBackendConfig, MessengerConfig};
 pub use metrics::MetricsConfig;

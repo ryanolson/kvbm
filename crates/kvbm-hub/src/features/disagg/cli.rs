@@ -3,7 +3,7 @@
 
 //! `kvbmctl` client CLI for the disagg (conditional-disagg) feature.
 //!
-//! Surfaces the read-only hub endpoint (`/v1/features/disagg/instances`) as
+//! Surfaces the read-only hub endpoint (`/v1/ext/disagg/instances`) as
 //! `kvbmctl disagg instances` — the registered prefill/decode instance split.
 //! Mirrors [`IndexerCli`](crate::features::indexer::cli::IndexerCli): a
 //! zero-state [`FeatureCli`] that shares the feature's own route consts with
@@ -15,8 +15,8 @@ use futures::future::BoxFuture;
 
 use crate::client::HubClient;
 use crate::features::cli::FeatureCli;
-use crate::features::disagg::protocol::{ConditionalDisaggInstancesResponse, ROUTE_PREFIX, paths};
-use crate::protocol::FeatureKey;
+use crate::features::disagg::protocol::{ConditionalDisaggInstancesResponse, paths};
+use crate::protocol::{DISAGG_EXTENSION, FeatureKey};
 
 /// Zero-state CLI for the disagg feature.
 pub struct DisaggCli;
@@ -46,7 +46,7 @@ impl FeatureCli for DisaggCli {
             match matches.subcommand() {
                 Some(("instances", _)) => {
                     let r: ConditionalDisaggInstancesResponse = hub
-                        .get_json(&format!("/v1/features/{ROUTE_PREFIX}{}", paths::INSTANCES))
+                        .get_json(&format!("/v1/ext/{DISAGG_EXTENSION}{}", paths::INSTANCES))
                         .await?;
                     Ok(serde_json::to_value(r)?)
                 }

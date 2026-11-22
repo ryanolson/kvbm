@@ -5,25 +5,21 @@
 //!
 //! Mirrors [`features/indexer/protocol.rs`](crate::features::indexer::protocol):
 //! all paths are **relative** — the server nests them under
-//! `/v1/features/{ROUTE_PREFIX}` (see
-//! [`FeatureManager::route_prefix`](crate::features::FeatureManager::route_prefix)).
+//! `/v1/ext/{NAME}` (see
+//! `/v1/ext/{NAME}`).
 //! The feature owns its whole namespace; nothing here lives in the central
 //! [`crate::protocol::paths`].
 
 use serde::{Deserialize, Serialize};
 use velo_ext::InstanceId;
 
-/// URL segment the server nests this feature's routers under
-/// (`/v1/features/disagg/...`).
-pub const ROUTE_PREFIX: &str = "disagg";
-
-/// Relative route paths (mounted under `/v1/features/disagg`).
+/// Relative route paths (mounted under `/v1/ext/disagg`).
 pub mod paths {
     /// `GET /instances` — registered instances split by P/D role.
     pub const INSTANCES: &str = "/instances";
 }
 
-/// Response body for `GET /v1/features/disagg/instances` — the registered
+/// Response body for `GET /v1/ext/disagg/instances` — the registered
 /// instances split by conditional-disagg role.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct ConditionalDisaggInstancesResponse {

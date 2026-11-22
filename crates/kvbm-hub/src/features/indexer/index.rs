@@ -132,13 +132,8 @@ impl ManifestIndexes {
         self.feed.lock().sink.set(sink)
     }
 
-    pub fn bind(
-        &self,
-        instance: u128,
-        manifest: &CacheManifest,
-        kind: CreateKind,
-        max_seq_len: Option<usize>,
-    ) -> Result<(), BindError> {
+    /// The checks of [`Self::bind`], with no change to any binding.
+    pub fn check_bind(&self, manifest: &CacheManifest, kind: CreateKind) -> Result<(), BindError> {
         if kind == CreateKind::Carrier
             && !manifest
                 .resources()
@@ -147,9 +142,7 @@ impl ManifestIndexes {
         {
             return Err(BindError::CarrierWithoutBoundaryCapsule);
         }
-
         let manifest_id = manifest.id();
-        let mut bindings = self.bindings.write();
         if let Some(index) = self.indexes.get(&manifest_id)
             && index.kind != kind
         {
@@ -159,6 +152,19 @@ impl ManifestIndexes {
                 requested: kind,
             });
         }
+        Ok(())
+    }
+
+    pub fn bind(
+        &self,
+        instance: u128,
+        manifest: &CacheManifest,
+        kind: CreateKind,
+        max_seq_len: Option<usize>,
+    ) -> Result<(), BindError> {
+        let manifest_id = manifest.id();
+        let mut bindings = self.bindings.write();
+        self.check_bind(manifest, kind)?;
 
         let previous = bindings.get(&instance).copied();
         if let Some(previous) = previous

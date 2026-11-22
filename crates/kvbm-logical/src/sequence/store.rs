@@ -150,15 +150,16 @@ impl<U, S, A> BlockStore<U, S, A> {
     // N-element loop is O(N²). Draining a contiguous prefix in one call is
     // O(len) total.
 
-    /// Drains all staged entries in staging (FIFO) order, returning them as a
-    /// `Vec`. O(N) total, versus O(N²) for an N-element loop of
-    /// [`shift_staged`](Self::shift_staged).
+    /// Drains the first `min(n, staged.len())` staged entries in staging
+    /// (FIFO) order, returning them as a `Vec`. O(len) total, versus O(n²)
+    /// for an n-element loop of [`shift_staged`](Self::shift_staged).
     ///
     /// Returns an owned `Vec` (not the `Drain` iterator) so callers can
     /// re-borrow `self` (e.g. to call `insert_assigned`) while iterating the
     /// result.
-    pub fn drain_staged(&mut self) -> Vec<(BlockId, S)> {
-        self.staged.drain(..).collect()
+    pub fn drain_staged_prefix(&mut self, n: usize) -> Vec<(BlockId, S)> {
+        let n = n.min(self.staged.len());
+        self.staged.drain(..n).collect()
     }
 
     /// Drains the first `min(n, unassigned.len())` entries from unassigned in

@@ -9,11 +9,10 @@
 //! subsequent registration is checked against the baseline via
 //! [`check_layout_compat`].
 //!
-//! CD ([`super::disagg`]) is a specialisation of P2P: any
-//! `RegisterRequest` containing `Feature::ConditionalDisagg` MUST also
-//! contain `Feature::P2P` in the same request. The server enforces this
-//! pre-dispatch — see `crate::server::register_instance`. Do not duplicate
-//! the check inside this manager.
+//! CD ([`super::disagg`]) is a specialisation of P2P: any registration
+//! carrying the `disagg` extension MUST also carry `p2p`. velo-hub enforces
+//! this through `ConditionalDisaggManager::registration_requires`. Do not
+//! duplicate the check inside this manager.
 
 /// `kvbmctl p2p` action CLI for this feature. Gated behind the `kvbmctl` feature.
 #[cfg(feature = "kvbmctl")]

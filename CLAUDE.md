@@ -27,16 +27,29 @@ or modify dynamo from here.
 
 ## External dependencies
 
-- Three **git** deps on dynamo, pinned to revs on branch `ryan/carrier`:
+- All external git deps come from **public** branches in the ai-dynamo org that
+  carry upstream plus the changes kvbm and Rhino need. These branches are
+  add-only. Never force-push or rebase them, because kvbm and Rhino pin revs on
+  them.
+- kvbm must resolve to the same dependency graph as Rhino, which consumes it as a
+  git dependency. Change a shared pin (dynamo, nixl-sys, velo, tokio) only
+  together with Rhino.
+- Three **git** deps on dynamo, pinned to a rev on `ai-dynamo/dynamo` branch
+  `rhino-main` (upstream plus the carrier stack):
   `dynamo-tokens`, `dynamo-kv-router`, `dynamo-kv-hashing` (the latter two
   via `kvbm-consolidator`). The dependency only runs kvbm → dynamo; dynamo does not depend
-  on this repo. Keep that branch fetchable; prefer pinning to an immutable rev for CI
-  reproducibility.
+  on this repo.
 - `kvbm-memory` is a locally-owned crate (`crates/kvbm-memory`), forked from
   `dynamo-memory` and no longer resolved via git. The single graph-wide NIXL
-  binding pin (`nixl-sys = "=1.0.1"`) is declared once in `crates/Cargo.toml`'s
-  `[workspace.dependencies]`; `kvbm-memory` inherits it via `nixl-sys = { workspace = true }`.
-- `velo` / `velo-ext` are registry deps.
+  binding pin (`nixl-sys = "=1.4.1"`, a rev on `ai-dynamo/nixl` branch `rhino-1.4`:
+  NIXL 1.4.1 plus the deregistration and compiler fixes) is
+  declared once in `crates/Cargo.toml`'s `[workspace.dependencies]`; `kvbm-memory`
+  inherits it via `nixl-sys = { workspace = true }`. It stays at 1.4.1 because
+  Rhino runs the `nixl-cu13` 1.4.1 wheel.
+- `tokio` is a minimum version (`1.54.1`), not an exact pin.
+- `velo`, `velo-ext`, and `velo-hub` come from the public `ai-dynamo/velo` tag
+  `v0.21.0`. velo-hub is not on crates.io, and mixing a registry velo with the
+  git velo-hub would build two copies of the velo types.
 
 ## Build
 
@@ -92,13 +105,22 @@ When modifying code, evaluate and update related documentation so it stays accur
 If an `ACTIVE_PLAN.md` exists, load it each session and advance it to completion; update it
 before returning control. If it should be ignored, rename it to `_ACTIVE_PLAN_.md`.
 
-## Rhino-hosted Rust tests
+## Checking a change against Rhino
 
-Rhino excludes this Rust workspace. Tests with development dependencies require the KVBM workspace manifest, not `cargo test -p kvbm-logical` from Rhino alone. Rhino enables `static-kernels`. This feature selects how the compiled `kvbm_kernels` object links. The object links as a static archive, or as an nvcc-built shared library. Real-versus-stub kernel selection depends only on nvcc availability in `kvbm-kernels/build.rs`. `KVBM_REQUIRE_CUDA` makes a missing nvcc fatal under Rhino.
+Rhino consumes the kvbm crates as git dependencies pinned to one revision. Rhino
+enables `static-kernels`, which selects how the compiled `kvbm_kernels` object
+links: as a static archive, or as an nvcc-built shared library. Real-versus-stub
+kernel selection depends only on nvcc availability in `kvbm-kernels/build.rs`.
+`KVBM_REQUIRE_CUDA` makes a missing nvcc fatal.
 
-Run these commands from the Rhino root, through its canonical uv environment. Use the host's build lock and memory gate where applicable.
+To check a kvbm change against Rhino before moving Rhino's pin, add a `[patch]`
+for kvbm's git URL in a Rhino worktree's root `Cargo.toml`, with one entry per
+`kvbm-*` crate pointing at this checkout's `crates/kvbm-*`. Then build the Rhino
+crates that use kvbm through Rhino's uv environment:
 
 ```bash
-timeout 300 uv run cargo test --manifest-path 3rdparty/kvbm/crates/Cargo.toml --locked -p kvbm-logical -j 4
-timeout 300 uv run cargo test --manifest-path 3rdparty/kvbm/crates/Cargo.toml --locked -p kvbm-engine --no-default-features --features testing,static-kernels --test velo_session_loopback -j 4
+timeout 3000 uv run cargo check -p rhino-kvbm -p rhino-hub -p rhino-fast-load --all-targets -j 8
 ```
+
+Confirm that Rhino's `Cargo.lock` holds one copy each of `dynamo-kv-router`,
+`nixl-sys`, and `tokio`.

@@ -89,6 +89,8 @@ pub struct PolicyG1G2BoundRoute<T: PolicyG1SourceMetadata> {
 
 pub(super) struct PolicyG1G2RouteCore {
     resource: LogicalResourceId,
+    /// The execution lane of the G1 workers that this route copies from.
+    lane: u8,
     capacity: Arc<dyn G2Capacity>,
     transfer: Arc<dyn PolicyG1G2TransferExecutor>,
     runtime: Option<tokio::runtime::Handle>,
@@ -125,6 +127,11 @@ impl PolicyG1G2Route {
     /// transfer geometry. The caller must transfer the returned capability
     /// only to that resource's trusted logical factory. A violation can
     /// corrupt physical transfer state.
+    ///
+    /// The route copies between the G1 layouts of the worker grid of
+    /// `leader` and the G2 layouts that all lanes share. Pass a lane view
+    /// (`InstanceLeader::lane_view`) for the route of a lane other than
+    /// lane 0. The route then accepts only a source manager of that lane.
     ///
     /// ```compile_fail
     /// use kvbm_common::LogicalResourceId;
@@ -182,16 +189,20 @@ impl PolicyG1G2Route {
         Ok(Self::installation_from_leader(leader, resource, capacity))
     }
 
+    /// The route copies through the worker grid of `leader`. A lane view of
+    /// a leader (`InstanceLeader::lane_view`) gives the route of that lane.
     fn installation_from_leader(
         leader: InstanceLeader,
         resource: LogicalResourceId,
         capacity: Arc<dyn G2Capacity>,
     ) -> PolicyG1G2Installation {
+        let lane = leader.lane();
         let runtime = leader.runtime();
         let (route_identity, manager_identity) = new_identity_pair();
         let route = Self::from_parts(
             capacity,
             resource,
+            lane,
             Arc::new(LeaderTransferExecutor { leader }),
             Some(runtime),
             route_identity,
@@ -205,6 +216,7 @@ impl PolicyG1G2Route {
     fn from_parts(
         capacity: Arc<dyn G2Capacity>,
         resource: LogicalResourceId,
+        lane: u8,
         transfer: Arc<dyn PolicyG1G2TransferExecutor>,
         runtime: Option<tokio::runtime::Handle>,
         identity: ExactG1G2RouteIdentity,
@@ -212,6 +224,7 @@ impl PolicyG1G2Route {
         Self {
             core: Arc::new(PolicyG1G2RouteCore {
                 resource,
+                lane,
                 capacity,
                 transfer,
                 runtime,
@@ -230,6 +243,30 @@ impl PolicyG1G2Route {
         let route = Self::from_parts(
             capacity,
             resource,
+            0,
+            transfer,
+            tokio::runtime::Handle::try_current().ok(),
+            route_identity,
+        );
+        PolicyG1G2Installation {
+            route,
+            manager_identity,
+        }
+    }
+
+    /// A test route of one execution lane other than lane 0.
+    #[cfg(test)]
+    pub(crate) fn from_test_parts_in_lane(
+        capacity: Arc<dyn G2Capacity>,
+        resource: LogicalResourceId,
+        lane: u8,
+        transfer: Arc<dyn PolicyG1G2TransferExecutor>,
+    ) -> PolicyG1G2Installation {
+        let (route_identity, manager_identity) = new_identity_pair();
+        let route = Self::from_parts(
+            capacity,
+            resource,
+            lane,
             transfer,
             tokio::runtime::Handle::try_current().ok(),
             route_identity,
@@ -248,7 +285,14 @@ impl PolicyG1G2Route {
         runtime: tokio::runtime::Handle,
     ) -> PolicyG1G2Installation {
         let (route_identity, manager_identity) = new_identity_pair();
-        let route = Self::from_parts(capacity, resource, transfer, Some(runtime), route_identity);
+        let route = Self::from_parts(
+            capacity,
+            resource,
+            0,
+            transfer,
+            Some(runtime),
+            route_identity,
+        );
         PolicyG1G2Installation {
             route,
             manager_identity,
@@ -262,6 +306,11 @@ impl PolicyG1G2Installation {
         self.route.core.resource
     }
 
+    /// Return the execution lane of the certified G1 workers.
+    pub fn lane(&self) -> u8 {
+        self.route.core.lane
+    }
+
     /// Validate and bind this capability to one typed G1 manager identity.
     pub fn validate<T: PolicyG1SourceMetadata>(
         self,
@@ -272,6 +321,14 @@ impl PolicyG1G2Installation {
             let error = G2CapacityError::Rejected(format!(
                 "the exact route resource {:?} does not match source resource {source_resource:?}",
                 self.resource()
+            ));
+            return Err((error, self));
+        }
+        if self.lane() != source_manager.lane() {
+            let error = G2CapacityError::Rejected(format!(
+                "the exact route of lane {} does not match the source manager of lane {}",
+                self.lane(),
+                source_manager.lane()
             ));
             return Err((error, self));
         }

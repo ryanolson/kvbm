@@ -58,10 +58,10 @@ struct Cli {
     #[arg(long)]
     heartbeat_max_failures: Option<u32>,
 
-    /// Enable the prefill-router feature. The hub spawns a load-aware
-    /// dispatcher that pops requests off the CD prefill queue and routes
-    /// them to workers that registered with the
-    /// `Feature::PrefillRouter` payload. Both HTTP and velo backends
+    /// Enable the prefill-router feature. The hub places each prefill
+    /// request that a decode worker sends on a free worker that registered
+    /// with the `Feature::PrefillRouter` payload, picked by load, or
+    /// rejects it when none is free. Both HTTP and velo backends
     /// are supported. Requires the `disagg` feature.
     #[arg(long)]
     prefill_router: bool,
@@ -168,7 +168,7 @@ struct Cli {
     /// (`default`/`leader`/`worker`) or a flat key. Values are parsed as JSON
     /// (`2`, `true`, `{…}`) with a string fallback. Highest precedence among the
     /// two override flags. The merged result is round-trip-validated through the
-    /// connector parser and served verbatim as `GET /v1/config`'s `base_config`.
+    /// connector parser and served verbatim as `GET /v1/ext/kvbm/config`'s `base_config`.
     #[arg(long = "kvbm", value_name = "KEY.PATH=VALUE")]
     kvbm: Vec<String>,
 
@@ -194,7 +194,7 @@ struct Cli {
 /// All hub features a client can be granted via `--features` (in dependency
 /// order). `ConnectorControl` is infrastructure, always attached, not listed.
 /// `PrefillRouter` is not selectable here — it is gated by the
-/// `--prefill-router` flag so it is always paired with the disagg dispatcher.
+/// `--prefill-router` flag so it is always paired with the disagg feature.
 const SELECTABLE_FEATURES: [FeatureKey; 3] = [
     FeatureKey::P2P,
     FeatureKey::ConditionalDisagg,
@@ -512,15 +512,14 @@ async fn main() -> anyhow::Result<()> {
     if enabled.contains(&FeatureKey::P2P) {
         let p2p_manager = Arc::new(kvbm_hub::P2pManager::new());
         cpm.set_p2p_manager(Arc::clone(&p2p_manager));
-        builder = builder.add_feature_manager(p2p_manager as Arc<dyn kvbm_hub::FeatureManager>);
+        builder = builder.extension(p2p_manager);
     }
 
     // ConditionalDisagg + optional prefill router. The router is its
-    // own FeatureManager (it owns the fleet selector and the
-    // /v1/features/prefill-router/ HTTP surface). The CD manager
-    // continues to own the messenger queue; if `--prefill-router` is
-    // set we late-bind the router as the CD manager's dispatcher after
-    // both have attached.
+    // own extension: it owns the fleet selector, the velo handlers that
+    // place prefill requests, and the /v1/ext/prefill_router/ HTTP
+    // surface. With `--cd-breaker`, its tier broadcaster is wired to the
+    // CD manager's decode set after both have attached.
     let mut cd_for_late_bind: Option<Arc<kvbm_hub::ConditionalDisaggManager>> = None;
     let mut router_for_late_bind: Option<Arc<kvbm_hub::PrefillRouterManager>> = None;
     if enabled.contains(&FeatureKey::ConditionalDisagg) {
@@ -528,8 +527,7 @@ async fn main() -> anyhow::Result<()> {
         if cli.prefill_router {
             cd_for_late_bind = Some(Arc::clone(&cd_manager));
         }
-        builder = builder
-            .add_feature_manager(Arc::clone(&cd_manager) as Arc<dyn kvbm_hub::FeatureManager>);
+        builder = builder.extension(Arc::clone(&cd_manager));
     }
 
     if cli.prefill_router {
@@ -570,15 +568,14 @@ async fn main() -> anyhow::Result<()> {
             "prefill router feature enabled (continuous fleet membership)"
         );
         router_for_late_bind = Some(Arc::clone(&router_manager));
-        builder = builder
-            .add_feature_manager(Arc::clone(&router_manager) as Arc<dyn kvbm_hub::FeatureManager>);
+        builder = builder.extension(Arc::clone(&router_manager));
     } else {
         tracing::info!(
             "prefill router disabled (pass --prefill-router to route CD prefill traffic)"
         );
     }
 
-    builder = builder.add_feature_manager(cpm as Arc<dyn kvbm_hub::FeatureManager>);
+    builder = builder.extension(cpm);
 
     // Optional KV indexer feature. `max_seq_len` is the *initial* index
     // capacity (0 = start empty); it grows as registrants report larger values.
@@ -600,8 +597,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .with_event_plane(event_plane, nats_server, kvi.nats_subject_prefix.clone());
         tracing::info!(max_seq_len, block_size, "KV indexer feature enabled");
-        builder =
-            builder.add_feature_manager(Arc::new(manager) as Arc<dyn kvbm_hub::FeatureManager>);
+        builder = builder.extension(Arc::new(manager));
     }
 
     if let Some(velo_port) = config.velo_port {
@@ -625,10 +621,6 @@ async fn main() -> anyhow::Result<()> {
         "kvbm-hub listening"
     );
 
-    // Install the prefill router as the CD manager's dispatcher AFTER
-    // both have attached. The router accepts dispatch calls right away
-    // and queues internally until a worker registers — no startup
-    // discovery window needed.
     if let (Some(cd), Some(router)) = (cd_for_late_bind, router_for_late_bind) {
         // P2 CD-breaker tier push: cross-wire the broadcaster (owned by the
         // router, sharing the breaker Arc) and the CD manager (the decode-set
@@ -642,9 +634,6 @@ async fn main() -> anyhow::Result<()> {
             cd.set_tier_broadcaster(Arc::clone(broadcaster));
             tracing::info!("CD breaker tier-push broadcaster wired to the decode set");
         }
-        cd.start_dispatcher(router.dispatcher())
-            .map_err(|e| anyhow::anyhow!("install prefill router as CD dispatcher: {e}"))?;
-        tracing::info!("prefill router installed as CD prefill dispatcher");
     }
 
     tokio::signal::ctrl_c().await?;

@@ -4,11 +4,9 @@
 //! Load-aware worker selection over a dynamic prefill fleet.
 //!
 //! Each worker carries its own per-worker concurrency semaphore plus
-//! mutable counters (`inflight`, `load_net_new`). [`Selector::pick`]
-//! awaits until some worker has free capacity, then atomically acquires
-//! that worker's permit and increments its counters, returning a
-//! [`ChargeGuard`] whose `Drop` decrements the counters and wakes the
-//! next waiter via [`tokio::sync::Notify`].
+//! mutable counters (`inflight`, `load_net_new`). [`Selector::try_pick`]
+//! takes a permit of the free worker with the least load and charges its
+//! counters, returning a [`ChargeGuard`] whose `Drop` decrements them.
 //!
 //! Continuous fleet membership: [`Selector::add_worker`] and
 //! [`Selector::remove_worker`] are safe to call at any time; in-flight
@@ -18,7 +16,7 @@
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use velo_ext::InstanceId;
 
 use super::execution::PrefillExecutionBackend;
@@ -62,12 +60,12 @@ pub struct WorkerSlot {
     pub instance_id: InstanceId,
     /// Execution backend bound to this worker.
     pub backend: Arc<dyn PrefillExecutionBackend>,
-    /// Per-worker concurrency cap. Acquired in [`Selector::pick`]; the
-    /// returned [`OwnedSemaphorePermit`] is held by the dispatcher task
-    /// until execution completes.
-    permits: Arc<Semaphore>,
+    /// Per-worker concurrency cap. Acquired in [`Selector::try_pick`]; the
+    /// returned [`OwnedSemaphorePermit`] is held while the worker runs the
+    /// request.
+    pub(crate) permits: Arc<Semaphore>,
     /// Mutable counters used by the selector's sort key.
-    counters: Mutex<WorkerCounters>,
+    pub(crate) counters: Mutex<WorkerCounters>,
 }
 
 impl WorkerSlot {
@@ -93,10 +91,6 @@ impl std::fmt::Debug for WorkerSlot {
 pub struct Selector {
     config: SelectorConfig,
     state: RwLock<Vec<Arc<WorkerSlot>>>,
-    /// Signaled when a worker is added or a [`ChargeGuard`] is dropped.
-    /// Used by [`Selector::pick`] to wake when the fleet may now have
-    /// capacity.
-    notify: Arc<Notify>,
 }
 
 impl std::fmt::Debug for Selector {
@@ -115,7 +109,7 @@ impl std::fmt::Debug for Selector {
 
 impl Selector {
     /// Construct an empty selector. Workers must be added via
-    /// [`Self::add_worker`] before [`Self::pick`] can succeed.
+    /// [`Self::add_worker`] before [`Self::try_pick`] can succeed.
     pub fn new(config: SelectorConfig) -> Arc<Self> {
         assert!(
             config.per_worker_concurrency >= 1,
@@ -124,7 +118,6 @@ impl Selector {
         Arc::new(Self {
             config,
             state: RwLock::new(Vec::new()),
-            notify: Arc::new(Notify::new()),
         })
     }
 
@@ -157,9 +150,6 @@ impl Selector {
         } else {
             state.push(slot);
         }
-        drop(state);
-        // Wake any waiter parked because the fleet was empty / at cap.
-        self.notify.notify_waiters();
         newly_added
     }
 
@@ -203,31 +193,10 @@ impl Selector {
         self.state.read().len() as u32 * self.config.per_worker_concurrency
     }
 
-    /// Pick a worker for `net_new` tokens of new prefill work.
-    ///
-    /// Blocks until at least one worker has a free per-worker permit.
-    /// On success, charges the chosen worker's counters and returns the
-    /// slot, its acquired permit (the dispatcher task holds it until
-    /// execution completes), and a [`ChargeGuard`] whose `Drop`
-    /// decrements the counters and wakes the next waiter.
-    ///
-    /// If the fleet is empty, this call parks indefinitely on
-    /// [`Self::add_worker`].
-    pub async fn pick(self: &Arc<Self>, net_new: u64) -> PickedSlot {
-        loop {
-            // Arm the wait *before* the capacity check so we never miss
-            // a notification that happens between check-and-park.
-            let notified = self.notify.notified();
-            if let Some(picked) = self.try_pick(net_new) {
-                return picked;
-            }
-            notified.await;
-        }
-    }
-
-    /// Non-blocking variant of [`Self::pick`]. Returns `None` if no
-    /// worker currently has free capacity.
-    pub fn try_pick(self: &Arc<Self>, net_new: u64) -> Option<PickedSlot> {
+    /// Pick the free worker with the least load for `net_new` tokens of
+    /// new prefill work, skipping the workers in `exclude`. Returns `None`
+    /// if no other worker has free capacity.
+    pub fn try_pick(&self, net_new: u64, exclude: &[InstanceId]) -> Option<PickedSlot> {
         let workers = self.state.read().clone();
         if workers.is_empty() {
             return None;
@@ -244,6 +213,9 @@ impl Selector {
 
         for (idx, _c) in order {
             let slot = Arc::clone(&workers[idx]);
+            if exclude.contains(&slot.instance_id) {
+                continue;
+            }
             if let Ok(permit) = Arc::clone(&slot.permits).try_acquire_owned() {
                 // Charge counters under the slot's own lock.
                 {
@@ -254,7 +226,6 @@ impl Selector {
                 let guard = ChargeGuard {
                     slot: Arc::clone(&slot),
                     net_new,
-                    notify: Arc::clone(&self.notify),
                 };
                 return Some(PickedSlot {
                     slot,
@@ -272,9 +243,8 @@ impl Selector {
 pub struct PickedSlot {
     /// The chosen worker.
     pub slot: Arc<WorkerSlot>,
-    /// Per-worker permit; the dispatcher task holds this until
-    /// `backend.execute()` returns. Drop releases the slot for the next
-    /// pick.
+    /// Per-worker permit, held while the worker runs the request. Drop
+    /// releases the slot for the next pick.
     pub permit: OwnedSemaphorePermit,
     /// Counter guard; drop decrements `inflight` and `load_net_new`
     /// and wakes the next waiter.
@@ -282,35 +252,28 @@ pub struct PickedSlot {
 }
 
 /// Decrements `inflight` and `load_net_new` for a charged worker when
-/// dropped, and wakes any [`Selector::pick`] waiter via the selector's
-/// `Notify`.
+/// dropped.
 pub struct ChargeGuard {
     slot: Arc<WorkerSlot>,
     net_new: u64,
-    notify: Arc<Notify>,
 }
 
 impl Drop for ChargeGuard {
     fn drop(&mut self) {
-        {
-            let mut counters = self.slot.counters.lock();
-            counters.inflight = counters.inflight.saturating_sub(1);
-            counters.load_net_new = counters.load_net_new.saturating_sub(self.net_new);
-        }
-        self.notify.notify_waiters();
+        let mut counters = self.slot.counters.lock();
+        counters.inflight = counters.inflight.saturating_sub(1);
+        counters.load_net_new = counters.load_net_new.saturating_sub(self.net_new);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::execution::DispatchOutcome;
     use super::*;
     use crate::features::prefill_router::execution::PrefillExecutionBackend;
     use anyhow::Result;
     use async_trait::async_trait;
     use kvbm_protocols::disagg::DISAGG_PROTOCOL_VERSION;
-    use std::time::Duration;
-
-    use super::super::dispatcher::DispatchOutcome;
 
     struct StubBackend {
         id: InstanceId,
@@ -324,7 +287,10 @@ mod tests {
         fn label(&self) -> &'static str {
             "stub"
         }
-        async fn execute(&self, _req: PrefillRequest) -> Result<DispatchOutcome> {
+        fn reports_done(&self) -> bool {
+            true
+        }
+        async fn execute(&self, _req: &PrefillRequest) -> Result<DispatchOutcome> {
             Ok(DispatchOutcome::Accepted)
         }
     }
@@ -353,6 +319,7 @@ mod tests {
             token_ids: vec![0u32; n_tokens],
             num_provided_tokens: n_hashes * 16,
             request: KvHashingRequestEnvelope::default(),
+            scope_salt: None,
             expected_hash_digest: None,
             bundle: None,
         }
@@ -374,7 +341,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pick_picks_lowest_load() {
+    async fn try_pick_picks_lowest_load() {
         let sel = Selector::new(cfg());
         let a = add(&sel);
         let b = add(&sel);
@@ -401,7 +368,7 @@ mod tests {
             }
         }
 
-        let picked = sel.try_pick(50).expect("should pick");
+        let picked = sel.try_pick(50, &[]).expect("should pick");
         assert_eq!(picked.slot.instance_id, b);
     }
 
@@ -432,7 +399,7 @@ mod tests {
             .lock()
             .load_net_new = 999;
 
-        let picked = sel.try_pick(10).expect("b should still be available");
+        let picked = sel.try_pick(10, &[]).expect("b should still be available");
         assert_eq!(picked.slot.instance_id, b);
     }
 
@@ -453,7 +420,7 @@ mod tests {
         let a_slot = sel.snapshot().into_iter().next().unwrap();
         a_slot.counters.lock().inflight = 1;
 
-        let picked = sel.try_pick(10).expect("pick");
+        let picked = sel.try_pick(10, &[]).expect("pick");
         // a < b in insertion order, equal counters → a wins.
         assert_eq!(picked.slot.instance_id, a_slot.instance_id);
 
@@ -464,14 +431,14 @@ mod tests {
         let _drain: Vec<_> = (0..cfg().per_worker_concurrency)
             .map(|_| Arc::clone(&a_slot.permits).try_acquire_owned().unwrap())
             .collect();
-        let picked2 = sel.try_pick(10).expect("pick again");
+        let picked2 = sel.try_pick(10, &[]).expect("pick again");
         assert_eq!(picked2.slot.instance_id, b);
     }
 
     #[tokio::test]
     async fn try_pick_returns_none_when_empty() {
         let sel = Selector::new(cfg());
-        assert!(sel.try_pick(10).is_none());
+        assert!(sel.try_pick(10, &[]).is_none());
     }
 
     #[tokio::test]
@@ -481,18 +448,18 @@ mod tests {
             block_size: 16,
         });
         add(&sel);
-        let first = sel.try_pick(10).expect("first");
+        let first = sel.try_pick(10, &[]).expect("first");
         // Hold the permit; nothing else available.
-        assert!(sel.try_pick(10).is_none());
+        assert!(sel.try_pick(10, &[]).is_none());
         drop(first);
-        assert!(sel.try_pick(10).is_some());
+        assert!(sel.try_pick(10, &[]).is_some());
     }
 
     #[tokio::test]
     async fn charge_guard_decrements_on_drop() {
         let sel = Selector::new(cfg());
         let id = add(&sel);
-        let picked = sel.try_pick(123).expect("pick");
+        let picked = sel.try_pick(123, &[]).expect("pick");
         let slot_arc = sel
             .snapshot()
             .into_iter()
@@ -508,39 +475,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pick_unblocks_when_worker_added() {
+    async fn try_pick_skips_excluded_workers() {
         let sel = Selector::new(cfg());
-        let sel_clone = Arc::clone(&sel);
-        let waiter = tokio::spawn(async move { sel_clone.pick(10).await });
-        // No workers yet → waiter parked.
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(!waiter.is_finished());
-        add(&sel);
-        let picked = tokio::time::timeout(Duration::from_millis(500), waiter)
-            .await
-            .expect("pick should complete")
-            .unwrap();
-        assert!(picked.slot.backend.label() == "stub");
-    }
-
-    #[tokio::test]
-    async fn pick_unblocks_when_charge_dropped() {
-        let sel = Selector::new(SelectorConfig {
-            per_worker_concurrency: 1,
-            block_size: 16,
-        });
-        add(&sel);
-        let first = sel.try_pick(10).expect("first");
-        let sel_clone = Arc::clone(&sel);
-        let waiter = tokio::spawn(async move { sel_clone.pick(10).await });
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(!waiter.is_finished(), "should block until first drops");
-        drop(first);
-        let picked = tokio::time::timeout(Duration::from_millis(500), waiter)
-            .await
-            .expect("pick should complete")
-            .unwrap();
-        assert_eq!(picked.slot.counters().inflight, 1);
+        let a = add(&sel);
+        let b = add(&sel);
+        assert_eq!(sel.try_pick(10, &[a]).expect("b").slot.instance_id, b);
+        assert!(sel.try_pick(10, &[a, b]).is_none());
     }
 
     #[tokio::test]
@@ -549,7 +489,7 @@ mod tests {
         let a = add(&sel);
         let b = add(&sel);
         sel.remove_worker(a);
-        let picked = sel.try_pick(10).expect("pick");
+        let picked = sel.try_pick(10, &[]).expect("pick");
         assert_eq!(picked.slot.instance_id, b);
         assert_eq!(sel.worker_count(), 1);
     }

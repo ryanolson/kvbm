@@ -54,28 +54,39 @@ fn acquire(
     bytes: usize,
     guards: &mut RegistrationGuards,
 ) -> Result<Vec<Range<usize>>> {
-    let end = address
-        .checked_add(bytes)
-        .ok_or_else(|| anyhow::anyhow!("transfer range overflow"))?;
     let Some(provider) = layout.registration_provider() else {
+        let end = address
+            .checked_add(bytes)
+            .ok_or_else(|| anyhow::anyhow!("transfer range overflow"))?;
         return Ok(std::iter::once(address..end).collect());
     };
     let lease = provider.acquire(address, bytes)?;
-    validate_ranges(&lease.ranges, address, end)?;
+    validate_ranges(&lease.ranges, bytes)?;
     guards.push(lease.guard);
     Ok(lease.ranges)
 }
 
-fn validate_ranges(ranges: &[Range<usize>], address: usize, end: usize) -> Result<()> {
-    let mut cursor = address;
+/// A lease may give its ranges at other addresses than the requested range,
+/// for example in a registered arena that maps the same memory. The ranges
+/// must be in transfer order and their lengths must add up to the request.
+fn validate_ranges(ranges: &[Range<usize>], bytes: usize) -> Result<()> {
+    let mut covered = 0usize;
     for range in ranges {
         ensure!(
-            range.start == cursor && range.end > range.start && range.end <= end,
-            "registration lease does not cover the transfer range"
+            range.end > range.start,
+            "registration lease has an empty or reversed range"
         );
-        cursor = range.end;
+        covered = covered
+            .checked_add(range.len())
+            .filter(|&covered| covered <= bytes)
+            .ok_or_else(|| {
+                anyhow::anyhow!("registration lease covers more than the transfer range")
+            })?;
     }
-    ensure!(cursor == end, "registration lease has incomplete coverage");
+    ensure!(
+        covered == bytes,
+        "registration lease has incomplete coverage"
+    );
     Ok(())
 }
 
@@ -135,12 +146,20 @@ mod tests {
         );
     }
     #[test]
-    fn registration_coverage_rejects_holes_overlap_and_short_ranges() {
-        assert!(validate_ranges(&[10..14, 15..20], 10, 20).is_err());
-        assert!(validate_ranges(&[10..15, 14..20], 10, 20).is_err());
-        assert!(validate_ranges(std::slice::from_ref(&(10..19)), 10, 20).is_err());
-        assert!(validate_ranges(std::slice::from_ref(&(10..21)), 10, 20).is_err());
-        assert!(validate_ranges(&[10..10, 10..20], 10, 20).is_err());
-        assert!(validate_ranges(&[10..14, 14..20], 10, 20).is_ok());
+    fn registration_coverage_rejects_empty_short_and_long_ranges() {
+        assert!(validate_ranges(std::slice::from_ref(&(10..19)), 10).is_err());
+        assert!(validate_ranges(std::slice::from_ref(&(10..21)), 10).is_err());
+        assert!(validate_ranges(&[10..10, 10..20], 10).is_err());
+        assert!(validate_ranges(&[10..14, 15..22], 10).is_err());
+        assert!(validate_ranges(&[], 10).is_err());
+        assert!(validate_ranges(&[10..14, 14..20], 10).is_ok());
+    }
+    #[test]
+    fn registration_coverage_accepts_translated_ranges() {
+        assert!(validate_ranges(&[4096..4100, 100..106], 10).is_ok());
+        assert_eq!(
+            split_pairs(&[4096..4100, 100..106], std::slice::from_ref(&(30..40))),
+            vec![(4096, 30, 4), (100, 34, 6)]
+        );
     }
 }

@@ -53,14 +53,17 @@ kvbm-service = { path = "kvbm-service" }
 # NOTE: dynamo-kv-router is intentionally featureless. The `runtime-protocols`
 # feature pulls `dynamo-runtime` (and its dynamo-core closure); kvbm-consolidator
 # only consumes `dynamo_kv_router::zmq_wire`, which is available without features.
-# Pinned to a rev on ai-dynamo/dynamo branch ryan/carrier.
-dynamo-tokens = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "b0c71df0f63b65bb85f1dc9ec8d58b1899096d95" }
-dynamo-kv-router = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "b0c71df0f63b65bb85f1dc9ec8d58b1899096d95" }
-dynamo-kv-hashing = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "b0c71df0f63b65bb85f1dc9ec8d58b1899096d95" }
+# Pinned to a rev on the public ai-dynamo/dynamo branch rhino-main (upstream
+# plus the carrier stack). Rhino must resolve these to the same rev.
+dynamo-tokens = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "163dec195943bcb1cf01dc9ee0fbb2cb19cf8d31" }
+dynamo-kv-router = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "163dec195943bcb1cf01dc9ee0fbb2cb19cf8d31" }
+dynamo-kv-hashing = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "163dec195943bcb1cf01dc9ee0fbb2cb19cf8d31" }
 
-# velo (registry — 0.4.1 / 0.2.0 are published on crates.io)
-velo     = { version = "0.4.1" }
-velo-ext = { version = "0.2.0" }
+# velo, from one git tag: velo-hub is not on crates.io, and a crates.io velo
+# beside the git velo-hub would build two copies of the velo types.
+velo     = { git = "https://github.com/ai-dynamo/velo.git", tag = "v0.21.0" }
+velo-ext = { git = "https://github.com/ai-dynamo/velo.git", tag = "v0.21.0" }
+velo-hub = { git = "https://github.com/ai-dynamo/velo.git", tag = "v0.21.0" }
 
 # External dependencies (copied verbatim from dynamo root [workspace.dependencies])
 anyhow = { version = "1" }
@@ -84,7 +87,10 @@ hyper-util = { version = "=0.1.17" }
 indexmap = { version = "2" }
 libc = { version = "0.2" }
 libloading = "0.8.9"
-nixl-sys = { version = "=1.4.1", git = "https://github.com/Aphoh/nixl.git", rev = "9e04f3dcb56c84d5b63feb10250e657822168322" }
+# nixl-sys comes from the public ai-dynamo/nixl branch rhino-1.4: NIXL 1.4.1
+# plus the deregistration and compiler fixes. Rhino runs the nixl-cu13 1.4.1
+# wheel, so this pin must stay at 1.4.1 until Rhino moves.
+nixl-sys = { version = "=1.4.1", git = "https://github.com/ai-dynamo/nixl.git", rev = "a08e289bf065f0bf37c774c4a5c01d9f951a571e" }
 oneshot = { version = "0.1.13", features = ["std", "async"] }
 parking_lot = "0.12.5"
 prometheus = { version = "0.14" }
@@ -103,7 +109,7 @@ serde_json = { version = "1" }
 tempfile = "3"
 thiserror = { version = "2.0.17" }
 tmq = { version = "0.5.0" }
-tokio = { version = "=1.52.4", features = ["full"] }
+tokio = { version = "1.54.1", features = ["full"] }
 tokio-stream = { version = "0.1" }
 tokio-util = { version = "0.7.17", features = ["codec", "net", "rt", "io-util"] }
 tonic = { version = "0.13" }

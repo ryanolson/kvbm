@@ -156,6 +156,8 @@ struct MockSessionInner {
     /// Set by `inject_peer_drained`; mirrors `VeloSession`'s
     /// `peer_avail_drained`.
     peer_avail_drained: bool,
+    /// Set by `inject_peer_fixed_state`.
+    peer_fixed_state: Option<Vec<u8>>,
 
     // ---- holder-side local state ----
     committed: BTreeSet<SequenceHash>,
@@ -167,6 +169,7 @@ struct MockSessionInner {
     make_available_calls: Vec<Vec<SequenceHash>>,
     finish_commits_called: bool,
     finish_availability_called: bool,
+    sent_fixed_state: Option<Vec<u8>>,
     pull_calls: Vec<(Vec<SequenceHash>, Vec<BlockId>)>,
     closed_reason: Option<Option<String>>,
     finished_reason: Option<Option<String>>,
@@ -190,6 +193,7 @@ impl MockSessionInner {
             peer_available: BTreeMap::new(),
             peer_commits_closed: false,
             peer_avail_drained: false,
+            peer_fixed_state: None,
             committed: BTreeSet::new(),
             available_pins: BTreeMap::new(),
             verified_payloads: BTreeMap::new(),
@@ -197,6 +201,7 @@ impl MockSessionInner {
             make_available_calls: Vec::new(),
             finish_commits_called: false,
             finish_availability_called: false,
+            sent_fixed_state: None,
             pull_calls: Vec::new(),
             closed_reason: None,
             finished_reason: None,
@@ -529,6 +534,16 @@ impl MockSession {
         self.inner.lock().finish_availability_called
     }
 
+    /// The fixed-state record that this session sent.
+    pub fn sent_fixed_state(&self) -> Option<Vec<u8>> {
+        self.inner.lock().sent_fixed_state.clone()
+    }
+
+    /// Simulate the peer's `Frame::FixedState`.
+    pub fn inject_peer_fixed_state(&self, state: Vec<u8>) {
+        self.inner.lock().peer_fixed_state = Some(state);
+    }
+
     pub fn pull_calls(&self) -> Vec<(Vec<SequenceHash>, Vec<BlockId>)> {
         self.inner.lock().pull_calls.clone()
     }
@@ -750,6 +765,26 @@ impl Session for MockSession {
         } else {
             PeerCommitted::Open(v)
         }
+    }
+
+    fn send_fixed_state(&self, state: Vec<u8>) -> Result<()> {
+        {
+            let mut inner = self.inner.lock();
+            if inner.sent_fixed_state.is_some() {
+                return Err(anyhow!(
+                    "send_fixed_state: the session already sent its fixed state"
+                ));
+            }
+            inner.sent_fixed_state = Some(state.clone());
+        }
+        if let Some(partner) = self.partner() {
+            partner.inject_peer_fixed_state(state);
+        }
+        Ok(())
+    }
+
+    fn peer_fixed_state(&self) -> Option<Vec<u8>> {
+        self.inner.lock().peer_fixed_state.clone()
     }
 
     fn peer_available(&self) -> PeerAvailable {

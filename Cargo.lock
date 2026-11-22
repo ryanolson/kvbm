@@ -71,7 +71,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -82,7 +82,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -141,6 +141,42 @@ dependencies = [
  "serde_nanos",
  "serde_repr",
  "thiserror 1.0.69",
+ "time",
+ "tokio",
+ "tokio-rustls 0.26.4",
+ "tokio-stream",
+ "tokio-util",
+ "tokio-websockets",
+ "tracing",
+ "tryhard",
+ "url",
+]
+
+[[package]]
+name = "async-nats"
+version = "0.49.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fad3cd6df81292728e2a8cb1f1dcb4d7e7a1ab59b80c14fbbcba2baf9d5cf86a"
+dependencies = [
+ "base64",
+ "bytes",
+ "futures-util",
+ "memchr",
+ "nkeys",
+ "nuid",
+ "pin-project",
+ "portable-atomic",
+ "rand 0.10.3",
+ "regex",
+ "ring",
+ "rustls-native-certs 0.8.4",
+ "rustls-pki-types",
+ "rustls-webpki 0.103.13",
+ "serde",
+ "serde_json",
+ "serde_nanos",
+ "serde_repr",
+ "thiserror 2.0.18",
  "time",
  "tokio",
  "tokio-rustls 0.26.4",
@@ -782,7 +818,7 @@ dependencies = [
  "bitflags 2.13.0",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -918,6 +954,17 @@ name = "cfg_aliases"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
+
+[[package]]
+name = "chacha20"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.0",
+ "rand_core 0.10.1",
+]
 
 [[package]]
 name = "chrono"
@@ -1391,8 +1438,8 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "dynamo-kv-hashing"
-version = "1.6.0"
-source = "git+https://github.com/ai-dynamo/dynamo.git?rev=b0c71df0f63b65bb85f1dc9ec8d58b1899096d95#b0c71df0f63b65bb85f1dc9ec8d58b1899096d95"
+version = "1.7.0"
+source = "git+https://github.com/ai-dynamo/dynamo.git?rev=163dec195943bcb1cf01dc9ee0fbb2cb19cf8d31#163dec195943bcb1cf01dc9ee0fbb2cb19cf8d31"
 dependencies = [
  "derive_builder",
  "dynamo-tokens",
@@ -1403,14 +1450,15 @@ dependencies = [
 
 [[package]]
 name = "dynamo-kv-router"
-version = "1.6.0"
-source = "git+https://github.com/ai-dynamo/dynamo.git?rev=b0c71df0f63b65bb85f1dc9ec8d58b1899096d95#b0c71df0f63b65bb85f1dc9ec8d58b1899096d95"
+version = "1.7.0"
+source = "git+https://github.com/ai-dynamo/dynamo.git?rev=163dec195943bcb1cf01dc9ee0fbb2cb19cf8d31#163dec195943bcb1cf01dc9ee0fbb2cb19cf8d31"
 dependencies = [
  "anyhow",
  "arc-swap",
  "async-trait",
  "blake3",
  "crossbeam-queue",
+ "crossbeam-utils",
  "dashmap",
  "derive_builder",
  "dynamo-kv-hashing",
@@ -1440,8 +1488,8 @@ dependencies = [
 
 [[package]]
 name = "dynamo-tokens"
-version = "1.6.0"
-source = "git+https://github.com/ai-dynamo/dynamo.git?rev=b0c71df0f63b65bb85f1dc9ec8d58b1899096d95#b0c71df0f63b65bb85f1dc9ec8d58b1899096d95"
+version = "1.7.0"
+source = "git+https://github.com/ai-dynamo/dynamo.git?rev=163dec195943bcb1cf01dc9ee0fbb2cb19cf8d31#163dec195943bcb1cf01dc9ee0fbb2cb19cf8d31"
 dependencies = [
  "bs58",
  "bytemuck",
@@ -1456,8 +1504,8 @@ dependencies = [
 
 [[package]]
 name = "dynamo-truthy"
-version = "1.6.0"
-source = "git+https://github.com/ai-dynamo/dynamo.git?rev=b0c71df0f63b65bb85f1dc9ec8d58b1899096d95#b0c71df0f63b65bb85f1dc9ec8d58b1899096d95"
+version = "1.7.0"
+source = "git+https://github.com/ai-dynamo/dynamo.git?rev=163dec195943bcb1cf01dc9ee0fbb2cb19cf8d31#163dec195943bcb1cf01dc9ee0fbb2cb19cf8d31"
 dependencies = [
  "anyhow",
 ]
@@ -1555,7 +1603,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1812,6 +1860,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "r-efi 6.0.0",
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -2270,15 +2319,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "itertools"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
-dependencies = [
- "either",
-]
-
-[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2397,7 +2437,7 @@ name = "kvbm-engine"
 version = "1.2.0"
 dependencies = [
  "anyhow",
- "async-nats",
+ "async-nats 0.45.0",
  "aws-config",
  "aws-sdk-s3",
  "blake3",
@@ -2441,7 +2481,7 @@ name = "kvbm-hub"
 version = "1.2.0"
 dependencies = [
  "anyhow",
- "async-nats",
+ "async-nats 0.45.0",
  "async-trait",
  "axum",
  "clap",
@@ -2472,6 +2512,7 @@ dependencies = [
  "uuid",
  "velo",
  "velo-ext",
+ "velo-hub",
 ]
 
 [[package]]
@@ -2851,7 +2892,7 @@ dependencies = [
 [[package]]
 name = "nixl-sys"
 version = "1.4.1"
-source = "git+https://github.com/Aphoh/nixl.git?rev=9e04f3dcb56c84d5b63feb10250e657822168322#9e04f3dcb56c84d5b63feb10250e657822168322"
+source = "git+https://github.com/ai-dynamo/nixl.git?rev=a08e289bf065f0bf37c774c4a5c01d9f951a571e#a08e289bf065f0bf37c774c4a5c01d9f951a571e"
 dependencies = [
  "anyhow",
  "bincode 1.3.3",
@@ -2902,7 +2943,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3478,7 +3519,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
  "heck",
- "itertools 0.14.0",
+ "itertools",
  "log",
  "multimap",
  "once_cell",
@@ -3498,7 +3539,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -3699,6 +3740,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rand"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af"
+dependencies = [
+ "chacha20",
+ "getrandom 0.4.3",
+ "rand_core 0.10.1",
+]
+
+[[package]]
 name = "rand_chacha"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3735,6 +3787,12 @@ checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
 dependencies = [
  "getrandom 0.3.4",
 ]
+
+[[package]]
+name = "rand_core"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "rawpointer"
@@ -3952,7 +4010,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4432,7 +4490,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4565,7 +4623,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4689,9 +4747,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.52.4"
+version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "317fafbbe3f02fc663dad00ea6186197de963cd4190e86a26d8d0fae095539af"
+checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
  "bytes",
  "libc",
@@ -4771,14 +4829,15 @@ dependencies = [
 
 [[package]]
 name = "tokio-util"
-version = "0.7.18"
+version = "0.7.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ae9cec805b01e8fc3fd2fe289f89149a9b66dd16786abd8b19cfa7b48cb0098"
+checksum = "e464cf451ba96ebfc6f9b6542f17ee8b8956e33f1e40d9690624e59d7a7f8a4b"
 dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
  "futures-util",
+ "libc",
  "pin-project-lite",
  "tokio",
 ]
@@ -5208,12 +5267,11 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "velo"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7e92b2164d6df7b21f2b91eaae6a9b53eb313c8f6d305a642e75733c911f8d4"
+version = "0.21.0"
+source = "git+https://github.com/ai-dynamo/velo.git?tag=v0.21.0#e540c10179e7804e2ceee47da76c839d340e9256"
 dependencies = [
  "anyhow",
- "async-nats",
+ "async-nats 0.49.1",
  "async-stream",
  "axum",
  "bs58",
@@ -5253,9 +5311,8 @@ dependencies = [
 
 [[package]]
 name = "velo-ext"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9bbf99f74c0202bd1bf6caaa8bb784f461b757df7beafe734273519caf65372e"
+version = "0.5.6"
+source = "git+https://github.com/ai-dynamo/velo.git?tag=v0.21.0#e540c10179e7804e2ceee47da76c839d340e9256"
 dependencies = [
  "anyhow",
  "bytes",
@@ -5270,6 +5327,41 @@ dependencies = [
  "tokio-util",
  "uuid",
  "xxhash-rust",
+]
+
+[[package]]
+name = "velo-hub"
+version = "0.21.0"
+source = "git+https://github.com/ai-dynamo/velo.git?tag=v0.21.0#e540c10179e7804e2ceee47da76c839d340e9256"
+dependencies = [
+ "anyhow",
+ "axum",
+ "dashmap",
+ "futures",
+ "parking_lot",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+ "velo",
+ "velo-hub-ext",
+]
+
+[[package]]
+name = "velo-hub-ext"
+version = "0.21.0"
+source = "git+https://github.com/ai-dynamo/velo.git?tag=v0.21.0#e540c10179e7804e2ceee47da76c839d340e9256"
+dependencies = [
+ "http 1.4.2",
+ "serde",
+ "serde_json",
+ "uuid",
+ "velo-ext",
 ]
 
 [[package]]
@@ -5452,7 +5544,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

@@ -48,13 +48,15 @@ day-to-day development; they are the forward work.
 ### CI finalization
 - 5 workflows are drafted under `.github/workflows/` (rust-checks, wheel-build,
   kvbm-kernels-cuda, gpu-tests, python-lint). Remaining: provision real GPU / CUDA-toolkit /
-  arm runner labels (currently placeholders), and the `DYNAMO_GIT_TOKEN` secret if the
-  `ai-dynamo/dynamo` branch the deps point at is private.
+  arm runner labels (currently placeholders). No git token is needed, because every
+  git dep points at a public branch.
 
 ### Dynamo git-dependency pins
 - `crates/Cargo.toml` pins `dynamo-tokens` / `dynamo-kv-router` /
-  `dynamo-kv-hashing` to immutable revs on `ryan/carrier`. Keep that branch alive while
-  those revisions are in use.
+  `dynamo-kv-hashing` to immutable revs on the public `ai-dynamo/dynamo` branch
+  `rhino-main` (upstream plus the carrier stack). That branch is add-only, so
+  pinned revs stay fetchable. `nixl-sys` is `=1.4.1` on the public
+  `ai-dynamo/nixl` branch `rhino-1.4`, matching Rhino's nixl-cu13 1.4.1 runtime.
   (`dynamo-memory` was replaced by the locally-owned `kvbm-memory` crate — no
   longer a git dep.)
 

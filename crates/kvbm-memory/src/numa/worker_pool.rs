@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use super::{NumaNode, get_device_numa_node, pin_thread_to_numa_node};
+use super::{NumaNode, get_device_numa_node, is_numa_disabled, pin_thread_to_numa_node};
 use crate::StorageError;
 use crate::mmap_pinned::{MmappedPinnedOptions, MmappedPinnedStorage};
 
@@ -349,7 +349,38 @@ impl NumaWorkerPool {
         Ok(worker)
     }
 
+    /// Allocate one [`MmappedPinnedStorage`] slab with the NUMA policy of the
+    /// process.
+    ///
+    /// If NUMA placement is disabled (`DYN_MEMORY_DISABLE_NUMA`, see
+    /// [`super::is_numa_enabled`]), the function ignores `opt.numa_node` and
+    /// the OS places the pages. If not, the function is the same as
+    /// [`Self::allocate_mmap_pinned_on_node`]. Use `opt.numa_node = None`
+    /// when the node is unknown.
+    ///
+    /// [`MmappedPinnedStorage::numa_policy`] reports the policy that the slab
+    /// used.
+    pub fn allocate_mmap_pinned(
+        &self,
+        mut opt: MmappedPinnedOptions,
+    ) -> Result<MmappedPinnedStorage, StorageError> {
+        if is_numa_disabled()
+            && let Some(node) = opt.numa_node.take()
+        {
+            tracing::debug!(
+                "NUMA placement is disabled; node {} is ignored for the mmap pinned slab",
+                node.0
+            );
+        }
+        self.allocate_mmap_pinned_on_node(opt)
+    }
+
     /// Allocate one [`MmappedPinnedStorage`] slab on the given NUMA node.
+    ///
+    /// If `opt.numa_node` is `None`, the allocation runs on the calling
+    /// thread without a NUMA worker, without thread pinning, and without
+    /// `mbind`. The OS places the pages. The first-touch and the
+    /// `cuMemHostRegister` still occur.
     ///
     /// Spawns a one-shot worker thread pinned to `opt.numa_node` (via
     /// [`pin_thread_to_numa_node`]) and runs the full mmap → mbind →
@@ -363,7 +394,7 @@ impl NumaWorkerPool {
     ///
     /// # Contract
     ///
-    /// `opt.numa_node` **must** be a host-CPU NUMA node (see
+    /// `opt.numa_node`, if it is a node, **must** be a host-CPU NUMA node (see
     /// `crate::resources::NumaNodeRole::HostCpu` /
     /// `crate::Resources::host_memory_nodes`, both gated behind the
     /// `host-pools` feature). Passing a memory-only
@@ -374,7 +405,9 @@ impl NumaWorkerPool {
         &self,
         opt: MmappedPinnedOptions,
     ) -> Result<MmappedPinnedStorage, StorageError> {
-        let node = opt.numa_node;
+        let Some(node) = opt.numa_node else {
+            return MmappedPinnedStorage::allocate(opt);
+        };
         let handle = thread::Builder::new()
             .name(format!("mmap-pinned-node-{}", node.0))
             .spawn(move || -> Result<MmappedPinnedStorage, StorageError> {
@@ -512,6 +545,26 @@ mod cuda_tests {
         unsafe {
             cudarc::driver::result::free_host(ptr as *mut std::ffi::c_void).unwrap();
         }
+    }
+
+    #[test]
+    fn test_mmap_pinned_without_numa_node_uses_os_default_policy() {
+        use crate::mmap_pinned::{HugepageMode, NumaPlacementPolicy};
+
+        let pool = NumaWorkerPool::new();
+        let storage = pool
+            .allocate_mmap_pinned(MmappedPinnedOptions {
+                size: 8192,
+                numa_node: None,
+                hugepage_mode: HugepageMode::Disabled,
+                hugepage_size: None,
+                ctx_device_id: 0,
+            })
+            .unwrap();
+
+        assert_eq!(storage.numa_policy(), NumaPlacementPolicy::OsDefault);
+        assert_eq!(storage.numa_node(), None);
+        assert!(storage.mapped_len() >= 8192);
     }
 
     #[test]

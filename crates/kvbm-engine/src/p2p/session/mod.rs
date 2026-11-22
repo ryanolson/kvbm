@@ -200,6 +200,9 @@ pub enum Frame {
     VerifiedAvailable { blocks: Vec<VerifiedCommittedBlock> },
     /// Holder→puller. Terminator for the availability stream.
     Drained,
+    /// Either side. One opaque fixed-state record, for example the
+    /// export of a host carrier slot. See [`Session::send_fixed_state`].
+    FixedState { state: Vec<u8> },
     /// Puller→holder. Request the holder authorize a pull
     /// of these hashes.
     Pull {
@@ -341,6 +344,21 @@ pub trait Session: Send + Sync {
     // --------------------------------------------------------
     // Either side.
     // --------------------------------------------------------
+
+    /// Send one opaque fixed-state record to the peer, for example the
+    /// export of a host carrier slot. A session sends at most one record.
+    /// Frames keep their order, so a record sent before
+    /// [`Session::finish_availability`] reaches the peer before `Drained`.
+    /// The sender keeps the state readable until the session detaches.
+    fn send_fixed_state(&self, state: Vec<u8>) -> Result<()> {
+        let _ = state;
+        anyhow::bail!("session does not support fixed state")
+    }
+
+    /// The fixed-state record that the peer sent, once it has arrived.
+    fn peer_fixed_state(&self) -> Option<Vec<u8>> {
+        None
+    }
 
     /// Lifecycle events stream. Subscribe-once.
     /// Commit/availability changes go through their dedicated

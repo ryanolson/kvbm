@@ -19,7 +19,7 @@
 //! the inflight budget is a decode-side concept).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
@@ -114,7 +114,16 @@ pub(crate) struct PrefillRequestState {
     /// forever `Pending`) or lose the exactly-once kick CAS without a
     /// terminal — the claim refuses it instead.
     usaa_claimed: AtomicBool,
+
+    /// RAII-release handshake bits ([`RELEASE_DEFERRED`], [`DEFERRAL_ENDED`]).
+    /// A release that lands before the pipeline parks the session (a short
+    /// prefill can finish before the attach lands) hands the release to the
+    /// pipeline instead of refusing the park.
+    release_flags: AtomicU8,
 }
+
+const RELEASE_DEFERRED: u8 = 1;
+const DEFERRAL_ENDED: u8 = 2;
 
 /// USAA kick arguments latched by `prefill_onboard_by_id`, consumed exactly once by
 /// whichever side of the two-phase handshake fires the kick (or by the
@@ -186,6 +195,7 @@ impl PrefillRequestState {
             cleanup_claimed: AtomicBool::new(false),
             local_search: Mutex::new(None),
             usaa_claimed: AtomicBool::new(false),
+            release_flags: AtomicU8::new(0),
         }
     }
 
@@ -380,6 +390,25 @@ impl PrefillRequestState {
 
     /// Claim the right to run the session close/finalize for this lifecycle.
     /// Returns `true` for the single CAS winner; every later caller loses.
+    /// RAII-release half of the release handshake: `true` when the pipeline
+    /// has not parked yet and now owns the release.
+    pub(crate) fn defer_release(&self) -> bool {
+        self.release_flags
+            .fetch_or(RELEASE_DEFERRED, Ordering::AcqRel)
+            & DEFERRAL_ENDED
+            == 0
+    }
+
+    /// Pipeline half of the release handshake, called once the session is
+    /// parked or the pipeline ends: `true` exactly once, when a release
+    /// deferred to the pipeline, which must now run it.
+    pub(crate) fn end_release_deferral(&self) -> bool {
+        let prev = self
+            .release_flags
+            .fetch_or(DEFERRAL_ENDED, Ordering::AcqRel);
+        prev & DEFERRAL_ENDED == 0 && prev & RELEASE_DEFERRED != 0
+    }
+
     pub(crate) fn claim_cleanup(&self) -> bool {
         self.cleanup_claimed
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
@@ -631,6 +660,27 @@ mod tests {
             "take-once: a second teardown path finds nothing to release"
         );
         assert!(state.local_search_id().is_none());
+    }
+
+    #[test]
+    fn release_handshake_has_one_owner() {
+        let early = state();
+        assert!(early.defer_release(), "a release before the park defers");
+        assert!(early.end_release_deferral(), "the park then runs it");
+        assert!(
+            !early.end_release_deferral(),
+            "the pipeline end runs it only once"
+        );
+
+        let late = state();
+        assert!(
+            !late.end_release_deferral(),
+            "no release yet: nothing to run"
+        );
+        assert!(
+            !late.defer_release(),
+            "a release after the park runs itself"
+        );
     }
 
     #[test]

@@ -296,7 +296,7 @@ impl<T: BlockMetadata> BlockStore<T> {
         // Registry attachment mutation takes its own lock. It must happen
         // after the store lock releases.
         for handle in handles {
-            handle.mark_absent::<T>();
+            handle.mark_absent::<T>(self.presence_lane());
         }
         Ok((blocks, evicted))
     }

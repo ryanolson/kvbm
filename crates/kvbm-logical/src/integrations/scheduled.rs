@@ -527,8 +527,9 @@ impl<T: BlockMetadata> SchedulableSequence<T> {
 
         let blocks_registered_before = self.inner.assigned_blocks();
 
-        // Stage and register the prefill blocks
-        self.inner.complete_and_register_pending(manager);
+        // Stage the prefill blocks, and register those this chunk computed.
+        self.inner
+            .complete_and_register_pending(manager, new_position);
         self.prefill_position = new_position;
         self.kv_position = self.prefill_position;
 
@@ -617,7 +618,8 @@ impl<T: BlockMetadata> SchedulableSequence<T> {
         // Always stage pending completions — handles both:
         // 1. Blocks completed during prefill's token append (deferred staging)
         // 2. Block just completed by this decode token
-        self.inner.complete_and_register_pending(manager);
+        self.inner
+            .complete_and_register_pending(manager, self.inner.total_tokens());
 
         self.kv_position += 1;
         self.state = SequenceState::Idle;
@@ -725,7 +727,8 @@ impl<T: BlockMetadata> SchedulableSequence<T> {
 
         // Stage and register all pending completions (including any from
         // prefill's deferred staging and blocks just completed above)
-        self.inner.complete_and_register_pending(manager);
+        self.inner
+            .complete_and_register_pending(manager, self.inner.total_tokens());
 
         self.kv_position += accepted.len();
 

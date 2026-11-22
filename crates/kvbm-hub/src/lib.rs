@@ -3,66 +3,60 @@
 
 //! # KVBM Hub
 //!
-//! Central coordination service for KVBM velo clients (connector / engine).
-//! The hub is a single HTTP service that velo clients use as a shared source
-//! of truth for peer discovery and registration, plus a velo participant
-//! itself for control-plane messaging (heartbeat and, in the future,
-//! scheduling / shard placement / etc).
+//! KVBM coordination service built on `velo-hub`. `velo-hub` owns peer
+//! discovery, registration, heartbeats and the HTTP listeners. This crate adds
+//! the KVBM extensions (P2P, conditional disagg, indexer, prefill router and
+//! connector control) and the aggregate KVBM config at
+//! [`protocol::paths::HUB_CONFIG`].
 //!
 //! # Topology
 //!
-//! A hub server binds two axum listeners:
+//! A hub server binds two listeners:
 //!
-//! - **Discovery port** (`1337` default) — HTTP implementation of the
-//!   `velo::discovery::PeerDiscovery` protocol.
+//! - **Discovery port** (`1337` default) — read-only peer lookups.
 //! - **Control port** (`8337` default) — registration, heartbeat, health.
 //!
-//! The server is also a velo node: it exposes velo handlers (bidirectional
-//! messaging with clients) in addition to the HTTP surface.
+//! Each extension serves its routes under `/v1/ext/{name}`. The server is
+//! also a velo node, so it can message registered clients.
 //!
 //! # Client usage
 //!
 //! ```no_run
 //! # async fn demo() -> anyhow::Result<()> {
 //! use std::sync::Arc;
-//! use kvbm_hub::HubClient;
 //!
-//! let hub: Arc<HubClient> = kvbm_hub::create_client_builder()
+//! let hub = kvbm_hub::create_client_builder()
 //!     .host("name-or-ip")
-//!     .port(1337)
+//!     .discovery_port(1337)
+//!     .control_port(8337)
 //!     .build()?;
 //!
 //! let velo = velo::Velo::builder()
-//!     .discovery(hub.clone())
+//!     .discovery(Arc::new(hub.discovery()))
 //!     .build()
 //!     .await?;
 //!
-//! hub.register_handlers(&velo)?;
-//! hub.register_instance(velo.peer_info()).await?;
+//! hub.register(&velo, Vec::new(), None).await?;
 //! # Ok(())
 //! # }
 //! ```
-//!
-//! When the last `Arc<HubClient>` is dropped, the held registration guard
-//! issues an HTTP `DELETE` against the hub so the instance is promptly
-//! removed from discovery.
 
 pub mod client;
 pub mod config;
 pub mod features;
 pub mod handlers;
 pub mod protocol;
-mod registration;
-pub mod registry;
 /// `kvbmctl` config rendering. Gated behind the `kvbmctl` feature because it
 /// depends on `kvbm-config`, which transitively pulls CUDA (cudarc) — kept out
 /// of the default CPU-only hub build.
 #[cfg(feature = "kvbmctl")]
 pub mod render;
 pub mod server;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_hub;
 pub mod web;
 
-pub use client::{HubClient, HubClientBuilder, HubClientConfig, HubRegistrationGuard};
+pub use client::{HubClient, HubClientBuilder};
 pub use config::{HubConfig, IndexerConfig};
 #[cfg(feature = "kvbmctl")]
 pub use features::cli::{FeatureCli, feature_clis, hub_arg};
@@ -83,30 +77,24 @@ pub use features::p2p::{P2pClient, P2pManager};
 pub use features::prefill_router::{
     BreakerConfig, CALIBRATE_HANDLER, CalibrationDefaults, CalibrationRequest, CalibrationResponse,
     CalibrationResults, CalibrationSnapshot, CircuitBreaker, DecodeSetProvider, DispatchOutcome,
-    HttpExecutionBackend, PREFILL_DISPATCH_HANDLER, PerformanceModel, PrefillDispatchRequest,
-    PrefillDispatchResponse, PrefillExecutionBackend, PrefillRequestDispatcher, PrefillRouter,
-    PrefillRouterManager, RawCalibrationPayload, RawTrace, RecordingDispatcher,
-    ResolvedCalibrationRequest, ScatterData, Selector, SelectorConfig, TierBroadcaster,
-    VeloExecutionBackend, analyze_calibration,
+    HttpExecutionBackend, PREFILL_DISPATCH_HANDLER, PREFILL_DONE_HANDLER, PREFILL_SUBMIT_HANDLER,
+    PerformanceModel, PrefillAssignment, PrefillDispatchRequest, PrefillDispatchResponse,
+    PrefillDone, PrefillDoneNotice, PrefillExecutionBackend, PrefillRouter, PrefillRouterManager,
+    RawCalibrationPayload, RawTrace, ResolvedCalibrationRequest, ScatterData, Selector,
+    SelectorConfig, TierBroadcaster, VeloExecutionBackend, analyze_calibration,
+    register_prefill_worker,
 };
-pub use features::{FeatureConfigRequirements, FeatureError, FeatureManager, HubContext};
-pub use handlers::{
-    HEARTBEAT_HANDLER, HeartbeatAck, HeartbeatRequest, TIER_SIGNAL_HANDLER, TierSignal,
-    TierSignalAck,
-};
+pub use features::{FeatureConfigRequirements, KvbmFeature};
+pub use handlers::{TIER_SIGNAL_HANDLER, TierSignal, TierSignalAck};
 pub use kvbm_common::BlockLayoutMode;
 pub use kvbm_logical::events::CreateKind;
 pub use protocol::{
-    CD_PREFILL_QUEUE, ConditionalDisaggConfig, ConditionalDisaggRole, DEFAULT_CONTROL_PORT,
-    DEFAULT_DISCOVERY_PORT, Feature, FeatureDescriptor, FeatureKey, HubConfigResponse,
-    IndexerFeatureConfig, P2pConfig, PrefillBackendAdvertisement, PrefillRequest,
-    PrefillRouterConfig, PrimaryConfig, ProbeResponse, RuntimeConfigSummary, VllmHttpEndpoint,
+    ConditionalDisaggConfig, ConditionalDisaggRole, DEFAULT_CONTROL_PORT, DEFAULT_DISCOVERY_PORT,
+    Feature, FeatureDescriptor, FeatureKey, HubConfigResponse, IndexerFeatureConfig, P2pConfig,
+    PrefillBackendAdvertisement, PrefillRequest, PrefillRouterConfig, PrimaryConfig,
+    RuntimeConfigSummary, VllmHttpEndpoint,
 };
-pub use registry::{
-    EvictionCallback, InMemoryRegistry, PeerRegistry, RegisteredPeer, RegistryError,
-    RegistryIncarnation, RegistryRemoval,
-};
-pub use server::{HubServer, HubServerBuilder, HubServerState};
+pub use server::{HubServer, HubServerBuilder};
 
 /// Shorthand for [`HubClientBuilder::new`].
 pub fn create_client_builder() -> HubClientBuilder {

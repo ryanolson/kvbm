@@ -8,15 +8,15 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>KVBM Hub</title>
-  <link rel="stylesheet" href="tokens.css">
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="/v1/ext/connector_control/tokens.css">
+  <link rel="stylesheet" href="/v1/ext/connector_control/style.css">
   <!-- app.js MUST load before alpine.min.js: Alpine's CDN bundle calls
        Alpine.start() the moment its script executes, which fires
        `alpine:init` synchronously. Our `addEventListener("alpine:init", …)`
        must already be in place by then. Both are defer so they still run
        after parse, before DOMContentLoaded, in document order. -->
-  <script defer src="app.js"></script>
-  <script defer src="vendor/alpine.min.js"></script>
+  <script defer src="/v1/ext/connector_control/app.js"></script>
+  <script defer src="/v1/ext/connector_control/vendor/alpine.min.js"></script>
 </head>
 <body>
   <div id="app" x-data="hubApp" x-init="init()">

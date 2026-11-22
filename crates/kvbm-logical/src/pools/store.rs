@@ -436,6 +436,11 @@ pub(crate) struct BlockStore<T: BlockMetadata> {
     /// holders can still override per-block via
     /// `ImmutableBlock::set_evict_on_reset`.
     default_reset_on_release: bool,
+    /// The execution lane whose physical residency this store reports in the
+    /// presence markers of a registration. Stores of the same tier `T` on
+    /// one registry keep their presence apart by this lane. A deployment
+    /// with one lane uses lane 0.
+    presence_lane: std::sync::atomic::AtomicU8,
     /// Test-only hook to deterministically widen the
     /// "Arc strong=0 but `release_primary` not yet run" race window.
     /// `release_primary` acquires this gate *before* taking the store
@@ -557,11 +562,26 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
             total_blocks: maximum_blocks,
             metrics,
             default_reset_on_release,
+            presence_lane: std::sync::atomic::AtomicU8::new(0),
             #[cfg(test)]
             release_primary_gate: Mutex::new(()),
             #[cfg(test)]
             release_primary_arrivals: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// The execution lane of the presence markers of this store.
+    pub(crate) fn presence_lane(&self) -> u8 {
+        self.presence_lane
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Set the execution lane of the presence markers. The manager builder
+    /// calls this before the store registers a block. A later call would
+    /// leave the markers of registered blocks on the earlier lane.
+    pub(crate) fn set_presence_lane(&self, lane: u8) {
+        self.presence_lane
+            .store(lane, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Store-wide default for the per-slot "reset on last drop" override.
@@ -985,7 +1005,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         // mark_absent::<T> takes the registry attachments lock — invoke
         // outside the store lock to honour the documented ordering.
         for h in handles {
-            h.mark_absent::<T>();
+            h.mark_absent::<T>(self.presence_lane());
         }
         Some((blocks, evicted))
     }
@@ -1022,7 +1042,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         debug_assert_eq!(fenced_count + out.len(), count);
         drop(inner);
         for h in handles {
-            h.mark_absent::<T>();
+            h.mark_absent::<T>(self.presence_lane());
         }
         (out, evicted)
     }
@@ -1077,7 +1097,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         self.metrics.inc_evictions(count as u64);
         drop(inner);
         for handle in handles {
-            handle.mark_absent::<T>();
+            handle.mark_absent::<T>(self.presence_lane());
         }
         (blocks, evicted)
     }
@@ -1312,7 +1332,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         // already been released. Skip on Reject — no new presence-bearing
         // slot was created.
         if presence_added {
-            handle.mark_present::<T>();
+            handle.mark_present::<T>(self.presence_lane());
         }
 
         // Block guard drops here: armed=false on Allow/fresh paths
@@ -1460,7 +1480,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         // (attachments → store) is satisfied because the store lock has
         // already been released.
         for h in present_handles {
-            h.mark_present::<T>();
+            h.mark_present::<T>(self.presence_lane());
         }
 
         // Allow/fresh guards are disarmed (the slot already transitioned)
@@ -1747,7 +1767,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         // (attachments → store) is satisfied because the store lock has
         // already been released. Matches the `release_duplicate` pattern.
         if let Some(handle) = handle_to_mark_absent {
-            handle.mark_absent::<T>();
+            handle.mark_absent::<T>(self.presence_lane());
         }
     }
 
@@ -1778,7 +1798,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
             self.reset_slot_locked(&mut inner, block_id);
             handle
         };
-        handle.mark_absent::<T>();
+        handle.mark_absent::<T>(self.presence_lane());
     }
 
     /// Batched release of a set of [`ImmutableBlock`] guards under **one**
@@ -1909,7 +1929,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         // preserves the documented attachments → inner ordering by never
         // letting the two overlap.
         for handle in pending_mark_absent {
-            handle.mark_absent::<T>();
+            handle.mark_absent::<T>(self.presence_lane());
         }
 
         report

@@ -109,6 +109,13 @@ pub struct PhysicalWorker {
     #[builder(default, setter(strip_option))]
     resource_handles: Option<ResourceLayoutHandles>,
 
+    /// Layouts that a peer reads by handle, outside every transfer
+    /// dispatch, such as the slots of a fixed recurrent state. They are
+    /// exported with `resource_handles`, so a peer that imports this worker
+    /// can address them, but no placement or transfer plan names them.
+    #[builder(default)]
+    exported_layouts: Vec<(LogicalResourceId, TierLayoutHandles)>,
+
     /// Remote handle mappings for peer-to-peer transfers (legacy, no rank).
     /// Key: (InstanceId, LogicalLayoutHandle) → remote LayoutHandle
     ///
@@ -259,7 +266,13 @@ impl PhysicalWorker {
             LogicalLayoutHandle::G3 => self.g3_handle,
             LogicalLayoutHandle::G4 => None,
         };
-        resolve_local_layout_handle(self.resource_handles.as_ref(), resource, tier, legacy)
+        resolve_local_layout_handle(
+            self.resource_handles.as_ref(),
+            &self.exported_layouts,
+            resource,
+            tier,
+            legacy,
+        )
     }
 
     fn primary_resource_id(&self) -> LogicalResourceId {
@@ -410,6 +423,11 @@ impl PhysicalWorker {
             Some(resources) => {
                 let grouped = resources
                     .iter()
+                    .chain(
+                        self.exported_layouts
+                            .iter()
+                            .map(|(resource, handles)| (*resource, handles)),
+                    )
                     .map(|(resource, handles)| {
                         self.build_resource_descriptors(handles)
                             .map(|layouts| ResourceLayoutDescriptor::new(resource, layouts))
@@ -1273,17 +1291,32 @@ fn select_primary_layout_handle(
     }
 }
 
+/// The layout of `tier` for `resource` on this worker.
+///
+/// A dispatch resource resolves from `resources`. A resource of
+/// `exported` (a layout outside every transfer dispatch, such as the slots
+/// of a fixed recurrent state) resolves from its own tier handles, so a
+/// local transfer can copy between two tiers of it, or between two blocks of
+/// one tier. The owner of the worker, or a leader through the
+/// `LOCAL_TRANSFER` handler of a remote worker, names it by its resource id.
 fn resolve_local_layout_handle(
     resources: Option<&ResourceLayoutHandles>,
+    exported: &[(LogicalResourceId, TierLayoutHandles)],
     resource: LogicalResourceId,
     tier: LogicalLayoutHandle,
     legacy: Option<LayoutHandle>,
 ) -> Option<LayoutHandle> {
-    match resources {
+    let dispatch = match resources {
         Some(resources) => resources.handle(resource, tier),
         None if resource == LogicalResourceId::default() => legacy,
         None => None,
-    }
+    };
+    dispatch.or_else(|| {
+        exported
+            .iter()
+            .find(|(exported_resource, _)| *exported_resource == resource)
+            .and_then(|(_, handles)| handles.handle(tier))
+    })
 }
 
 #[cfg(test)]
@@ -1346,6 +1379,7 @@ mod resource_handle_tests {
         assert_eq!(
             resolve_local_layout_handle(
                 Some(&resources),
+                &[],
                 secondary,
                 LogicalLayoutHandle::G2,
                 Some(primary_g2),
@@ -1353,9 +1387,95 @@ mod resource_handle_tests {
             Some(secondary_g2)
         );
         assert_eq!(
-            resolve_local_layout_handle(None, secondary, LogicalLayoutHandle::G2, Some(primary_g2),),
+            resolve_local_layout_handle(
+                None,
+                &[],
+                secondary,
+                LogicalLayoutHandle::G2,
+                Some(primary_g2),
+            ),
             None,
             "legacy handles must not masquerade as a non-default resource"
+        );
+    }
+
+    /// A fixed state resource is exported and has no dispatch entry. A local
+    /// transfer resolves both of its tiers, so the owner of a remote worker
+    /// can copy a fixed state between the device layout and the host layout
+    /// through the local transfer handler.
+    #[test]
+    fn local_transfer_handle_resolves_an_exported_layout() {
+        let primary = LogicalResourceId(3);
+        let fixed = LogicalResourceId(11);
+        let primary_g2 = LayoutHandle::new(8, 4);
+        let fixed_device = LayoutHandle::new(8, 20);
+        let fixed_host = LayoutHandle::new(8, 21);
+        let resources = ResourceLayoutHandles::new(
+            primary,
+            vec![(
+                primary,
+                TierLayoutHandles::new(None, Some(primary_g2), None),
+            )],
+        )
+        .unwrap();
+        let exported = [(
+            fixed,
+            TierLayoutHandles::new(Some(fixed_device), Some(fixed_host), None),
+        )];
+
+        for resources in [Some(&resources), None] {
+            assert_eq!(
+                resolve_local_layout_handle(
+                    resources,
+                    &exported,
+                    fixed,
+                    LogicalLayoutHandle::G1,
+                    None,
+                ),
+                Some(fixed_device)
+            );
+            assert_eq!(
+                resolve_local_layout_handle(
+                    resources,
+                    &exported,
+                    fixed,
+                    LogicalLayoutHandle::G2,
+                    None,
+                ),
+                Some(fixed_host)
+            );
+            assert_eq!(
+                resolve_local_layout_handle(
+                    resources,
+                    &exported,
+                    fixed,
+                    LogicalLayoutHandle::G3,
+                    None,
+                ),
+                None
+            );
+        }
+        // A dispatch resource keeps its own handle.
+        assert_eq!(
+            resolve_local_layout_handle(
+                Some(&resources),
+                &exported,
+                primary,
+                LogicalLayoutHandle::G2,
+                None,
+            ),
+            Some(primary_g2)
+        );
+        // A resource that is in neither set has no layout.
+        assert_eq!(
+            resolve_local_layout_handle(
+                Some(&resources),
+                &exported,
+                LogicalResourceId(12),
+                LogicalLayoutHandle::G2,
+                None,
+            ),
+            None
         );
     }
 }

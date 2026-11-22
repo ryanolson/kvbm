@@ -12,4 +12,4 @@ pub mod protocol;
 
 pub use client::ConditionalDisaggClient;
 pub use manager::ConditionalDisaggManager;
-pub use protocol::{ConditionalDisaggInstancesResponse, ROUTE_PREFIX};
+pub use protocol::ConditionalDisaggInstancesResponse;

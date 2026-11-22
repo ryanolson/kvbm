@@ -151,7 +151,7 @@ impl<T: BlockMetadata> BlockStore<T> {
         drop(inner);
 
         for handle in restored.discarded_handles {
-            handle.mark_absent::<T>();
+            handle.mark_absent::<T>(self.presence_lane());
         }
     }
 
@@ -189,9 +189,9 @@ impl<T: BlockMetadata> BlockStore<T> {
         drop(inner);
 
         for handle in restored.discarded_handles {
-            handle.mark_absent::<T>();
+            handle.mark_absent::<T>(self.presence_lane());
         }
-        victim_handle.mark_absent::<T>();
+        victim_handle.mark_absent::<T>(self.presence_lane());
         (!victim_replaced).then_some(victim_hash)
     }
 }

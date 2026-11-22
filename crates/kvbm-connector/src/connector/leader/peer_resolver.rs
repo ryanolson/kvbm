@@ -55,6 +55,7 @@ impl PeerResolver for HubPeerResolver {
         Box::pin(async move {
             let peer_info = self
                 .hub
+                .discovery()
                 .discover_by_instance_id(instance_id)
                 .await
                 .with_context(|| format!("hub lookup for instance {}", instance_id))?;

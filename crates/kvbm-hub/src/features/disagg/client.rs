@@ -7,26 +7,23 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use tokio::sync::OnceCell;
 use velo::Messenger;
 use velo::discovery::PeerDiscovery;
-use velo::queue::NextOptions;
-use velo::queue::backends::messenger::{MessengerQueueBackend, MessengerQueueConfig};
 use velo_ext::{InstanceId, PeerInfo};
 
 use super::protocol::ConditionalDisaggInstancesResponse;
 use crate::client::HubClient;
+use crate::features::prefill_router::{PREFILL_SUBMIT_HANDLER, PrefillDispatchResponse};
 use crate::protocol::{
-    self, ConditionalDisaggConfig, ConditionalDisaggRole, Feature, LayoutCompatPayload, P2pConfig,
+    ConditionalDisaggConfig, ConditionalDisaggRole, Feature, LayoutCompatPayload, P2pConfig,
     PrefillRequest, RuntimeConfigSummary,
 };
 
 /// Thin wrapper that registers an instance under the ConditionalDisagg
-/// feature and exposes helpers for peer discovery and prefill-queue IO.
+/// feature and exposes helpers for peer discovery and prefill dispatch.
 ///
 /// Construction requires the [`HubClient`] (HTTP discovery surface) and an
-/// [`Arc<Messenger>`] (used to open a [`MessengerQueueBackend`] targeting the
-/// hub for prefill enqueue / dequeue). Use [`ConditionalDisaggClient::new`]
+/// [`Arc<Messenger>`] (used to send prefill requests to the hub). Use [`ConditionalDisaggClient::new`]
 /// when you have a full [`velo::Velo`], or
 /// [`ConditionalDisaggClient::with_messenger`] when only a bare [`Messenger`]
 /// is available (e.g. from [`kvbm_engine::runtime::KvbmRuntime`]).
@@ -34,12 +31,9 @@ pub struct ConditionalDisaggClient {
     hub: Arc<HubClient>,
     messenger: Arc<Messenger>,
     role: ConditionalDisaggRole,
-    /// Hub's velo `InstanceId`, learned on `register()`. Queue RPCs need
-    /// this to address the hub-side queue service.
+    /// Hub's velo `InstanceId`, learned on `register()`. Prefill requests
+    /// are sent to it.
     hub_velo_id: OnceLock<InstanceId>,
-    /// Lazily-built queue backend targeting the hub. Constructed on first
-    /// prefill-queue call.
-    queue_backend: OnceCell<Arc<MessengerQueueBackend>>,
 }
 
 impl std::fmt::Debug for ConditionalDisaggClient {
@@ -65,7 +59,7 @@ impl ConditionalDisaggClient {
     ///
     /// Prefer this constructor when only a bare [`Messenger`] is available.
     /// The [`Messenger`] is the only piece of [`velo::Velo`] this client
-    /// actually uses (for the hub-targeted prefill queue backend), so a full
+    /// actually uses (to send prefill requests to the hub), so a full
     /// [`velo::Velo`] instance is not required.
     pub fn with_messenger(
         hub: Arc<HubClient>,
@@ -77,7 +71,6 @@ impl ConditionalDisaggClient {
             messenger,
             role,
             hub_velo_id: OnceLock::new(),
-            queue_backend: OnceCell::new(),
         })
     }
 
@@ -88,7 +81,7 @@ impl ConditionalDisaggClient {
 
     /// Seed the hub's velo `InstanceId` when registration was performed
     /// elsewhere (e.g. the shared P2P foundation registered `[P2P, CD, ...]` in
-    /// one call). Idempotent; needed before prefill-queue calls. No-op on `None`.
+    /// one call). Idempotent; needed before prefill requests. No-op on `None`.
     pub fn set_hub_velo_id(&self, hub_velo_id: Option<InstanceId>) {
         if let Some(id) = hub_velo_id {
             let _ = self.hub_velo_id.set(id);
@@ -105,26 +98,26 @@ impl ConditionalDisaggClient {
     /// alongside the mandatory P2P feature carrying `layout_compat`.
     ///
     /// On success, caches the hub's velo `InstanceId` internally so
-    /// subsequent prefill-queue calls can target it without re-reading the
+    /// subsequent prefill requests can target it without re-reading the
     /// response.
     ///
     /// `layout_compat` is mandatory — c2 removed the opt-in bypass path.
     pub async fn register(
         &self,
-        peer_info: PeerInfo,
+        velo: &velo::Velo,
         layout_compat: LayoutCompatPayload,
     ) -> Result<Option<InstanceId>> {
-        self.register_with(peer_info, layout_compat, Vec::new(), None)
+        self.register_with(velo, layout_compat, Vec::new(), None)
             .await
     }
 
     /// Like [`register`](Self::register) but additionally declares
     /// `extra_features` (e.g. `Feature::Indexer`) and an optional must-match
-    /// [`RuntimeConfigSummary`], all in a single `POST /v1/instances`. The
+    /// [`RuntimeConfigSummary`], all in one registration. The
     /// mandatory `P2P` + `ConditionalDisagg` features are always prepended.
     pub async fn register_with(
         &self,
-        peer_info: PeerInfo,
+        velo: &velo::Velo,
         layout_compat: LayoutCompatPayload,
         extra_features: Vec<Feature>,
         runtime: Option<RuntimeConfigSummary>,
@@ -134,18 +127,7 @@ impl ConditionalDisaggClient {
             Feature::ConditionalDisagg(ConditionalDisaggConfig { role: self.role }),
         ];
         features.extend(extra_features);
-        let hub_id = match runtime {
-            Some(rt) => {
-                self.hub
-                    .register_instance_with_features_and_runtime(peer_info, features, rt)
-                    .await?
-            }
-            None => {
-                self.hub
-                    .register_instance_with_features(peer_info, features)
-                    .await?
-            }
-        };
+        let hub_id = self.hub.register(velo, features, runtime).await?;
         if let Some(id) = hub_id {
             let _ = self.hub_velo_id.set(id);
         }
@@ -156,17 +138,16 @@ impl ConditionalDisaggClient {
     pub async fn list_instances(&self) -> Result<ConditionalDisaggInstancesResponse> {
         let url = self
             .hub
-            .config()
-            .discovery_url
+            .public_url()
             .join(&format!(
-                "/v1/features/{}{}",
-                super::protocol::ROUTE_PREFIX,
+                "/v1/ext/{}{}",
+                crate::protocol::DISAGG_EXTENSION,
                 super::protocol::paths::INSTANCES
             ))
             .context("joining CD list path")?;
         let resp = reqwest::get(url)
             .await
-            .context("GET /v1/features/disagg/instances")?;
+            .context("GET /v1/ext/disagg/instances")?;
         if !resp.status().is_success() {
             return Err(anyhow!("CD list endpoint returned {}", resp.status()));
         }
@@ -193,6 +174,7 @@ impl ConditionalDisaggClient {
             if let Some(first) = ids.first().copied() {
                 return self
                     .hub
+                    .discovery()
                     .discover_by_instance_id(first)
                     .await
                     .with_context(|| format!("resolving PeerInfo for {first}"));
@@ -214,20 +196,9 @@ impl ConditionalDisaggClient {
         })
     }
 
-    async fn queue_backend(&self) -> Result<&Arc<MessengerQueueBackend>> {
-        self.queue_backend
-            .get_or_try_init(|| async {
-                let hub_id = self.hub_velo_id()?;
-                Ok::<_, anyhow::Error>(Arc::new(MessengerQueueBackend::new(
-                    self.messenger.clone(),
-                    hub_id,
-                    MessengerQueueConfig::default(),
-                )))
-            })
-            .await
-    }
-
-    /// Enqueue a [`PrefillRequest`] on the hub's CD prefill queue.
+    /// Send a [`PrefillRequest`] to the hub's prefill router. Returns once a
+    /// prefill worker has taken it. An error means that no prefill worker
+    /// took it, so the caller can prefill locally.
     ///
     /// Only valid for Decode participants — returns an error if this client's
     /// role is not [`ConditionalDisaggRole::Decode`].
@@ -238,42 +209,22 @@ impl ConditionalDisaggClient {
                 self.role
             ));
         }
-        let encoded = serde_json::to_vec(req).context("encoding PrefillRequest")?;
-        let backend = self.queue_backend().await?;
-        let tx = velo::queue::sender::<Vec<u8>>(backend.as_ref(), protocol::CD_PREFILL_QUEUE)
+        let response = self
+            .messenger
+            .typed_unary::<PrefillDispatchResponse>(PREFILL_SUBMIT_HANDLER)?
+            .payload(req)
+            .context("encoding PrefillRequest")?
+            .instance(self.hub_velo_id()?)
+            .send()
             .await
-            .context("building CD prefill queue sender")?;
-        tx.enqueue(&encoded)
-            .await
-            .context("enqueue PrefillRequest")?;
-        Ok(())
-    }
-
-    /// Dequeue a [`PrefillRequest`] from the hub's CD prefill queue,
-    /// blocking for up to `timeout`. Returns `Ok(None)` when the window
-    /// elapses with no item available.
-    ///
-    /// Only valid for Prefill participants — returns an error if this
-    /// client's role is not [`ConditionalDisaggRole::Prefill`].
-    pub async fn pull_prefill_request(&self, timeout: Duration) -> Result<Option<PrefillRequest>> {
-        if self.role != ConditionalDisaggRole::Prefill {
-            return Err(anyhow!(
-                "pull_prefill_request is only valid for Prefill participants (this client is {:?})",
-                self.role
-            ));
+            .context("send the prefill request to the hub")?;
+        if response.ok {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "the hub placed no prefill worker: {}",
+                response.error.as_deref().unwrap_or("no reason given")
+            ))
         }
-        let backend = self.queue_backend().await?;
-        let rx = velo::queue::receiver::<Vec<u8>>(backend.as_ref(), protocol::CD_PREFILL_QUEUE)
-            .await
-            .context("building CD prefill queue receiver")?;
-        let batch = rx
-            .next_with_options(NextOptions::new().batch_size(1).timeout(timeout))
-            .await
-            .context("dequeue PrefillRequest")?;
-        batch
-            .into_iter()
-            .next()
-            .map(|bytes| serde_json::from_slice(&bytes).context("decoding PrefillRequest"))
-            .transpose()
     }
 }

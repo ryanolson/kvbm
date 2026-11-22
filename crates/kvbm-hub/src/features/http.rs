@@ -21,24 +21,24 @@ use serde::Serialize;
 use velo_ext::InstanceId;
 
 use crate::protocol::{ErrorBody, ErrorCode};
-use crate::registry::PeerRegistry;
+use velo_hub::store::HubStore;
 
 /// Build a [`LeaderControlClient`] for `instance_id` after validating velo +
 /// registry attachment and that the instance is currently registered.
 ///
 /// `velo` / `registry` are the manager's own `OnceLock`s, populated during
-/// [`FeatureManager::attach`](crate::features::FeatureManager::attach).
+/// [`velo_hub::Extension::attach`].
 ///
 /// `Err` is boxed-as-`Response` because [`axum::response::Response`] is
 /// ~120 bytes and would otherwise blow up the `result_large_err` clippy lint
 /// on the happy path — the `#[allow]` lives here so both call sites inherit it.
 #[allow(clippy::result_large_err)]
 pub(crate) fn leader_client(
-    velo: &OnceLock<Arc<velo::Velo>>,
-    registry: &OnceLock<Arc<dyn PeerRegistry>>,
+    velo: &OnceLock<velo::WeakVelo>,
+    store: &OnceLock<Arc<dyn HubStore>>,
     instance_id: InstanceId,
 ) -> Result<LeaderControlClient, Response> {
-    let Some(velo) = velo.get() else {
+    let Some(velo) = velo.get().and_then(velo::WeakVelo::upgrade) else {
         return Err(service_unavailable("hub has no velo transport configured"));
     };
     // The hub self-registers in its own registry (so leaders can discover it),
@@ -54,10 +54,10 @@ pub(crate) fn leader_client(
             "cannot issue leader control to the hub itself",
         ));
     }
-    let Some(registry) = registry.get() else {
-        return Err(service_unavailable("registry not attached"));
+    let Some(store) = store.get() else {
+        return Err(service_unavailable("store not attached"));
     };
-    if !registry.contains(instance_id) {
+    if !store.contains(instance_id) {
         return Err(error_response(
             StatusCode::NOT_FOUND,
             "instance not registered",

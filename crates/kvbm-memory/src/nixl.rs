@@ -50,7 +50,9 @@ impl<T: Send + Sync + fmt::Debug> MappedRegistrationGuard for T {}
 /// Registered intervals and their lifetime owner for one requested range.
 #[derive(Debug)]
 pub struct MappedRegistrationLease {
-    /// Ordered, contiguous registered intervals that exactly cover the request.
+    /// Registered intervals in transfer order. Their lengths add up to the
+    /// request. An interval can be at another address than the request, for
+    /// example in a registered arena that maps the same memory.
     pub ranges: Vec<std::ops::Range<usize>>,
     /// Keeps every covered registration and physical allocation alive.
     pub guard: Arc<dyn MappedRegistrationGuard>,

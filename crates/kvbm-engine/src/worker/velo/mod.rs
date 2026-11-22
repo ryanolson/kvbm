@@ -65,13 +65,27 @@ pub(crate) mod handler_names {
     pub const OBJECT_HAS_BLOCKS: &str = "kvbm.worker.object_has_blocks";
     pub const OBJECT_PUT_BLOCKS: &str = "kvbm.worker.object_put_blocks";
     pub const OBJECT_GET_BLOCKS: &str = "kvbm.worker.object_get_blocks";
+
+    /// The handler name of `name` for one worker of a process.
+    ///
+    /// A process with one worker registers the names above as they are
+    /// (`worker` is `None`). A process that serves two or more workers on one
+    /// messenger gives each worker an id, and each worker registers its own
+    /// set of handlers under `name#id`. A client selects a worker by the same
+    /// id, so no message needs a worker field.
+    pub fn scoped(name: &str, worker: Option<u64>) -> String {
+        match worker {
+            None => name.to_string(),
+            Some(id) => format!("{name}#{id}"),
+        }
+    }
 }
 
 use super::DirectWorker;
 use super::*;
 use kvbm_common::KvbmTransferRoute;
 use kvbm_physical::layout::LayoutConfig;
-use kvbm_physical::transfer::{CopyEngine, TransferOptions};
+use kvbm_physical::transfer::{CopyEngine, TransferDrainOutcome, TransferOptions};
 
 use ::velo::Messenger;
 use bytes::Bytes;
@@ -85,6 +99,39 @@ struct SerializableTransferOptions {
     bounce_buffer_handle: Option<LayoutHandle>,
     bounce_buffer_block_ids: Option<Vec<BlockId>>,
     metric_route: Option<KvbmTransferRoute>,
+    /// The CUDA copy primitive that the sender selected. A message without
+    /// the field lets the receiver choose.
+    #[serde(default)]
+    copy_engine: WireCopyEngine,
+}
+
+/// The wire form of [`CopyEngine`].
+#[derive(Serialize, Deserialize, Clone, Copy, Default)]
+enum WireCopyEngine {
+    #[default]
+    Auto,
+    VectorizedKernel,
+    MemcpyBatch,
+}
+
+impl From<CopyEngine> for WireCopyEngine {
+    fn from(engine: CopyEngine) -> Self {
+        match engine {
+            CopyEngine::Auto => Self::Auto,
+            CopyEngine::VectorizedKernel => Self::VectorizedKernel,
+            CopyEngine::MemcpyBatch => Self::MemcpyBatch,
+        }
+    }
+}
+
+impl From<WireCopyEngine> for CopyEngine {
+    fn from(engine: WireCopyEngine) -> Self {
+        match engine {
+            WireCopyEngine::Auto => Self::Auto,
+            WireCopyEngine::VectorizedKernel => Self::VectorizedKernel,
+            WireCopyEngine::MemcpyBatch => Self::MemcpyBatch,
+        }
+    }
 }
 
 impl From<SerializableTransferOptions> for TransferOptions {
@@ -108,9 +155,7 @@ impl From<SerializableTransferOptions> for TransferOptions {
             // cross-leader case (Universal↔Universal under c3 semantics
             // → requires_transform = false → auto-promote never fires).
             use_planner: false,
-            // copy_engine is likewise not serialized; the receiver picks
-            // its own CUDA copy primitive.
-            copy_engine: CopyEngine::Auto,
+            copy_engine: opts.copy_engine.into(),
         }
     }
 }
@@ -142,6 +187,7 @@ impl From<TransferOptions> for SerializableTransferOptions {
             bounce_buffer_handle,
             bounce_buffer_block_ids,
             metric_route: opts.metric_route,
+            copy_engine: opts.copy_engine.into(),
         }
     }
 }
@@ -156,6 +202,62 @@ struct LocalTransferMessage {
     src_block_ids: Vec<BlockId>,
     dst_block_ids: Vec<BlockId>,
     options: SerializableTransferOptions,
+}
+
+/// The reply to a `LOCAL_TRANSFER` request.
+///
+/// The reply carries the drain certainty of the worker, so that the client
+/// can tell a drained failure from an unproven one. An RPC error has no
+/// reply. The client then reports [`TransferDrainOutcome::Unproven`], because
+/// the worker can have an active copy.
+#[derive(Serialize, Deserialize)]
+enum LocalTransferReply {
+    /// The transfer completed.
+    Completed,
+    /// The transfer failed, and no physical operation is active.
+    DrainedWithError { error: String },
+    /// The transfer failed, and the worker did not prove that its work drained.
+    Unproven { error: String },
+}
+
+impl LocalTransferReply {
+    fn from_outcome(outcome: TransferDrainOutcome) -> Self {
+        match outcome {
+            TransferDrainOutcome::Completed => Self::Completed,
+            TransferDrainOutcome::DrainedWithError(error) => Self::DrainedWithError {
+                error: format!("{error:#}"),
+            },
+            TransferDrainOutcome::Unproven(error) => Self::Unproven {
+                error: format!("{error:#}"),
+            },
+        }
+    }
+
+    fn into_outcome(self) -> TransferDrainOutcome {
+        match self {
+            Self::Completed => TransferDrainOutcome::Completed,
+            Self::DrainedWithError { error } => {
+                TransferDrainOutcome::DrainedWithError(anyhow::anyhow!(error))
+            }
+            Self::Unproven { error } => TransferDrainOutcome::Unproven(anyhow::anyhow!(error)),
+        }
+    }
+
+    /// Decode the reply bytes of a `LOCAL_TRANSFER` request.
+    ///
+    /// An empty reply is the success reply of a handler that does not send
+    /// this type. A reply that does not decode proves nothing.
+    fn decode(bytes: &[u8]) -> TransferDrainOutcome {
+        if bytes.is_empty() {
+            return TransferDrainOutcome::Completed;
+        }
+        match serde_json::from_slice::<Self>(bytes) {
+            Ok(reply) => reply.into_outcome(),
+            Err(error) => TransferDrainOutcome::Unproven(anyhow::anyhow!(
+                "local transfer reply did not decode: {error}"
+            )),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -187,6 +289,7 @@ mod local_transfer_message_tests {
                 bounce_buffer_handle: None,
                 bounce_buffer_block_ids: None,
                 metric_route: None,
+                copy_engine: WireCopyEngine::Auto,
             },
         }
     }

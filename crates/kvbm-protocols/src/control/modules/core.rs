@@ -17,7 +17,7 @@ use super::super::layout_compat::LayoutCompatPayload;
 /// Velo handler name for the always-on `describe_instance` operation.
 ///
 /// In steady state the leader **pushes** an [`InstanceDescription`] to the hub
-/// via `POST /v1/instances/{id}/describe`. This velo handler exists for the
+/// via `POST /v1/ext/connector_control/instances/{id}/describe`. This velo handler exists for the
 /// hub's fallback pull (cold cache after hub restart, operator-triggered
 /// re-fetch via `GET /describe?force=true` or `POST /control/core/describe_instance`).
 pub const DESCRIBE_INSTANCE_HANDLER: &str = "kvbm.leader.control.describe_instance";

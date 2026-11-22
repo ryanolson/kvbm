@@ -4,8 +4,8 @@
 //! Feature-owned wire protocol for the prefill router.
 //!
 //! All paths are **relative** — the server nests them under
-//! `/v1/features/{ROUTE_PREFIX}` (see
-//! [`FeatureManager::route_prefix`](crate::features::FeatureManager::route_prefix)).
+//! `/v1/ext/{NAME}` (see
+//! `/v1/ext/{NAME}`).
 //! Nothing here lives in the central [`crate::protocol::paths`]; the feature
 //! owns its whole namespace.
 
@@ -13,21 +13,29 @@ use kvbm_protocols::disagg::TransferParams;
 use serde::{Deserialize, Serialize};
 use velo_ext::InstanceId;
 
-/// URL segment the server nests this feature's routers under
-/// (`/v1/features/prefill-router/...`).
-pub const ROUTE_PREFIX: &str = "prefill-router";
-
-/// Velo unary handler name the hub's [`super::execution::VeloExecutionBackend`]
-/// calls on each registered velo target. The bindings crate registers the
-/// matching handler from `PrefillRouterHandler::new`.
+/// Velo unary handler on a prefill worker. The hub's
+/// [`super::execution::VeloExecutionBackend`] calls it with the request it
+/// assigned to the worker, and a decode worker can call it directly when it
+/// already knows the prefill worker. The handler acks when it has taken the
+/// request, and the worker sends [`PREFILL_DONE_HANDLER`] to the caller when
+/// the request ends.
 pub const PREFILL_DISPATCH_HANDLER: &str = "kvbm.prefill_router.dispatch";
 
-/// Wire payload sent by the hub-side velo execution backend to a registered
-/// prefill worker. NOT the raw [`crate::protocol::PrefillRequest`] because the
-/// hub pre-wraps `kv_transfer_params` here, so the receiving worker can hand
-/// it directly to `sampling_params.extra_args` without re-deriving — the
-/// HTTP backend already does this in its `/v1/completions` body and the velo
-/// path stays symmetric.
+/// Velo unary handler on the hub. A decode worker sends it a
+/// [`crate::protocol::PrefillRequest`]; the hub picks a prefill worker,
+/// forwards the request, and replies with a [`PrefillDispatchResponse`].
+pub const PREFILL_SUBMIT_HANDLER: &str = "kvbm.prefill_router.submit";
+
+/// Velo active message that a prefill worker sends to the dispatcher of a
+/// request when the request ends: success, failure or cancel. The hub frees
+/// the worker's router capacity on it.
+pub const PREFILL_DONE_HANDLER: &str = "kvbm.prefill_router.done";
+
+/// Wire payload sent to [`PREFILL_DISPATCH_HANDLER`]. NOT the raw
+/// [`crate::protocol::PrefillRequest`] because `kv_transfer_params` is
+/// pre-wrapped here, so the receiving worker can hand it directly to its
+/// engine without re-deriving — the HTTP backend already does this in its
+/// `/v1/completions` body and the velo path stays symmetric.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PrefillDispatchRequest {
     /// Original request id, propagated for logging / tracing.
@@ -39,9 +47,19 @@ pub struct PrefillDispatchRequest {
     pub kv_transfer_params: TransferParams,
 }
 
-/// Wire response a prefill worker returns. `ok=true` means the worker
-/// accepted and ran the prefill end-to-end; on failure `error` carries the
-/// formatted reason.
+impl From<&crate::protocol::PrefillRequest> for PrefillDispatchRequest {
+    fn from(request: &crate::protocol::PrefillRequest) -> Self {
+        Self {
+            request_id: request.request_id.clone(),
+            token_ids: request.token_ids.clone(),
+            kv_transfer_params: TransferParams::remote_prefill(request.remote_prefill_params()),
+        }
+    }
+}
+
+/// Reply of [`PREFILL_DISPATCH_HANDLER`] and [`PREFILL_SUBMIT_HANDLER`].
+/// `ok=true` means a prefill worker took the request; on failure `error`
+/// carries the reason.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PrefillDispatchResponse {
     pub ok: bool,
@@ -49,7 +67,15 @@ pub struct PrefillDispatchResponse {
     pub error: Option<String>,
 }
 
-/// Relative route paths (mounted under `/v1/features/prefill-router`).
+/// Payload of [`PREFILL_DONE_HANDLER`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrefillDone {
+    pub request_id: String,
+    /// The KVBM session of the request; the router charges by it.
+    pub session_id: String,
+}
+
+/// Relative route paths (mounted under `/v1/ext/prefill_router`).
 pub mod paths {
     /// `GET /targets` — registered prefill targets + their advertised
     /// execution backend.
@@ -130,7 +156,7 @@ pub struct PrefillTargetSummary {
     pub advertisement: PrefillBackendAdvertisement,
 }
 
-/// Response body for `GET /v1/features/prefill-router/targets`.
+/// Response body for `GET /v1/ext/prefill_router/targets`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct TargetsResponse {
     /// Registered prefill targets, in deterministic order
@@ -151,7 +177,7 @@ pub struct WorkerCountersSnapshot {
     pub load_net_new: u64,
 }
 
-/// Response body for `GET /v1/features/prefill-router/counters`.
+/// Response body for `GET /v1/ext/prefill_router/counters`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct CountersResponse {
     /// Per-worker counter snapshots in the same order as [`TargetsResponse`].
@@ -213,6 +239,7 @@ mod tests {
             decode_endpoint: None,
             num_provided_tokens: 0,
             request: KvHashingRequestEnvelope::default(),
+            scope_salt: None,
             expected_hash_digest: None,
             bundle: None,
         };

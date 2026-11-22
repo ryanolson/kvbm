@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Hub configuration-management contract (P1):
-//! - `GET /v1/config` aggregate (primary + per-feature descriptors + dep graph,
+//! - `GET /v1/ext/kvbm/config` aggregate (primary + per-feature descriptors + dep graph,
 //!   with KV-index sizing inherited from `primary`),
 //! - register-time dependency-closure enforcement (generalised CD→P2P),
 //! - register-time must-match validation against `primary`,
@@ -17,15 +17,15 @@ use dynamo_tokens::TokenBlockSequence;
 use futures::SinkExt;
 use kvbm_hub::{
     BlockLayoutMode, ConditionalDisaggConfig, ConditionalDisaggManager, ConditionalDisaggRole,
-    Feature, FeatureManager, HubConfigResponse, HubServer, IndexerFeatureConfig, IndexerManager,
-    P2pManager, PrimaryConfig, RuntimeConfigSummary,
+    Feature, HubConfigResponse, HubServer, IndexerFeatureConfig, IndexerManager, P2pManager,
+    PrimaryConfig, RuntimeConfigSummary, test_hub,
 };
 use kvbm_logical::events::{KvCacheEvents, KvbmCacheEvents};
 use kvbm_logical::{KvbmSequenceHashProvider, SequenceHash};
 use kvbm_protocols::cache_manifest::{
     CacheManifest, ModelIdentity, ResourceRequirement, ResourceRole,
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 use tmq::{Context, Multipart, publish::Publish, publish::publish};
 use velo_ext::{InstanceId, PeerInfo, WorkerAddress};
 
@@ -80,9 +80,9 @@ async fn start_hub() -> HubServer {
             g2_blocks: None,
             advertise_host: Some("127.0.0.1".to_string()),
         })
-        .add_feature_manager(p2p as Arc<dyn FeatureManager>)
-        .add_feature_manager(Arc::new(ConditionalDisaggManager::new()) as Arc<dyn FeatureManager>)
-        .add_feature_manager(Arc::new(kv) as Arc<dyn FeatureManager>)
+        .extension(p2p)
+        .extension(Arc::new(ConditionalDisaggManager::new()))
+        .extension(Arc::new(kv))
         .serve()
         .await
         .expect("start hub")
@@ -97,21 +97,12 @@ fn peer() -> (InstanceId, PeerInfo) {
 }
 
 async fn register(
-    http: &reqwest::Client,
-    control_base: &str,
+    server: &HubServer,
     peer_info: PeerInfo,
     features: Vec<Feature>,
     runtime: Option<RuntimeConfigSummary>,
-) -> reqwest::Response {
-    http.post(format!("{control_base}/v1/instances"))
-        .json(&json!({
-            "peer_info": peer_info,
-            "features": features,
-            "runtime": runtime,
-        }))
-        .send()
-        .await
-        .expect("POST /v1/instances")
+) -> test_hub::Attempt {
+    test_hub::attempt(server, peer_info, &features, runtime).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -121,10 +112,10 @@ async fn aggregate_config_reports_primary_and_features() {
     let http = reqwest::Client::new();
 
     let resp: HubConfigResponse = http
-        .get(format!("{base}/v1/config"))
+        .get(format!("{base}{}", kvbm_hub::protocol::paths::HUB_CONFIG))
         .send()
         .await
-        .expect("GET /v1/config")
+        .expect("GET the hub config")
         .json()
         .await
         .expect("decode HubConfigResponse");
@@ -176,13 +167,10 @@ async fn aggregate_config_reports_primary_and_features() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cd_without_p2p_rejected_by_dependency_closure() {
     let server = start_hub().await;
-    let base = format!("http://{}", server.control_addr());
-    let http = reqwest::Client::new();
 
     let (_, p) = peer();
     let resp = register(
-        &http,
-        &base,
+        &server,
         p,
         vec![Feature::ConditionalDisagg(ConditionalDisaggConfig {
             role: ConditionalDisaggRole::Decode,
@@ -203,13 +191,10 @@ async fn cd_without_p2p_rejected_by_dependency_closure() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn indexer_register_block_size_mismatch_rejected() {
     let server = start_hub().await;
-    let base = format!("http://{}", server.control_addr());
-    let http = reqwest::Client::new();
 
     let (_, p) = peer();
     let resp = register(
-        &http,
-        &base,
+        &server,
         p,
         vec![Feature::Indexer(indexer_config(None))],
         Some(RuntimeConfigSummary {
@@ -230,8 +215,7 @@ async fn indexer_register_block_size_mismatch_rejected() {
     // — validation has an authoritative value to compare against).
     let (_, p_empty) = peer();
     let empty = register(
-        &http,
-        &base,
+        &server,
         p_empty,
         vec![Feature::Indexer(indexer_config(None))],
         Some(RuntimeConfigSummary::default()),
@@ -246,8 +230,7 @@ async fn indexer_register_block_size_mismatch_rejected() {
     // A matching summary registers fine.
     let (_, p_ok) = peer();
     let ok = register(
-        &http,
-        &base,
+        &server,
         p_ok,
         vec![Feature::Indexer(indexer_config(None))],
         Some(RuntimeConfigSummary {
@@ -267,13 +250,10 @@ async fn indexer_register_without_runtime_summary_rejected() {
     // summary must NOT bypass must-match validation (the legacy escape hatch
     // is only for P2P / CD).
     let server = start_hub().await;
-    let base = format!("http://{}", server.control_addr());
-    let http = reqwest::Client::new();
 
     let (_, p) = peer();
     let resp = register(
-        &http,
-        &base,
+        &server,
         p,
         vec![Feature::Indexer(indexer_config(None))],
         None,
@@ -295,11 +275,10 @@ async fn indexer_register_grows_capacity() {
     // (never shrinks); a smaller one leaves it unchanged.
     let server = start_hub().await;
     let disc = format!("http://{}", server.discovery_addr());
-    let ctrl = format!("http://{}", server.control_addr());
     let http = reqwest::Client::new();
 
     let kv_config = |http: reqwest::Client, disc: String| async move {
-        http.get(format!("{disc}/v1/features/indexer/config"))
+        http.get(format!("{disc}/v1/ext/indexer/config"))
             .send()
             .await
             .unwrap()
@@ -315,8 +294,7 @@ async fn indexer_register_grows_capacity() {
     // Register with a larger max_seq_len → capacity grows.
     let (_, p) = peer();
     let resp = register(
-        &http,
-        &ctrl,
+        &server,
         p,
         vec![Feature::Indexer(indexer_config(Some(MAX_SEQ_LEN * 2)))],
         Some(RuntimeConfigSummary {
@@ -331,8 +309,7 @@ async fn indexer_register_grows_capacity() {
     // A smaller report never shrinks it.
     let (_, p2) = peer();
     register(
-        &http,
-        &ctrl,
+        &server,
         p2,
         vec![Feature::Indexer(indexer_config(Some(BLOCK_SIZE)))],
         Some(RuntimeConfigSummary {
@@ -350,12 +327,11 @@ async fn indexer_register_grows_capacity() {
 async fn indexer_unregister_sweeps_index() {
     let server = start_hub().await;
     let disc = format!("http://{}", server.discovery_addr());
-    let ctrl = format!("http://{}", server.control_addr());
     let http = reqwest::Client::new();
 
     // Discover the ZMQ ingest endpoint from the aggregate.
     let cfg: HubConfigResponse = http
-        .get(format!("{disc}/v1/config"))
+        .get(format!("{disc}{}", kvbm_hub::protocol::paths::HUB_CONFIG))
         .send()
         .await
         .unwrap()
@@ -377,8 +353,7 @@ async fn indexer_unregister_sweeps_index() {
     let id_u128 = id.as_u128();
     let hashes = plhs(3, 1337);
     let resp = register(
-        &http,
-        &ctrl,
+        &server,
         p,
         vec![Feature::Indexer(indexer_config(None))],
         Some(RuntimeConfigSummary {
@@ -392,7 +367,6 @@ async fn indexer_unregister_sweeps_index() {
         "register status {}",
         resp.status()
     );
-    let registration: kvbm_hub::protocol::RegisterResponse = resp.json().await.unwrap();
 
     let ctx = Context::new();
     let mut sock: Publish = publish(&ctx).set_linger(0).connect(&endpoint).unwrap();
@@ -413,7 +387,7 @@ async fn indexer_unregister_sweeps_index() {
     // driven by registration (declaring `Feature::Indexer`), distinct from the
     // index contents driven by emitted KV events.
     let registered: kvbm_hub::InstancesResponse = http
-        .get(format!("{disc}/v1/features/indexer/instances"))
+        .get(format!("{disc}/v1/ext/indexer/instances"))
         .send()
         .await
         .unwrap()
@@ -426,17 +400,8 @@ async fn indexer_unregister_sweeps_index() {
         registered.instances
     );
 
-    // Unregister → on_unregister sweeps the index entries for this instance.
-    let del = http
-        .delete(format!("{ctrl}/v1/instances/{id}"))
-        .header(
-            kvbm_hub::protocol::MUTATION_CREDENTIAL_HEADER,
-            registration.mutation_credential.unwrap().to_header_value(),
-        )
-        .send()
-        .await
-        .unwrap();
-    assert!(del.status().is_success(), "delete status {}", del.status());
+    // Unregister sweeps the index entries for this instance.
+    resp.client.unregister().await.expect("unregister");
 
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {
@@ -452,7 +417,7 @@ async fn indexer_unregister_sweeps_index() {
 
     // Unregister also drops the instance from the registered-instances set.
     let registered: kvbm_hub::InstancesResponse = http
-        .get(format!("{disc}/v1/features/indexer/instances"))
+        .get(format!("{disc}/v1/ext/indexer/instances"))
         .send()
         .await
         .unwrap()
@@ -491,7 +456,7 @@ async fn send_create(sock: &mut Publish, hashes: Vec<SequenceHash>, instance_id:
 async fn index_has_instance(http: &reqwest::Client, disc_base: &str, id: &str) -> bool {
     let body: Value = http
         .get(format!(
-            "{disc_base}/v1/features/indexer/manifests/{}/hashes/by_position/0",
+            "{disc_base}/v1/ext/indexer/manifests/{}/hashes/by_position/0",
             indexer_config(None).manifest.id()
         ))
         .send()
