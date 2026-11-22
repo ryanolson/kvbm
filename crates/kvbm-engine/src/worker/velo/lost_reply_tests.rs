@@ -428,3 +428,271 @@ async fn a_check_reaches_only_the_worker_that_took_the_copy() -> Result<()> {
     assert_eq!(checks(&neighbour), 0);
     Ok(())
 }
+
+#[tokio::test]
+async fn a_worker_record_without_drain_proof_stays_unproven() -> Result<()> {
+    let pair = create_messenger_pair_tcp().await?;
+    let records = LocalTransferRecords::new();
+    serve(
+        &pair.messenger_b,
+        &records,
+        copy_ending(|| TransferDrainOutcome::Unproven(anyhow::anyhow!("injected unproven copy"))),
+    )?;
+    records.hooks.lose_next_reply.store(true, Ordering::Release);
+
+    let outcome = transfer(&client(&pair))?.await_drain().await;
+
+    let recheck = recheck_of(&outcome);
+    assert_names_the_worker(&recheck, &pair, &records);
+    assert!(matches!(
+        records.check(recheck.transfer_id).record,
+        Record::Unproven { .. }
+    ));
+    assert_eq!(checks(&records), 1, "exactly one check");
+    Ok(())
+}
+
+/// The worker has no local-transfer handler, so velo fails the send before
+/// the request leaves. No copy ran: the outcome is a drained failure, at
+/// once, with no wait and no check.
+#[tokio::test]
+async fn a_transfer_that_never_reached_the_wire_is_a_drained_failure_at_once() -> Result<()> {
+    let pair = create_messenger_pair_tcp().await?;
+    let incarnation = uuid::Uuid::new_v4();
+    register_incarnation(
+        &pair.messenger_b,
+        incarnation,
+        &Arc::new(AtomicUsize::new(0)),
+    )?;
+    let unknown_checks = Arc::new(AtomicUsize::new(0));
+    register_unknown_check(&pair.messenger_b, incarnation, &unknown_checks)?;
+
+    let started = Instant::now();
+    let outcome = transfer(&client(&pair))?.await_drain().await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(outcome, TransferDrainOutcome::DrainedWithError(_)),
+        "a send that never reached the wire launched no copy, got {}",
+        describe(&outcome)
+    );
+    assert_eq!(unknown_checks.load(Ordering::Acquire), 0, "no check");
+    assert!(
+        elapsed < TIMING.wait,
+        "a send that never left must not wait, but resolved after {elapsed:?}"
+    );
+    Ok(())
+}
+
+/// The worker has no incarnation handler (an older worker). The transfer runs
+/// unbound. A check could not decide, so a lost reply is unknown at once,
+/// with no check sent.
+#[tokio::test]
+async fn an_unbound_lost_reply_is_unproven_without_a_check() -> Result<()> {
+    let pair = create_messenger_pair_tcp().await?;
+    register_lost_reply_transfer(&pair.messenger_b)?;
+    let unknown_checks = Arc::new(AtomicUsize::new(0));
+    register_unknown_check(&pair.messenger_b, uuid::Uuid::new_v4(), &unknown_checks)?;
+
+    let started = Instant::now();
+    let outcome = transfer(&client(&pair))?.await_drain().await;
+    let elapsed = started.elapsed();
+
+    let recheck = recheck_of(&outcome);
+    assert_eq!(recheck.incarnation, None);
+    assert_eq!(unknown_checks.load(Ordering::Acquire), 0, "no check");
+    assert!(
+        elapsed < TIMING.wait,
+        "an unbound lost reply must not wait for a check, but resolved after {elapsed:?}"
+    );
+    Ok(())
+}
+
+/// The first incarnation request times out. The client must ask again on the
+/// next transfer, not treat the worker as an older one.
+#[tokio::test]
+async fn an_incarnation_request_that_timed_out_is_asked_again_on_the_next_transfer() -> Result<()> {
+    let pair = create_messenger_pair_tcp().await?;
+    let records = LocalTransferRecords::new();
+    serve(
+        &pair.messenger_b,
+        &records,
+        copy_ending(|| TransferDrainOutcome::Completed),
+    )?;
+    let asks = Arc::new(AtomicUsize::new(0));
+    register_slow_first_incarnation(&pair.messenger_b, records.incarnation(), &asks)?;
+    let client = client(&pair);
+
+    let first = transfer(&client)?.await_drain().await;
+    assert!(
+        matches!(first, TransferDrainOutcome::Completed),
+        "got {}",
+        describe(&first)
+    );
+    records.hooks.lose_next_reply.store(true, Ordering::Release);
+    let second = transfer(&client)?.await_drain().await;
+
+    assert_eq!(asks.load(Ordering::Acquire), 2, "the client asked again");
+    assert!(
+        matches!(second, TransferDrainOutcome::Completed),
+        "the second transfer is bound, so its check decides, got {}",
+        describe(&second)
+    );
+    Ok(())
+}
+
+/// An older worker has no incarnation handler. velo rejects the request at
+/// once, and the client does not ask again on the next transfer.
+#[tokio::test]
+async fn an_older_worker_is_not_asked_for_its_incarnation_again_at_once() -> Result<()> {
+    let pair = create_messenger_pair_tcp().await?;
+    let transfer_handler = ::velo::Handler::unary_handler_async(
+        handler_names::scoped(handler_names::LOCAL_TRANSFER, Some(WORKER)),
+        |_ctx| async { Ok(Some(Bytes::new())) },
+    )
+    .build();
+    pair.messenger_b.register_handler(transfer_handler)?;
+    let client = client(&pair);
+
+    let first = transfer(&client)?.await_drain().await;
+    assert!(
+        matches!(first, TransferDrainOutcome::Completed),
+        "got {}",
+        describe(&first)
+    );
+    let asks = Arc::new(AtomicUsize::new(0));
+    register_incarnation(&pair.messenger_b, uuid::Uuid::new_v4(), &asks)?;
+    let second = transfer(&client)?.await_drain().await;
+
+    assert!(
+        matches!(second, TransferDrainOutcome::Completed),
+        "got {}",
+        describe(&second)
+    );
+    assert_eq!(
+        asks.load(Ordering::Acquire),
+        0,
+        "not asked again within the retry window"
+    );
+    Ok(())
+}
+
+/// A legacy request has no transfer id. The worker runs it and replies, and
+/// keeps no record.
+#[tokio::test]
+async fn a_legacy_request_without_a_transfer_id_runs_and_keeps_no_record() -> Result<()> {
+    let pair = create_messenger_pair_tcp().await?;
+    let records = LocalTransferRecords::new();
+    serve(
+        &pair.messenger_b,
+        &records,
+        copy_ending(|| TransferDrainOutcome::Completed),
+    )?;
+    let legacy = serde_json::json!({
+        "src": "G2",
+        "dst": "G1",
+        "src_block_ids": [0],
+        "dst_block_ids": [0],
+        "options": {
+            "layer_range": null,
+            "nixl_write_notification": null,
+            "bounce_buffer_handle": null,
+            "bounce_buffer_block_ids": null,
+            "metric_route": null
+        }
+    });
+    let reply = pair
+        .messenger_a
+        .unary(&handler_names::scoped(
+            handler_names::LOCAL_TRANSFER,
+            Some(WORKER),
+        ))?
+        .raw_payload(Bytes::from(serde_json::to_vec(&legacy)?))
+        .instance(pair.messenger_b.instance_id())
+        .send()
+        .await?;
+
+    assert!(matches!(
+        LocalTransferReply::decode(&reply),
+        TransferDrainOutcome::Completed
+    ));
+    assert!(records.active_ids().is_empty());
+    assert_eq!(records.record_count(), 0, "no record for a legacy request");
+    Ok(())
+}
+
+fn register_incarnation(
+    messenger: &Messenger,
+    incarnation: uuid::Uuid,
+    asks: &Arc<AtomicUsize>,
+) -> Result<()> {
+    let asks = Arc::clone(asks);
+    let reply = Bytes::from(serde_json::to_vec(&IncarnationReply { incarnation })?);
+    let handler = ::velo::Handler::unary_handler_async(
+        handler_names::scoped(handler_names::WORKER_INCARNATION, Some(WORKER)),
+        move |_ctx| {
+            asks.fetch_add(1, Ordering::AcqRel);
+            let reply = reply.clone();
+            async move { Ok(Some(reply)) }
+        },
+    )
+    .build();
+    messenger.register_handler(handler)
+}
+
+/// An incarnation handler whose first answer comes after the check deadline.
+fn register_slow_first_incarnation(
+    messenger: &Messenger,
+    incarnation: uuid::Uuid,
+    asks: &Arc<AtomicUsize>,
+) -> Result<()> {
+    let asks = Arc::clone(asks);
+    let reply = Bytes::from(serde_json::to_vec(&IncarnationReply { incarnation })?);
+    let handler = ::velo::Handler::unary_handler_async(
+        handler_names::scoped(handler_names::WORKER_INCARNATION, Some(WORKER)),
+        move |_ctx| {
+            let first = asks.fetch_add(1, Ordering::AcqRel) == 0;
+            let reply = reply.clone();
+            async move {
+                if first {
+                    tokio::time::sleep(TIMING.deadline * 2).await;
+                }
+                Ok(Some(reply))
+            }
+        },
+    )
+    .build();
+    messenger.register_handler(handler)
+}
+
+fn register_lost_reply_transfer(messenger: &Messenger) -> Result<()> {
+    let handler = ::velo::Handler::unary_handler_async(
+        handler_names::scoped(handler_names::LOCAL_TRANSFER, Some(WORKER)),
+        |_ctx| async { Err::<Option<Bytes>, _>(anyhow::anyhow!("injected lost reply")) },
+    )
+    .build();
+    messenger.register_handler(handler)
+}
+
+/// A check handler that answers "no record" at once.
+fn register_unknown_check(
+    messenger: &Messenger,
+    incarnation: uuid::Uuid,
+    checks: &Arc<AtomicUsize>,
+) -> Result<()> {
+    let checks = Arc::clone(checks);
+    let reply = Bytes::from(serde_json::to_vec(&CheckReply {
+        incarnation,
+        record: Record::Unknown,
+    })?);
+    let handler = ::velo::Handler::unary_handler_async(
+        handler_names::scoped(handler_names::LOCAL_TRANSFER_CHECK, Some(WORKER)),
+        move |_ctx| {
+            checks.fetch_add(1, Ordering::AcqRel);
+            let reply = reply.clone();
+            async move { Ok(Some(reply)) }
+        },
+    )
+    .build();
+    messenger.register_handler(handler)
+}

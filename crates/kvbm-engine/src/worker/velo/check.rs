@@ -103,8 +103,12 @@ impl LocalTransferRecheck {
     /// [`TransferDrainOutcome::Completed`], "drained with error" gives
     /// [`TransferDrainOutcome::DrainedWithError`]. Every other answer, and no
     /// answer, gives [`TransferDrainOutcome::Unproven`] with this capability
-    /// attached again.
+    /// attached again. Without a bound incarnation no answer could decide, so
+    /// no check is sent.
     pub async fn check(&self, messenger: &Messenger, deadline: Duration) -> TransferDrainOutcome {
+        if self.incarnation.is_none() {
+            return self.unbound();
+        }
         match self.ask(messenger, deadline).await {
             Ok(reply) => self.decide(reply),
             Err(error) => self.unproven(format!("the check got no answer: {error:#}")),
@@ -128,7 +132,7 @@ impl LocalTransferRecheck {
 
     fn decide(&self, reply: CheckReply) -> TransferDrainOutcome {
         let Some(incarnation) = self.incarnation else {
-            return self.unproven("the worker incarnation was not bound before the copy");
+            return self.unbound();
         };
         if reply.incarnation != incarnation {
             return self.unproven(format!(
@@ -147,6 +151,12 @@ impl LocalTransferRecheck {
             }
             Record::Unknown => self.unproven("the worker has no record of the transfer"),
         }
+    }
+
+    /// The outcome of a transfer with no bound incarnation: no check can
+    /// decide it, so none is sent.
+    pub(super) fn unbound(&self) -> TransferDrainOutcome {
+        self.unproven("the worker incarnation was not bound before the copy")
     }
 
     /// An unknown outcome that carries this capability.
@@ -334,8 +344,19 @@ impl LocalTransferRecords {
 
     /// Record the drain outcome of `transfer_id`.
     pub(super) fn finish(&self, transfer_id: Uuid, outcome: &TransferDrainOutcome) {
-        let now = Instant::now();
+        #[cfg(test)]
+        {
+            // Bind the hook first: an `if let` on the guard would hold the
+            // hooks lock while the hook runs.
+            let hook = self.hooks.before_finish_lock.lock().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let mut registry = self.registry.lock();
+        // Read the clock under the lock, so the finished queue stays in time
+        // order and aging can stop at the first record that is too new.
+        let now = Instant::now();
         if let Some(entry) = registry.entries.get_mut(&transfer_id) {
             entry.record = Record::from_outcome(outcome);
             entry.at = now;
@@ -369,6 +390,23 @@ impl LocalTransferRecords {
             .collect()
     }
 
+    /// The number of records held.
+    #[cfg(test)]
+    pub(super) fn record_count(&self) -> usize {
+        self.registry.lock().entries.len()
+    }
+
+    /// The finish times in the order the finished queue holds them.
+    #[cfg(test)]
+    fn finished_times(&self) -> Vec<Instant> {
+        self.registry
+            .lock()
+            .finished
+            .iter()
+            .map(|(_, at)| *at)
+            .collect()
+    }
+
     #[cfg(test)]
     pub(super) fn evict_all(&self) {
         let mut registry = self.registry.lock();
@@ -391,6 +429,8 @@ pub(super) struct TestHooks {
     pub(super) evict_after_next: std::sync::atomic::AtomicBool,
     /// Checks received.
     pub(super) checks: std::sync::atomic::AtomicUsize,
+    /// Run once in the next `finish`, before it takes the registry lock.
+    pub(super) before_finish_lock: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 #[cfg(test)]
@@ -439,6 +479,50 @@ mod tests {
         assert_eq!(records.check(active).record, Record::Active);
         assert_eq!(records.check(finished).record, Record::Unknown);
         assert_eq!(records.check(next).record, Record::Active);
+    }
+
+    #[test]
+    fn a_full_registry_of_active_records_evicts_the_oldest() {
+        let records = records(2, RECORD_MAX_AGE);
+        let (first, second, third) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        records.begin(first);
+        records.begin(second);
+        records.begin(third);
+        assert_eq!(records.check(first).record, Record::Unknown);
+        assert_eq!(records.check(second).record, Record::Active);
+        assert_eq!(records.check(third).record, Record::Active);
+    }
+
+    /// Two transfers finish at the same time. The one that read the clock
+    /// first takes the lock second. The finished queue must still be in time
+    /// order, or aging stops at the newer record and keeps an expired one.
+    #[test]
+    fn concurrent_finishes_keep_the_finished_queue_in_time_order() {
+        let records = Arc::new(records(8, RECORD_MAX_AGE));
+        let (early, late) = (Uuid::new_v4(), Uuid::new_v4());
+        records.begin(early);
+        records.begin(late);
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        *records.hooks.before_finish_lock.lock() = Some(Box::new(move || {
+            held.recv().expect("released");
+        }));
+        let early_finish = {
+            let records = Arc::clone(&records);
+            std::thread::spawn(move || records.finish(early, &TransferDrainOutcome::Completed))
+        };
+        while records.hooks.before_finish_lock.lock().is_some() {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        records.finish(late, &TransferDrainOutcome::Completed);
+        release.send(()).expect("the early finish is held");
+        early_finish.join().expect("early finish");
+
+        let times = records.finished_times();
+        assert!(
+            times.windows(2).all(|pair| pair[0] <= pair[1]),
+            "the finished queue is out of time order: {times:?}"
+        );
     }
 
     #[test]

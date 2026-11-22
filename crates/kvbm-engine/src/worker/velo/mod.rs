@@ -49,12 +49,17 @@
 //!   for it with `WORKER_INCARNATION`, under the check deadline, and keeps it.
 //!   Every transfer is bound to the incarnation the client held when it sent
 //!   the transfer.
-//! - **The check.** If the RPC fails after the request left, the copy may
-//!   still run. The client waits (`LocalTransferCheckTiming::wait`), then asks
-//!   the same instance and worker once with `LOCAL_TRANSFER_CHECK`, under an
-//!   explicit velo deadline (`LocalTransferCheckTiming::deadline`). The
+//! - **Not sent.** If velo reports that the request never reached the wire
+//!   (`UnaryResult::admitted` fails), no copy ran. The receipt is
+//!   `DrainedWithError` at once.
+//! - **The check.** If the RPC fails after the request was admitted, the copy
+//!   may still run. The client waits (`LocalTransferCheckTiming::wait`), then
+//!   asks the same instance and worker once with `LOCAL_TRANSFER_CHECK`, under
+//!   an explicit velo deadline (`LocalTransferCheckTiming::deadline`). The
 //!   defaults are 2 s and 5 s; `messenger.local_transfer_check` in
-//!   `kvbm-config` overrides them.
+//!   `kvbm-config` overrides them. A copy still active at the check stays
+//!   unknown; the engine pauses the request, and only a later check of the
+//!   same target lifts it.
 //! - **What decides.** Only a record from the same incarnation decides: a
 //!   record "completed" gives `Completed`, and a record "drained with error"
 //!   gives `DrainedWithError`. Everything else gives `Unproven`: no answer by
@@ -72,10 +77,12 @@
 //!   first. An evicted record answers "unknown".
 //! - **Compatibility.** All wire changes are additive. A request from an older
 //!   client has no transfer id, and the worker keeps no record for it. An older
-//!   worker has no `WORKER_INCARNATION` handler; velo rejects the call at once.
-//!   The client then sends the transfer unbound and asks again after 30 s. A
-//!   lost reply from an unbound transfer is `Unproven`, with no incarnation in
-//!   its capability.
+//!   worker has no `WORKER_INCARNATION` handler; velo rejects the call at once,
+//!   and its handshake list shows the handler missing. The client then sends
+//!   transfers unbound and asks again after 30 s. Any other failed request,
+//!   such as a timeout, is asked again on the next transfer. A lost reply from
+//!   an unbound transfer is `Unproven` at once, with no incarnation in its
+//!   capability and no check sent, because no answer could decide it.
 
 mod check;
 mod client;
@@ -352,6 +359,14 @@ mod local_transfer_message_tests {
                 copy_engine: WireCopyEngine::Auto,
             },
         }
+    }
+
+    #[test]
+    fn a_legacy_local_transfer_message_has_no_transfer_id() {
+        let mut legacy = serde_json::to_value(message(LogicalResourceId(7))).unwrap();
+        legacy.as_object_mut().unwrap().remove("transfer_id");
+        let decoded: LocalTransferMessage = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.transfer_id, None);
     }
 
     #[test]
