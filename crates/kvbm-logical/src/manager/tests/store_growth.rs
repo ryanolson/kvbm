@@ -296,3 +296,52 @@ fn growing_into_the_built_index_allocation_keeps_it() {
         "the grow reallocated an index that already covered the capacity: {after} against the built {built}",
     );
 }
+
+/// Fill a store to capacity, release and evict everything, then shrink and
+/// grow back. The index keeps the allocation it was built with; a
+/// reservation the allocation already covers is not repeated.
+#[test]
+fn shrinking_after_a_full_release_keeps_the_index_allocation() {
+    // The size a G1 manager's physical capacity reaches in production, and
+    // the point where `room(capacity)` sits above half the bucket count, so
+    // a repeated reservation would double the table.
+    const CAPACITY: usize = 229_376;
+    let manager = lineage_manager(CAPACITY, 64 * CAPACITY);
+    let store = manager.store_for_test();
+    let built = store.active_by_hash_capacity();
+
+    let mut held: VecDeque<Vec<ImmutableBlock<TestBlockData>>> = VecDeque::new();
+    let mut next_token = 0u32;
+    hold_fresh(&manager, &mut held, &mut next_token, CAPACITY);
+    assert_eq!(store.active_by_hash_len(), CAPACITY);
+
+    // Release every primary, then evict the whole inactive set. Hold the
+    // reallocations so a chunk cannot be handed back to the reset pool and
+    // returned to the next chunk instead of evicting.
+    held.clear();
+    assert_eq!(store.active_by_hash_len(), 0);
+    let mut evicted = Vec::with_capacity(CAPACITY);
+    for _ in 0..CAPACITY / CHUNK {
+        evicted.extend(
+            manager
+                .allocate_blocks(CHUNK)
+                .expect("every inactive block is evictable"),
+        );
+    }
+    assert_eq!(manager.inactive_len(), 0);
+    drop(evicted);
+    println!(
+        "full release: capacity after build {built}, after the release {}, live primaries {}",
+        store.active_by_hash_capacity(),
+        store.active_by_hash_len(),
+    );
+
+    manager.set_capacity(CAPACITY / 2).expect("shrink to half");
+    manager.set_capacity(CAPACITY).expect("grow back");
+    let after = store.active_by_hash_capacity();
+    println!("full release: capacity after the shrink and grow back {after}, built {built}");
+    assert!(
+        after <= built,
+        "the grow back reallocated the index: {after} against the built {built}",
+    );
+}
