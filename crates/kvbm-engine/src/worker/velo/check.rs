@@ -109,9 +109,12 @@ impl LocalTransferRecheck {
         if self.incarnation.is_none() {
             return self.unbound();
         }
-        match self.ask(messenger, deadline).await {
-            Ok(reply) => self.decide(reply),
-            Err(error) => self.unproven(format!("the check got no answer: {error:#}")),
+        // The outer timeout also bounds any handshake velo runs first, which
+        // the request's own timeout may not cover.
+        match tokio::time::timeout(deadline, self.ask(messenger, deadline)).await {
+            Ok(Ok(reply)) => self.decide(reply),
+            Ok(Err(error)) => self.unproven(format!("the check got no answer: {error:#}")),
+            Err(_) => self.unproven(format!("the check got no answer within {deadline:?}")),
         }
     }
 

@@ -36,24 +36,23 @@ pub struct VeloWorkerClient {
     incarnation: Arc<IncarnationBinding>,
 }
 
-/// How long a client waits before it asks an older worker (one without the
-/// incarnation handler) for its incarnation again. Transfers in that time run
-/// unbound. Any other failed request is retried on the next transfer.
-const INCARNATION_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
-
 /// The incarnation of one remote worker, learned once.
+///
+/// A failed request is not remembered: the next transfer asks again. The
+/// client cannot tell an older worker without the handler from a worker that
+/// has not registered it yet, so it never stops asking.
 #[derive(Default)]
 struct IncarnationBinding {
     known: OnceLock<uuid::Uuid>,
-    /// Serializes the request, and remembers when the worker was last found
-    /// to have no incarnation handler.
-    request: tokio::sync::Mutex<Option<std::time::Instant>>,
+    /// Serializes the request, so concurrent first transfers share one.
+    request: tokio::sync::Mutex<()>,
 }
 
 impl IncarnationBinding {
-    /// The worker's incarnation, asking for it if it is not known yet.
-    /// `None` when the request failed, or the worker is an older one without
-    /// the handler and was found so within [`INCARNATION_RETRY_AFTER`].
+    /// The worker's incarnation, asking for it if it is not known yet. `None`
+    /// when it is not known by `deadline`, for example from an older worker
+    /// without the handler. The whole call, including the wait for another
+    /// transfer's request, stays within `deadline`.
     async fn bind(
         &self,
         messenger: &Messenger,
@@ -61,42 +60,39 @@ impl IncarnationBinding {
         worker_id: Option<u64>,
         deadline: std::time::Duration,
     ) -> Option<uuid::Uuid> {
+        self.bind_with(deadline, || {
+            Self::ask(messenger, remote, worker_id, deadline)
+        })
+        .await
+    }
+
+    async fn bind_with<F, Fut>(&self, deadline: std::time::Duration, ask: F) -> Option<uuid::Uuid>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<uuid::Uuid>>,
+    {
         if let Some(incarnation) = self.known.get() {
             return Some(*incarnation);
         }
-        let mut older_at = self.request.lock().await;
-        if let Some(incarnation) = self.known.get() {
-            return Some(*incarnation);
-        }
-        if older_at.is_some_and(|at| at.elapsed() < INCARNATION_RETRY_AFTER) {
-            return None;
-        }
-        match Self::ask(messenger, remote, worker_id, deadline).await {
-            Ok(incarnation) => {
-                let _ = self.known.set(incarnation);
-                Some(incarnation)
+        let attempt = async {
+            let _request = self.request.lock().await;
+            if let Some(incarnation) = self.known.get() {
+                return Ok(*incarnation);
             }
-            Err(error) => {
-                // velo keeps each peer's handler list from its handshake. A
-                // list without the handler is an older worker; anything else
-                // (a timeout, a worker still starting) is asked again on the
-                // next transfer.
-                let handler = handler_names::scoped(handler_names::WORKER_INCARNATION, worker_id);
-                let older = messenger
-                    .available_handlers(remote)
-                    .await
-                    .is_ok_and(|handlers| !handlers.contains(&handler));
-                *older_at = older.then(std::time::Instant::now);
-                tracing::debug!(
-                    %remote,
-                    ?worker_id,
-                    older,
-                    error = %format!("{error:#}"),
-                    "worker did not give its incarnation; this local transfer runs unbound"
-                );
-                None
-            }
-        }
+            let incarnation = ask().await?;
+            let _ = self.known.set(incarnation);
+            Ok(incarnation)
+        };
+        let error = match tokio::time::timeout(deadline, attempt).await {
+            Ok(Ok(incarnation)) => return Some(incarnation),
+            Ok(Err(error)) => error,
+            Err(_) => anyhow::anyhow!("no answer within {deadline:?}"),
+        };
+        tracing::debug!(
+            error = %format!("{error:#}"),
+            "worker did not give its incarnation; this local transfer runs unbound"
+        );
+        None
     }
 
     async fn ask(
@@ -201,31 +197,30 @@ impl VeloWorkerClient {
                 let handler = handler_names::scoped(handler_names::LOCAL_TRANSFER, worker_id);
                 let outcome = match velo.unary(&handler) {
                     Ok(request) => {
-                        let mut reply = request.raw_payload(bytes).instance(remote_instance).send();
-                        match reply.admitted().await {
-                            // The frame never reached the wire, so no copy
-                            // can run.
-                            Err(error) => TransferDrainOutcome::DrainedWithError(anyhow::anyhow!(
-                                "local transfer RPC was not sent: {error:#}"
-                            )),
-                            Ok(()) => match reply.await {
-                                Ok(reply) => LocalTransferReply::decode(&reply),
-                                // No incarnation was bound, so no check can
-                                // decide. The outcome is unknown at once.
-                                Err(_) if recheck.incarnation.is_none() => recheck.unbound(),
-                                // The request can be with the worker, and the
-                                // worker can have an active copy. Wait, then
-                                // ask the same worker once.
-                                Err(error) => {
-                                    tracing::warn!(
-                                        %recheck,
-                                        error = %error,
-                                        "local transfer reply lost; checking with the worker"
-                                    );
-                                    tokio::time::sleep(timing.wait).await;
-                                    recheck.check(&velo, timing.deadline).await
-                                }
-                            },
+                        let reply = request
+                            .raw_payload(bytes)
+                            .instance(remote_instance)
+                            .send()
+                            .await;
+                        match reply {
+                            Ok(reply) => LocalTransferReply::decode(&reply),
+                            // velo cannot prove that a failed send stayed
+                            // unsent, so every error here is a lost reply. No
+                            // incarnation was bound, so no check can decide:
+                            // the outcome is unknown at once.
+                            Err(_) if recheck.incarnation.is_none() => recheck.unbound(),
+                            // The request can be with the worker, and the
+                            // worker can have an active copy. Wait, then ask
+                            // the same worker once.
+                            Err(error) => {
+                                tracing::warn!(
+                                    %recheck,
+                                    error = %error,
+                                    "local transfer reply lost; checking with the worker"
+                                );
+                                tokio::time::sleep(timing.wait).await;
+                                recheck.check(&velo, timing.deadline).await
+                            }
                         }
                     }
                     // The request did not leave this process.
@@ -1337,6 +1332,34 @@ mod tests {
             LocalTransferReply::decode(b"not a reply"),
             TransferDrainOutcome::Unproven(_)
         ));
+    }
+
+    /// A worker that never answers holds the binding for at most its
+    /// deadline, and so does a second transfer waiting behind the first.
+    #[tokio::test]
+    async fn incarnation_binding_stays_within_its_deadline() {
+        let binding = Arc::new(IncarnationBinding::default());
+        let deadline = std::time::Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let silent = || std::future::pending::<Result<uuid::Uuid>>();
+        let (first, second) = tokio::join!(
+            binding.bind_with(deadline, silent),
+            binding.bind_with(deadline, silent)
+        );
+        let elapsed = started.elapsed();
+        assert_eq!((first, second), (None, None));
+        assert!(
+            elapsed < deadline + std::time::Duration::from_millis(150),
+            "binding took {elapsed:?}, past its {deadline:?} deadline"
+        );
+        let known = uuid::Uuid::new_v4();
+        assert_eq!(
+            binding
+                .bind_with(deadline, || async move { Ok(known) })
+                .await,
+            Some(known),
+            "a later transfer asks again"
+        );
     }
 
     #[test]

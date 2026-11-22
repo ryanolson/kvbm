@@ -452,11 +452,12 @@ async fn a_worker_record_without_drain_proof_stays_unproven() -> Result<()> {
     Ok(())
 }
 
-/// The worker has no local-transfer handler, so velo fails the send before
-/// the request leaves. No copy ran: the outcome is a drained failure, at
-/// once, with no wait and no check.
+/// The worker has no local-transfer handler, so velo fails the send's
+/// admission. velo v0.21.0 cannot prove such a frame stayed unsent (a TCP
+/// teardown can fail admission after the channel accepted the frame), so the
+/// outcome stays unknown and takes the lost-reply path: one check.
 #[tokio::test]
-async fn a_transfer_that_never_reached_the_wire_is_a_drained_failure_at_once() -> Result<()> {
+async fn a_send_velo_did_not_admit_stays_unproven() -> Result<()> {
     let pair = create_messenger_pair_tcp().await?;
     let incarnation = uuid::Uuid::new_v4();
     register_incarnation(
@@ -467,19 +468,15 @@ async fn a_transfer_that_never_reached_the_wire_is_a_drained_failure_at_once() -
     let unknown_checks = Arc::new(AtomicUsize::new(0));
     register_unknown_check(&pair.messenger_b, incarnation, &unknown_checks)?;
 
-    let started = Instant::now();
     let outcome = transfer(&client(&pair))?.await_drain().await;
-    let elapsed = started.elapsed();
 
-    assert!(
-        matches!(outcome, TransferDrainOutcome::DrainedWithError(_)),
-        "a send that never reached the wire launched no copy, got {}",
-        describe(&outcome)
-    );
-    assert_eq!(unknown_checks.load(Ordering::Acquire), 0, "no check");
-    assert!(
-        elapsed < TIMING.wait,
-        "a send that never left must not wait, but resolved after {elapsed:?}"
+    let recheck = recheck_of(&outcome);
+    assert_eq!(recheck.instance, pair.messenger_b.instance_id());
+    assert_eq!(recheck.incarnation, Some(incarnation));
+    assert_eq!(
+        unknown_checks.load(Ordering::Acquire),
+        1,
+        "exactly one check"
     );
     Ok(())
 }
@@ -541,10 +538,12 @@ async fn an_incarnation_request_that_timed_out_is_asked_again_on_the_next_transf
     Ok(())
 }
 
-/// An older worker has no incarnation handler. velo rejects the request at
-/// once, and the client does not ask again on the next transfer.
+/// The first transfer reaches the worker before it has registered its
+/// incarnation handler, as during start-up. The client must ask again on the
+/// next transfer: an older worker and a worker still starting look the same.
 #[tokio::test]
-async fn an_older_worker_is_not_asked_for_its_incarnation_again_at_once() -> Result<()> {
+async fn a_worker_that_registers_its_incarnation_handler_later_is_bound_on_the_next_transfer()
+-> Result<()> {
     let pair = create_messenger_pair_tcp().await?;
     let transfer_handler = ::velo::Handler::unary_handler_async(
         handler_names::scoped(handler_names::LOCAL_TRANSFER, Some(WORKER)),
@@ -560,20 +559,22 @@ async fn an_older_worker_is_not_asked_for_its_incarnation_again_at_once() -> Res
         "got {}",
         describe(&first)
     );
-    let asks = Arc::new(AtomicUsize::new(0));
-    register_incarnation(&pair.messenger_b, uuid::Uuid::new_v4(), &asks)?;
+    // Start-up finishes: the production handlers replace the early one.
+    let records = LocalTransferRecords::new();
+    serve(
+        &pair.messenger_b,
+        &records,
+        copy_ending(|| TransferDrainOutcome::Completed),
+    )?;
+    records.hooks.lose_next_reply.store(true, Ordering::Release);
     let second = transfer(&client)?.await_drain().await;
 
     assert!(
         matches!(second, TransferDrainOutcome::Completed),
-        "got {}",
+        "the second transfer must be bound, so its check decides, got {}",
         describe(&second)
     );
-    assert_eq!(
-        asks.load(Ordering::Acquire),
-        0,
-        "not asked again within the retry window"
-    );
+    assert_eq!(checks(&records), 1, "exactly one check");
     Ok(())
 }
 

@@ -46,14 +46,14 @@
 //!   with an error.
 //! - **Incarnation.** Each worker service has an incarnation: a random id
 //!   fixed when the service starts. Before its first transfer, the client asks
-//!   for it with `WORKER_INCARNATION`, under the check deadline, and keeps it.
+//!   for it with `WORKER_INCARNATION`, under the check deadline, and keeps it
+//!   once it has an answer.
 //!   Every transfer is bound to the incarnation the client held when it sent
 //!   the transfer.
-//! - **Not sent.** If velo reports that the request never reached the wire
-//!   (`UnaryResult::admitted` fails), no copy ran. The receipt is
-//!   `DrainedWithError` at once.
-//! - **The check.** If the RPC fails after the request was admitted, the copy
-//!   may still run. The client waits (`LocalTransferCheckTiming::wait`), then
+//! - **The check.** If the RPC fails after the request was handed to velo,
+//!   the copy may still run: velo cannot prove that a failed send stayed
+//!   unsent. Only a failure to build the request proves nothing left the
+//!   process, and gives `DrainedWithError`. The client waits (`LocalTransferCheckTiming::wait`), then
 //!   asks the same instance and worker once with `LOCAL_TRANSFER_CHECK`, under
 //!   an explicit velo deadline (`LocalTransferCheckTiming::deadline`). The
 //!   defaults are 2 s and 5 s; `messenger.local_transfer_check` in
@@ -77,12 +77,13 @@
 //!   first. An evicted record answers "unknown".
 //! - **Compatibility.** All wire changes are additive. A request from an older
 //!   client has no transfer id, and the worker keeps no record for it. An older
-//!   worker has no `WORKER_INCARNATION` handler; velo rejects the call at once,
-//!   and its handshake list shows the handler missing. The client then sends
-//!   transfers unbound and asks again after 30 s. Any other failed request,
-//!   such as a timeout, is asked again on the next transfer. A lost reply from
-//!   an unbound transfer is `Unproven` at once, with no incarnation in its
-//!   capability and no check sent, because no answer could decide it.
+//!   worker has no `WORKER_INCARNATION` handler; velo rejects the call at once.
+//!   The client cannot tell that from a worker still starting, so it sends the
+//!   transfer unbound and asks again on the next one. The whole incarnation
+//!   request, including any wait behind another transfer's request, stays
+//!   within the check deadline. A lost reply from an unbound transfer is
+//!   `Unproven` at once, with no incarnation in its capability and no check
+//!   sent, because no answer could decide it.
 
 mod check;
 mod client;
