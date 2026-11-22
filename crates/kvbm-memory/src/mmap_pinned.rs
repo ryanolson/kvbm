@@ -39,7 +39,7 @@
 //! `BindRefused` error names both failures.
 //! [`HostPlacement::observed`] is the node the kernel reports for the first
 //! page after the touch, so an `OsDefault` policy never hides where the
-//! pages went. That query is best-effort: if `get_mempolicy` is denied,
+//! pages went. The queries are best-effort: if `get_mempolicy` is denied,
 //! `observed` is `None` and the allocation goes on.
 //!
 //! Only a refused bind turns into a fallback. An `mmap`, CUDA context or
@@ -47,10 +47,15 @@
 //! node with too little free memory is not checked: `MPOL_BIND` has no
 //! fallback once pages fault in, so first touch can end in an OOM kill.
 //!
-//! [`HostPlacement::policy`] is what the kernel showed before registration:
-//! a bind counts only if `get_mempolicy` reports `MPOL_BIND` on the node for
-//! the first, middle and last page (or, if that query is denied, if `mbind`
-//! succeeded). On GB10 with driver 610.57.04, `cuMemHostRegister` itself
+//! [`HostPlacement::policy`] reflects the kernel before registration. After
+//! first touch the entry reads the policy of the first, middle and last page.
+//! Any reading that is not `MPOL_BIND` on the node turns the bind into
+//! [`PlacementFallback::BindRefused`]. A bind with no reading against it
+//! stays `Bound(n)`. If the first page's policy was read back, the bind is
+//! kernel-confirmed and [`HostPlacement::observed`] is `Some`. If that query
+//! was denied, `observed` is `None`: `mbind` returned success under
+//! `MPOL_MF_STRICT`, but the kernel's policy was not read back, so the bind
+//! is not kernel-confirmed. On GB10 with driver 610.57.04, `cuMemHostRegister` itself
 //! calls `mbind(MPOL_PREFERRED_MANY)` on the range with the device's node,
 //! whether or not kvbm bound it, and `cuMemHostUnregister` resets the range
 //! to `MPOL_DEFAULT`. So after registration the kernel's policy no longer
@@ -167,13 +172,22 @@ pub struct HostPlacement {
     /// reported it. `None` when it is unknown.
     pub requested: Option<NumaNode>,
     /// The policy the pages got: bound to a node, or placed by the OS.
+    ///
+    /// From [`allocate_pinned_host`], `Bound(n)` means `mbind(MPOL_BIND,
+    /// MPOL_MF_STRICT)` to `n` returned success and no policy reading
+    /// contradicted it. Whether the kernel confirmed it shows in
+    /// [`Self::observed`]: `Some` means the first page's policy was read back
+    /// and showed `MPOL_BIND` on `n`; `None` means it was not read back (the
+    /// query failed), so the bind rests on `mbind`'s answer alone.
     pub policy: NumaPlacementPolicy,
     /// Why the pages were not bound. `None` when they were bound, or when the
     /// caller asked for OS placement.
     pub fallback: Option<PlacementFallback>,
     /// The node the kernel reports for the first page after first touch.
     /// `None` when the query failed (for example, denied by seccomp) or was
-    /// not made.
+    /// not made. For a bound region, also `None` when the first page's policy
+    /// could not be read back, so `Some` always means the bind was confirmed
+    /// by the kernel.
     pub observed: Option<NumaNode>,
 }
 
@@ -580,8 +594,6 @@ pub(crate) fn map_place_register<T, R: Into<PageReading>>(
             e
         );
     }
-    let observed = readings[0].node.as_ref().ok().copied();
-
     // A bind counts only if the kernel shows it: any policy answer that is
     // not MPOL_BIND on the node refuses it. With no policy answer at all,
     // the bind's own result stands.
@@ -599,6 +611,14 @@ pub(crate) fn map_place_register<T, R: Into<PageReading>>(
         policy = NumaPlacementPolicy::OsDefault;
         fallback = Some(PlacementFallback::BindRefused { node, error });
     }
+
+    // `observed` is the first page's node. For a bound region it is reported
+    // only if the first page's policy was read back (and so showed the bind);
+    // otherwise the bind rests on mbind's answer alone, and `None` says so.
+    let observed = match (policy, &readings[0].policy) {
+        (NumaPlacementPolicy::Bound(_), Err(_)) => None,
+        _ => readings[0].node.as_ref().ok().copied(),
+    };
 
     let registered = register(mmap.ptr, mmap.len)?;
     Ok(Placed {
@@ -1202,10 +1222,11 @@ mod tests {
         assert_eq!(placed.placement.observed, None);
     }
 
-    /// The other way round: a failed policy query keeps the bind's own
-    /// result, and the node answer is still observed.
+    /// A bind whose policy was not read back stays `Bound` (mbind's own
+    /// answer), but is not reported as confirmed: `observed` is `None` even
+    /// though the node query answered.
     #[test]
-    fn a_failed_policy_query_does_not_hide_the_page_node() {
+    fn a_bind_without_a_policy_reading_is_not_reported_as_confirmed() {
         let placed = map_place_register(
             1 << 16,
             Some(NumaNode(0)),
@@ -1224,6 +1245,27 @@ mod tests {
             NumaPlacementPolicy::Bound(NumaNode(0))
         );
         assert_eq!(placed.placement.fallback, None);
+        assert_eq!(placed.placement.observed, None);
+    }
+
+    /// For a region the OS places, a failed policy query does not hide the
+    /// page's node.
+    #[test]
+    fn a_failed_policy_query_does_not_hide_the_page_node() {
+        let placed = map_place_register(
+            1 << 16,
+            None,
+            PlacementDecision::OsDefault(PlacementFallback::NodeUnknown),
+            Ok(()),
+            |_, _, _| panic!("no bind for an OS-placement decision"),
+            |_| PageReading {
+                policy: Err(std::io::Error::from_raw_os_error(libc::EPERM)),
+                node: Ok(NumaNode(0)),
+            },
+            no_register,
+        )
+        .unwrap();
+        assert_eq!(placed.placement.policy, NumaPlacementPolicy::OsDefault);
         assert_eq!(placed.placement.observed, Some(NumaNode(0)));
     }
 
