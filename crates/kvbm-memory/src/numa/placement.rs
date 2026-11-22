@@ -94,15 +94,13 @@ pub struct PagePlacement {
 ///
 /// A diagnostic: it reads, and changes nothing except that the kernel faults
 /// in a page that is not yet present. Fails with the `get_mempolicy` error,
-/// for example `EPERM` under a seccomp profile that denies the call.
+/// for example `EPERM` under a seccomp profile that denies the call. The
+/// policy is read first; if that fails, the node query (which faults the page
+/// in) does not run.
 pub fn page_placement(addr: usize) -> std::io::Result<PagePlacement> {
-    let PageReading { policy, node } = read_page(addr);
-    let (mode, nodes) = policy?;
-    Ok(PagePlacement {
-        mode,
-        nodes,
-        node: node?,
-    })
+    let (mode, nodes) = read_policy(addr)?;
+    let node = read_node(addr)?;
+    Ok(PagePlacement { mode, nodes, node })
 }
 
 /// The two `get_mempolicy` answers for one page, each kept on its own, so a

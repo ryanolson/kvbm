@@ -1524,7 +1524,6 @@ mod tests {
     /// Rerun the test `name` alone in a child process. Returns `true` in the
     /// child, which then runs the test body. In the parent, asserts that the
     /// child passed and returns `false`.
-    #[cfg(feature = "testing-cuda")]
     fn rerun_alone_in_a_child(name: &str) -> bool {
         const CHILD: &str = "KVBM_MEMORY_TEST_CHILD";
         if std::env::var_os(CHILD).is_some() {
@@ -1544,38 +1543,35 @@ mod tests {
         false
     }
 
-    /// Install a seccomp filter on this thread (inherited by the threads it
-    /// starts) that fails each syscall in `denied` with `EPERM`, as a
-    /// container's seccomp profile can. Filters stack. Only for a child test
-    /// process.
-    #[cfg(feature = "testing-cuda")]
-    fn deny_syscalls(denied: &[libc::c_long]) {
-        fn stmt(code: u32, k: u32) -> libc::sock_filter {
-            libc::sock_filter {
-                code: code as u16,
-                jt: 0,
-                jf: 0,
-                k,
-            }
+    fn bpf_stmt(code: u32, k: u32) -> libc::sock_filter {
+        libc::sock_filter {
+            code: code as u16,
+            jt: 0,
+            jf: 0,
+            k,
         }
-        fn jeq(k: u32, jt: u8, jf: u8) -> libc::sock_filter {
-            libc::sock_filter {
-                code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
-                jt,
-                jf,
-                k,
-            }
+    }
+
+    fn bpf_jeq(k: u32, jt: u8, jf: u8) -> libc::sock_filter {
+        libc::sock_filter {
+            code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+            jt,
+            jf,
+            k,
         }
-        // seccomp_data.nr is at offset 0.
-        let mut prog = vec![stmt(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, 0)];
-        for &nr in denied {
-            prog.push(jeq(nr as u32, 0, 1));
-            prog.push(stmt(
-                libc::BPF_RET | libc::BPF_K,
-                libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
-            ));
-        }
-        prog.push(stmt(libc::BPF_RET | libc::BPF_K, libc::SECCOMP_RET_ALLOW));
+    }
+
+    const BPF_LOAD_WORD: u32 = libc::BPF_LD | libc::BPF_W | libc::BPF_ABS;
+    const BPF_RETURN: u32 = libc::BPF_RET | libc::BPF_K;
+    const RET_EPERM: u32 = libc::SECCOMP_RET_ERRNO | libc::EPERM as u32;
+    /// Offsets in `struct seccomp_data`: the syscall number, and the low
+    /// word of the fifth argument (little-endian).
+    const SECCOMP_NR: u32 = 0;
+    const SECCOMP_ARG4_LO: u32 = 16 + 4 * 8;
+
+    /// Install a seccomp filter program on this thread; the threads it starts
+    /// inherit it, and filters stack. Only for a child test process.
+    fn install_seccomp(mut prog: Vec<libc::sock_filter>) {
         let fprog = libc::sock_fprog {
             len: prog.len() as u16,
             filter: prog.as_mut_ptr(),
@@ -1594,6 +1590,60 @@ mod tests {
                 std::io::Error::last_os_error()
             );
         }
+    }
+
+    /// Fail each syscall in `denied` with `EPERM`, as a container's seccomp
+    /// profile can.
+    #[cfg(feature = "testing-cuda")]
+    fn deny_syscalls(denied: &[libc::c_long]) {
+        let mut prog = vec![bpf_stmt(BPF_LOAD_WORD, SECCOMP_NR)];
+        for &nr in denied {
+            prog.push(bpf_jeq(nr as u32, 0, 1));
+            prog.push(bpf_stmt(BPF_RETURN, RET_EPERM));
+        }
+        prog.push(bpf_stmt(BPF_RETURN, libc::SECCOMP_RET_ALLOW));
+        install_seccomp(prog);
+    }
+
+    /// The public diagnostic stops at a failed policy query: the node query,
+    /// which faults the page in, does not run. Only the policy query
+    /// (`get_mempolicy` with flags `MPOL_F_ADDR`) is denied, in a child
+    /// process, so the result does not depend on the order of the tests.
+    #[test]
+    fn a_denied_policy_query_does_not_fault_the_page() {
+        if !rerun_alone_in_a_child(
+            "mmap_pinned::tests::a_denied_policy_query_does_not_fault_the_page",
+        ) {
+            return;
+        }
+        install_seccomp(vec![
+            bpf_stmt(BPF_LOAD_WORD, SECCOMP_NR),
+            bpf_jeq(libc::SYS_get_mempolicy as u32, 0, 3),
+            bpf_stmt(BPF_LOAD_WORD, SECCOMP_ARG4_LO),
+            bpf_jeq(2, 0, 1), // MPOL_F_ADDR alone: the policy query
+            bpf_stmt(BPF_RETURN, RET_EPERM),
+            bpf_stmt(BPF_RETURN, libc::SECCOMP_RET_ALLOW),
+        ]);
+
+        let page = system_page_size();
+        let g = mmap_anon(page).unwrap();
+        let resident = || {
+            let mut vec = 0u8;
+            // SAFETY: the mapping is live and one page long; `vec` holds one
+            // byte per page.
+            assert_eq!(
+                unsafe { libc::mincore(g.ptr as *mut libc::c_void, page, &mut vec) },
+                0
+            );
+            vec & 1 == 1
+        };
+        assert!(!resident(), "a fresh anonymous page is not resident");
+        let err = crate::numa::page_placement(g.ptr).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EPERM));
+        assert!(!resident(), "the failed diagnostic faulted the page in");
+        // The node query itself is still allowed, and does fault the page in.
+        crate::numa::placement::read_page(g.ptr).node.unwrap();
+        assert!(resident());
     }
 
     /// Through the public entry: with `mbind` and `get_mempolicy` denied (as
