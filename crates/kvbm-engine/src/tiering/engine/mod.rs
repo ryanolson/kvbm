@@ -40,6 +40,7 @@ mod inflight;
 mod local;
 mod offload;
 mod onboard;
+mod paused;
 mod prefill;
 mod prefill_validation;
 #[cfg(test)]

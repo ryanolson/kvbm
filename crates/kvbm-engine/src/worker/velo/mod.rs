@@ -105,6 +105,7 @@ mod lost_reply_tests;
 mod service;
 mod unresolved;
 
+pub(crate) use check::CheckEvidence;
 pub use check::{
     DEFAULT_LOCAL_TRANSFER_CHECK_DEADLINE, DEFAULT_LOCAL_TRANSFER_CHECK_WAIT,
     LocalTransferCheckTiming, LocalTransferRecheck,

@@ -70,6 +70,7 @@ nvtx = { version = "1.3", optional = true }
 [dev-dependencies]
 # Control-plane tests exercise the public velo client.
 kvbm-protocols = { workspace = true, features = ["client"] }
+tokio = { workspace = true, features = ["test-util"] }
 
 # Consolidator integration tests subscribe to the egress ZMQ PUB socket.
 kvbm-consolidator = { workspace = true }

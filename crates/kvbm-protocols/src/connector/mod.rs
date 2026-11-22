@@ -31,7 +31,7 @@ mod tests;
 pub use actions::{EngineWorkerSink, LoadOutcome, SaveOutcome, WorkerEngineDriver};
 pub use engine::LeaderEngine;
 pub use handles::{
-    FenceHandle, FindBlocksHandle, OffloadHandle, OnboardHandle, RequestOffloadDrain,
+    FenceHandle, FindBlocksHandle, OffloadHandle, OnboardHandle, OnboardPause, RequestOffloadDrain,
 };
 pub use noop::{NoopBlockEngine, NoopWorkerSink};
 pub use protocol::{

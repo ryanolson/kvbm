@@ -15,6 +15,7 @@ use bytes::Bytes;
 use kvbm_physical::transfer::TransferDrainOutcome;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use tokio::time::Instant as ClockInstant;
 use uuid::Uuid;
 
 use super::handler_names;
@@ -95,6 +96,28 @@ impl fmt::Display for LocalTransferRecheck {
     }
 }
 
+/// Timing of the check that produced an unproven outcome.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CheckEvidence {
+    pub(crate) attempted: Option<ClockInstant>,
+    pub(crate) answered: Option<ClockInstant>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{reason}")]
+struct UnprovenCheck {
+    evidence: CheckEvidence,
+    reason: String,
+}
+
+impl CheckEvidence {
+    pub(crate) fn from_error(error: &anyhow::Error) -> Self {
+        error
+            .downcast_ref::<UnprovenCheck>()
+            .map_or_else(Self::default, |check| check.evidence)
+    }
+}
+
 impl LocalTransferRecheck {
     /// Ask the captured worker once, under `deadline`, whether the transfer
     /// drained.
@@ -106,65 +129,97 @@ impl LocalTransferRecheck {
     /// attached again. Without a bound incarnation no answer could decide, so
     /// no check is sent.
     pub async fn check(&self, messenger: &Messenger, deadline: Duration) -> TransferDrainOutcome {
-        if self.incarnation.is_none() {
+        let Some(incarnation) = self.incarnation else {
             return self.unbound();
-        }
+        };
+        let mut evidence = CheckEvidence {
+            attempted: Some(ClockInstant::now()),
+            answered: None,
+        };
         // The outer timeout also bounds any handshake velo runs first, which
         // the request's own timeout may not cover.
         match tokio::time::timeout(deadline, self.ask(messenger, deadline)).await {
-            Ok(Ok(reply)) => self.decide(reply),
-            Ok(Err(error)) => self.unproven(format!("the check got no answer: {error:#}")),
-            Err(_) => self.unproven(format!("the check got no answer within {deadline:?}")),
+            Ok(Ok(bytes)) => {
+                evidence.answered = Some(ClockInstant::now());
+                match serde_json::from_slice(&bytes) {
+                    Ok(reply) => self.decide(incarnation, reply, evidence),
+                    Err(error) => self.unproven(evidence, format!("invalid check reply: {error}")),
+                }
+            }
+            Ok(Err(error)) => {
+                self.unproven(evidence, format!("the check got no answer: {error:#}"))
+            }
+            Err(_) => self.unproven(
+                evidence,
+                format!("the check got no answer within {deadline:?}"),
+            ),
         }
     }
 
-    async fn ask(&self, messenger: &Messenger, deadline: Duration) -> anyhow::Result<CheckReply> {
+    async fn ask(&self, messenger: &Messenger, deadline: Duration) -> anyhow::Result<Bytes> {
         let handler = handler_names::scoped(handler_names::LOCAL_TRANSFER_CHECK, self.worker_id);
         let payload = serde_json::to_vec(&CheckMessage {
             transfer_id: self.transfer_id,
         })?;
-        let bytes = messenger
+        messenger
             .unary(&handler)?
             .raw_payload(Bytes::from(payload))
             .instance(self.instance)
             .timeout(deadline)
             .send()
-            .await?;
-        Ok(serde_json::from_slice(&bytes)?)
+            .await
     }
 
-    fn decide(&self, reply: CheckReply) -> TransferDrainOutcome {
-        let Some(incarnation) = self.incarnation else {
-            return self.unbound();
-        };
+    fn decide(
+        &self,
+        incarnation: Uuid,
+        reply: CheckReply,
+        evidence: CheckEvidence,
+    ) -> TransferDrainOutcome {
         if reply.incarnation != incarnation {
-            return self.unproven(format!(
-                "the check reached incarnation {}, not the one that took the copy",
-                reply.incarnation
-            ));
+            return self.unproven(
+                evidence,
+                format!(
+                    "the check reached incarnation {}, not the one that took the copy",
+                    reply.incarnation
+                ),
+            );
         }
         match reply.record {
             Record::Completed => TransferDrainOutcome::Completed,
             Record::DrainedWithError { error } => {
                 TransferDrainOutcome::DrainedWithError(anyhow::anyhow!(error))
             }
-            Record::Active => self.unproven("the worker reports the copy still active"),
+            Record::Active => self.unproven(evidence, "the worker reports the copy still active"),
             Record::Unproven { error } => {
-                self.unproven(format!("the worker has no drain proof: {error}"))
+                self.unproven(evidence, format!("the worker has no drain proof: {error}"))
             }
-            Record::Unknown => self.unproven("the worker has no record of the transfer"),
+            Record::Unknown => self.unproven(evidence, "the worker has no record of the transfer"),
         }
     }
 
     /// The outcome of a transfer with no bound incarnation: no check can
     /// decide it, so none is sent.
     pub(super) fn unbound(&self) -> TransferDrainOutcome {
-        self.unproven("the worker incarnation was not bound before the copy")
+        self.unproven(
+            CheckEvidence::default(),
+            "the worker incarnation was not bound before the copy",
+        )
     }
 
     /// An unknown outcome that carries this capability.
-    pub(super) fn unproven(&self, reason: impl fmt::Display) -> TransferDrainOutcome {
-        TransferDrainOutcome::Unproven(anyhow::anyhow!("{reason}").context(self.clone()))
+    pub(super) fn unproven(
+        &self,
+        evidence: CheckEvidence,
+        reason: impl fmt::Display,
+    ) -> TransferDrainOutcome {
+        TransferDrainOutcome::Unproven(
+            anyhow::Error::new(UnprovenCheck {
+                evidence,
+                reason: reason.to_string(),
+            })
+            .context(self.clone()),
+        )
     }
 }
 

@@ -26,11 +26,34 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Instant;
 
 use super::actions::{LoadOutcome, SaveOutcome};
 use super::engine::LeaderEngine;
 use super::protocol::RequestId;
 use super::protocol::{AcceptId, ActionFailure, ActionId, ActionStatus, SearchId};
+
+/// An onboard waiting for proof that its worker finished the copy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct OnboardPause {
+    since: Instant,
+    worker: String,
+}
+
+impl OnboardPause {
+    /// When the onboard paused.
+    pub fn since(&self) -> Instant {
+        self.since
+    }
+
+    /// One unresolved worker, or `"unknown"` if its identity is unavailable.
+    pub fn worker(&self) -> &str {
+        &self.worker
+    }
+}
+
+type PauseCell = Arc<Mutex<Option<(Instant, String)>>>;
 
 /// ONBOARD handle. Leader-local: an [`ActionId`] + a `Weak<dyn LeaderEngine>`
 /// back-ref (for the RAII drop) + a shared completion cell the engine driver
@@ -68,6 +91,7 @@ pub struct OnboardHandle {
     /// watchdog). The connector consumes this fence and gates destination G1
     /// reuse on it; ordinary onboards leave it absent.
     physical_drain: Option<FenceHandle>,
+    pause: Option<PauseCell>,
 }
 
 impl OnboardHandle {
@@ -89,6 +113,7 @@ impl OnboardHandle {
             status,
             dest_block_ids,
             physical_drain: None,
+            pause: None,
         }
     }
 
@@ -109,7 +134,27 @@ impl OnboardHandle {
             status,
             dest_block_ids,
             physical_drain: Some(physical_drain),
+            pause: None,
         }
+    }
+
+    /// Installs the engine's pause observation cell. Engine-internal and outside
+    /// the stable contract.
+    #[doc(hidden)]
+    pub fn with_pause_cell(mut self, cell: PauseCell) -> Self {
+        self.pause = Some(cell);
+        self
+    }
+
+    /// The current pause, if the onboard is waiting for its copy to be proven.
+    pub fn paused(&self) -> Option<OnboardPause> {
+        let (since, worker) = self
+            .pause
+            .as_ref()?
+            .lock()
+            .expect("pause mutex poisoned")
+            .clone()?;
+        Some(OnboardPause { since, worker })
     }
 
     /// The opaque action id.
