@@ -410,6 +410,17 @@ pub(crate) struct BlockStoreInner<T: BlockMetadata> {
     /// reserve is sized from the live capacity with [`room`], never from the
     /// store's maximum.
     active_by_hash: SeqHashMap<BlockId>,
+    /// Entries `active_by_hash` was last allocated for: its `capacity()`
+    /// right after the build and after each reservation.
+    ///
+    /// `set_capacity` compares [`room`] against this instead of calling
+    /// `reserve` unconditionally. `HashMap::reserve` checks the growth
+    /// budget, not the allocation: after a churn has spent the budget on
+    /// tombstones, a reservation the current table already fits (for
+    /// example, growing back to a capacity this store has held) would
+    /// still grow the table, because rehashing in place only happens below
+    /// half the bucket count.
+    active_by_hash_full: usize,
     /// Hashes whose canonical inactive lineage is owned by a pressure action.
     ///
     /// A concurrent registration can add a newer physical block with the
@@ -569,6 +580,8 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
             free.insert(id);
         }
         let reset_on_release = vec![default_reset_on_release; total_blocks];
+        let active_by_hash =
+            SeqHashMap::with_capacity_and_hasher(room(total_blocks), IdBuildHasher);
         let inner = BlockStoreInner {
             capacity: total_blocks,
             slots,
@@ -576,7 +589,8 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
             fenced: BTreeSet::new(),
             fence: None,
             inactive,
-            active_by_hash: SeqHashMap::with_capacity_and_hasher(room(total_blocks), IdBuildHasher),
+            active_by_hash_full: active_by_hash.capacity(),
+            active_by_hash,
             held_by_hash: SeqHashMap::default(),
             reset_on_release,
         };
@@ -731,13 +745,25 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         }
         inner.capacity = capacity;
         if capacity > previous {
-            // Reserve before the slots and the inactive index grow, so a
-            // later registration finds room instead of rehashing under the
-            // lock. A shrink leaves the reserve in place: growing back to a
-            // capacity this store has already held allocates nothing.
-            let reserve_entries = room(capacity);
-            let additional = reserve_entries.saturating_sub(inner.active_by_hash.len());
-            inner.active_by_hash.reserve(additional);
+            // Reserve in this same critical section as the slot and inactive
+            // index grow, so a later registration finds room instead of
+            // rehashing under the lock. Skip it when the current allocation
+            // already covers the new capacity building on the old one: after
+            // a churn has spent the growth budget on tombstones, reserving
+            // again would grow a table that already fits. A shrink leaves
+            // both the reserve and the layout alone.
+            // Take the reported capacity as a lower bound on the allocation
+            // as well: an insert path that ran out of growth budget grows the
+            // table on its own, and that new headroom should count.
+            inner.active_by_hash_full = inner
+                .active_by_hash_full
+                .max(inner.active_by_hash.capacity());
+            let wanted = room(capacity);
+            if wanted > inner.active_by_hash_full {
+                let additional = wanted.saturating_sub(inner.active_by_hash.len());
+                inner.active_by_hash.reserve(additional);
+                inner.active_by_hash_full = inner.active_by_hash.capacity();
+            }
             for id in previous..capacity {
                 push_reset_id_locked(&mut inner, id);
             }

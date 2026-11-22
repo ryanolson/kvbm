@@ -39,11 +39,11 @@ const CHUNK: usize = 1024;
 /// hashes, so the index returns to [`LIVE`] entries every step.
 const TURNOUTS: usize = 100;
 
-/// In-place rebuilds this fixed workload is allowed, on aarch64 (16-byte
-/// probe groups). Taken from the recorded run in the PR.
+/// In-place rebuilds this fixed workload is allowed, on aarch64 (8-wide
+/// probe groups, NEON `uint8x8_t`). Taken from the recorded run in the PR.
 const REHASH_BOUND_AARCH64: usize = 0;
-/// In-place rebuilds this fixed workload is allowed, on x86_64 (SSE2,
-/// 16-byte probe groups). Taken from the recorded CI run in the PR.
+/// In-place rebuilds this fixed workload is allowed, on x86_64 (16-wide
+/// probe groups, SSE2). Taken from the recorded CI run in the PR.
 const REHASH_BOUND_X86_64: usize = 0;
 
 /// The recorded rebuild count for this host's probe-group width.
@@ -81,8 +81,15 @@ struct ChurnStats {
     peak_inactive: usize,
     /// Steps that doubled the index past its build reservation.
     growths: usize,
-    /// Steps where the index rebuilt in place: `capacity()` rose by more
-    /// than that step's removals, which a per-removal group reset cannot do.
+    /// Steps where the index rebuilt in place.
+    ///
+    /// `capacity()` is items plus growth left. A removal either leaves a
+    /// tombstone (both drop by one) or empties its probe group (the entry
+    /// drops, the budget gains one), so it never raises `capacity()`. An
+    /// insertion raises it by one only when it fills a tombstone without
+    /// taking a fresh slot. So a step can raise it by at most its number of
+    /// inserts, and only a rebuild restores the allocation's limit above
+    /// that.
     rehashes: usize,
 }
 
@@ -115,16 +122,17 @@ fn hold_fresh(
     }
 }
 
-/// Fill to `live` held primaries, then turn a quarter of them over
-/// `turnouts` times, reading the live-primary index after every step.
+/// Fill to `live` held primaries, then turn `step` of them over `turnouts`
+/// times, reading the live-primary index after every step.
 fn fill_and_churn(
     manager: &BlockManager<TestBlockData>,
     live: usize,
+    step: usize,
     turnouts: usize,
 ) -> ChurnStats {
-    assert_eq!(live % (4 * CHUNK), 0, "a quarter is whole chunks");
+    assert_eq!(step % CHUNK, 0, "a step is whole chunks");
+    assert_eq!(live % step, 0, "a step is a whole share of the live set");
     assert!(turnouts > 0, "the churn runs at least one step");
-    let quarter = live / 4;
     let store = manager.store_for_test();
     let after_build = store.active_by_hash_capacity();
     let mut stats = ChurnStats {
@@ -149,21 +157,21 @@ fn fill_and_churn(
 
     for _ in 0..turnouts {
         let before = store.active_by_hash_capacity();
-        // Drop the oldest quarter: each release moves a block to inactive.
-        for _ in 0..quarter / CHUNK {
+        // Drop the oldest step: each release moves a block to inactive.
+        for _ in 0..step / CHUNK {
             drop(held.pop_front());
         }
-        assert_eq!(store.active_by_hash_len(), live - quarter);
+        assert_eq!(store.active_by_hash_len(), live - step);
         stats.peak_inactive = stats.peak_inactive.max(manager.inactive_len());
-        // Allocate that quarter (it evicts the blocks just released), stage
+        // Allocate that step (it evicts the blocks just released), stage
         // fresh hashes, register and hold.
-        hold_fresh(manager, &mut held, &mut next_token, quarter);
+        hold_fresh(manager, &mut held, &mut next_token, step);
         assert_eq!(store.active_by_hash_len(), live);
         stats.peak_inactive = stats.peak_inactive.max(manager.inactive_len());
         let after = store.active_by_hash_capacity();
         if after > stats.after_build {
             stats.growths += 1;
-        } else if after.saturating_sub(before) > quarter {
+        } else if after.saturating_sub(before) > step {
             stats.rehashes += 1;
         }
         stats.peak_capacity = stats.peak_capacity.max(after);
@@ -188,7 +196,7 @@ fn report(label: &str, stats: &ChurnStats) {
 #[test]
 fn active_by_hash_does_not_grow_while_live_primaries_fill_and_churn() {
     let manager = lineage_manager(LIVE, 64 * LIVE);
-    let stats = fill_and_churn(&manager, LIVE, TURNOUTS);
+    let stats = fill_and_churn(&manager, LIVE, LIVE / 4, TURNOUTS);
     report("live churn", &stats);
 
     assert_eq!(
@@ -236,7 +244,7 @@ fn set_capacity_reserves_active_by_hash() {
     manager.set_capacity(4 * LIVE).expect("grow back");
     assert_eq!(store.active_by_hash_capacity(), grown);
 
-    let stats = fill_and_churn(&manager, 4 * LIVE, TURNOUTS);
+    let stats = fill_and_churn(&manager, 4 * LIVE, LIVE, TURNOUTS);
     report("reserved 4x", &stats);
     assert_eq!(
         stats.after_fill, grown,
@@ -246,5 +254,45 @@ fn set_capacity_reserves_active_by_hash() {
         stats.growths, 0,
         "the churn uses the reserve instead of growing it: capacity peaked at {} against a reservation of {}",
         stats.peak_capacity, grown,
+    );
+}
+
+/// A grow back to a capacity the index already covers must not reallocate
+/// it. The index allocation after the build covers `room(7168)` entries, so
+/// the churn at 6144 and the grow back fit without a reservation.
+#[test]
+fn growing_back_after_a_shrink_keeps_the_index_allocation() {
+    let manager = lineage_manager(7168, 64 * 7168);
+    let store = manager.store_for_test();
+    let built = store.active_by_hash_capacity();
+    manager.set_capacity(6144).expect("shrink");
+    let stats = fill_and_churn(&manager, 6144, 2048, TURNOUTS);
+    report("shrink then regrow", &stats);
+    manager
+        .set_capacity(7168)
+        .expect("grow back to the built capacity");
+    let after = store.active_by_hash_capacity();
+    println!("shrink then regrow: capacity after the grow back {after}, built {built}");
+    assert!(
+        after <= built,
+        "the grow back reallocated the index: {after} against the built {built}",
+    );
+}
+
+/// A `set_capacity` whose room the built index already covers must not
+/// reallocate it, even after a churn has used up its growth budget.
+#[test]
+fn growing_into_the_built_index_allocation_keeps_it() {
+    let manager = lineage_manager(6144, 64 * 7168);
+    let store = manager.store_for_test();
+    let built = store.active_by_hash_capacity();
+    let stats = fill_and_churn(&manager, 6144, 2048, TURNOUTS);
+    report("grow into the built allocation", &stats);
+    manager.set_capacity(7168).expect("grow to 7168");
+    let after = store.active_by_hash_capacity();
+    println!("grow into the built allocation: capacity after the grow {after}, built {built}");
+    assert!(
+        after <= built,
+        "the grow reallocated an index that already covered the capacity: {after} against the built {built}",
     );
 }
