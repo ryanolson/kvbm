@@ -45,6 +45,7 @@
 //! `cargo test --all-targets` stays fast.
 
 use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
@@ -224,6 +225,20 @@ fn self_test() {
     let words = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
     // Test-harness flags without `--bench` must not be parsed.
     assert!(parse_args(&words(&[])).unwrap().is_none());
+    // A non-UTF-8 argument without `--bench` must not matter either.
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let raw = [
+            OsString::from_vec(vec![0xff]),
+            OsString::from("--nocapture"),
+        ];
+        assert!(!has_bench(&raw));
+        assert!(has_bench(&[
+            OsString::from_vec(vec![0xff]),
+            "--bench".into()
+        ]));
+    }
     assert!(
         parse_args(&words(&["--nocapture", "--test-threads=1"]))
             .unwrap()
@@ -491,8 +506,28 @@ fn run_inactive(blocks: usize, turnovers: usize) {
     );
 }
 
+/// Whether `--bench` is among the raw arguments. It looks at the undecoded
+/// arguments, so a non-UTF-8 argument from `cargo test` or a shell cannot make
+/// a run that is not a bench fail.
+fn has_bench(args: &[OsString]) -> bool {
+    args.iter().any(|arg| arg == "--bench")
+}
+
 fn main() -> ExitCode {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let raw: Vec<OsString> = std::env::args_os().skip(1).collect();
+    if !has_bench(&raw) {
+        // Not run as a bench: `cargo test --all-targets` runs this binary
+        // with its own flags, and that run does nothing.
+        return ExitCode::SUCCESS;
+    }
+    let Ok(argv) = raw
+        .into_iter()
+        .map(OsString::into_string)
+        .collect::<Result<Vec<String>, _>>()
+    else {
+        eprintln!("arguments must be valid UTF-8\n{USAGE}");
+        return ExitCode::from(2);
+    };
     let args = match parse_args(&argv) {
         Ok(Some(args)) => args,
         // Not run as a bench: `cargo test --all-targets` runs this binary
