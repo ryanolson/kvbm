@@ -640,4 +640,23 @@ mod tests {
         assert_eq!(failure.to_string(), "group failed: outer: inner; lost");
         assert!(failure.is_unproven());
     }
+
+    #[tokio::test]
+    #[ignore = "the typed aggregate does not honor width or precision"]
+    async fn aggregate_error_display_preserves_width_and_precision() {
+        let result = TransferCompleteNotification::aggregate_results(
+            vec![Err(anyhow!("worker failed"))],
+            &Arc::new(EventManager::local()),
+            &tokio::runtime::Handle::current(),
+        );
+        let Err(error) = result else {
+            panic!("dispatch failed");
+        };
+        let error: &dyn std::error::Error = error.as_ref();
+
+        assert_eq!(
+            format!("{error:>20.6}"),
+            format!("{:>20.6}", "worker failed")
+        );
+    }
 }
