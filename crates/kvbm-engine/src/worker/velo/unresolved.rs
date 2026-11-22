@@ -444,4 +444,49 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    #[ignore = "re-folding drops the capability when the replacement error has none"]
+    fn a_contradictory_drain_update_keeps_the_original_capability_after_refolding() {
+        let worker = capability(1);
+        let mut transfer = UnresolvedTransfer::from_unproven(unproven_on(&worker));
+        let claims_drain = aggregate(vec![TransferPartFailure::Unproven(anyhow::anyhow!(
+            "drain is still unproven"
+        ))]);
+
+        assert!(transfer.apply(
+            &worker,
+            TransferDrainOutcome::DrainedWithError(claims_drain)
+        ));
+        assert_eq!(transfer.rechecks().collect::<Vec<_>>(), vec![&worker]);
+
+        let TransferDrainOutcome::Unproven(error) = transfer.into_outcome() else {
+            panic!("the update did not prove drain");
+        };
+        let transfer = UnresolvedTransfer::from_unproven(error);
+        assert_eq!(transfer.rechecks().collect::<Vec<_>>(), vec![&worker]);
+    }
+
+    #[test]
+    #[ignore = "re-folding can recover a different transfer's capability"]
+    fn a_failed_update_cannot_change_which_transfer_resolves_the_participant() {
+        let original = capability(1);
+        let mut different_transfer = original.clone();
+        different_transfer.transfer_id = uuid::Uuid::new_v4();
+        let mut transfer = UnresolvedTransfer::from_unproven(unproven_on(&original));
+
+        assert!(!transfer.apply(&different_transfer, TransferDrainOutcome::Completed));
+        assert!(transfer.apply(
+            &original,
+            TransferDrainOutcome::Unproven(unproven_on(&different_transfer)),
+        ));
+
+        let TransferDrainOutcome::Unproven(error) = transfer.into_outcome() else {
+            panic!("the update did not prove drain");
+        };
+        let mut transfer = UnresolvedTransfer::from_unproven(error);
+        assert!(!transfer.apply(&different_transfer, TransferDrainOutcome::Completed));
+        assert!(transfer.apply(&original, TransferDrainOutcome::Completed));
+        assert!(!transfer.apply(&original, TransferDrainOutcome::Completed));
+    }
 }
