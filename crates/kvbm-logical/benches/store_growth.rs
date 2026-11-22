@@ -39,7 +39,9 @@
 //!     --blocks 262144 --turnovers 20 --workload live
 //! ```
 //!
-//! Without `--bench` in its arguments the binary returns at once, so
+//! `--bench --self-test` checks the bench's own argument parsing and
+//! percentiles and exits. Without `--bench` in its arguments the binary
+//! returns at once, whatever else it is given, so
 //! `cargo test --all-targets` stays fast.
 
 use std::collections::VecDeque;
@@ -67,10 +69,11 @@ const QUICK_BLOCKS: usize = 65_536;
 const QUICK_TURNOVERS: usize = 4;
 
 const USAGE: &str = "usage: store_growth --bench [--quick] [--blocks N] [--turnovers T] \
-                     [--workload live|inactive|all]\n  \
+                     [--workload live|inactive|all] [--self-test]\n  \
                      --blocks N      block count; a multiple of 4096 (default 2097152)\n  \
                      --turnovers T   churn turnovers of C/4 blocks each (default 100)\n  \
-                     --quick         65536 blocks, 4 turnovers: a smoke check, not a measurement";
+                     --quick         65536 blocks, 4 turnovers: a smoke check, not a measurement\n  \
+                     --self-test     check the bench's argument parsing and percentiles, then exit";
 
 type Manager = BlockManager<TestMeta>;
 type Guard = ImmutableBlock<TestMeta>;
@@ -88,18 +91,22 @@ struct Args {
     which: Which,
 }
 
-/// Parse the arguments after `--bench`. Returns `Ok(None)` when `--bench` is
-/// absent.
-fn parse_args() -> Result<Option<Args>, String> {
-    let mut bench = false;
+/// Parse the arguments after the program name. Returns `Ok(None)` when
+/// `--bench` is absent, without looking at any other argument:
+/// `cargo test --all-targets` runs this binary with the test harness's own
+/// flags (for example `--nocapture`), and that run must succeed and do nothing.
+fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
+    if !args.iter().any(|arg| arg == "--bench") {
+        return Ok(None);
+    }
     let mut quick = false;
     let mut blocks = None;
     let mut turnovers = None;
     let mut which = Which::All;
-    let mut args = std::env::args().skip(1);
+    let mut args = args.iter().cloned();
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--bench" => bench = true,
+            "--bench" | "--self-test" => {}
             "--quick" => quick = true,
             "--blocks" => blocks = Some(number(&arg, args.next())?),
             "--turnovers" => turnovers = Some(number(&arg, args.next())?),
@@ -116,9 +123,6 @@ fn parse_args() -> Result<Option<Args>, String> {
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument {other}")),
         }
-    }
-    if !bench {
-        return Ok(None);
     }
     let blocks = blocks.unwrap_or(if quick { QUICK_BLOCKS } else { DEFAULT_BLOCKS });
     let turnovers = turnovers.unwrap_or(if quick {
@@ -168,7 +172,7 @@ fn build_manager(blocks: usize) -> Manager {
 }
 
 /// One timed call's samples, in nanoseconds, in a preallocated buffer.
-struct Samples(Vec<u32>);
+struct Samples(Vec<u64>);
 
 impl Samples {
     fn with_capacity(calls: usize) -> Self {
@@ -177,30 +181,76 @@ impl Samples {
 
     fn push(&mut self, nanos: u128) {
         debug_assert!(self.0.len() < self.0.capacity(), "samples must not grow");
-        self.0.push(u32::try_from(nanos).unwrap_or(u32::MAX));
+        // A u64 holds more than 500 years of nanoseconds, so a long pause is
+        // never clipped to a shared value.
+        self.0.push(u64::try_from(nanos).unwrap_or(u64::MAX));
     }
 
     /// Print one row: calls, p50, p99 and max in microseconds.
     fn print(&mut self, phase: &str, call: &str) {
         let n = self.0.len();
-        if n == 0 {
+        let Some((p50, p99, max)) = percentiles(&mut self.0) else {
             println!(
                 "  {phase:<6} {call:<9} {:>8} {:>10} {:>10} {:>10}",
                 0, "-", "-", "-"
             );
             return;
-        }
-        self.0.sort_unstable();
-        // Nearest rank.
-        let at = |p: f64| self.0[((p * n as f64).ceil() as usize).clamp(1, n) - 1];
-        let us = |nanos: u32| format!("{:.1}", f64::from(nanos) / 1e3);
+        };
+        let us = |nanos: u64| format!("{:.1}", nanos as f64 / 1e3);
         println!(
             "  {phase:<6} {call:<9} {n:>8} {:>10} {:>10} {:>10}",
-            us(at(0.50)),
-            us(at(0.99)),
-            us(self.0[n - 1])
+            us(p50),
+            us(p99),
+            us(max)
         );
     }
+}
+
+/// Sort the samples, then return nearest-rank p50, p99 and the maximum, in the
+/// samples' unit. `None` for no samples.
+fn percentiles(samples: &mut [u64]) -> Option<(u64, u64, u64)> {
+    let n = samples.len();
+    if n == 0 {
+        return None;
+    }
+    samples.sort_unstable();
+    let at = |p: f64| samples[((p * n as f64).ceil() as usize).clamp(1, n) - 1];
+    Some((at(0.50), at(0.99), samples[n - 1]))
+}
+
+/// Checks of the bench's own helpers, run by `--bench --self-test`. The
+/// binary has no test harness, so `cargo test` does not run them.
+fn self_test() {
+    let words = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+    // Test-harness flags without `--bench` must not be parsed.
+    assert!(parse_args(&words(&[])).unwrap().is_none());
+    assert!(
+        parse_args(&words(&["--nocapture", "--test-threads=1"]))
+            .unwrap()
+            .is_none()
+    );
+    let quick = parse_args(&words(&["--bench", "--quick"]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (quick.blocks, quick.turnovers),
+        (QUICK_BLOCKS, QUICK_TURNOVERS)
+    );
+    assert!(parse_args(&words(&["--bench", "--blocks", "100"])).is_err());
+    assert!(parse_args(&words(&["--bench", "--bogus"])).is_err());
+    // Two long pauses, both over u32::MAX nanoseconds, must stay distinct.
+    let mut samples = Samples::with_capacity(100);
+    for nanos in (1..=98u128).map(|i| i * 1_000) {
+        samples.push(nanos);
+    }
+    samples.push(5_000_000_000);
+    samples.push(6_000_000_000);
+    assert_eq!(
+        percentiles(&mut samples.0),
+        Some((50_000, 5_000_000_000, 6_000_000_000))
+    );
+    assert_eq!(percentiles(&mut []), None);
+    println!("store_growth: self-test passed");
 }
 
 /// Stage `count` blocks with hashes no earlier chunk shares: one salt for
@@ -442,7 +492,8 @@ fn run_inactive(blocks: usize, turnovers: usize) {
 }
 
 fn main() -> ExitCode {
-    let args = match parse_args() {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let args = match parse_args(&argv) {
         Ok(Some(args)) => args,
         // Not run as a bench: `cargo test --all-targets` runs this binary
         // with no arguments.
@@ -455,6 +506,10 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if argv.iter().any(|arg| arg == "--self-test") {
+        self_test();
+        return ExitCode::SUCCESS;
+    }
     println!(
         "store_growth: lineage backend, TinyLFU tracker, events manager, Reject duplicates; \
          times are per call over a {CHUNK}-block chunk"
