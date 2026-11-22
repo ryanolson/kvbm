@@ -1391,8 +1391,8 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "dynamo-kv-hashing"
-version = "1.6.0"
-source = "git+https://github.com/ai-dynamo/dynamo.git?rev=b0c71df0f63b65bb85f1dc9ec8d58b1899096d95#b0c71df0f63b65bb85f1dc9ec8d58b1899096d95"
+version = "1.7.0"
+source = "git+https://github.com/ai-dynamo/dynamo.git?rev=6eb009fb929e50ef4cadbc5635f39ab22a4716f2#6eb009fb929e50ef4cadbc5635f39ab22a4716f2"
 dependencies = [
  "derive_builder",
  "dynamo-tokens",
@@ -1403,14 +1403,15 @@ dependencies = [
 
 [[package]]
 name = "dynamo-kv-router"
-version = "1.6.0"
-source = "git+https://github.com/ai-dynamo/dynamo.git?rev=b0c71df0f63b65bb85f1dc9ec8d58b1899096d95#b0c71df0f63b65bb85f1dc9ec8d58b1899096d95"
+version = "1.7.0"
+source = "git+https://github.com/ai-dynamo/dynamo.git?rev=6eb009fb929e50ef4cadbc5635f39ab22a4716f2#6eb009fb929e50ef4cadbc5635f39ab22a4716f2"
 dependencies = [
  "anyhow",
  "arc-swap",
  "async-trait",
  "blake3",
  "crossbeam-queue",
+ "crossbeam-utils",
  "dashmap",
  "derive_builder",
  "dynamo-kv-hashing",
@@ -1440,8 +1441,8 @@ dependencies = [
 
 [[package]]
 name = "dynamo-tokens"
-version = "1.6.0"
-source = "git+https://github.com/ai-dynamo/dynamo.git?rev=b0c71df0f63b65bb85f1dc9ec8d58b1899096d95#b0c71df0f63b65bb85f1dc9ec8d58b1899096d95"
+version = "1.7.0"
+source = "git+https://github.com/ai-dynamo/dynamo.git?rev=6eb009fb929e50ef4cadbc5635f39ab22a4716f2#6eb009fb929e50ef4cadbc5635f39ab22a4716f2"
 dependencies = [
  "bs58",
  "bytemuck",
@@ -1456,8 +1457,8 @@ dependencies = [
 
 [[package]]
 name = "dynamo-truthy"
-version = "1.6.0"
-source = "git+https://github.com/ai-dynamo/dynamo.git?rev=b0c71df0f63b65bb85f1dc9ec8d58b1899096d95#b0c71df0f63b65bb85f1dc9ec8d58b1899096d95"
+version = "1.7.0"
+source = "git+https://github.com/ai-dynamo/dynamo.git?rev=6eb009fb929e50ef4cadbc5635f39ab22a4716f2#6eb009fb929e50ef4cadbc5635f39ab22a4716f2"
 dependencies = [
  "anyhow",
 ]
@@ -2850,8 +2851,8 @@ dependencies = [
 
 [[package]]
 name = "nixl-sys"
-version = "1.4.1"
-source = "git+https://github.com/Aphoh/nixl.git?rev=9e04f3dcb56c84d5b63feb10250e657822168322#9e04f3dcb56c84d5b63feb10250e657822168322"
+version = "1.6.0"
+source = "git+https://github.com/ai-dynamo/nixl.git?rev=1b9b58e43b6cdbccc5a39521327e70233e3059cb#1b9b58e43b6cdbccc5a39521327e70233e3059cb"
 dependencies = [
  "anyhow",
  "bincode 1.3.3",
@@ -4689,9 +4690,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.52.4"
+version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "317fafbbe3f02fc663dad00ea6186197de963cd4190e86a26d8d0fae095539af"
+checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
  "bytes",
  "libc",
@@ -4771,14 +4772,15 @@ dependencies = [
 
 [[package]]
 name = "tokio-util"
-version = "0.7.18"
+version = "0.7.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ae9cec805b01e8fc3fd2fe289f89149a9b66dd16786abd8b19cfa7b48cb0098"
+checksum = "e464cf451ba96ebfc6f9b6542f17ee8b8956e33f1e40d9690624e59d7a7f8a4b"
 dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
  "futures-util",
+ "libc",
  "pin-project-lite",
  "tokio",
 ]

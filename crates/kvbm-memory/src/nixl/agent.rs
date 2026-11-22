@@ -334,9 +334,9 @@ impl NixlAgent {
 
 // Delegate common methods to the underlying agent.
 //
-// The workspace pin in `crates/Cargo.toml` is nixl-sys `=1.4.1`. Two defects
+// The workspace pin in `crates/Cargo.toml` is nixl-sys `=1.6.0`. Two defects
 // that made `Agent::fetch_remote_md` and `Agent::invalidate_remote_md` unusable
-// at `=1.0.1` are fixed at that version. The former self-deadlocked, and the
+// at `=1.0.1` are fixed since 1.4.1. The former self-deadlocked, and the
 // latter passed a string without a NUL terminator to the C API.
 //
 // `Agent::get_local_md` exports every registration on the agent. Use
