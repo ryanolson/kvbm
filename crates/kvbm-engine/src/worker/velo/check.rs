@@ -408,6 +408,14 @@ mod tests {
     }
 
     #[test]
+    fn the_default_timing_matches_the_config_default() {
+        assert_eq!(
+            LocalTransferCheckTiming::default(),
+            LocalTransferCheckTiming::from(&kvbm_config::LocalTransferCheckConfig::default())
+        );
+    }
+
+    #[test]
     fn a_record_moves_from_active_to_its_outcome() {
         let records = records(4, RECORD_MAX_AGE);
         let id = Uuid::new_v4();

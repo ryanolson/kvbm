@@ -40,6 +40,8 @@ Every config option, its type, default, and corresponding native KVBM environmen
 | Config Path | Type | Default | Env Var | Description |
 |---|---|---|---|---|
 | `messenger.init_timeout_secs` | `u64` | `1800` | `KVBM_MESSENGER_INIT_TIMEOUT_SECS` | Leader-worker init timeout (seconds) |
+| `messenger.local_transfer_check.wait_ms` | `u64` | `2000` | `KVBM_MESSENGER_LOCAL_TRANSFER_CHECK_WAIT_MS` | Wait after a lost local-transfer reply before the leader checks with the worker (ms) |
+| `messenger.local_transfer_check.deadline_ms` | `u64` | `5000` | `KVBM_MESSENGER_LOCAL_TRANSFER_CHECK_DEADLINE_MS` | Deadline of that check, and of the worker incarnation request (ms, min 1) |
 | `messenger.backend.tcp_addr` | `Option<String>` | None | `KVBM_MESSENGER_BACKEND_TCP_ADDR` | Bind IP address (mutually exclusive with tcp_interface) |
 | `messenger.backend.tcp_interface` | `Option<String>` | None | `KVBM_MESSENGER_BACKEND_TCP_INTERFACE` | Bind network interface name (mutually exclusive with tcp_addr) |
 | `messenger.backend.tcp_port` | `u16` | `0` | `KVBM_MESSENGER_BACKEND_TCP_PORT` | TCP port. 0 = OS-assigned ephemeral |
