@@ -65,59 +65,78 @@ pub(crate) struct AttachmentStore {
     /// registration that replaces this entry.
     pub(super) event_release: Option<EventReleaseHandle>,
     /// Refcounted physical-residency tracking for registered slots.
-    /// Each `Primary`, `Duplicate`, `Inactive`, or `Held` slot for this hash
-    /// and tier `T` contributes one count. `has_block::<T>` returns
-    /// `count > 0`. The count does not prove request availability. Key is
-    /// `TypeId::of::<T>()`.
+    /// Each `Primary`, `Duplicate`, `Inactive`, or `Held` slot for this hash,
+    /// tier `T`, and execution lane contributes one count. `has_block::<T>`
+    /// returns true when the count of a lane is more than zero. The count
+    /// does not prove request availability. Key is `TypeId::of::<T>()` and
+    /// the lane of the store.
     pub(crate) presence_markers: PresenceMarkers,
 }
 
 /// Tiers that [`PresenceMarkers`] keeps without a heap allocation.
 const INLINE_PRESENCE_TIERS: usize = 2;
 
-/// Presence counts for each metadata tier of one registration.
+/// The key of one presence count: a metadata tier and an execution lane.
+///
+/// Stores of one tier type on one registry keep their residency apart by
+/// the lane. A deployment with one lane uses lane 0 for each tier.
+pub(crate) type PresenceKey = (TypeId, u8);
+
+/// Presence counts for each metadata tier and lane of one registration.
 ///
 /// A registration is present in few tiers, so the counts live in a short
 /// inline list. The first marker does not allocate, which a hash map does.
 #[derive(Debug, Default)]
 pub(crate) struct PresenceMarkers {
-    inline: [Option<(TypeId, u32)>; INLINE_PRESENCE_TIERS],
-    overflow: Vec<(TypeId, u32)>,
+    inline: [Option<(PresenceKey, u32)>; INLINE_PRESENCE_TIERS],
+    overflow: Vec<(PresenceKey, u32)>,
 }
 
 impl PresenceMarkers {
-    fn count_mut(&mut self, type_id: TypeId) -> Option<&mut u32> {
+    fn count_mut(&mut self, key: PresenceKey) -> Option<&mut u32> {
         self.inline
             .iter_mut()
             .flatten()
             .chain(self.overflow.iter_mut())
-            .find(|(id, _)| *id == type_id)
+            .find(|(id, _)| *id == key)
             .map(|(_, count)| count)
     }
 
-    pub(crate) fn count(&self, type_id: TypeId) -> u32 {
+    /// The count of one tier in one lane.
+    pub(crate) fn count(&self, key: PresenceKey) -> u32 {
         self.inline
             .iter()
             .flatten()
             .chain(self.overflow.iter())
-            .find(|(id, _)| *id == type_id)
+            .find(|(id, _)| *id == key)
             .map_or(0, |(_, count)| *count)
     }
 
-    pub(crate) fn increment(&mut self, type_id: TypeId) {
-        if let Some(count) = self.count_mut(type_id) {
+    /// The count of one tier, added over all lanes.
+    pub(crate) fn count_all_lanes(&self, type_id: TypeId) -> u32 {
+        self.inline
+            .iter()
+            .flatten()
+            .chain(self.overflow.iter())
+            .filter(|((id, _), _)| *id == type_id)
+            .map(|(_, count)| *count)
+            .sum()
+    }
+
+    pub(crate) fn increment(&mut self, key: PresenceKey) {
+        if let Some(count) = self.count_mut(key) {
             *count += 1;
         } else if let Some(slot) = self.inline.iter_mut().find(|slot| slot.is_none()) {
-            *slot = Some((type_id, 1));
+            *slot = Some((key, 1));
         } else {
-            self.overflow.push((type_id, 1));
+            self.overflow.push((key, 1));
         }
     }
 
-    /// Decrements the count of `type_id` and removes it at zero. Returns
-    /// `false` if `type_id` has no count.
-    pub(crate) fn decrement(&mut self, type_id: TypeId) -> bool {
-        let Some(count) = self.count_mut(type_id) else {
+    /// Decrements the count of `key` and removes it at zero. Returns
+    /// `false` if `key` has no count.
+    pub(crate) fn decrement(&mut self, key: PresenceKey) -> bool {
+        let Some(count) = self.count_mut(key) else {
             return false;
         };
         debug_assert!(*count > 0, "presence marker with a zero count");
@@ -128,10 +147,10 @@ impl PresenceMarkers {
         if let Some(slot) = self
             .inline
             .iter_mut()
-            .find(|slot| matches!(slot, Some((id, _)) if *id == type_id))
+            .find(|slot| matches!(slot, Some((id, _)) if *id == key))
         {
             *slot = None;
-        } else if let Some(index) = self.overflow.iter().position(|(id, _)| *id == type_id) {
+        } else if let Some(index) = self.overflow.iter().position(|(id, _)| *id == key) {
             self.overflow.swap_remove(index);
         }
         true
@@ -275,9 +294,9 @@ mod presence_marker_tests {
     #[test]
     fn counts_more_tiers_than_the_inline_list() {
         let ids = [
-            TypeId::of::<TierA>(),
-            TypeId::of::<TierB>(),
-            TypeId::of::<TierC>(),
+            (TypeId::of::<TierA>(), 0),
+            (TypeId::of::<TierB>(), 0),
+            (TypeId::of::<TierC>(), 0),
         ];
         let mut markers = PresenceMarkers::default();
         for (n, id) in ids.iter().enumerate() {
@@ -295,5 +314,23 @@ mod presence_marker_tests {
         }
         assert_eq!(ids.map(|id| markers.count(id)), [0, 2, 0]);
         assert!(markers.overflow.is_empty() || markers.inline.iter().any(Option::is_none));
+    }
+
+    #[test]
+    fn lanes_of_one_tier_keep_separate_counts() {
+        let tier = TypeId::of::<TierA>();
+        let mut markers = PresenceMarkers::default();
+        markers.increment((tier, 0));
+        markers.increment((tier, 1));
+        markers.increment((tier, 1));
+        assert_eq!(markers.count((tier, 0)), 1);
+        assert_eq!(markers.count((tier, 1)), 2);
+        assert_eq!(markers.count((tier, 2)), 0);
+        assert_eq!(markers.count_all_lanes(tier), 3);
+        assert_eq!(markers.count_all_lanes(TypeId::of::<TierB>()), 0);
+        assert!(markers.decrement((tier, 0)));
+        assert!(!markers.decrement((tier, 0)));
+        assert_eq!(markers.count((tier, 1)), 2);
+        assert_eq!(markers.count_all_lanes(tier), 2);
     }
 }

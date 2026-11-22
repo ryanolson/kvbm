@@ -91,7 +91,7 @@
 //! coverage:
 //!
 //! - **Hub gate (cross-mode, CD-opt-in only).** At
-//!   `POST /v1/instances`, the first ConditionalDisagg instance that
+//!   registration, the first ConditionalDisagg instance that
 //!   sends a `LayoutCompatPayload` defines the baseline (mode +
 //!   canonical shape + per-worker layout); subsequent registrations
 //!   whose payload doesn't match are rejected with `400 Bad Request`

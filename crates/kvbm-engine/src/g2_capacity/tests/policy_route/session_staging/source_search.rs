@@ -782,3 +782,126 @@ async fn source_binding_rejects_another_g1_manager() -> Result<()> {
     );
     Ok(())
 }
+
+/// A holder with two execution lanes keeps one G1 source for each lane of a
+/// resource. A prefix whose first blocks are on the device pool of lane 0
+/// and whose next blocks are on the device pool of lane 1 is one prefix, and
+/// each lane stages its own blocks into the G2 pool that the lanes share.
+#[tokio::test]
+async fn a_prefix_over_two_lanes_is_served_and_staged_by_each_lane() -> Result<()> {
+    let transfer0 = Arc::new(ImmediateTransfer::default());
+    let holder = Holder::with_transfer(2, transfer0.clone()).await?;
+    let hashes = chain(4, 80);
+    ensure!(hashes[..2] == holder.fixture.hashes[..]);
+
+    // Lane 1 has its own device pool with the next two blocks of the chain.
+    let lane1 = Arc::new(
+        TestManagerBuilder::<G1>::new()
+            .block_count(2)
+            .block_size(4)
+            .lane(1)
+            .build(),
+    );
+    let _lane1_blocks = retained(&lane1, &hashes[2..])?;
+    let transfer1 = Arc::new(ImmediateTransfer::default());
+    let installation = PolicyG1G2Route::from_test_parts_in_lane(
+        holder.fixture.capacity.clone(),
+        RESOURCE,
+        1,
+        transfer1.clone(),
+    );
+    let lane1_route = match installation.validate(RESOURCE, &lane1) {
+        Ok(validated) => validated.bind(),
+        Err(_) => anyhow::bail!("the route of lane 1 accepts the manager of lane 1"),
+    };
+    let lane1_source = lane1_route.into_session_source(&lane1)?;
+    ensure!(lane1_source.lane() == 1);
+    holder
+        .leader
+        .install_g1_sources(std::slice::from_ref(&lane1_source))?;
+    ensure!(holder.leader.g1_source(RESOURCE, 0).is_some());
+    ensure!(holder.leader.g1_source(RESOURCE, 1).is_some());
+    ensure!(holder.leader.g1_source(RESOURCE, 2).is_none());
+
+    let response = holder
+        .leader
+        .open_transfer_session(OpenTransferSessionRequest {
+            sequence_hashes: hashes.clone(),
+            resource: Some(RESOURCE),
+            find_mode: FindMode::Sync,
+            search_mode: SearchMode::Prefix,
+            tiers: device_tier(),
+            ..Default::default()
+        })
+        .await?;
+    let committed = match response {
+        OpenTransferSessionResponse::Sync { committed, .. } => committed,
+        _ => anyhow::bail!("the two lanes together hold the prefix"),
+    };
+    ensure!(
+        committed == hashes,
+        "the prefix crosses from lane 0 to lane 1"
+    );
+    let session = holder.available().await?;
+    ensure!(transfer0.calls() >= 1, "lane 0 stages its own blocks");
+    ensure!(transfer1.calls() >= 1, "lane 1 stages its own blocks");
+    let available = session
+        .make_available_calls()
+        .into_iter()
+        .flatten()
+        .collect::<std::collections::HashSet<_>>();
+    let expected = hashes
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    ensure!(
+        available == expected,
+        "each block of both lanes becomes available from the shared G2 pool"
+    );
+    Ok(())
+}
+
+/// The route of one lane refuses the G1 manager of another lane, and a lane
+/// has one source for a resource.
+#[tokio::test]
+async fn a_lane_route_binds_only_the_manager_of_its_lane() -> Result<()> {
+    let holder = Holder::new(1).await?;
+    let lane1 = Arc::new(
+        TestManagerBuilder::<G1>::new()
+            .block_count(1)
+            .block_size(4)
+            .lane(1)
+            .build(),
+    );
+    let lane0_route = test_installation(
+        holder.fixture.capacity.clone(),
+        RESOURCE,
+        Arc::new(ImmediateTransfer::default()),
+    );
+    ensure!(
+        lane0_route.validate(RESOURCE, &lane1).is_err(),
+        "a route of lane 0 must refuse a manager of lane 1"
+    );
+    let lane1_source = |manager: &Arc<BlockManager<G1>>| -> Result<Arc<G1SessionSource>> {
+        let installation = PolicyG1G2Route::from_test_parts_in_lane(
+            holder.fixture.capacity.clone(),
+            RESOURCE,
+            1,
+            Arc::new(ImmediateTransfer::default()),
+        );
+        match installation.validate(RESOURCE, manager) {
+            Ok(validated) => validated.bind().into_session_source(manager),
+            Err(_) => anyhow::bail!("the route of lane 1 accepts the manager of lane 1"),
+        }
+    };
+    let first = lane1_source(&lane1)?;
+    let second = lane1_source(&lane1)?;
+    holder
+        .leader
+        .install_g1_sources(std::slice::from_ref(&first))?;
+    ensure!(
+        holder.leader.install_g1_sources(&[second]).is_err(),
+        "lane 1 keeps its first binding for the resource"
+    );
+    Ok(())
+}

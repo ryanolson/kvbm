@@ -10,7 +10,7 @@
 //! * [`plane`] — the production [`kvbm_engine::cd::PrefillPlane`]: completes
 //!   the wire `RemotePrefillRequest` (window-truncated token ids + the
 //!   provided-prefix hash digest, which never cross the engine seam) from the
-//!   leader's slot map and enqueues it on the hub's CD prefill queue.
+//!   leader's slot map and sends it to the hub's prefill router.
 //! * [`tier`] — the velo tier-signal handler writing the engine-owned
 //!   [`kvbm_engine::cd::TierCell`].
 //! * [`wiring`] — the hub/P2P registration (feature assembly, peer resolver,
@@ -214,6 +214,7 @@ mod tests {
     fn handshake_with(features: &[kvbm_hub::FeatureKey]) -> HubHandshake {
         HubHandshake {
             url: "http://127.0.0.1:1337".to_string(),
+            control_port: kvbm_config::DEFAULT_HUB_CONTROL_PORT,
             effective: HashSet::from_iter(features.iter().copied()),
             indexer_transport: None,
             runtime_summary: kvbm_hub::RuntimeConfigSummary::default(),

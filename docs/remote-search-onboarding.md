@@ -219,7 +219,7 @@ leader runs in vLLM's EngineCore subprocess; its `kvbm_audit` events land in the
   nccl re-bump) or the wrong `NIXL` path.
 - B never pulls (`transfer_pull_completed` absent) → confirm both logged `standalone P2P
   participation registered` + `remote-search discovery injected`, and the hub serves `indexer,p2p`
-  (`curl -s http://127.0.0.1:1337/v1/config`). If the hub lacked `p2p`, startup fails fast.
+  (`curl -s http://127.0.0.1:1337/v1/ext/kvbm/config`). If the hub lacked `p2p`, startup fails fast.
 - Stale procs / port-in-use (`kvbm_hub` won't bind 1337/8337) → `pkill -9 -f kvbm_hub; pkill -9 -f
   vllm.entrypoints.openai` and retry.
 

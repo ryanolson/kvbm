@@ -36,7 +36,7 @@ use crate::{InstanceId, KvbmRuntime};
 pub(in super::super) struct CdFoundation {
     pub(in super::super) hub: Arc<HubClient>,
     /// Hub's velo `InstanceId` (when the hub runs a velo participant) — the
-    /// CD client targets its prefill queue at this id.
+    /// CD client sends its prefill requests to this id.
     pub(in super::super) hub_velo_id: Option<InstanceId>,
     pub(in super::super) peer_resolver: Arc<HubPeerResolver>,
     pub(in super::super) session_factory: Arc<dyn SessionFactory>,
@@ -148,16 +148,10 @@ pub(in super::super) async fn wire_hub(
         .context("CD features require a KvbmRuntime built with a Velo (got bare Messenger only)")?
         .clone();
 
-    let hub = build_hub_client(&handshake.url)?;
-    hub.register_handlers_messenger(velo.messenger())
-        .context("installing hub velo handlers for CD/P2P registration")?;
+    let hub = build_hub_client(&handshake.url, handshake.control_port)?;
 
     let hub_velo_id = hub
-        .register_instance_with_features_and_runtime(
-            velo.peer_info(),
-            features,
-            handshake.runtime_summary.clone(),
-        )
+        .register(&velo, features, Some(handshake.runtime_summary.clone()))
         .await
         .with_context(|| {
             format!(

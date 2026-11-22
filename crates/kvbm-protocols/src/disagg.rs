@@ -301,6 +301,10 @@ pub struct RemotePrefillParams {
     /// the local PLH chain is bit-identical by construction.
     #[serde(default)]
     pub request: KvHashingRequestEnvelope,
+    /// The salt hash of the request's reuse scope. Prefill hashes and
+    /// registers its blocks with it. `None` is the global scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_salt: Option<u64>,
     /// xxh3_64 digest of decode's `[0, DNPT/block_size)` PLH slice.
     /// Prefill recomputes the digest from its own slot's PLH slice and
     /// asserts equality before accepting the dispatch. Defense-in-depth
@@ -326,6 +330,7 @@ impl RemotePrefillParams {
             decode_endpoint: None,
             num_provided_tokens: 0,
             request: KvHashingRequestEnvelope::default(),
+            scope_salt: None,
             expected_hash_digest: None,
             bundle: None,
         }
@@ -686,6 +691,10 @@ pub struct RemotePrefillRequest {
     pub num_provided_tokens: usize,
     #[serde(default)]
     pub request: KvHashingRequestEnvelope,
+    /// The salt hash of the request's reuse scope. Prefill hashes and
+    /// registers its blocks with it. `None` is the global scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_salt: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_hash_digest: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -710,6 +719,7 @@ impl RemotePrefillRequest {
             decode_endpoint: self.decode_endpoint.clone(),
             num_provided_tokens: self.num_provided_tokens,
             request: self.request.clone(),
+            scope_salt: self.scope_salt,
             expected_hash_digest: self.expected_hash_digest,
             bundle: self.bundle.clone(),
         }
@@ -803,6 +813,7 @@ mod tests {
             token_ids: vec![1, 2, 3],
             num_provided_tokens: 48,
             request: KvHashingRequestEnvelope::default(),
+            scope_salt: Some(7),
             expected_hash_digest: Some(0xDEADBEEF),
             bundle: None,
         };
@@ -817,6 +828,7 @@ mod tests {
         assert_eq!(params.decode_endpoint, request.decode_endpoint);
         assert_eq!(params.num_provided_tokens, request.num_provided_tokens);
         assert_eq!(params.request, request.request);
+        assert_eq!(params.scope_salt, request.scope_salt);
         assert_eq!(params.expected_hash_digest, request.expected_hash_digest);
     }
 
@@ -830,6 +842,7 @@ mod tests {
             token_ids: vec![1, 2, 3, 4, 5],
             num_provided_tokens: 4,
             request: KvHashingRequestEnvelope::default(),
+            scope_salt: None,
             expected_hash_digest: None,
             bundle: None,
         }
@@ -989,6 +1002,7 @@ mod tests {
             decode_endpoint: None,
             num_provided_tokens: 48,
             request: KvHashingRequestEnvelope::default(),
+            scope_salt: None,
             expected_hash_digest: Some(0x1234_5678_9ABC_DEF0),
             bundle: None,
         });

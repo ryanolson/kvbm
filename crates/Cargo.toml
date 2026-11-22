@@ -58,9 +58,11 @@ dynamo-tokens = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "6eb009
 dynamo-kv-router = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "6eb009fb929e50ef4cadbc5635f39ab22a4716f2" }
 dynamo-kv-hashing = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "6eb009fb929e50ef4cadbc5635f39ab22a4716f2" }
 
-# velo (registry — 0.4.1 / 0.2.0 are published on crates.io)
-velo     = { version = "0.4.1" }
-velo-ext = { version = "0.2.0" }
+# velo, from one git tag: velo-hub is not on crates.io, and a crates.io velo
+# beside the git velo-hub would build two copies of the velo types.
+velo     = { git = "https://github.com/ai-dynamo/velo.git", tag = "v0.21.0" }
+velo-ext = { git = "https://github.com/ai-dynamo/velo.git", tag = "v0.21.0" }
+velo-hub = { git = "https://github.com/ai-dynamo/velo.git", tag = "v0.21.0" }
 
 # External dependencies (copied verbatim from dynamo root [workspace.dependencies])
 anyhow = { version = "1" }
@@ -84,8 +86,9 @@ hyper-util = { version = "=0.1.17" }
 indexmap = { version = "2" }
 libc = { version = "0.2" }
 libloading = "0.8.9"
-# nixl-sys comes from the public ai-dynamo/nixl branch rhino-main.
-nixl-sys = { version = "=1.6.0", git = "https://github.com/ai-dynamo/nixl.git", rev = "1b9b58e43b6cdbccc5a39521327e70233e3059cb" }
+# nixl-sys is NIXL 1.4.1 plus the deregistration and compiler fixes, the same
+# rev as Rhino. TEMP-PIN: move to the public ai-dynamo/nixl branch once pushed.
+nixl-sys = { version = "=1.4.1", git = "https://github.com/NVIDIA-dev/warnold-nixl.git", rev = "a08e289bf065f0bf37c774c4a5c01d9f951a571e" }
 oneshot = { version = "0.1.13", features = ["std", "async"] }
 parking_lot = "0.12.5"
 prometheus = { version = "0.14" }

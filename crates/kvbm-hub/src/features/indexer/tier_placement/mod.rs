@@ -25,13 +25,13 @@
 //!
 //! # Why this is a sub-module of `indexer`, not its own feature
 //!
-//! A top-level `FeatureManager` would cost a [`FeatureKey`] variant, a
+//! A top-level extension would cost a [`FeatureKey`] variant, a
 //! [`Feature`] payload variant, CLI/registration/dependency-closure wiring —
 //! and would still need its own copy of the owner-credential and
 //! [`RegistrationEpoch`] machinery. Everything the projection needs,
 //! [`IndexerManager`] already owns: owner credentials and epochs (through
 //! [`BundleDirectory`]), `on_unregister` parity, the registered-instance set,
-//! and the `/v1/features/indexer` namespace.
+//! and the `/v1/ext/indexer` namespace.
 //!
 //! [`FeatureKey`]: crate::protocol::FeatureKey
 //! [`Feature`]: crate::protocol::Feature

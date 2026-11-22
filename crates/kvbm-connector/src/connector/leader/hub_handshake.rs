@@ -3,7 +3,7 @@
 
 //! Hub handshake.
 //!
-//! When `leader.hub` is configured, the connector pulls `GET {url}/v1/config`
+//! When `leader.hub` is configured, the connector pulls `GET {url}/v1/ext/kvbm/config`
 //! once at startup, resolves which hub features it will participate in, and
 //! builds the must-match [`RuntimeConfigSummary`] it registers with.
 //!
@@ -61,6 +61,8 @@ const AUTO_COREGISTERED_DEPS: &[(FeatureKey, FeatureKey)] =
 pub struct HubHandshake {
     /// Resolved hub base URL (from `leader.hub.url`).
     pub url: String,
+    /// Hub control port (from `leader.hub.control_port`).
+    pub control_port: u16,
     /// Effective connector-level features (a subset of [`CONNECTOR_CAPS`]).
     pub effective: HashSet<FeatureKey>,
     /// KV-index ingest transport — `Some` iff Indexer is effective and local
@@ -170,9 +172,10 @@ pub async fn resolve(
             if explicit {
                 return Err(e);
             }
-            tracing::warn!(hub = %hub.url, error = %e, "hub /v1/config unavailable; hub features disabled");
+            tracing::warn!(hub = %hub.url, error = %e, "hub /v1/ext/kvbm/config unavailable; hub features disabled");
             return Ok(HubHandshake {
                 url: hub.url.clone(),
+                control_port: hub.control_port,
                 effective: HashSet::new(),
                 indexer_transport: None,
                 runtime_summary,
@@ -237,7 +240,7 @@ pub async fn resolve(
             .collect()
     };
 
-    // Validate each candidate: its dependencies are enabled on the hub, a
+    // Validate each candidate: a
     // disagg role is present for CD, and its must-match fields agree with the
     // hub primary. Any of these would otherwise be rejected at registration —
     // which must NOT fail startup in auto mode. So drop the feature (auto) or
@@ -245,15 +248,7 @@ pub async fn resolve(
     let primary = &aggregate.primary;
     let mut effective: HashSet<FeatureKey> = HashSet::new();
     for key in candidates {
-        match unsatisfiable(
-            &aggregate,
-            key,
-            &enabled,
-            &runtime_summary,
-            primary,
-            disagg,
-            &caps,
-        ) {
+        match unsatisfiable(&aggregate, key, &runtime_summary, primary, disagg, &caps) {
             None => {
                 effective.insert(key);
             }
@@ -285,6 +280,7 @@ pub async fn resolve(
 
     Ok(HubHandshake {
         url: hub.url.clone(),
+        control_port: hub.control_port,
         effective,
         indexer_transport,
         runtime_summary,
@@ -292,7 +288,11 @@ pub async fn resolve(
 }
 
 async fn fetch_aggregate(hub_url: &str) -> Result<HubConfigResponse> {
-    let url = format!("{}/v1/config", hub_url.trim_end_matches('/'));
+    let url = format!(
+        "{}{}",
+        hub_url.trim_end_matches('/'),
+        kvbm_hub::protocol::paths::HUB_CONFIG
+    );
     let client = reqwest::Client::new();
     let resp = client
         .get(&url)
@@ -305,7 +305,7 @@ async fn fetch_aggregate(hub_url: &str) -> Result<HubConfigResponse> {
     }
     resp.json::<HubConfigResponse>()
         .await
-        .context("decoding hub /v1/config")
+        .context("decoding hub /v1/ext/kvbm/config")
 }
 
 /// Returns `Some(reason)` when the connector's `summary` disagrees with the hub
@@ -364,20 +364,11 @@ fn required_with_deps(aggregate: &HubConfigResponse, key: FeatureKey) -> Feature
 fn unsatisfiable(
     aggregate: &HubConfigResponse,
     key: FeatureKey,
-    enabled: &HashSet<FeatureKey>,
     summary: &RuntimeConfigSummary,
     primary: &PrimaryConfig,
     disagg: Option<&DisaggConfig>,
     _caps: &WorkerCapabilities,
 ) -> Option<String> {
-    // Every (transitive) dependency must be enabled on the hub — they are
-    // co-registered (e.g. P2P with ConditionalDisagg) and the hub rejects a
-    // declared feature whose manager is absent.
-    for dep in transitive_deps(aggregate, key) {
-        if !enabled.contains(&dep) {
-            return Some(format!("dependency {dep} is not enabled on the hub"));
-        }
-    }
     // ConditionalDisagg needs a per-instance role.
     if key == FeatureKey::ConditionalDisagg && disagg.is_none() {
         return Some("requires a `disagg` role but none is configured".to_string());
@@ -401,22 +392,6 @@ fn unsatisfiable(
     }
     // Must-match fields (folding in dependency requirements) must agree.
     must_match_mismatch(aggregate, key, summary, primary)
-}
-
-/// Transitive dependency closure of `key` (excluding `key` itself).
-fn transitive_deps(aggregate: &HubConfigResponse, key: FeatureKey) -> HashSet<FeatureKey> {
-    let mut seen: HashSet<FeatureKey> = HashSet::new();
-    let mut stack = vec![key];
-    while let Some(k) = stack.pop() {
-        if let Some(fd) = aggregate.features.iter().find(|f| f.key == k) {
-            for dep in &fd.dependencies {
-                if seen.insert(*dep) {
-                    stack.push(*dep);
-                }
-            }
-        }
-    }
-    seen
 }
 
 /// BFS for the first transitive dep of `key` that is not in `requested`.
@@ -548,8 +523,8 @@ mod tests {
 
     use kvbm_config::DisaggregationRole;
     use kvbm_hub::{
-        ConditionalDisaggManager, FeatureManager, HubServer, IndexerManager, P2pManager,
-        PrefillRouterManager, PrimaryConfig, SelectorConfig,
+        ConditionalDisaggManager, HubServer, IndexerManager, P2pManager, PrefillRouterManager,
+        PrimaryConfig, SelectorConfig,
     };
 
     const BS: usize = 16;
@@ -567,12 +542,10 @@ mod tests {
                 ..Default::default()
             });
         if features.contains(&"p2p") {
-            b = b.add_feature_manager(Arc::new(P2pManager::new()) as Arc<dyn FeatureManager>);
+            b = b.extension(Arc::new(P2pManager::new()));
         }
         if features.contains(&"disagg") {
-            b = b.add_feature_manager(
-                Arc::new(ConditionalDisaggManager::new()) as Arc<dyn FeatureManager>
-            );
+            b = b.extension(Arc::new(ConditionalDisaggManager::new()));
         }
         if features.contains(&"indexer") {
             let kv = IndexerManager::new(
@@ -582,14 +555,14 @@ mod tests {
                 Some("127.0.0.1".to_string()),
             )
             .unwrap();
-            b = b.add_feature_manager(Arc::new(kv) as Arc<dyn FeatureManager>);
+            b = b.extension(Arc::new(kv));
         }
         if features.contains(&"prefill_router") {
             let router = PrefillRouterManager::new(SelectorConfig {
                 per_worker_concurrency: 4,
                 block_size: BS,
             });
-            b = b.add_feature_manager(router as Arc<dyn FeatureManager>);
+            b = b.extension(router);
         }
         b.serve().await.unwrap()
     }
@@ -598,6 +571,7 @@ mod tests {
         LeaderHubConfig {
             url: url.to_string(),
             features: features.iter().map(|s| s.to_string()).collect(),
+            control_port: kvbm_config::DEFAULT_HUB_CONTROL_PORT,
         }
     }
 
@@ -626,6 +600,7 @@ mod tests {
     fn handshake_with(effective: &[FeatureKey]) -> HubHandshake {
         HubHandshake {
             url: "http://hub".to_string(),
+            control_port: kvbm_config::DEFAULT_HUB_CONTROL_PORT,
             effective: effective.iter().copied().collect(),
             indexer_transport: None,
             runtime_summary: RuntimeConfigSummary {
@@ -1026,25 +1001,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn explicit_feature_or_dep_not_offered_fails() {
+    async fn explicit_feature_not_offered_fails() {
         // Hub offers only indexer → requesting disagg fails.
         let server = start_hub(&["indexer"]).await;
-        let url = format!("http://{}", server.discovery_addr());
-        assert!(
-            resolve(
-                &hub_cfg(&url, &["disagg"]),
-                BS,
-                BlockLayoutMode::Operational,
-                Some(&disagg()),
-                WorkerCapabilities::default(),
-            )
-            .await
-            .is_err()
-        );
-        server.shutdown().await.unwrap();
-
-        // Hub offers disagg but not its p2p dependency → fails.
-        let server = start_hub(&["disagg"]).await;
         let url = format!("http://{}", server.discovery_addr());
         assert!(
             resolve(
@@ -1096,28 +1055,6 @@ mod tests {
             .is_err()
         );
 
-        server.shutdown().await.unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn auto_drops_cd_when_p2p_dependency_missing() {
-        // Hub offers disagg but not its p2p dependency. Auto mode
-        // must drop CD (best-effort), never hard-fail startup.
-        let server = start_hub(&["disagg"]).await;
-        let url = format!("http://{}", server.discovery_addr());
-        let h = resolve(
-            &hub_cfg(&url, &[]),
-            BS,
-            BlockLayoutMode::Operational,
-            Some(&disagg()),
-            WorkerCapabilities::default(),
-        )
-        .await
-        .unwrap();
-        assert!(
-            !h.has(FeatureKey::ConditionalDisagg),
-            "CD must be dropped when its p2p dep is missing"
-        );
         server.shutdown().await.unwrap();
     }
 

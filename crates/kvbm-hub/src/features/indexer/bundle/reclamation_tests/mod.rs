@@ -10,12 +10,11 @@ use kvbm_protocols::cache_manifest::{
 };
 use velo_ext::InstanceId;
 
-use super::{BundleDirectory, BundleDirectoryError, test_registration_epoch};
+use super::{BundleDirectory, BundleDirectoryError, CredentialAuthorized, test_registration_epoch};
 use crate::features::indexer::protocol::{
     BundleAdvertisementRecord, BundleInvalidateRequest, BundlePublishRequest,
     BundleQueryMissReason, BundleQueryOutcome, BundleQueryRequest,
 };
-use crate::protocol::MutationCredential;
 
 const RESOURCE: LogicalResourceId = LogicalResourceId(10);
 
@@ -58,7 +57,7 @@ fn advertisement(
 ) -> BundlePublishRequest {
     let key = key(manifest, boundary_tokens);
     BundlePublishRequest {
-        credential: MutationCredential::for_test_owner(owner),
+        credential: super::test_owner_credential(owner),
         advertisement: BundleAdvertisementRecord {
             key,
             generation,
@@ -76,7 +75,7 @@ fn advertisement(
 
 fn register_owner(directory: &BundleDirectory, owner: InstanceId) {
     directory
-        .register_owner(owner, MutationCredential::for_test_owner(owner))
+        .commit_owner_credential(owner, super::test_owner_credential(owner))
         .unwrap();
 }
 
@@ -118,10 +117,10 @@ fn query_physically_reclaims_expired_advertisements_for_registered_owners() {
     register_owner(&directory, expired_owner);
     register_owner(&directory, live_owner);
     directory
-        .publish(advertisement(expired_owner, manifest, 8, 1, 10))
+        .publish_by_credential(advertisement(expired_owner, manifest, 8, 1, 10))
         .unwrap();
     directory
-        .publish(advertisement(live_owner, manifest, 16, 1, 100))
+        .publish_by_credential(advertisement(live_owner, manifest, 16, 1, 100))
         .unwrap();
 
     now.store(11, Ordering::Release);
@@ -142,7 +141,7 @@ fn query_physically_reclaims_expired_advertisements_for_registered_owners() {
             .state
             .read()
             .unwrap()
-            .owner_credentials
+            .owner_epochs
             .contains_key(&expired_owner),
         "expiration must reclaim the advertisement without deregistering its owner"
     );
@@ -157,12 +156,12 @@ fn expiration_classification_survives_unrelated_mutation_pruning() {
     let expired_key = key(manifest, 8);
     register_owner(&directory, owner);
     directory
-        .publish(advertisement(owner, manifest, 8, 1, 10))
+        .publish_by_credential(advertisement(owner, manifest, 8, 1, 10))
         .unwrap();
 
     now.store(11, Ordering::Release);
     directory
-        .publish(advertisement(owner, manifest, 16, 1, 100))
+        .publish_by_credential(advertisement(owner, manifest, 16, 1, 100))
         .expect("an unrelated publication should reclaim the expired key");
 
     assert_eq!(
@@ -183,7 +182,7 @@ fn mutation_time_pruning_bounds_unique_key_advertisements() {
     for step in 1..=64 {
         now.store(step, Ordering::Release);
         directory
-            .publish(advertisement(owner, manifest, step * 4, 1, step + 1))
+            .publish_by_credential(advertisement(owner, manifest, step * 4, 1, step + 1))
             .unwrap();
     }
 
@@ -213,10 +212,10 @@ fn stale_expiration_does_not_remove_a_refreshed_generation() {
     let bundle_key = key(manifest, 8);
     register_owner(&directory, owner);
     directory
-        .publish(advertisement(owner, manifest, 8, 7, 10))
+        .publish_by_credential(advertisement(owner, manifest, 8, 7, 10))
         .unwrap();
     directory
-        .publish(advertisement(owner, manifest, 8, 8, 100))
+        .publish_by_credential(advertisement(owner, manifest, 8, 8, 100))
         .unwrap();
 
     now.store(11, Ordering::Release);
@@ -238,15 +237,15 @@ fn expiration_pruning_preserves_unexpired_generation_tombstones() {
     let retired_key = key(manifest, 8);
     register_owner(&directory, owner);
     directory
-        .publish(advertisement(owner, manifest, 8, 7, 100))
+        .publish_by_credential(advertisement(owner, manifest, 8, 7, 100))
         .unwrap();
     directory
-        .publish(advertisement(owner, manifest, 16, 1, 10))
+        .publish_by_credential(advertisement(owner, manifest, 16, 1, 10))
         .unwrap();
     assert!(
         directory
-            .invalidate(BundleInvalidateRequest {
-                credential: MutationCredential::for_test_owner(owner),
+            .invalidate_by_credential(BundleInvalidateRequest {
+                credential: super::test_owner_credential(owner),
                 key: retired_key,
                 generation: 7,
                 owner,
@@ -257,11 +256,11 @@ fn expiration_pruning_preserves_unexpired_generation_tombstones() {
 
     now.store(11, Ordering::Release);
     directory
-        .publish(advertisement(owner, manifest, 24, 1, 100))
+        .publish_by_credential(advertisement(owner, manifest, 24, 1, 100))
         .unwrap();
     assert_eq!(stored_advertisement_count(&directory), 1);
     assert_eq!(
-        directory.publish(advertisement(owner, manifest, 8, 7, 200)),
+        directory.publish_by_credential(advertisement(owner, manifest, 8, 7, 200)),
         Err(BundleDirectoryError::StaleGeneration {
             current: 7,
             attempted: 7,

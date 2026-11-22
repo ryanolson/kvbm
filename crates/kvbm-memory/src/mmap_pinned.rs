@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! `mmap` + `cuMemHostRegister` host pinned storage with NUMA `mbind` and
-//! best-effort hugepages.
+//! `mmap` + `cuMemHostRegister` host pinned storage with optional NUMA
+//! `mbind` and best-effort hugepages.
 //!
 //! Companion to [`crate::pinned::PinnedStorage`] (which uses `cuMemHostAlloc`,
 //! no hugepage / mbind control). This path exists because hugepage-backed
@@ -11,14 +11,17 @@
 //! kvbm-service host-memory pool; use [`crate::PinnedStorage`] for legacy
 //! per-GPU allocations.
 //!
-//! Pipeline per allocation (caller's thread should already be pinned to a
-//! CPU in the target node's cpulist for correct first-touch):
+//! Pipeline per allocation. For an allocation with a target node, the
+//! caller's thread should already be pinned to a CPU in the cpulist of that
+//! node for correct first-touch:
 //!
 //! 1. `mmap(NULL, len, RW, MAP_PRIVATE | MAP_ANON [| MAP_HUGETLB|MAP_HUGE_2MB])`
 //!    — try explicit hugetlb, fall back per [`HugepageMode`].
 //! 2. `mbind(addr, len, MPOL_BIND, nodemask({target}), …, MPOL_MF_STRICT)`
 //!    — belt-and-suspenders against the kernel migrating away from the
-//!    target node, even after first-touch lands the page locally.
+//!    target node, even after first-touch lands the page locally. An
+//!    allocation without a target node skips this step, and the OS places
+//!    the pages ([`NumaPlacementPolicy::OsDefault`]).
 //! 3. First-touch one byte per (huge)page from the calling thread.
 //! 4. `cuMemHostRegister(ptr, len, DEVICEMAP)` to pin + map to CUDA.
 //!
@@ -65,6 +68,15 @@ pub enum HugepageTier {
     None,
 }
 
+/// The NUMA placement policy that one slab used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NumaPlacementPolicy {
+    /// `mbind(MPOL_BIND)` bound the pages to this node.
+    Bound(NumaNode),
+    /// No `mbind`. The OS placed the pages with its default policy.
+    OsDefault,
+}
+
 /// Options for [`MmappedPinnedStorage::allocate`].
 #[derive(Debug, Clone)]
 pub struct MmappedPinnedOptions {
@@ -77,7 +89,11 @@ pub struct MmappedPinnedOptions {
     /// `crate::resources::NumaNodeRole::HostCpu`, gated behind the
     /// `host-pools` feature). `mbind(MPOL_BIND)` is
     /// applied against this node.
-    pub numa_node: NumaNode,
+    ///
+    /// `None` skips the `mbind`. The OS then places the pages with its
+    /// default policy. Use `None` when the node is unknown or when NUMA
+    /// placement is disabled.
+    pub numa_node: Option<NumaNode>,
     /// Hugepage strategy.
     pub hugepage_mode: HugepageMode,
     /// Page size to request from the explicit hugetlb pool. `None` => use
@@ -89,7 +105,8 @@ pub struct MmappedPinnedOptions {
 }
 
 /// `mmap`-backed host pinned memory registered with CUDA via
-/// `cuMemHostRegister`, with NUMA placement enforced by `mbind`.
+/// `cuMemHostRegister`. `mbind` enforces the NUMA placement when the
+/// allocation has a target node.
 #[derive(Debug)]
 pub struct MmappedPinnedStorage {
     // RAII guard — only used for its Drop impl (cuMemHostUnregister).
@@ -99,7 +116,7 @@ pub struct MmappedPinnedStorage {
     register_guard: HostRegisterGuard,
     mmap_guard: MmapGuard,
     hugepage_tier: HugepageTier,
-    numa_node: NumaNode,
+    numa_policy: NumaPlacementPolicy,
     ctx: Arc<CudaContext>,
 }
 
@@ -107,10 +124,12 @@ unsafe impl Send for MmappedPinnedStorage {}
 unsafe impl Sync for MmappedPinnedStorage {}
 
 impl MmappedPinnedStorage {
-    /// Allocate one slab according to `opt`. **Caller must already be on a
-    /// CPU in `opt.numa_node`'s cpulist** so the first-touch policy lands
-    /// pages on the right node. The [`crate::numa::worker_pool::NumaWorkerPool`]
-    /// is the production caller and handles thread pinning.
+    /// Allocate one slab according to `opt`. If `opt.numa_node` is a node,
+    /// **the caller must already be on a CPU in the cpulist of that node** so
+    /// the first-touch policy lands pages on the right node. The
+    /// [`crate::numa::worker_pool::NumaWorkerPool`] is the production caller
+    /// and handles thread pinning. If `opt.numa_node` is `None`, the function
+    /// does no `mbind` and the OS places the pages.
     pub fn allocate(opt: MmappedPinnedOptions) -> Result<Self> {
         if opt.size == 0 {
             return Err(StorageError::AllocationFailed(
@@ -128,12 +147,18 @@ impl MmappedPinnedStorage {
         let page_size = hugepage_size.unwrap_or_else(default_hugepage_size);
         let (mmap_guard, hugepage_tier) = mmap_with_tier(size, page_size, hugepage_mode)?;
 
-        mbind_to_node(mmap_guard.ptr, mmap_guard.len, numa_node).map_err(|e| {
-            StorageError::AllocationFailed(format!(
-                "mbind(MPOL_BIND) on node {}: {}",
-                numa_node.0, e
-            ))
-        })?;
+        let numa_policy = match numa_node {
+            Some(node) => {
+                mbind_to_node(mmap_guard.ptr, mmap_guard.len, node).map_err(|e| {
+                    StorageError::AllocationFailed(format!(
+                        "mbind(MPOL_BIND) on node {}: {}",
+                        node.0, e
+                    ))
+                })?;
+                NumaPlacementPolicy::Bound(node)
+            }
+            None => NumaPlacementPolicy::OsDefault,
+        };
 
         first_touch(mmap_guard.ptr, mmap_guard.len, hugepage_tier);
 
@@ -146,7 +171,7 @@ impl MmappedPinnedStorage {
             register_guard,
             mmap_guard,
             hugepage_tier,
-            numa_node,
+            numa_policy,
             ctx,
         })
     }
@@ -171,9 +196,18 @@ impl MmappedPinnedStorage {
         self.hugepage_tier
     }
 
-    /// NUMA node the pages were bound to via `mbind(MPOL_BIND)`.
-    pub fn numa_node(&self) -> NumaNode {
-        self.numa_node
+    /// NUMA placement policy that this slab used.
+    pub fn numa_policy(&self) -> NumaPlacementPolicy {
+        self.numa_policy
+    }
+
+    /// NUMA node the pages were bound to via `mbind(MPOL_BIND)`. `None` when
+    /// the OS placed the pages.
+    pub fn numa_node(&self) -> Option<NumaNode> {
+        match self.numa_policy {
+            NumaPlacementPolicy::Bound(node) => Some(node),
+            NumaPlacementPolicy::OsDefault => None,
+        }
     }
 
     /// CUDA context used for registration.
@@ -431,7 +465,8 @@ fn mbind_to_node(addr: usize, len: usize, node: NumaNode) -> std::result::Result
 }
 
 /// Touch one byte per page so first-touch lands pages on the calling
-/// thread's CPU's NUMA node. The caller pins the thread before invoking.
+/// thread's CPU's NUMA node. For a target node, the caller pins the thread
+/// before invoking.
 fn first_touch(addr: usize, len: usize, tier: HugepageTier) {
     let step = match tier {
         HugepageTier::Explicit { page_size } => page_size,
@@ -555,6 +590,31 @@ mod tests {
                 let v = std::ptr::read_volatile((g.ptr as *const u8).add(i));
                 assert_eq!(v, (i % 256) as u8);
             }
+        }
+    }
+
+    /// An allocation without a NUMA node does no `mbind`. The first-touch
+    /// and the CUDA host registration still occur.
+    #[cfg(feature = "testing-cuda")]
+    #[test]
+    fn allocate_without_numa_node_uses_os_default_policy() {
+        let storage = MmappedPinnedStorage::allocate(MmappedPinnedOptions {
+            size: 8192,
+            numa_node: None,
+            hugepage_mode: HugepageMode::Disabled,
+            hugepage_size: None,
+            ctx_device_id: 0,
+        })
+        .unwrap();
+
+        assert_eq!(storage.numa_policy(), NumaPlacementPolicy::OsDefault);
+        assert_eq!(storage.numa_node(), None);
+        assert_eq!(storage.hugepage_tier(), HugepageTier::None);
+        assert!(storage.mapped_len() >= 8192);
+        unsafe {
+            let ptr = storage.as_ptr() as *mut u8;
+            std::ptr::write_volatile(ptr, 0xA5);
+            assert_eq!(std::ptr::read_volatile(ptr), 0xA5);
         }
     }
 }

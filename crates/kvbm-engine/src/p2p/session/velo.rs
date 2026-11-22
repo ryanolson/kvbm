@@ -194,6 +194,10 @@ struct VeloSessionInner {
     /// Set when peer sends `Frame::Drained`. Discriminant for
     /// `PeerAvailable::Open` vs `Sealed` snapshots.
     peer_avail_drained: Mutex<bool>,
+    /// The fixed-state record that the peer sent.
+    peer_fixed_state: Mutex<Option<Vec<u8>>>,
+    /// Set when this side sends its fixed-state record.
+    fixed_state_sent: Mutex<bool>,
 
     // Pending pulls keyed by pull_id. The oneshot resolves with
     // `Ok(())` on inbound `PullComplete`; an abort path (`close()` or
@@ -346,6 +350,8 @@ impl VeloSession {
             peer_available: Mutex::new(BTreeMap::new()),
             peer_commits_closed: Mutex::new(false),
             peer_avail_drained: Mutex::new(false),
+            peer_fixed_state: Mutex::new(None),
+            fixed_state_sent: Mutex::new(false),
             pending_pulls: DashMap::new(),
             inbound_pulls: DashMap::new(),
             next_pull_id: AtomicU64::new(1),
@@ -546,6 +552,7 @@ fn frame_kind(frame: &Frame) -> &'static str {
         Frame::Available { .. } => "Available",
         Frame::VerifiedAvailable { .. } => "VerifiedAvailable",
         Frame::Drained => "Drained",
+        Frame::FixedState { .. } => "FixedState",
         Frame::Pull { .. } => "Pull",
         Frame::PullComplete { .. } => "PullComplete",
         Frame::PullAck { .. } => "PullAck",
@@ -778,6 +785,22 @@ fn dispatch_frame(inner: &Arc<VeloSessionInner>, frame: Frame, runtime: &Handle)
                 }
             }
             inner.avail_stream.push(AvailabilityDelta::Verified(blocks));
+        }
+        Frame::FixedState { state } => {
+            crate::engine_audit!(
+                "session_recv_fixed_state",
+                session_id = %session_id,
+                num_bytes = state.len()
+            );
+            let mut peer_fixed_state = inner.peer_fixed_state.lock();
+            if peer_fixed_state.is_some() {
+                tracing::error!(
+                    session_id = %session_id,
+                    "protocol violation: a second Frame::FixedState dropped"
+                );
+                return;
+            }
+            *peer_fixed_state = Some(state);
         }
         Frame::Drained => {
             crate::engine_audit!(
@@ -1270,6 +1293,27 @@ impl Session for VeloSession {
         } else {
             PeerCommitted::Open(v)
         }
+    }
+
+    fn send_fixed_state(&self, state: Vec<u8>) -> Result<()> {
+        crate::engine_audit!(
+            "session_send_fixed_state",
+            session_id = %self.inner.session_id,
+            num_bytes = state.len()
+        );
+        let mut sent = self.inner.fixed_state_sent.lock();
+        if *sent {
+            return Err(anyhow!(
+                "send_fixed_state: the session already sent its fixed state"
+            ));
+        }
+        self.enqueue_frame(Frame::FixedState { state })?;
+        *sent = true;
+        Ok(())
+    }
+
+    fn peer_fixed_state(&self) -> Option<Vec<u8>> {
+        self.inner.peer_fixed_state.lock().clone()
     }
 
     fn peer_available(&self) -> PeerAvailable {

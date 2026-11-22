@@ -9,12 +9,18 @@ use serde::{Deserialize, Serialize};
 ///
 /// The hub mints a fresh random value for every registration, including a
 /// same-`InstanceId` replacement. It is a public binding, not an authority:
-/// mutation credentials still authenticate directory writes.
+/// the hub registration credential still authenticates directory writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct RegistrationEpoch(uuid::Uuid);
 
 impl RegistrationEpoch {
+    /// Rebuild an epoch from its UUID, e.g. the hub lease's epoch.
+    #[must_use]
+    pub const fn from_uuid(value: uuid::Uuid) -> Self {
+        Self(value)
+    }
+
     /// Mint a fresh registration identity with UUID-v4 entropy.
     #[must_use]
     #[allow(clippy::new_without_default)] // random identity; a `Default` would hide a lifecycle mint.

@@ -19,8 +19,9 @@ tracing-subscriber = { workspace = true }
 
 
 # Velo (discovery trait, Velo facade, handlers, messenger-backed work queues)
-velo     = { workspace = true, features = ["queue-messenger"] }
+velo     = { workspace = true }
 velo-ext = { workspace = true }
+velo-hub = { workspace = true, features = ["server", "client"] }
 
 # KVBM
 kvbm-common    = { workspace = true }
@@ -94,6 +95,8 @@ path = "src/bin/kvbmctl.rs"
 required-features = ["kvbmctl"]
 
 [dev-dependencies]
+# Integration tests use the in-process `test_hub`.
+kvbm-hub           = { path = ".", features = ["test-support"] }
 tokio              = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
 tracing-subscriber = { workspace = true }
 # Used by the indexer find_blocks integration test to build real PLHs and seed

@@ -13,6 +13,9 @@ use std::sync::OnceLock;
 pub struct VeloWorkerClient {
     messenger: Arc<Messenger>,
     remote: InstanceId,
+    /// The worker of the remote process that this client drives. `None` is
+    /// the one worker of a process whose service has no worker id.
+    worker_id: Option<u64>,
     g1_handle: Arc<OnceLock<LayoutHandle>>,
     g2_handle: Arc<OnceLock<LayoutHandle>>,
     g3_handle: Arc<OnceLock<LayoutHandle>>,
@@ -53,6 +56,7 @@ impl VeloWorkerClient {
         dst_block_ids: Arc<[BlockId]>,
         options: TransferOptions,
     ) -> Result<TransferCompleteNotification> {
+        let worker_id = self.worker_id;
         if src == LogicalLayoutHandle::G2
             && dst == LogicalLayoutHandle::G1
             && self.local_onboard_requires_serialization(resource)
@@ -60,10 +64,6 @@ impl VeloWorkerClient {
         {
             anyhow::bail!("local collective transfer group is aborted: {reason}");
         }
-        // Create a single local event for this operation
-        let event = self.messenger.events().new_event()?;
-        let awaiter = self.messenger.events().awaiter(event.handle())?;
-
         // Convert to serializable options
         // TODO: Extract bounce buffer handle if present in options.bounce_buffer
         let options = SerializableTransferOptions {
@@ -72,6 +72,7 @@ impl VeloWorkerClient {
             bounce_buffer_handle: None,
             bounce_buffer_block_ids: None,
             metric_route: options.metric_route,
+            copy_engine: options.copy_engine.into(),
         };
 
         // Create the message
@@ -90,25 +91,49 @@ impl VeloWorkerClient {
         let velo = self.messenger.clone();
         let remote_instance = self.remote;
 
+        // The task sends the drain outcome of this operation to the receipt.
+        let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+
         // Use unary (not am_sync) to wait for transfer completion
         self.messenger.tracker().spawn_on(
             async move {
-                let result = velo
-                    .unary(handler_names::LOCAL_TRANSFER)?
-                    .raw_payload(bytes)
-                    .instance(remote_instance)
-                    .send()
-                    .await;
-
-                match result {
-                    Ok(_) => event.trigger(),
-                    Err(e) => event.poison(e.to_string()),
-                }
+                let handler = handler_names::scoped(handler_names::LOCAL_TRANSFER, worker_id);
+                let outcome = match velo.unary(&handler) {
+                    Ok(request) => {
+                        let reply = request
+                            .raw_payload(bytes)
+                            .instance(remote_instance)
+                            .send()
+                            .await;
+                        match reply {
+                            Ok(reply) => LocalTransferReply::decode(&reply),
+                            // The request can be with the worker, and the
+                            // worker can have an active copy. The outcome is
+                            // unknown.
+                            Err(error) => TransferDrainOutcome::Unproven(anyhow::anyhow!(
+                                "local transfer RPC has an unknown outcome: {error}"
+                            )),
+                        }
+                    }
+                    // The request did not leave this process.
+                    Err(error) => TransferDrainOutcome::DrainedWithError(anyhow::anyhow!(
+                        "local transfer RPC was not sent: {error}"
+                    )),
+                };
+                let _ = outcome_tx.send(outcome);
             },
             self.messenger.runtime(),
         );
 
-        Ok(TransferCompleteNotification::from_awaiter(awaiter))
+        Ok(TransferCompleteNotification::from_drain_future(
+            async move {
+                outcome_rx.await.unwrap_or_else(|_| {
+                    TransferDrainOutcome::Unproven(anyhow::anyhow!(
+                        "local transfer RPC task stopped before it reported an outcome"
+                    ))
+                })
+            },
+        ))
     }
 }
 
@@ -120,6 +145,7 @@ impl WorkerTransfers for VeloWorkerClient {
     }
 
     fn abort_local_collectives(&self, reason: String) -> Result<TransferCompleteNotification> {
+        let worker_id = self.worker_id;
         let _ = self.collective_failure.set(reason.clone());
         let event = self.messenger.events().new_event()?;
         let awaiter = self.messenger.events().awaiter(event.handle())?;
@@ -132,7 +158,10 @@ impl WorkerTransfers for VeloWorkerClient {
         self.messenger.tracker().spawn_on(
             async move {
                 let result = velo
-                    .unary(handler_names::ABORT_LOCAL_COLLECTIVES)?
+                    .unary(&handler_names::scoped(
+                        handler_names::ABORT_LOCAL_COLLECTIVES,
+                        worker_id,
+                    ))?
                     .raw_payload(bytes)
                     .instance(remote)
                     .send()
@@ -185,6 +214,7 @@ impl WorkerTransfers for VeloWorkerClient {
         dst_block_ids: Arc<[BlockId]>,
         options: TransferOptions,
     ) -> Result<TransferCompleteNotification> {
+        let worker_id = self.worker_id;
         let event = self.messenger.events().new_event()?;
         let awaiter = self.messenger.events().awaiter(event.handle())?;
 
@@ -194,6 +224,7 @@ impl WorkerTransfers for VeloWorkerClient {
             bounce_buffer_handle: None,
             bounce_buffer_block_ids: None,
             metric_route: options.metric_route,
+            copy_engine: options.copy_engine.into(),
         };
 
         let message = RemoteOnboardMessage {
@@ -212,7 +243,10 @@ impl WorkerTransfers for VeloWorkerClient {
             async move {
                 // Use unary instead of am_sync for explicit response handling
                 let result = velo
-                    .unary(handler_names::REMOTE_ONBOARD)?
+                    .unary(&handler_names::scoped(
+                        handler_names::REMOTE_ONBOARD,
+                        worker_id,
+                    ))?
                     .raw_payload(bytes)
                     .instance(remote_instance)
                     .send()
@@ -236,6 +270,7 @@ impl WorkerTransfers for VeloWorkerClient {
         dst: RemoteDescriptor,
         options: TransferOptions,
     ) -> Result<TransferCompleteNotification> {
+        let worker_id = self.worker_id;
         let event = self.messenger.events().new_event()?;
         let awaiter = self.messenger.events().awaiter(event.handle())?;
 
@@ -245,6 +280,7 @@ impl WorkerTransfers for VeloWorkerClient {
             bounce_buffer_handle: None,
             bounce_buffer_block_ids: None,
             metric_route: options.metric_route,
+            copy_engine: options.copy_engine.into(),
         };
 
         let message = RemoteOffloadMessage {
@@ -263,7 +299,10 @@ impl WorkerTransfers for VeloWorkerClient {
             async move {
                 // Use unary instead of am_sync for explicit response handling
                 let result = velo
-                    .unary(handler_names::REMOTE_OFFLOAD)?
+                    .unary(&handler_names::scoped(
+                        handler_names::REMOTE_OFFLOAD,
+                        worker_id,
+                    ))?
                     .raw_payload(bytes)
                     .instance(remote_instance)
                     .send()
@@ -285,6 +324,7 @@ impl WorkerTransfers for VeloWorkerClient {
         instance_id: InstanceId,
         metadata: Vec<SerializedLayout>,
     ) -> Result<ConnectRemoteResponse> {
+        let worker_id = self.worker_id;
         // Serialize metadata to bytes (SerializedLayout uses bincode internally)
         let serialized_metadata: Vec<Vec<u8>> =
             metadata.iter().map(|m| m.as_bytes().to_vec()).collect();
@@ -307,7 +347,10 @@ impl WorkerTransfers for VeloWorkerClient {
         self.messenger.tracker().spawn_on(
             async move {
                 let result = velo
-                    .unary(handler_names::CONNECT_REMOTE)?
+                    .unary(&handler_names::scoped(
+                        handler_names::CONNECT_REMOTE,
+                        worker_id,
+                    ))?
                     .raw_payload(bytes)
                     .instance(remote_instance)
                     .send()
@@ -342,6 +385,7 @@ impl WorkerTransfers for VeloWorkerClient {
         dst_block_ids: Arc<[BlockId]>,
         options: TransferOptions,
     ) -> Result<TransferCompleteNotification> {
+        let worker_id = self.worker_id;
         let message = ExecuteRemoteOnboardForInstanceMessage {
             instance_id,
             remote_logical_type,
@@ -362,7 +406,10 @@ impl WorkerTransfers for VeloWorkerClient {
         self.messenger.tracker().spawn_on(
             async move {
                 let result = velo
-                    .unary(handler_names::REMOTE_ONBOARD_FOR_INSTANCE)?
+                    .unary(&handler_names::scoped(
+                        handler_names::REMOTE_ONBOARD_FOR_INSTANCE,
+                        worker_id,
+                    ))?
                     .raw_payload(bytes)
                     .instance(remote_instance)
                     .send()
@@ -383,6 +430,7 @@ impl WorkerTransfers for VeloWorkerClient {
         &self,
         plan: crate::leader::dispatch::WorkerPullPlan,
     ) -> Result<TransferCompleteNotification> {
+        let worker_id = self.worker_id;
         let message = RemotePullPlanMessage { plan };
         let bytes = Bytes::from(serde_json::to_vec(&message)?);
 
@@ -395,7 +443,10 @@ impl WorkerTransfers for VeloWorkerClient {
         self.messenger.tracker().spawn_on(
             async move {
                 let result = velo
-                    .unary(handler_names::REMOTE_PULL_PLAN)?
+                    .unary(&handler_names::scoped(
+                        handler_names::REMOTE_PULL_PLAN,
+                        worker_id,
+                    ))?
                     .raw_payload(bytes)
                     .instance(remote_instance)
                     .send()
@@ -422,6 +473,7 @@ impl WorkerTransfers for VeloWorkerClient {
         dst_block_ids: Arc<[BlockId]>,
         options: TransferOptions,
     ) -> Result<TransferCompleteNotification> {
+        let worker_id = self.worker_id;
         let message = ExecuteRemoteOnboardForInstanceRankMessage {
             instance_id,
             remote_rank,
@@ -442,7 +494,10 @@ impl WorkerTransfers for VeloWorkerClient {
         self.messenger.tracker().spawn_on(
             async move {
                 let result = velo
-                    .unary(handler_names::REMOTE_ONBOARD_FOR_INSTANCE_RANK)?
+                    .unary(&handler_names::scoped(
+                        handler_names::REMOTE_ONBOARD_FOR_INSTANCE_RANK,
+                        worker_id,
+                    ))?
                     .raw_payload(bytes)
                     .instance(remote_instance)
                     .send()
@@ -466,6 +521,7 @@ impl Worker for VeloWorkerClient {
         resource: LogicalResourceId,
         block_ids: Vec<BlockId>,
     ) -> BoxFuture<'static, Result<Vec<PayloadDigest>>> {
+        let worker_id = self.worker_id;
         let message = HostPayloadDigestsMessage {
             resource,
             block_ids,
@@ -478,7 +534,10 @@ impl Worker for VeloWorkerClient {
         let remote = self.remote;
         Box::pin(async move {
             let response = messenger
-                .unary(handler_names::HOST_PAYLOAD_DIGESTS)?
+                .unary(&handler_names::scoped(
+                    handler_names::HOST_PAYLOAD_DIGESTS,
+                    worker_id,
+                ))?
                 .raw_payload(bytes)
                 .instance(remote)
                 .send()
@@ -500,10 +559,14 @@ impl Worker for VeloWorkerClient {
     }
 
     fn export_metadata(&self) -> Result<SerializedLayoutResponse> {
+        let worker_id = self.worker_id;
         // Use unary (not typed_unary) to avoid JSON serialization of bincode data
         let unary_result = self
             .messenger
-            .unary(handler_names::EXPORT_METADATA)?
+            .unary(&handler_names::scoped(
+                handler_names::EXPORT_METADATA,
+                worker_id,
+            ))?
             .instance(self.remote)
             .send();
 
@@ -517,10 +580,14 @@ impl Worker for VeloWorkerClient {
     }
 
     fn import_metadata(&self, metadata: SerializedLayout) -> Result<ImportMetadataResponse> {
+        let worker_id = self.worker_id;
         // Use raw_payload to avoid JSON serialization of bincode data
         let unary_result = self
             .messenger
-            .unary(handler_names::IMPORT_METADATA)?
+            .unary(&handler_names::scoped(
+                handler_names::IMPORT_METADATA,
+                worker_id,
+            ))?
             .raw_payload(Bytes::from(metadata.as_bytes().to_vec()))
             .instance(self.remote)
             .send();
@@ -540,9 +607,27 @@ impl Worker for VeloWorkerClient {
 impl VeloWorkerClient {
     /// Create a new VeloWorkerClient for communicating with a remote worker.
     pub fn new(messenger: Arc<Messenger>, remote: InstanceId) -> Self {
+        Self::with_worker_id(messenger, remote, None)
+    }
+
+    /// A client of worker `worker_id` in the remote process. The process
+    /// serves each of its workers with
+    /// [`VeloWorkerService::new_for_worker`](super::VeloWorkerService::new_for_worker)
+    /// on one messenger, and the worker id selects the handlers of one of
+    /// them.
+    pub fn new_for_worker(messenger: Arc<Messenger>, remote: InstanceId, worker_id: u64) -> Self {
+        Self::with_worker_id(messenger, remote, Some(worker_id))
+    }
+
+    fn with_worker_id(
+        messenger: Arc<Messenger>,
+        remote: InstanceId,
+        worker_id: Option<u64>,
+    ) -> Self {
         Self {
             messenger,
             remote,
+            worker_id,
             g1_handle: Arc::new(OnceLock::new()),
             g2_handle: Arc::new(OnceLock::new()),
             g3_handle: Arc::new(OnceLock::new()),
@@ -652,6 +737,7 @@ impl ObjectBlockOps for VeloWorkerClient {
         &self,
         keys: Vec<SequenceHash>,
     ) -> BoxFuture<'static, Vec<(SequenceHash, Option<usize>)>> {
+        let worker_id = self.worker_id;
         let message = ObjectHasBlocksMessage { keys: keys.clone() };
         let bytes = match serde_json::to_vec(&message) {
             Ok(b) => Bytes::from(b),
@@ -665,7 +751,10 @@ impl ObjectBlockOps for VeloWorkerClient {
 
         Box::pin(async move {
             let result = velo
-                .unary(handler_names::OBJECT_HAS_BLOCKS)
+                .unary(&handler_names::scoped(
+                    handler_names::OBJECT_HAS_BLOCKS,
+                    worker_id,
+                ))
                 .ok()
                 .map(|u| u.raw_payload(bytes).instance(remote).send());
 
@@ -690,6 +779,7 @@ impl ObjectBlockOps for VeloWorkerClient {
         src_layout: LogicalLayoutHandle,
         block_ids: Vec<BlockId>,
     ) -> BoxFuture<'static, Vec<Result<SequenceHash, SequenceHash>>> {
+        let worker_id = self.worker_id;
         // For remote workers, we send the logical layout handle - they resolve it locally
         let message = ObjectPutBlocksMessage {
             keys: keys.clone(),
@@ -706,7 +796,10 @@ impl ObjectBlockOps for VeloWorkerClient {
 
         Box::pin(async move {
             let result = velo
-                .unary(handler_names::OBJECT_PUT_BLOCKS)
+                .unary(&handler_names::scoped(
+                    handler_names::OBJECT_PUT_BLOCKS,
+                    worker_id,
+                ))
                 .ok()
                 .map(|u| u.raw_payload(bytes).instance(remote).send());
 
@@ -732,6 +825,7 @@ impl ObjectBlockOps for VeloWorkerClient {
         dst_layout: LogicalLayoutHandle,
         block_ids: Vec<BlockId>,
     ) -> BoxFuture<'static, Vec<Result<SequenceHash, SequenceHash>>> {
+        let worker_id = self.worker_id;
         // For remote workers, we send the logical layout handle - they resolve it locally
         let message = ObjectGetBlocksMessage {
             keys: keys.clone(),
@@ -748,7 +842,10 @@ impl ObjectBlockOps for VeloWorkerClient {
 
         Box::pin(async move {
             let result = velo
-                .unary(handler_names::OBJECT_GET_BLOCKS)
+                .unary(&handler_names::scoped(
+                    handler_names::OBJECT_GET_BLOCKS,
+                    worker_id,
+                ))
                 .ok()
                 .map(|u| u.raw_payload(bytes).instance(remote).send());
 
@@ -967,5 +1064,168 @@ mod tests {
                 .contains("injected replicated-resource failure")
         );
         Ok(())
+    }
+
+    /// One process serves two or more workers on one messenger. Each worker
+    /// has its own set of handlers, and a client with a worker id reaches
+    /// the handlers of that worker only. A client without a worker id
+    /// reaches the plain handlers of a process with one worker.
+    #[tokio::test]
+    async fn a_client_with_a_worker_id_reaches_the_handlers_of_that_worker() -> Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let pair = crate::testing::messenger::create_messenger_pair_tcp().await?;
+        let workers = [None, Some(1), Some(2)];
+        let calls: Vec<Arc<AtomicUsize>> = workers
+            .iter()
+            .map(|_| Arc::new(AtomicUsize::new(0)))
+            .collect();
+        for (worker, counter) in workers.iter().zip(&calls) {
+            let counter = Arc::clone(counter);
+            let handler = ::velo::Handler::unary_handler_async(
+                handler_names::scoped(handler_names::LOCAL_TRANSFER, *worker),
+                move |ctx| {
+                    let counter = Arc::clone(&counter);
+                    async move {
+                        let _message: LocalTransferMessage = serde_json::from_slice(&ctx.payload)?;
+                        counter.fetch_add(1, Ordering::Relaxed);
+                        Ok(Some(Bytes::new()))
+                    }
+                },
+            )
+            .build();
+            pair.messenger_b.register_handler(handler)?;
+        }
+        let counts = || {
+            calls
+                .iter()
+                .map(|counter| counter.load(Ordering::Relaxed))
+                .collect::<Vec<_>>()
+        };
+        let remote = pair.messenger_b.instance_id();
+        let transfer = |client: VeloWorkerClient| {
+            client.execute_local_transfer(
+                LogicalLayoutHandle::G1,
+                LogicalLayoutHandle::G2,
+                Arc::<[BlockId]>::from(vec![0]),
+                Arc::<[BlockId]>::from(vec![0]),
+                TransferOptions::default(),
+            )
+        };
+
+        transfer(VeloWorkerClient::new_for_worker(
+            Arc::clone(&pair.messenger_a),
+            remote,
+            2,
+        ))?
+        .await?;
+        assert_eq!(counts(), [0, 0, 1]);
+        transfer(VeloWorkerClient::new_for_worker(
+            Arc::clone(&pair.messenger_a),
+            remote,
+            1,
+        ))?
+        .await?;
+        assert_eq!(counts(), [0, 1, 1]);
+        transfer(VeloWorkerClient::new(Arc::clone(&pair.messenger_a), remote))?.await?;
+        assert_eq!(counts(), [1, 1, 1]);
+        Ok(())
+    }
+
+    /// The outcome of a failed RPC is unknown, because the worker can have an
+    /// active copy. A reply carries the drain outcome of the worker.
+    #[tokio::test]
+    async fn a_local_transfer_receipt_separates_unknown_and_drained_failures() -> Result<()> {
+        let pair = crate::testing::messenger::create_messenger_pair_tcp().await?;
+        let rpc_error = ::velo::Handler::unary_handler_async(
+            handler_names::scoped(handler_names::LOCAL_TRANSFER, Some(1)),
+            |_ctx| async { Err::<Option<Bytes>, _>(anyhow::anyhow!("injected RPC failure")) },
+        )
+        .build();
+        pair.messenger_b.register_handler(rpc_error)?;
+        let drained = ::velo::Handler::unary_handler_async(
+            handler_names::scoped(handler_names::LOCAL_TRANSFER, Some(2)),
+            |_ctx| async {
+                let reply = LocalTransferReply::DrainedWithError {
+                    error: "injected drained failure".to_string(),
+                };
+                Ok(Some(Bytes::from(serde_json::to_vec(&reply)?)))
+            },
+        )
+        .build();
+        pair.messenger_b.register_handler(drained)?;
+        let remote = pair.messenger_b.instance_id();
+        let transfer = |worker_id| {
+            VeloWorkerClient::new_for_worker(Arc::clone(&pair.messenger_a), remote, worker_id)
+                .execute_local_transfer(
+                    LogicalLayoutHandle::G1,
+                    LogicalLayoutHandle::G2,
+                    Arc::<[BlockId]>::from(vec![0]),
+                    Arc::<[BlockId]>::from(vec![0]),
+                    TransferOptions::default(),
+                )
+        };
+
+        assert!(matches!(
+            transfer(1)?.await_drain().await,
+            TransferDrainOutcome::Unproven(_)
+        ));
+        match transfer(2)?.await_drain().await {
+            TransferDrainOutcome::DrainedWithError(error) => {
+                assert!(error.to_string().contains("injected drained failure"));
+            }
+            TransferDrainOutcome::Completed => panic!("the worker failure must reach the receipt"),
+            TransferDrainOutcome::Unproven(error) => {
+                panic!("the worker reply proved drain: {error:#}")
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_local_transfer_reply_keeps_the_drain_outcome() {
+        let round_trip = |outcome| {
+            let wire = serde_json::to_vec(&LocalTransferReply::from_outcome(outcome)).unwrap();
+            LocalTransferReply::decode(&wire)
+        };
+        assert!(matches!(
+            round_trip(TransferDrainOutcome::Completed),
+            TransferDrainOutcome::Completed
+        ));
+        assert!(matches!(
+            round_trip(TransferDrainOutcome::DrainedWithError(anyhow::anyhow!(
+                "drained"
+            ))),
+            TransferDrainOutcome::DrainedWithError(_)
+        ));
+        assert!(matches!(
+            round_trip(TransferDrainOutcome::Unproven(anyhow::anyhow!("unknown"))),
+            TransferDrainOutcome::Unproven(_)
+        ));
+        // A handler that does not send this type replies with no bytes on success.
+        assert!(matches!(
+            LocalTransferReply::decode(&[]),
+            TransferDrainOutcome::Completed
+        ));
+        assert!(matches!(
+            LocalTransferReply::decode(b"not a reply"),
+            TransferDrainOutcome::Unproven(_)
+        ));
+    }
+
+    #[test]
+    fn a_worker_id_scopes_each_handler_name() {
+        assert_eq!(
+            handler_names::scoped(handler_names::LOCAL_TRANSFER, None),
+            handler_names::LOCAL_TRANSFER
+        );
+        assert_eq!(
+            handler_names::scoped(handler_names::LOCAL_TRANSFER, Some(3)),
+            "kvbm.worker.local_transfer#3"
+        );
+        assert_ne!(
+            handler_names::scoped(handler_names::LOCAL_TRANSFER, Some(1)),
+            handler_names::scoped(handler_names::LOCAL_TRANSFER, Some(11))
+        );
     }
 }

@@ -11,14 +11,15 @@ use axum::Router;
 use axum::extract::{Path, State};
 use axum::response::Response;
 use axum::routing::post;
-use futures::future::BoxFuture;
 use parking_lot::RwLock;
 use velo_ext::InstanceId;
 
 use crate::features::http::{control_error_response, leader_client, ok_response};
-use crate::features::{FeatureError, FeatureManager, HubContext};
-use crate::protocol::{self, Feature, FeatureKey, LayoutCompatPayload};
-use crate::registry::PeerRegistry;
+use velo_hub::store::{HubStore, Removal};
+use velo_hub::{AttachContext, Committed, Extension, Rejection, Txn};
+
+use crate::features::{FeatureConfigRequirements, FeatureError, KvbmFeature};
+use crate::protocol::{self, LayoutCompatPayload, P2pConfig};
 use kvbm_protocols::control::layout_compat::check_layout_compat;
 use kvbm_protocols::control::{
     CloseTransferSessionRequest, OpenTransferSessionRequest, PullFromSessionRequest, SearchRequest,
@@ -34,12 +35,12 @@ use kvbm_protocols::control::{
 pub struct P2pManager {
     inner: RwLock<P2pInner>,
     /// Hub velo handle — needed to issue `/control/transfer/*` RPCs to the
-    /// target leader. Set in [`FeatureManager::attach`]; absent when the hub
+    /// target leader. Set in [`velo_hub::Extension::attach`]; absent when the hub
     /// has no velo transport (transfer routes then return 503).
-    velo: OnceLock<Arc<velo::Velo>>,
+    velo: OnceLock<velo::WeakVelo>,
     /// Shared peer registry — used to confirm a transfer target is currently
     /// registered before issuing the velo call. Set in `attach`.
-    registry: OnceLock<Arc<dyn PeerRegistry>>,
+    store: OnceLock<Arc<dyn HubStore>>,
 }
 
 struct P2pInner {
@@ -57,7 +58,7 @@ impl std::fmt::Debug for P2pManager {
             .field("instance_count", &inner.instances.len())
             .field("has_baseline", &inner.layout_baseline.is_some())
             .field("velo_attached", &self.velo.get().is_some())
-            .field("registry_attached", &self.registry.get().is_some())
+            .field("store_attached", &self.store.get().is_some())
             .finish()
     }
 }
@@ -77,7 +78,7 @@ impl P2pManager {
                 layout_baseline: None,
             }),
             velo: OnceLock::new(),
-            registry: OnceLock::new(),
+            store: OnceLock::new(),
         }
     }
 
@@ -139,105 +140,108 @@ impl P2pManager {
     }
 }
 
-impl FeatureManager for P2pManager {
-    fn key(&self) -> FeatureKey {
-        FeatureKey::P2P
-    }
-
-    fn config_requirements(&self) -> crate::features::FeatureConfigRequirements {
+impl KvbmFeature for P2pManager {
+    fn config_requirements(&self) -> FeatureConfigRequirements {
         // P2P transfers require both peers to agree on block size and the
-        // cross-leader layout-compat mode. (The detailed layout_compat payload
-        // is still validated separately in `on_register`; this is the cheap
-        // primary-consistency gate.) CD inherits these via its P2P dependency.
-        crate::features::FeatureConfigRequirements {
+        // cross-leader layout-compat mode. CD inherits these through its
+        // P2P registration requirement.
+        FeatureConfigRequirements {
             block_size: true,
             block_layout: true,
         }
     }
+}
 
-    fn attach<'a>(&'a self, ctx: HubContext) -> BoxFuture<'a, Result<(), FeatureError>> {
-        // Stash the registry + (optional) velo so the `/control/transfer/*`
-        // handlers can proxy to the target leader. Mirrors `ControlPlaneManager`.
-        Box::pin(async move {
-            let _ = self.registry.set(ctx.registry.clone());
-            if let Some(v) = ctx.velo.clone() {
-                let _ = self.velo.set(v);
-            } else {
-                tracing::warn!(
-                    "P2pManager: hub has no velo transport — \
-                     /control/transfer/* routes will return 503"
-                );
+impl Extension for P2pManager {
+    const NAME: &'static str = protocol::P2P_EXTENSION;
+    type Registration = P2pConfig;
+    /// The layout to admit, or `None` when the owner did not opt in or is
+    /// already a member.
+    type Staged = Option<LayoutCompatPayload>;
+
+    async fn attach(&self, ctx: &AttachContext<'_>) -> anyhow::Result<()> {
+        let _ = self.store.set(Arc::clone(ctx.store()));
+        match ctx.velo() {
+            Some(velo) => {
+                let _ = self.velo.set(velo.downgrade());
             }
-            Ok(())
-        })
+            None => tracing::warn!(
+                "P2pManager: hub has no velo transport; the transfer routes answer 503"
+            ),
+        }
+        Ok(())
     }
 
-    fn on_register<'a>(
-        &'a self,
-        instance_id: InstanceId,
-        feature: &'a Feature,
-    ) -> BoxFuture<'a, Result<(), FeatureError>> {
-        Box::pin(async move {
-            let Feature::P2P(cfg) = feature else {
-                return Err(FeatureError::KeyMismatch {
-                    manager: FeatureKey::P2P,
-                    payload: feature.key(),
-                });
-            };
-            let candidate = &cfg.layout_compat;
-
-            let mut inner = self.inner.write();
-
-            // Idempotent re-register: an instance that's already in the set
-            // does not re-validate (the baseline already accepted it once).
-            if inner.instances.contains(&instance_id) {
-                return Ok(());
-            }
-
-            match inner.layout_baseline.as_ref() {
-                None => {
-                    candidate.validate_self().map_err(|e| {
-                        FeatureError::InvalidConfig(format!(
-                            "P2P layout_compat payload from instance {instance_id} is \
-                             internally inconsistent: {e}"
-                        ))
-                    })?;
-                    inner.layout_baseline = Some(candidate.clone());
-                }
-                Some(baseline) => check_layout_compat(baseline, candidate).map_err(|e| {
-                    FeatureError::InvalidConfig(format!(
-                        "P2P layout_compat incompatibility for instance {instance_id}: {e}"
-                    ))
-                })?,
-            }
-
-            inner.instances.insert(instance_id);
-            Ok(())
-        })
+    async fn prepare(
+        &self,
+        txn: &Txn<'_>,
+        payload: Option<P2pConfig>,
+    ) -> Result<Self::Staged, Rejection> {
+        let Some(cfg) = payload else {
+            return Ok(None);
+        };
+        let owner = txn.owner;
+        let inner = self.inner.read();
+        // A member does not validate again: the baseline accepted it once.
+        if inner.instances.contains(&owner) {
+            return Ok(None);
+        }
+        match inner.layout_baseline.as_ref() {
+            None => cfg.layout_compat.validate_self().map_err(|e| {
+                Rejection::bad_request(format!(
+                    "P2P layout_compat payload from instance {owner} is internally \
+                     inconsistent: {e}"
+                ))
+            })?,
+            Some(baseline) => check_layout_compat(baseline, &cfg.layout_compat).map_err(|e| {
+                Rejection::bad_request(format!(
+                    "P2P layout_compat incompatibility for instance {owner}: {e}"
+                ))
+            })?,
+        }
+        Ok(Some(cfg.layout_compat))
     }
 
-    fn on_unregister(&self, instance_id: InstanceId) {
+    fn commit(&self, staged: Self::Staged, registration: &Committed<'_>) {
+        let owner = registration.owner;
         let mut inner = self.inner.write();
-        inner.instances.remove(&instance_id);
-        // Clear the baseline once the last P2P instance leaves so a fresh
-        // group can adopt a different mode/shape without bouncing the hub.
-        if inner.instances.is_empty() {
-            inner.layout_baseline = None;
+        if !registration.opted_in(Self::NAME) {
+            inner.remove(owner);
+            return;
+        }
+        if let Some(layout) = staged {
+            inner.layout_baseline.get_or_insert(layout);
+            inner.instances.insert(owner);
         }
     }
 
-    fn control_router(self: Arc<Self>) -> Router {
+    fn on_removed(&self, removal: Removal) {
+        self.inner.write().remove(removal.id);
+    }
+
+    fn control_routes(self: Arc<Self>) -> Router {
         transfer_routes(self)
     }
 
-    fn public_router(self: Arc<Self>) -> Router {
+    fn public_routes(self: Arc<Self>) -> Router {
         // Mirror `ControlPlaneManager`: the transfer surface is mounted on
         // both listeners so callers can reach it on either port.
         transfer_routes(self)
     }
 }
 
-/// The `/v1/instances/{id}/control/transfer/*` surface. Block-copy session
+impl P2pInner {
+    /// Drop `owner`. The baseline clears with the last member, so a fresh
+    /// group can adopt a different mode or shape without a hub restart.
+    fn remove(&mut self, owner: InstanceId) {
+        self.instances.remove(&owner);
+        if self.instances.is_empty() {
+            self.layout_baseline = None;
+        }
+    }
+}
+
+/// The `/v1/ext/connector_control/instances/{id}/control/transfer/*` surface. Block-copy session
 /// management is a P2P concern, so these routes only exist when the P2P
 /// feature is enabled on the hub.
 fn transfer_routes(manager: Arc<P2pManager>) -> Router {
@@ -265,7 +269,7 @@ fn p2p_leader_client(
     mgr: &P2pManager,
     instance_id: InstanceId,
 ) -> Result<kvbm_protocols::control::LeaderControlClient, Response> {
-    leader_client(&mgr.velo, &mgr.registry, instance_id)
+    leader_client(&mgr.velo, &mgr.store, instance_id)
 }
 
 /// `POST /control/transfer/search_prefix` — always-on (when P2P is enabled).

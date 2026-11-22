@@ -17,6 +17,7 @@ async fn start_hub() -> HubServer {
         .heartbeat_interval(Duration::from_secs(3600))
         .heartbeat_max_failures(u32::MAX)
         .registration_ttl(Duration::from_secs(3600))
+        .extension(std::sync::Arc::new(kvbm_hub::ControlPlaneManager::new()))
         .serve()
         .await
         .expect("start hub")
@@ -29,10 +30,10 @@ fn http() -> reqwest::Client {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn serves_index_and_assets_with_correct_content_type() {
     let server = start_hub().await;
-    let base = format!("http://{}", server.control_addr());
+    let base = format!("http://{}/v1/ext/connector_control", server.control_addr());
 
     let cases = &[
-        ("/", "text/html; charset=utf-8", "<title>KVBM Hub</title>"),
+        ("", "text/html; charset=utf-8", "<title>KVBM Hub</title>"),
         ("/app.js", "application/javascript; charset=utf-8", "hubApp"),
         ("/style.css", "text/css; charset=utf-8", "--accent"),
         ("/tokens.css", "text/css; charset=utf-8", "--accent"),

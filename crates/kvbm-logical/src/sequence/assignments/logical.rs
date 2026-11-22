@@ -238,17 +238,20 @@ impl<T: BlockMetadata> LogicalBlockAssignments<T> {
         Ok(to_stage)
     }
 
-    /// Takes all staged blocks (FIFO order), registers them with the block
-    /// manager as one batch, and moves them to assigned.
+    /// Takes the first `max_blocks` staged blocks (FIFO order), registers
+    /// them with the block manager as one batch, and moves them to assigned.
     ///
     /// Returns the number of blocks registered.
-    pub fn register(&mut self, manager: &BlockManager<T>) -> usize {
-        let count = self.store.staged_count();
-
+    pub fn register(&mut self, manager: &BlockManager<T>, max_blocks: usize) -> usize {
         // Drain the whole batch up front (O(len) once) instead of shifting
         // one element at a time (O(count * len) — see `BlockStore`'s "Batch
         // Drain" doc comment).
-        let (block_ids, staged): (Vec<_>, Vec<_>) = self.store.drain_staged().into_iter().unzip();
+        let (block_ids, staged): (Vec<_>, Vec<_>) = self
+            .store
+            .drain_staged_prefix(max_blocks)
+            .into_iter()
+            .unzip();
+        let count = block_ids.len();
         for (block_id, immutable) in block_ids.into_iter().zip(manager.register_blocks(staged)) {
             self.store.insert_assigned(block_id, immutable);
         }
@@ -452,7 +455,7 @@ mod tests {
 
         // Stage and register the new blocks
         la.stage(&seq.blocks()[3..5]).unwrap();
-        la.register(&manager);
+        la.register(&manager, usize::MAX);
 
         assert_eq!(la.assigned_count(), 5);
         assert_eq!(la.staged_count(), 0);
@@ -660,7 +663,7 @@ mod tests {
         la.extend_blocks(blocks).unwrap();
         la.stage(seq.blocks()).unwrap();
 
-        let registered = la.register(&manager);
+        let registered = la.register(&manager, usize::MAX);
         assert_eq!(registered, 3);
         assert_eq!(la.assigned_count(), 3);
         assert_eq!(la.staged_count(), 0);
@@ -678,7 +681,7 @@ mod tests {
         let manager = create_test_manager::<TestMeta>(10);
         let mut la = LogicalBlockAssignments::<TestMeta>::new();
 
-        let registered = la.register(&manager);
+        let registered = la.register(&manager, usize::MAX);
         assert_eq!(registered, 0);
     }
 
@@ -706,7 +709,7 @@ mod tests {
         assert_eq!(la.unassigned_count(), 0);
 
         // register
-        la.register(&manager);
+        la.register(&manager, usize::MAX);
         assert_eq!(la.assigned_count(), 5);
         assert_eq!(la.staged_count(), 0);
 
@@ -731,13 +734,13 @@ mod tests {
 
         // Stage first 3, register them
         la.stage(&seq.blocks()[..3]).unwrap();
-        la.register(&manager);
+        la.register(&manager, usize::MAX);
         assert_eq!(la.assigned_count(), 3);
         assert_eq!(la.unassigned_count(), 3);
 
         // Stage remaining 3, register them
         la.stage(&seq.blocks()[..3]).unwrap();
-        la.register(&manager);
+        la.register(&manager, usize::MAX);
         assert_eq!(la.assigned_count(), 6);
         assert_eq!(la.unassigned_count(), 0);
 
@@ -764,7 +767,7 @@ mod tests {
 
         // Stage first 2, then register them
         la.stage(&seq.blocks()[..2]).unwrap();
-        la.register(&manager);
+        la.register(&manager, usize::MAX);
 
         // Stage 2 more
         la.stage(&seq.blocks()[..2]).unwrap();
@@ -794,7 +797,7 @@ mod tests {
         let mut la = LogicalBlockAssignments::new();
         la.extend_blocks(blocks).unwrap();
         la.stage(seq.blocks()).unwrap();
-        la.register(&manager);
+        la.register(&manager, usize::MAX);
         assert_eq!(la.assigned_count(), 3);
 
         la.clear();
@@ -811,7 +814,7 @@ mod tests {
         let mut la = LogicalBlockAssignments::new();
         la.extend_blocks(blocks).unwrap();
         la.stage(seq.blocks()).unwrap();
-        la.register(&manager);
+        la.register(&manager, usize::MAX);
 
         let drained = la.take_assigned();
         assert_eq!(drained.len(), 3);
@@ -990,7 +993,7 @@ mod tests {
         let mut la = LogicalBlockAssignments::new();
         la.extend_blocks(blocks).unwrap();
         la.stage(seq.blocks()).unwrap();
-        la.register(&manager);
+        la.register(&manager, usize::MAX);
         assert_eq!(la.assigned_count(), 3);
 
         // Those block_ids are now back in the reset pool (RAII from the original
@@ -1076,7 +1079,7 @@ mod tests {
         let mut la = LogicalBlockAssignments::new();
         la.extend_blocks(blocks).unwrap();
         la.stage(seq.blocks()).unwrap();
-        la.register(&manager);
+        la.register(&manager, usize::MAX);
 
         assert!(la.get_assigned(0).is_some());
         assert!(la.get_assigned(1).is_some());
@@ -1128,7 +1131,7 @@ mod tests {
             assert_eq!(id, expected_id, "staged order mismatch at index {i}");
         }
 
-        let registered = la.register(&manager);
+        let registered = la.register(&manager, usize::MAX);
         assert_eq!(registered, n);
         for (i, expected_id) in ids.iter().enumerate() {
             let (id, _) = la.get_assigned(i).unwrap();
@@ -1280,7 +1283,7 @@ mod tests {
 
             let start = Instant::now();
             la.stage(seq.blocks()).unwrap();
-            la.register(&manager);
+            la.register(&manager, usize::MAX);
             start.elapsed()
         }
 

@@ -169,6 +169,11 @@ pub struct BlockManagerConfigBuilder<T: BlockMetadata> {
     /// override via [`ImmutableBlock::set_evict_on_reset`].
     default_reset_on_release: Option<bool>,
 
+    /// The execution lane of the presence markers of this manager. Managers
+    /// of the same tier type on one registry keep their residency apart by
+    /// this lane. `None` is lane 0.
+    presence_lane: Option<u8>,
+
     /// Phantom data for type parameter
     _phantom: std::marker::PhantomData<T>,
 }
@@ -185,6 +190,7 @@ impl<T: BlockMetadata> Default for BlockManagerConfigBuilder<T> {
             duplication_policy: None,
             aggregator: None,
             default_reset_on_release: None,
+            presence_lane: None,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -259,6 +265,20 @@ impl<T: BlockMetadata> BlockManagerConfigBuilder<T> {
     ///
     /// Default thresholds: `[3, 8, 15]` for transitions between:
     /// Cold (0-2 hits) -> Warm (3-7) -> Hot (8-14) -> Very Hot (15+).
+    /// Set the execution lane of this manager.
+    ///
+    /// Two managers of the same tier type `T` can share one registry, for
+    /// example the device pools of two data-parallel replicas of one model.
+    /// The registry then counts the residency of each one in its own lane:
+    /// [`BlockRegistrationHandle::has_block_in_lane`](crate::registry::BlockRegistrationHandle::has_block_in_lane)
+    /// and [`BlockRegistry::check_presence_in_lane`] answer for one lane, and
+    /// `has_block` and `check_presence` answer for all lanes together. A
+    /// manager without this call is in lane 0.
+    pub fn lane(mut self, lane: u8) -> Self {
+        self.presence_lane = Some(lane);
+        self
+    }
+
     pub fn with_multi_lru_backend(mut self) -> Self {
         self.inactive_backend = Some(InactiveBackendConfig::MultiLru {
             frequency_thresholds: [3, 8, 15],
@@ -557,6 +577,7 @@ impl<T: BlockMetadata> BlockManagerConfigBuilder<T> {
             metrics.clone(),
             self.default_reset_on_release.unwrap_or(false),
         );
+        store.set_presence_lane(self.presence_lane.unwrap_or(0));
 
         // Register with aggregator if provided
         if let Some(ref aggregator) = self.aggregator {

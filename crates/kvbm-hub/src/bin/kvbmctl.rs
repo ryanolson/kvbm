@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! `kvbmctl` — a thin read-only client over the same `GET /v1/config` aggregate
+//! `kvbmctl` — a thin read-only client over the same `GET /v1/ext/kvbm/config` aggregate
 //! the connector consumes. Its one job today is to render a paste-ready vLLM
 //! CLI fragment so operators stop hand-writing `--kv-transfer-config` blobs:
 //!
@@ -156,7 +156,7 @@ async fn render_vllm(args: VllmArgs) -> Result<()> {
     let aggregate = client
         .get_config()
         .await
-        .with_context(|| format!("fetching GET /v1/config from {}", args.hub))?;
+        .with_context(|| format!("fetching GET /v1/ext/kvbm/config from {}", args.hub))?;
 
     let opts = VllmRenderOptions {
         features: args.features,

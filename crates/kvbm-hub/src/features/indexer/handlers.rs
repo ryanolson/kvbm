@@ -7,7 +7,7 @@
 //! [`IndexerManager::attach`](super::manager::IndexerManager) (when a transport
 //! is configured). This is the **client → hub** direction — the reverse of the
 //! hub → client heartbeat handler in [`crate::handlers`] — and the velo-plane
-//! equivalent of `POST /v1/features/indexer/query`, keeping the result typed
+//! equivalent of `POST /v1/ext/indexer/query`, keeping the result typed
 //! ([`SequenceHash`] + [`InstanceId`]) instead of stringifying it.
 
 use std::sync::Arc;
@@ -16,7 +16,11 @@ use uuid::Uuid;
 use velo::Handler;
 use velo_ext::InstanceId;
 
-use super::bundle::BundleDirectory;
+use kvbm_protocols::cache_manifest::RegistrationEpoch;
+use velo_hub::protocol::Credential;
+use velo_hub::{Authority, AuthorityError};
+
+use super::bundle::{BundleDirectory, BundleDirectoryError};
 use super::index::ManifestIndexes;
 use super::protocol::{
     BUNDLE_INVALIDATE_HANDLER, BUNDLE_PUBLISH_HANDLER, BUNDLE_QUERY_HANDLER,
@@ -54,15 +58,38 @@ pub fn create_query_handler(indexes: Arc<ManifestIndexes>) -> Handler {
     .build()
 }
 
+/// The registration epoch the hub's lease grants `credential` for `owner`.
+pub(super) fn authorized_epoch(
+    authority: &Authority,
+    owner: InstanceId,
+    credential: &Credential,
+) -> Result<RegistrationEpoch, BundleDirectoryError> {
+    let lease = authority
+        .authorize(owner, Some(credential))
+        .map_err(|error| match error {
+            AuthorityError::Unavailable => BundleDirectoryError::Unavailable,
+            _ => BundleDirectoryError::UnauthorizedOwner { owner },
+        })?;
+    Ok(RegistrationEpoch::from_uuid(lease.epoch.as_uuid()))
+}
+
 /// Build publish, invalidate, and query handlers for the complete-bundle index.
-pub fn create_bundle_handlers(directory: Arc<BundleDirectory>) -> [Handler; 3] {
+pub fn create_bundle_handlers(
+    directory: Arc<BundleDirectory>,
+    authority: Authority,
+) -> [Handler; 3] {
     let publish_directory = Arc::clone(&directory);
+    let publish_authority = authority.clone();
     let publish = Handler::typed_unary_async::<BundlePublishRequest, (), _, _>(
         BUNDLE_PUBLISH_HANDLER,
         move |ctx| {
             let directory = Arc::clone(&publish_directory);
+            let authority = publish_authority.clone();
             async move {
-                directory.publish(ctx.input).map_err(anyhow::Error::from)?;
+                let request = ctx.input;
+                let epoch =
+                    authorized_epoch(&authority, request.advertisement.owner, &request.credential)?;
+                directory.publish(epoch, request)?;
                 Ok(())
             }
         },
@@ -74,7 +101,12 @@ pub fn create_bundle_handlers(directory: Arc<BundleDirectory>) -> [Handler; 3] {
         BUNDLE_INVALIDATE_HANDLER,
         move |ctx| {
             let directory = Arc::clone(&invalidate_directory);
-            async move { directory.invalidate(ctx.input).map_err(anyhow::Error::from) }
+            let authority = authority.clone();
+            async move {
+                let request = ctx.input;
+                let epoch = authorized_epoch(&authority, request.owner, &request.credential)?;
+                Ok(directory.invalidate(epoch, request)?)
+            }
         },
     )
     .build();

@@ -6,7 +6,7 @@
 //!
 //! Unlike the read-only [`FeatureCli`](crate::features::cli::FeatureCli)
 //! surface under `kvbmctl get`, these are **per-instance actions**: each targets
-//! a leader through the hub's `/v1/instances/{id}/control/...` routes. The
+//! a leader through the hub's `/v1/ext/connector_control/instances/{id}/control/...` routes. The
 //! route templates are the [`crate::protocol::paths`] consts (shared with the
 //! server-side routers) — this CLI never hand-rolls a path string.
 //!
@@ -118,11 +118,14 @@ fn instance(m: &ArgMatches, name: &str) -> String {
         .clone()
 }
 
-/// Fill a `protocol::paths` control-route template (which carries the literal
-/// `{instance_id}` segment) with a concrete instance id. The CLI and the
-/// server-side router share the same const; only the substitution differs.
+/// The hub path of a `protocol::paths` transfer route for `instance_id`. The
+/// route template is relative to the `p2p` extension's mount point.
 fn fill_instance(template: &str, instance_id: &str) -> String {
-    template.replace("{instance_id}", instance_id)
+    format!(
+        "/v1/ext/{}{}",
+        crate::protocol::P2P_EXTENSION,
+        template.replace("{instance_id}", instance_id)
+    )
 }
 
 /// Dispatch a `p2p` subcommand against `hub`. Returns the JSON to print.
@@ -391,7 +394,7 @@ mod tests {
     fn fill_instance_substitutes_the_path_template() {
         assert_eq!(
             fill_instance(CONTROL_TRANSFER_OPEN_SESSION, "inst-1"),
-            "/v1/instances/inst-1/control/transfer/open_session"
+            "/v1/ext/p2p/instances/inst-1/control/transfer/open_session"
         );
     }
 

@@ -132,7 +132,21 @@ impl WorkerTransfers for ResourceDispatchWorker {
         dst_block_ids: Arc<[BlockId]>,
         options: TransferOptions,
     ) -> Result<TransferCompleteNotification> {
-        match self.placement(resource)? {
+        // A layout that the worker exports outside every dispatch, such as
+        // the slots of a fixed state, has no placement. Each rank holds its
+        // own part, so the physical worker copies it. The physical worker
+        // refuses a resource that it does not know.
+        let Some(placement) = self.placements.get(resource) else {
+            return self.inner.execute_local_transfer_for_resource(
+                resource,
+                src,
+                dst,
+                src_block_ids,
+                dst_block_ids,
+                options,
+            );
+        };
+        match placement {
             WorkerDataPlacement::TensorSharded => self.inner.execute_local_transfer_for_resource(
                 resource,
                 src,
@@ -387,6 +401,77 @@ mod tests {
             .unwrap();
 
         assert_eq!(actual, expected);
+    }
+
+    /// A fixed state resource has no placement. The dispatcher gives its
+    /// local transfer to the physical worker, which resolves the exported
+    /// layout. A leader in another process copies a carrier on this path.
+    #[tokio::test]
+    async fn resource_dispatch_forwards_an_exported_resource_to_the_physical_worker() {
+        use kvbm_common::LogicalLayoutHandle;
+        use kvbm_physical::manager::TierLayoutHandles;
+        use kvbm_physical::transfer::TransferOptions;
+
+        use super::WorkerTransfers;
+
+        let primary = LogicalResourceId::default();
+        let fixed = LogicalResourceId(11);
+        let agent = create_test_agent(&format!("resource-exported-{}", uuid::Uuid::new_v4()));
+        let primary_layout = create_fc_layout(agent.clone(), StorageKind::System, 2);
+        let device_layout = create_fc_layout(agent.clone(), StorageKind::System, 2);
+        let host_layout = create_fc_layout(agent.clone(), StorageKind::System, 2);
+        fill_blocks(&device_layout, &[1], FillPattern::Constant(53)).unwrap();
+        let manager = create_transfer_manager(agent, None).unwrap();
+        let primary_g2 = manager.register_layout(primary_layout).unwrap();
+        let device = manager.register_layout(device_layout).unwrap();
+        let host = manager.register_layout(host_layout).unwrap();
+        let inner = Arc::new(
+            PhysicalWorker::builder()
+                .manager(manager)
+                .g2_handle(primary_g2)
+                .exported_layouts(vec![(
+                    fixed,
+                    TierLayoutHandles::new(Some(device), Some(host), None),
+                )])
+                .rank(0)
+                .build()
+                .unwrap(),
+        );
+        let worker = ResourceDispatchWorker {
+            inner,
+            replicated: None,
+            placements: LocalTransferPlacements::new(
+                primary,
+                vec![(primary, WorkerDataPlacement::TensorSharded)],
+            )
+            .unwrap(),
+        };
+
+        worker
+            .execute_local_transfer_for_resource(
+                fixed,
+                LogicalLayoutHandle::G1,
+                LogicalLayoutHandle::G2,
+                Arc::from(vec![1]),
+                Arc::from(vec![0]),
+                TransferOptions::default(),
+            )
+            .unwrap()
+            .await
+            .unwrap();
+
+        assert!(
+            worker
+                .execute_local_transfer_for_resource(
+                    LogicalResourceId(99),
+                    LogicalLayoutHandle::G1,
+                    LogicalLayoutHandle::G2,
+                    Arc::from(vec![1]),
+                    Arc::from(vec![0]),
+                    TransferOptions::default(),
+                )
+                .is_err()
+        );
     }
 
     #[test]

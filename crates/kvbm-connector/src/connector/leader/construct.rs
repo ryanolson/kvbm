@@ -118,20 +118,16 @@ async fn register_indexer_only(
     let velo = runtime
         .velo()
         .ok_or_else(|| anyhow!("indexer hub registration requires a Velo runtime"))?;
-    let hub = super::build_hub_client(&handshake.url)?;
-    // Install hub velo handlers (heartbeat) so the hub's liveness probe doesn't
-    // unregister us — which would prematurely sweep our index.
-    hub.register_handlers_messenger(velo.messenger())
-        .context("installing hub velo handlers for indexer registration")?;
+    let hub = super::build_hub_client(&handshake.url, handshake.control_port)?;
     let max_seq_len = runtime.config().max_seq_len;
-    hub.register_instance_with_features_and_runtime(
-        velo.peer_info(),
+    hub.register(
+        velo,
         vec![kvbm_hub::Feature::Indexer(kvbm_hub::IndexerFeatureConfig {
             max_seq_len,
             manifest,
             create_kind: CreateKind::Block,
         })],
-        handshake.runtime_summary.clone(),
+        Some(handshake.runtime_summary.clone()),
     )
     .await
     .context("registering Feature::Indexer with kvbm-hub")?;
@@ -323,7 +319,7 @@ pub(super) async fn build_engine_stack(c: &Construction) -> Result<EngineStack> 
     }
 
     // Hub handshake (init.rs:442-472). `hub` absent ⇒ no hub features (normal
-    // hub-less work). When present, pull GET /v1/config, resolve the effective
+    // hub-less work). When present, pull GET /v1/ext/kvbm/config, resolve the effective
     // feature set, and learn the KV-index ZMQ endpoint.
     let cfg = runtime.config();
     let handshake: Option<HubHandshake> = match cfg.hub.as_ref() {

@@ -4,9 +4,9 @@
 //! Integration tests for the `metrics` control module's HTTP surface on the
 //! hub:
 //!
-//! - `POST /v1/instances/{id}/control/metrics/snapshot` — single leader,
+//! - `POST /v1/ext/connector_control/instances/{id}/control/metrics/snapshot` — single leader,
 //!   gated on `ModuleId::Metrics`.
-//! - `GET /v1/metrics` — fanout across every registered leader that has
+//! - `GET /v1/ext/connector_control/metrics` — fanout across every registered leader that has
 //!   the metrics module enabled. Failing/absent leaders surface as per-
 //!   instance error entries rather than failing the whole response.
 //!
@@ -46,6 +46,7 @@ async fn new_velo() -> Arc<velo::Velo> {
         .add_transport(new_velo_transport())
         .build()
         .await
+        .map(Arc::new)
         .unwrap()
 }
 
@@ -57,7 +58,7 @@ async fn start_hub() -> HubServer {
         .discovery_port(0)
         .control_port(0)
         .add_transport(transport as Arc<dyn velo::Transport>)
-        .add_feature_manager(mgr as Arc<dyn kvbm_hub::FeatureManager>)
+        .extension(mgr)
         // Disable hub-driven heartbeat so probes don't race with our canned
         // handlers (mirrors control_routes / control_gating).
         .heartbeat_interval(Duration::from_secs(3600))
@@ -140,25 +141,28 @@ fn http() -> reqwest::Client {
 
 fn snapshot_url(server: &HubServer, id: velo_ext::InstanceId) -> String {
     format!(
-        "http://{}/v1/instances/{}/control/metrics/snapshot",
+        "http://{}/v1/ext/connector_control/instances/{}/control/metrics/snapshot",
         server.control_addr(),
         id
     )
 }
 
 fn fanout_url(server: &HubServer) -> String {
-    format!("http://{}/v1/metrics", server.control_addr())
+    format!(
+        "http://{}/v1/ext/connector_control/metrics",
+        server.control_addr()
+    )
 }
 
 fn modules_url(server: &HubServer, id: velo_ext::InstanceId) -> String {
     format!(
-        "http://{}/v1/instances/{}/modules",
+        "http://{}/v1/ext/connector_control/instances/{}/modules",
         server.control_addr(),
         id
     )
 }
 
-/// Poll `GET /v1/instances/{id}/modules` until the manager reports a cached
+/// Poll `GET /v1/ext/connector_control/instances/{id}/modules` until the manager reports a cached
 /// hit — i.e. `on_register_any`'s background fetch has landed. Without this,
 /// the gating tests race the background `list_modules` task and would
 /// occasionally flake.
@@ -216,7 +220,7 @@ async fn snapshot_ok_returns_200_with_unwrapped_body() {
 
     let client = build_client(&server);
     client
-        .register_instance(peer.peer_info())
+        .register(&peer, Vec::new(), None)
         .await
         .expect("register");
     let id = peer.instance_id();
@@ -254,7 +258,7 @@ async fn snapshot_returns_404_when_module_absent() {
 
     let client = build_client(&server);
     client
-        .register_instance(peer.peer_info())
+        .register(&peer, Vec::new(), None)
         .await
         .expect("register");
     let id = peer.instance_id();
@@ -293,7 +297,7 @@ async fn snapshot_propagates_internal_error_as_500() {
 
     let client = build_client(&server);
     client
-        .register_instance(peer.peer_info())
+        .register(&peer, Vec::new(), None)
         .await
         .expect("register");
     let id = peer.instance_id();
@@ -340,12 +344,12 @@ async fn fanout_aggregates_and_filters_by_module() {
 
     let client_a = build_client(&server);
     client_a
-        .register_instance(peer_a.peer_info())
+        .register(&peer_a, Vec::new(), None)
         .await
         .expect("register a");
     let client_b = build_client(&server);
     client_b
-        .register_instance(peer_b.peer_info())
+        .register(&peer_b, Vec::new(), None)
         .await
         .expect("register b");
 
@@ -409,12 +413,12 @@ async fn fanout_slow_leader_times_out_does_not_block_others() {
 
     let client_fast = build_client(&server);
     client_fast
-        .register_instance(peer_fast.peer_info())
+        .register(&peer_fast, Vec::new(), None)
         .await
         .expect("register fast");
     let client_slow = build_client(&server);
     client_slow
-        .register_instance(peer_slow.peer_info())
+        .register(&peer_slow, Vec::new(), None)
         .await
         .expect("register slow");
 
@@ -478,12 +482,12 @@ async fn fanout_per_instance_error_does_not_fail_response() {
 
     let client_ok = build_client(&server);
     client_ok
-        .register_instance(peer_ok.peer_info())
+        .register(&peer_ok, Vec::new(), None)
         .await
         .expect("register ok");
     let client_err = build_client(&server);
     client_err
-        .register_instance(peer_err.peer_info())
+        .register(&peer_err, Vec::new(), None)
         .await
         .expect("register err");
 

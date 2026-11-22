@@ -141,6 +141,17 @@ pub struct InstanceLeader {
     /// Used for RDMA transfers with proper handle mapping storage.
     parallel_worker: Option<Arc<dyn ParallelWorkers>>,
 
+    /// The execution lane of `workers` and `parallel_worker`. A leader from
+    /// the builder is in lane 0. [`Self::lane_view`] gives the leader of
+    /// another lane.
+    lane: u8,
+
+    /// The worker grid of each execution lane, by lane. Each lane has its
+    /// own G1 layouts, and all lanes share the G2 managers, the registry,
+    /// and the sessions of this instance. A leader with one lane has one
+    /// grid.
+    lane_grids: Arc<Vec<LaneGrid>>,
+
     /// Cached worker metadata (avoids querying workers repeatedly).
     cached_worker_metadata: Option<Vec<SerializedLayout>>,
 
@@ -296,6 +307,13 @@ pub struct InstanceLeader {
     min_remote_blocks: usize,
 }
 
+/// The workers of one execution lane of an instance.
+#[derive(Clone)]
+struct LaneGrid {
+    workers: Vec<Arc<dyn Worker>>,
+    parallel_worker: Option<Arc<dyn ParallelWorkers>>,
+}
+
 /// Builder for InstanceLeader.
 #[derive(Default)]
 pub struct InstanceLeaderBuilder {
@@ -309,6 +327,8 @@ pub struct InstanceLeaderBuilder {
     primary_g2_resource: LogicalResourceId,
     g3_manager: Option<Arc<BlockManager<G3>>>,
     workers: Vec<Arc<dyn Worker>>,
+    /// The workers of each execution lane after lane 0, in lane order.
+    lane_workers: Vec<Vec<Arc<dyn Worker>>>,
     /// Direct injection of a [`ParallelWorkers`] implementation. When set,
     /// bypasses the `workers` → [`SpmdParallelWorkers`] construction in
     /// [`Self::build`] so callers can supply a custom or test-stub impl.
@@ -416,6 +436,24 @@ impl InstanceLeaderBuilder {
     /// Set all workers at once.
     pub fn workers(mut self, workers: Vec<Arc<dyn Worker>>) -> Self {
         self.workers = workers;
+        self
+    }
+
+    /// Add the workers of the next execution lane.
+    ///
+    /// An instance can serve two or more data-parallel replicas of one
+    /// model. Each replica is an execution lane with its own device (G1)
+    /// layouts. All lanes share the G2 managers, the registry, the sessions,
+    /// and the identity of this instance.
+    ///
+    /// `workers` (or `worker`) gives lane 0. The first call of this method
+    /// gives lane 1, the next call lane 2. Worker `i` of each lane is the
+    /// same rank of the parallel grid: its G2 handle names the G2 layout
+    /// that worker `i` of lane 0 names, and its G1 handle names the device
+    /// layout of its own lane. [`InstanceLeader::lane_view`] gives the
+    /// leader whose local transfers run on one lane.
+    pub fn lane_workers(mut self, workers: Vec<Arc<dyn Worker>>) -> Self {
+        self.lane_workers.push(workers);
         self
     }
 
@@ -575,6 +613,34 @@ impl InstanceLeaderBuilder {
             None
         };
 
+        // Lane 0 is the grid above. Each later lane has its own workers over
+        // its own G1 layouts. A lane grid makes no remote connection, so it
+        // takes no parallelism template and no cached metadata.
+        let mut lane_grids = vec![LaneGrid {
+            workers: self.workers.clone(),
+            parallel_worker: parallel_worker.clone(),
+        }];
+        for (index, workers) in self.lane_workers.iter().enumerate() {
+            let lane = index + 1;
+            anyhow::ensure!(
+                lane <= usize::from(u8::MAX),
+                "an instance has at most {} execution lanes",
+                usize::from(u8::MAX) + 1
+            );
+            anyhow::ensure!(
+                workers.len() == self.workers.len(),
+                "execution lane {lane} has {} workers, and lane 0 has {}",
+                workers.len(),
+                self.workers.len()
+            );
+            let spmd = SpmdParallelWorkers::new(workers.clone(), events.clone(), runtime.clone())
+                .with_block_layout_mode(self.block_layout_mode);
+            lane_grids.push(LaneGrid {
+                workers: workers.clone(),
+                parallel_worker: Some(Arc::new(spmd)),
+            });
+        }
+
         let resolved_g2 =
             resolve_g2_managers(self.g2_manager, self.g2_managers, self.primary_g2_resource)?;
         let g2_capacities = resolve_g2_capacities(
@@ -598,6 +664,8 @@ impl InstanceLeaderBuilder {
             g3_manager: self.g3_manager,
             workers: self.workers,
             parallel_worker,
+            lane: 0,
+            lane_grids: Arc::new(lane_grids),
             cached_worker_metadata: self.cached_worker_metadata,
             session_states: Arc::new(DashMap::new()),
             transport,
@@ -752,11 +820,54 @@ impl InstanceLeader {
         self.g1_sources.install(self, sources)
     }
 
-    pub(crate) fn g1_source(
+    /// The execution lane of the workers of this leader.
+    pub fn lane(&self) -> u8 {
+        self.lane
+    }
+
+    /// The count of execution lanes of this instance.
+    pub fn lane_count(&self) -> usize {
+        self.lane_grids.len()
+    }
+
+    /// The leader of execution lane `lane` of this instance.
+    ///
+    /// The result shares each piece of logical state with `self`: the
+    /// registry, the G2 managers and capacities, the G1 sources, the
+    /// sessions, the messenger, and the identity. Only the worker grid
+    /// differs. So a local transfer, an offload engine, an onboard, or a
+    /// `PolicyG1G2Route` that takes the result runs on the G1 layouts of
+    /// that lane and on the G2 layouts that all lanes share.
+    pub fn lane_view(&self, lane: u8) -> Result<Self> {
+        let grid = self.lane_grids.get(usize::from(lane)).ok_or_else(|| {
+            anyhow::anyhow!(
+                "the instance has {} execution lanes and no lane {lane}",
+                self.lane_grids.len()
+            )
+        })?;
+        let mut view = self.clone();
+        view.workers = grid.workers.clone();
+        view.parallel_worker = grid.parallel_worker.clone();
+        view.lane = lane;
+        Ok(view)
+    }
+
+    /// The G1 source of `resource` in one execution lane.
+    pub fn g1_source(
         &self,
         resource: LogicalResourceId,
+        lane: u8,
     ) -> Option<Arc<crate::p2p::g1_source::G1SessionSource>> {
-        self.g1_sources.get(resource)
+        self.g1_sources.get(resource, lane)
+    }
+
+    /// An empty pin set over the enabled G1 sources of `resource` in all
+    /// lanes, for one holder search.
+    pub(crate) fn g1_pins(
+        &self,
+        resource: LogicalResourceId,
+    ) -> Option<Box<dyn crate::p2p::g1_source::PinnedG1Source>> {
+        self.g1_sources.pins(resource)
     }
 
     /// Get a reference to the G2 BlockManager.
@@ -2960,6 +3071,95 @@ mod tests {
             builder = builder.g3_manager(g3.clone());
         }
         Ok((Arc::new(builder.build()?), g2, g3))
+    }
+
+    /// A lane view sends a local transfer to the workers of its lane only.
+    /// Each lane shares the registry and the G2 managers of the instance.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lane_view_runs_a_local_transfer_on_the_workers_of_its_lane() -> Result<()> {
+        use crate::remote::search::bundle::test_support::RecordingParallelWorkers;
+
+        let build = |lanes: Vec<Vec<Arc<dyn Worker>>>, messenger| {
+            let registry = BlockRegistry::builder().build();
+            let g2 = Arc::new(
+                TestManagerBuilder::<G2>::new()
+                    .block_count(8)
+                    .block_size(4)
+                    .registry(registry.clone())
+                    .build(),
+            );
+            let mut builder = InstanceLeader::builder()
+                .messenger(messenger)
+                .registry(registry)
+                .g2_manager(g2);
+            for (lane, workers) in lanes.into_iter().enumerate() {
+                builder = if lane == 0 {
+                    builder.workers(workers)
+                } else {
+                    builder.lane_workers(workers)
+                };
+            }
+            builder.build()
+        };
+
+        let lane0 = Arc::new(RecordingParallelWorkers::default());
+        let lane1 = Arc::new(RecordingParallelWorkers::default());
+        let leader = build(
+            vec![
+                vec![lane0.clone() as Arc<dyn Worker>],
+                vec![lane1.clone() as Arc<dyn Worker>],
+            ],
+            create_messenger_tcp().await?,
+        )?;
+        assert_eq!(leader.lane(), 0);
+        assert_eq!(leader.lane_count(), 2);
+        let view = leader.lane_view(1)?;
+        assert_eq!(view.lane(), 1);
+        assert_eq!(view.lane_count(), 2);
+        assert!(Arc::ptr_eq(
+            leader.g2_manager_for(leader.primary_g2_resource()).unwrap(),
+            view.g2_manager_for(view.primary_g2_resource()).unwrap(),
+        ));
+        assert!(leader.lane_view(2).is_err());
+
+        let resource = leader.primary_g2_resource();
+        view.execute_local_transfer_for_resource(
+            resource,
+            LogicalLayoutHandle::G2,
+            LogicalLayoutHandle::G1,
+            vec![3],
+            vec![5],
+            TransferOptions::default(),
+        )?
+        .await?;
+        assert!(lane0.onboards().is_empty());
+        assert_eq!(lane1.onboards().len(), 1);
+        assert_eq!(lane1.onboards()[0].destination_block_ids, vec![5]);
+
+        leader
+            .lane_view(0)?
+            .execute_local_transfer_for_resource(
+                resource,
+                LogicalLayoutHandle::G2,
+                LogicalLayoutHandle::G1,
+                vec![1],
+                vec![2],
+                TransferOptions::default(),
+            )?
+            .await?;
+        assert_eq!(lane0.onboards().len(), 1);
+        assert_eq!(lane1.onboards().len(), 1);
+
+        // Each lane has the worker count of lane 0.
+        let unequal = build(
+            vec![
+                vec![Arc::new(RecordingParallelWorkers::default()) as Arc<dyn Worker>],
+                Vec::new(),
+            ],
+            create_messenger_tcp().await?,
+        );
+        assert!(unequal.is_err());
+        Ok(())
     }
 
     /// Regression: `import_remote_metadata` must run `connect_remote` (and await

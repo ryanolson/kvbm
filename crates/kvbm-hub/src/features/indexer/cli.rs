@@ -3,7 +3,7 @@
 
 //! `kvbmctl` client CLI for the KV indexer feature.
 //!
-//! Surfaces the read-only hub endpoints (`/v1/features/indexer/{config,
+//! Surfaces the read-only hub endpoints (`/v1/ext/indexer/{config,
 //! manifests/{manifest}/hashes/by_position/{pos}, query}`) as `kvbmctl get indexer
 //! {config,by-pos,query}`. The win over hand-rolled curl is `query`: it takes a
 //! decimal `u128` and packs it into the 16-big-endian-byte wire shape the hub
@@ -18,11 +18,11 @@ use serde_json::json;
 
 use crate::client::HubClient;
 use crate::features::cli::FeatureCli;
-use crate::features::indexer::protocol::ROUTE_PREFIX;
 use crate::features::indexer::{
     ByPositionResponse, IndexerConfigResponse, InstancesResponse, QueryResponse,
 };
 use crate::protocol::FeatureKey;
+use crate::protocol::INDEXER_EXTENSION;
 
 /// Zero-state CLI for the KV indexer feature.
 pub struct IndexerCli;
@@ -33,7 +33,7 @@ impl FeatureCli for IndexerCli {
     }
 
     fn command(&self) -> Command {
-        // The CLI command name and the hub HTTP namespace (`ROUTE_PREFIX`) are
+        // The CLI command name and the hub HTTP namespace (`INDEXER_EXTENSION`) are
         // both the feature key `indexer`, used for the URLs below.
         Command::new("indexer")
             .about("Query the hub's KV block index")
@@ -83,7 +83,7 @@ impl FeatureCli for IndexerCli {
         matches: &'a ArgMatches,
     ) -> BoxFuture<'a, Result<serde_json::Value>> {
         Box::pin(async move {
-            let base = format!("/v1/features/{ROUTE_PREFIX}");
+            let base = format!("/v1/ext/{INDEXER_EXTENSION}");
             match matches.subcommand() {
                 Some(("config", _)) => {
                     let r: IndexerConfigResponse = hub.get_json(&format!("{base}/config")).await?;

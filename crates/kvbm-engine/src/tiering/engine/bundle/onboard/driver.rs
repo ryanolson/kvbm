@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use kvbm_common::{BlockId, LogicalLayoutHandle, LogicalResourceId, SequenceHash};
 use kvbm_logical::ImmutableBlock;
-use kvbm_physical::transfer::TransferCompleteNotification;
+use kvbm_physical::transfer::{TransferCompleteNotification, TransferDrainOutcome};
 use kvbm_protocols::cache_manifest::{ResourceRequirement, ResourceRole};
 use kvbm_protocols::connector::{
     ActionFailure, ActionId, ActionStatus, BundleOnboardPlan, FenceHandle, FindBlocksHandle,
@@ -41,6 +41,15 @@ struct CompletedResource {
     resource: LogicalResourceId,
     destination_block_ids: Vec<BlockId>,
     result: anyhow::Result<()>,
+}
+
+/// The result of the physical phase of one bundle onboard.
+struct BundlePhysicalOutcome {
+    status: ActionStatus,
+    /// `false` when a transfer receipt did not prove that its physical work
+    /// drained. The destination blocks can then receive data, and they must
+    /// stay fenced.
+    drain_proven: bool,
 }
 
 impl LocalConnectorEngine {
@@ -113,7 +122,10 @@ impl LocalConnectorEngine {
         let driver = Arc::clone(&self);
         let terminal_block_ids = destination_block_ids.clone();
         self.leader.runtime().spawn(async move {
-            let (dispatch_failure, completed) = driver.execute_resource_onboards(resources).await;
+            // This action has no physical-drain fence, so it does not use the
+            // drain proof.
+            let (dispatch_failure, completed, _drain_proven) =
+                driver.execute_resource_onboards(resources).await;
             let outcome = fold_resource_onboard(dispatch_failure, completed);
             driver.finish_load_action(action_id, &request_id, outcome, terminal_block_ids);
         });
@@ -186,10 +198,17 @@ impl LocalConnectorEngine {
                             driver.finish_load_action(
                                 action_id,
                                 &request_id,
-                                outcome,
+                                outcome.status,
                                 terminal_dest_ids,
                             );
-                            driver.finish_physical_load_action(action_id, &drain_cell);
+                            if outcome.drain_proven {
+                                driver.finish_physical_load_action(action_id, &drain_cell);
+                            } else {
+                                tracing::error!(
+                                    %request_id,
+                                    "bundle onboard transfer did not prove physical drain; destination quarantine remains fail-closed"
+                                );
+                            }
                         }
                         Err(error) => {
                             tracing::error!(
@@ -245,13 +264,19 @@ impl LocalConnectorEngine {
     fn spawn_bundle_drain_waiter(
         self: &Arc<Self>,
         action_id: ActionId,
-        physical: tokio::task::JoinHandle<ActionStatus>,
+        physical: tokio::task::JoinHandle<BundlePhysicalOutcome>,
         physical_drain: Arc<AtomicBool>,
     ) {
         let driver = Arc::clone(self);
         self.leader.runtime().spawn(async move {
             match physical.await {
-                Ok(_) => driver.finish_physical_load_action(action_id, &physical_drain),
+                Ok(outcome) if outcome.drain_proven => {
+                    driver.finish_physical_load_action(action_id, &physical_drain)
+                }
+                Ok(_) => tracing::error!(
+                    ?action_id,
+                    "quarantined bundle onboard transfer did not prove physical drain; destination quarantine remains fail-closed"
+                ),
                 Err(error) => tracing::error!(
                     %error,
                     ?action_id,
@@ -304,26 +329,40 @@ impl LocalConnectorEngine {
         &self,
         resources: Vec<ResourceOnboard>,
         transaction: BundleOnboardTransaction,
-    ) -> ActionStatus {
-        let (dispatch_failure, completed) = self.execute_resource_onboards(resources).await;
-        fold_bundle_onboard(transaction, dispatch_failure, completed)
+    ) -> BundlePhysicalOutcome {
+        let (dispatch_failure, completed, drain_proven) =
+            self.execute_resource_onboards(resources).await;
+        BundlePhysicalOutcome {
+            status: fold_bundle_onboard(transaction, dispatch_failure, completed),
+            drain_proven,
+        }
     }
 
     async fn execute_resource_onboards(
         &self,
         resources: Vec<ResourceOnboard>,
-    ) -> (Option<DispatchFailure>, Vec<CompletedResource>) {
+    ) -> (Option<DispatchFailure>, Vec<CompletedResource>, bool) {
         let _admission = self.resource_onboard_admission.lock().await;
         let mut completed = Vec::with_capacity(resources.len());
+        // `false` after a receipt that did not prove physical drain.
+        let mut drain_proven = true;
         for transfer in resources {
             let dispatched = match self.dispatch_resource_onboard(transfer) {
                 Ok(dispatched) => dispatched,
-                Err(failure) => return (Some(failure), completed),
+                Err(failure) => return (Some(failure), completed, drain_proven),
+            };
+            let result = match dispatched.notification.await_drain().await {
+                TransferDrainOutcome::Completed => Ok(()),
+                TransferDrainOutcome::DrainedWithError(error) => Err(error),
+                TransferDrainOutcome::Unproven(error) => {
+                    drain_proven = false;
+                    Err(error)
+                }
             };
             let completion = CompletedResource {
                 resource: dispatched.resource,
                 destination_block_ids: dispatched.destination_block_ids,
-                result: dispatched.notification.await,
+                result,
             };
             let failed = completion.result.is_err();
             completed.push(completion);
@@ -331,7 +370,7 @@ impl LocalConnectorEngine {
                 break;
             }
         }
-        (None, completed)
+        (None, completed, drain_proven)
     }
 
     fn dispatch_resource_onboard(

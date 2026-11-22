@@ -149,6 +149,12 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
         self.store.id()
     }
 
+    /// The execution lane in which this manager reports its residency to the
+    /// registry. See `BlockManagerConfigBuilder::lane`.
+    pub fn lane(&self) -> u8 {
+        self.store.presence_lane()
+    }
+
     /// Allocate `count` mutable blocks, drawing first from the reset pool
     /// and then evicting from the inactive pool if needed.
     ///

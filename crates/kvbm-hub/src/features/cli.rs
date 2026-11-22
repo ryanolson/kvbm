@@ -3,7 +3,7 @@
 
 //! Client-side per-feature CLI surface for `kvbmctl`.
 //!
-//! Distinct from [`FeatureManager`](crate::features::FeatureManager), which is
+//! Distinct from [`KvbmFeature`](crate::features::KvbmFeature), which is
 //! *server-side* (holds the index, runs on the hub, constructed with server
 //! args). `kvbmctl` is a **client**: it talks HTTP to a possibly-remote hub and
 //! has no manager instance. So a feature's CLI surface — the clap subcommand it
@@ -27,7 +27,7 @@ use crate::protocol::FeatureKey;
 /// all per-invocation state comes from the [`ArgMatches`] and the [`HubClient`].
 pub trait FeatureCli: Send + Sync {
     /// The feature this CLI drives. Matches the server-side
-    /// [`FeatureManager::key`](crate::features::FeatureManager::key).
+    /// extension `NAME`.
     fn key(&self) -> FeatureKey;
 
     /// The clap subcommand this feature contributes under `kvbmctl get`. Named

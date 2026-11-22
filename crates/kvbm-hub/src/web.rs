@@ -1,16 +1,18 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Embedded single-page UI served from the hub's control port.
+//! Embedded single-page UI. The `connector_control` extension serves it on
+//! the hub's control port at `/v1/ext/connector_control/`.
 //!
 //! Each asset under `lib/kvbm-hub/web/` is baked into the binary via
 //! [`include_str!`] / [`include_bytes!`]; the matching route writes the
 //! bytes back with the correct `Content-Type`. Same-origin against the
 //! hub's control listener — no CORS, no extra port, no build step.
 //!
-//! The UI consumes hub HTTP endpoints (`GET /v1/instances`,
-//! `GET /v1/instances/{id}/modules`, `GET /v1/instances/{id}/describe`,
-//! the `POST /v1/instances/{id}/control/<module>/<handler>` namespace)
+//! The UI consumes hub HTTP endpoints (`GET /v1/instances`, and under
+//! `/v1/ext/connector_control`: `GET instances/{id}/modules`,
+//! `GET instances/{id}/describe` and the
+//! `POST instances/{id}/control/<module>/<handler>` namespace)
 //! purely from the browser — Alpine.js holds the entire state machine.
 
 use axum::Router;
@@ -28,7 +30,7 @@ const ALPINE_JS: &str = include_str!("../web/vendor/alpine.min.js");
 
 // ----- Router -----
 
-/// Routes for the embedded UI. Mount onto the hub's control router.
+/// Routes for the embedded UI, relative to the `connector_control` mount.
 pub fn ui_router() -> Router {
     Router::new()
         .route("/", get(serve_index))

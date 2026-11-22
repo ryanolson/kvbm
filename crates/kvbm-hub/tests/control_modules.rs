@@ -5,7 +5,7 @@
 //!
 //! Stands up a hub plus a fake leader peer that registers
 //! `LIST_MODULES_HANDLER` returning a canned `ListModulesResponse`. Drives
-//! `GET /v1/instances/{id}/modules` against the hub and asserts:
+//! `GET /v1/ext/connector_control/instances/{id}/modules` against the hub and asserts:
 //!
 //! 1. **Populated on register** — the manager's `on_register_any` fetch fills
 //!    the cache without the test poking it; `GET …/modules?cached=true` lands.
@@ -20,7 +20,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use kvbm_hub::protocol::{MUTATION_CREDENTIAL_HEADER, RegisterRequest, RegisterResponse, paths};
 use kvbm_hub::{ControlPlaneManager, HubServer};
 use kvbm_protocols::control::{
     LIST_MODULES_HANDLER, ListModulesRequest, ListModulesResponse, ModuleId,
@@ -46,6 +45,7 @@ async fn new_velo() -> Arc<velo::Velo> {
         .add_transport(new_velo_transport())
         .build()
         .await
+        .map(Arc::new)
         .unwrap()
 }
 
@@ -64,7 +64,7 @@ async fn start_hub_returning_mgr() -> (HubServer, Arc<ControlPlaneManager>) {
         .discovery_port(0)
         .control_port(0)
         .add_transport(transport as Arc<dyn velo::Transport>)
-        .add_feature_manager(mgr.clone() as Arc<dyn kvbm_hub::FeatureManager>)
+        .extension(mgr.clone())
         // Disable hub-driven heartbeat — the cache tests don't exercise it.
         .heartbeat_interval(Duration::from_secs(3600))
         .heartbeat_max_failures(u32::MAX)
@@ -171,7 +171,7 @@ fn install_replacement_race_list_modules(
 
 fn modules_url(server: &HubServer, id: velo_ext::InstanceId) -> String {
     format!(
-        "http://{}/v1/instances/{}/modules",
+        "http://{}/v1/ext/connector_control/instances/{}/modules",
         server.control_addr(),
         id
     )
@@ -225,7 +225,7 @@ async fn cache_populated_on_register() {
     // background. Hold `_client` to keep the registration alive.
     let _client = build_client(&server);
     _client
-        .register_instance(peer.peer_info())
+        .register(&peer, Vec::new(), None)
         .await
         .expect("register");
     let id = peer.instance_id();
@@ -271,7 +271,7 @@ async fn force_bypasses_cache() {
 
     let _client = build_client(&server);
     _client
-        .register_instance(peer.peer_info())
+        .register(&peer, Vec::new(), None)
         .await
         .expect("register");
     let id = peer.instance_id();
@@ -309,7 +309,7 @@ async fn cache_drops_stale_insert_after_unregister() {
 
     let client = build_client(&server);
     client
-        .register_instance(peer.peer_info())
+        .register(&peer, Vec::new(), None)
         .await
         .expect("register");
     let id = peer.instance_id();
@@ -343,32 +343,18 @@ async fn delayed_old_incarnation_result_cannot_overwrite_replacement_cache() {
         Arc::clone(&release_first),
     );
 
-    let request = RegisterRequest {
-        peer_info: peer.peer_info(),
-        features: Vec::new(),
-        runtime: None,
-    };
-    let register_url = format!("http://{}{}", server.control_addr(), paths::INSTANCES);
-    let initial: RegisterResponse = http()
-        .post(&register_url)
-        .json(&request)
-        .send()
-        .await
-        .unwrap()
-        .json()
+    // A second registration on the same client presents its credential, so
+    // the hub replaces the first incarnation.
+    let client = kvbm_hub::test_hub::client(&server);
+    client
+        .register_peer(peer.peer_info(), Default::default())
         .await
         .unwrap();
-    let credential = initial.mutation_credential.unwrap();
     first_started.notified().await;
-
-    let replacement = http()
-        .post(&register_url)
-        .header(MUTATION_CREDENTIAL_HEADER, credential.to_header_value())
-        .json(&request)
-        .send()
+    client
+        .register_peer(peer.peer_info(), Default::default())
         .await
-        .unwrap();
-    assert_eq!(replacement.status(), reqwest::StatusCode::OK);
+        .expect("replacement registers");
 
     let deadline = Instant::now() + Duration::from_secs(2);
     while mgr.modules_for(peer.instance_id()) != Some(vec![ModuleId::Transfer]) {
@@ -405,7 +391,7 @@ async fn control_to_hub_self_id_is_rejected() {
     // `hub_velo_id` a real leader learns and then (in the bug) polls control on.
     let client = build_client(&server);
     let hub_id = client
-        .register_instance(peer.peer_info())
+        .register(&peer, Vec::new(), None)
         .await
         .expect("register")
         .expect("hub returns its velo instance id on register");
@@ -436,7 +422,7 @@ async fn cache_cleared_on_unregister() {
 
     let client = build_client(&server);
     client
-        .register_instance(peer.peer_info())
+        .register(&peer, Vec::new(), None)
         .await
         .expect("register");
     let id = peer.instance_id();

@@ -8,7 +8,7 @@
 //! axum→typed-client wrapper; the client's decode path applies
 //! [`ControlError::http_status`] mapping uniformly.
 //!
-//! Operators hit a stable hub URL like `PUT /v1/instances/{id}/reset`; the
+//! Operators hit a stable hub URL like `PUT /v1/ext/connector_control/instances/{id}/reset`; the
 //! manager looks up `{id}` in the registry and dispatches the typed call.
 //!
 //! [`LeaderControlClient`]: kvbm_protocols::control::LeaderControlClient

@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use velo_ext::{InstanceId, PeerInfo};
+use velo_ext::InstanceId;
 
 use crate::client::HubClient;
 use crate::protocol::{Feature, LayoutCompatPayload, P2pConfig};
@@ -30,14 +30,11 @@ impl P2pClient {
     /// Register the leader with the hub, declaring only the P2P feature.
     pub async fn register(
         &self,
-        peer_info: PeerInfo,
+        velo: &velo::Velo,
         layout_compat: LayoutCompatPayload,
     ) -> Result<Option<InstanceId>> {
         self.hub
-            .register_instance_with_features(
-                peer_info,
-                vec![Feature::P2P(P2pConfig { layout_compat })],
-            )
+            .register(velo, vec![Feature::P2P(P2pConfig { layout_compat })], None)
             .await
     }
 }

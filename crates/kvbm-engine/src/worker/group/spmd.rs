@@ -140,9 +140,9 @@ impl SpmdParallelWorkers {
     ) -> Self {
         Self {
             workers,
-            events: Arc::clone(&events),
+            events,
             runtime: runtime.clone(),
-            replicated_onboard: ReplicatedOnboardCoordinator::new(events, runtime),
+            replicated_onboard: ReplicatedOnboardCoordinator::new(runtime),
             remote_handles: RwLock::new(HashMap::new()),
             remote_tp_sizes: RwLock::new(HashMap::new()),
             remote_descriptors: RwLock::new(HashMap::new()),

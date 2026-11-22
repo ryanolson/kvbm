@@ -52,7 +52,9 @@ pub use external::ExternalDeviceMemory;
 #[cfg(target_os = "linux")]
 pub use hugepage::{HugepageInfo, HugepagePool, PerNodeHugepages, ThpMode};
 #[cfg(target_os = "linux")]
-pub use mmap_pinned::{HugepageMode, HugepageTier, MmappedPinnedOptions, MmappedPinnedStorage};
+pub use mmap_pinned::{
+    HugepageMode, HugepageTier, MmappedPinnedOptions, MmappedPinnedStorage, NumaPlacementPolicy,
+};
 #[cfg(target_os = "linux")]
 pub use numa::{NumaNode, PciAddress, is_numa_disabled, is_numa_enabled};
 pub use offset::OffsetBuffer;

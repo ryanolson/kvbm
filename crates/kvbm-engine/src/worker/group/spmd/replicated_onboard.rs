@@ -5,23 +5,21 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
 use futures::stream::{FuturesUnordered, StreamExt};
-use kvbm_physical::transfer::TransferCompleteNotification;
+use kvbm_physical::transfer::{TransferCompleteNotification, TransferDrainOutcome};
 
 /// Serializes replicated collective onboards and permanently fails the rank
 /// group after its first divergent completion.
 pub(super) struct ReplicatedOnboardCoordinator {
     sequence: Arc<tokio::sync::Mutex<()>>,
     failure: Arc<OnceLock<String>>,
-    events: Arc<::velo::EventManager>,
     runtime: tokio::runtime::Handle,
 }
 
 impl ReplicatedOnboardCoordinator {
-    pub(super) fn new(events: Arc<::velo::EventManager>, runtime: tokio::runtime::Handle) -> Self {
+    pub(super) fn new(runtime: tokio::runtime::Handle) -> Self {
         Self {
             sequence: Arc::new(tokio::sync::Mutex::new(())),
             failure: Arc::new(OnceLock::new()),
-            events,
             runtime,
         }
     }
@@ -42,6 +40,9 @@ impl ReplicatedOnboardCoordinator {
         self.execute_with_wait_hook(dispatch, abort, None)
     }
 
+    /// The returned receipt resolves only after every rank receipt resolved.
+    /// A group failure thus proves that no accepted rank copy is active,
+    /// unless the outcome is [`TransferDrainOutcome::Unproven`].
     fn execute_with_wait_hook<Dispatch, Abort>(
         &self,
         dispatch: Dispatch,
@@ -55,12 +56,10 @@ impl ReplicatedOnboardCoordinator {
         if let Some(reason) = self.failure.get() {
             anyhow::bail!("replicated onboard group is aborted: {reason}");
         }
-        let event = self.events.new_event()?;
-        let awaiter = self.events.awaiter(event.handle())?;
         let sequence = Arc::clone(&self.sequence);
         let failure = Arc::clone(&self.failure);
 
-        self.runtime.spawn(async move {
+        let task = self.runtime.spawn(async move {
             let mut sequence_lock = Box::pin(sequence.lock());
             let sequence_guard = match futures::poll!(&mut sequence_lock) {
                 std::task::Poll::Ready(guard) => guard,
@@ -71,45 +70,101 @@ impl ReplicatedOnboardCoordinator {
                     sequence_lock.await
                 }
             };
-            let result = match failure.get() {
-                Some(reason) => Err(anyhow::anyhow!(
+            if let Some(reason) = failure.get() {
+                // No rank received this operation.
+                return TransferDrainOutcome::DrainedWithError(anyhow::anyhow!(
                     "replicated onboard group is aborted: {reason}"
-                )),
-                None => await_rank_notifications(dispatch()).await,
-            };
-            let Err(error) = result else {
-                let _ = event.trigger();
-                return;
-            };
-
-            let candidate = format!("replicated onboard rank group failed: {error:#}");
-            let first_failure = failure.set(candidate.clone()).is_ok();
-            let reason = failure.get().cloned().unwrap_or(candidate);
-            let _ = event.poison(reason.clone());
-            drop(sequence_guard);
-            if first_failure {
-                abort(reason);
+                ));
             }
+
+            let mut sequence_guard = Some(sequence_guard);
+            await_rank_notifications(dispatch(), |error| {
+                let candidate = format!("replicated onboard rank group failed: {error:#}");
+                let first_failure = failure.set(candidate.clone()).is_ok();
+                let reason = failure.get().cloned().unwrap_or(candidate);
+                // The failure is permanent, and each later operation fails
+                // before its dispatch. The sequence lock has no more function.
+                drop(sequence_guard.take());
+                if first_failure {
+                    // The abort releases ranks that wait in their collective.
+                    abort(reason);
+                }
+            })
+            .await
         });
 
-        Ok(TransferCompleteNotification::from_awaiter(awaiter))
+        Ok(TransferCompleteNotification::from_drain_future(
+            async move {
+                match task.await {
+                    Ok(outcome) => outcome,
+                    Err(error) => TransferDrainOutcome::Unproven(anyhow::anyhow!(
+                        "replicated onboard task stopped before it reported an outcome: {error}"
+                    )),
+                }
+            },
+        ))
     }
 }
 
-/// Poll every rank concurrently and surface the first failure. Serial waiting
-/// can hide a failed RPC behind an earlier rank blocked in its collective.
-async fn await_rank_notifications(
+/// Poll every rank concurrently until every rank receipt resolves.
+///
+/// The first failure calls `on_first_failure` immediately. Serial waiting can
+/// hide a failed RPC behind an earlier rank blocked in its collective. The
+/// function does not return at the first failure, because the other ranks can
+/// have an active copy. A synchronous dispatch error launched no copy.
+async fn await_rank_notifications<OnFailure>(
     notifications: Vec<Result<TransferCompleteNotification>>,
-) -> Result<()> {
+    on_first_failure: OnFailure,
+) -> TransferDrainOutcome
+where
+    OnFailure: FnOnce(&anyhow::Error),
+{
+    let mut on_first_failure = Some(on_first_failure);
+    let mut errors = Vec::new();
+    let mut unproven = false;
     let mut pending = FuturesUnordered::new();
     for notification in notifications {
-        let notification = notification?;
-        pending.push(async move { notification.await });
+        match notification {
+            Ok(notification) => pending.push(notification.await_drain()),
+            Err(error) => errors.push(error),
+        }
     }
-    while let Some(result) = pending.next().await {
-        result?;
+    if let Some(error) = errors.first()
+        && let Some(on_first_failure) = on_first_failure.take()
+    {
+        on_first_failure(error);
     }
-    Ok(())
+    while let Some(outcome) = pending.next().await {
+        let error = match outcome {
+            TransferDrainOutcome::Completed => continue,
+            TransferDrainOutcome::DrainedWithError(error) => error,
+            TransferDrainOutcome::Unproven(error) => {
+                unproven = true;
+                error
+            }
+        };
+        if let Some(on_first_failure) = on_first_failure.take() {
+            on_first_failure(&error);
+        }
+        errors.push(error);
+    }
+
+    if errors.is_empty() {
+        return TransferDrainOutcome::Completed;
+    }
+    let combined = anyhow::anyhow!(
+        "replicated onboard rank group failed: {}",
+        errors
+            .iter()
+            .map(|error| format!("{error:#}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    if unproven {
+        TransferDrainOutcome::Unproven(combined)
+    } else {
+        TransferDrainOutcome::DrainedWithError(combined)
+    }
 }
 
 pub(super) fn dispatch_collective_aborts<T, Abort>(
@@ -167,10 +222,7 @@ mod tests {
     #[tokio::test]
     async fn dispatches_one_logical_operation_at_a_time() {
         let events = Arc::new(::velo::EventManager::local());
-        let coordinator = ReplicatedOnboardCoordinator::new(
-            Arc::clone(&events),
-            tokio::runtime::Handle::current(),
-        );
+        let coordinator = ReplicatedOnboardCoordinator::new(tokio::runtime::Handle::current());
         let first_event = events.new_event().unwrap();
         let first_notification = TransferCompleteNotification::from_awaiter(
             events.awaiter(first_event.handle()).unwrap(),
@@ -229,10 +281,7 @@ mod tests {
     #[tokio::test]
     async fn failure_releases_sequence_and_aborts_every_rank_concurrently() {
         let events = Arc::new(::velo::EventManager::local());
-        let coordinator = ReplicatedOnboardCoordinator::new(
-            Arc::clone(&events),
-            tokio::runtime::Handle::current(),
-        );
+        let coordinator = ReplicatedOnboardCoordinator::new(tokio::runtime::Handle::current());
         let pending_event = events.new_event().unwrap();
         let pending_notification = TransferCompleteNotification::from_awaiter(
             events.awaiter(pending_event.handle()).unwrap(),
@@ -270,11 +319,15 @@ mod tests {
                 },
             )
             .unwrap();
-        let error = tokio::time::timeout(Duration::from_secs(1), completion)
-            .await
-            .expect("a failed rank must not wait for a peer stuck in its collective")
-            .expect_err("the logical onboard must surface the rank failure");
-        assert!(error.to_string().contains("injected rank RPC failure"));
+        // The failed rank starts the abort, but the group receipt waits for
+        // the rank that is in its collective.
+        let mut completion = Box::pin(std::future::IntoFuture::into_future(completion));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), completion.as_mut())
+                .await
+                .is_err(),
+            "the group receipt must wait for a peer that can have an active copy"
+        );
         for _ in 0..observed_ranks.len() {
             abort_entered_rx
                 .recv_timeout(Duration::from_secs(5))
@@ -301,5 +354,96 @@ mod tests {
                 .err()
                 .is_some_and(|error| error.to_string().contains("aborted"))
         );
+
+        pending_event.trigger().unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(1), completion)
+            .await
+            .expect("the group receipt must resolve after the last rank resolves")
+            .expect_err("the logical onboard must surface the rank failure");
+        assert!(error.to_string().contains("injected rank RPC failure"));
+    }
+
+    #[tokio::test]
+    async fn failed_rank_keeps_group_receipt_pending_until_pending_rank_resolves() {
+        let events = Arc::new(::velo::EventManager::local());
+        let coordinator = ReplicatedOnboardCoordinator::new(tokio::runtime::Handle::current());
+        let pending_event = events.new_event().unwrap();
+        let pending_notification = TransferCompleteNotification::from_awaiter(
+            events.awaiter(pending_event.handle()).unwrap(),
+        );
+        let aborts = Arc::new(AtomicUsize::new(0));
+        let observed_aborts = Arc::clone(&aborts);
+
+        let completion = coordinator
+            .execute(
+                move || {
+                    vec![
+                        Err(anyhow::anyhow!("injected rank dispatch failure")),
+                        Ok(pending_notification),
+                    ]
+                },
+                move |_| {
+                    aborts.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .unwrap();
+        let mut drain = tokio::spawn(completion.await_drain());
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut drain)
+                .await
+                .is_err(),
+            "the group receipt must stay pending while a rank receipt is pending"
+        );
+        assert_eq!(
+            observed_aborts.load(Ordering::SeqCst),
+            1,
+            "the first failure must start the abort before the last rank resolves"
+        );
+
+        pending_event.trigger().unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(1), drain)
+            .await
+            .expect("the group receipt must resolve after the last rank resolves")
+            .unwrap();
+        match outcome {
+            TransferDrainOutcome::DrainedWithError(error) => {
+                assert!(error.to_string().contains("injected rank dispatch failure"));
+            }
+            TransferDrainOutcome::Completed => panic!("the rank failure must reach the receipt"),
+            TransferDrainOutcome::Unproven(error) => {
+                panic!("every rank receipt resolved with drain proof: {error:#}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unproven_rank_outcome_makes_group_outcome_unproven() {
+        let coordinator = ReplicatedOnboardCoordinator::new(tokio::runtime::Handle::current());
+        let completion = coordinator
+            .execute(
+                || {
+                    vec![
+                        Ok(TransferCompleteNotification::completed()),
+                        Ok(TransferCompleteNotification::from_drain_future(async {
+                            TransferDrainOutcome::Unproven(anyhow::anyhow!(
+                                "injected lost RPC reply"
+                            ))
+                        })),
+                    ]
+                },
+                |_| {},
+            )
+            .unwrap();
+
+        match completion.await_drain().await {
+            TransferDrainOutcome::Unproven(error) => {
+                assert!(error.to_string().contains("injected lost RPC reply"));
+            }
+            TransferDrainOutcome::Completed => panic!("the rank failure must reach the receipt"),
+            TransferDrainOutcome::DrainedWithError(error) => {
+                panic!("a lost reply does not prove drain: {error:#}")
+            }
+        }
     }
 }

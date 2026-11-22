@@ -52,7 +52,7 @@ impl Default for MessengerConfig {
 }
 
 // Runtime construction (`build_velo` / `build_velo_with_discovery` /
-// `build_messenger`) lives in the `kvbm-runtime` crate so this crate stays
+// `build_velo`) lives in the `kvbm-runtime` crate so this crate stays
 // free of the `velo` dependency. See `kvbm_runtime::build_velo*`.
 
 /// Messenger backend (transport) configuration.

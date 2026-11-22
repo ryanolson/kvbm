@@ -74,6 +74,7 @@ pub struct TestManagerBuilder<T: BlockMetadata> {
     registry: Option<BlockRegistry>,
     events_manager: Option<Arc<EventsManager>>,
     frequency_tracking: FrequencyTrackingCapacity,
+    lane: Option<u8>,
     _phantom: PhantomData<T>,
 }
 
@@ -91,8 +92,16 @@ impl<T: BlockMetadata> TestManagerBuilder<T> {
             registry: None,
             events_manager: None,
             frequency_tracking: FrequencyTrackingCapacity::Medium,
+            lane: None,
             _phantom: PhantomData,
         }
+    }
+
+    /// The execution lane of the manager. See
+    /// `BlockManagerConfigBuilder::lane`.
+    pub fn lane(mut self, lane: u8) -> Self {
+        self.lane = Some(lane);
+        self
     }
 
     pub fn block_count(mut self, count: usize) -> Self {
@@ -133,13 +142,16 @@ impl<T: BlockMetadata> TestManagerBuilder<T> {
             builder.build()
         });
 
-        BlockManager::<T>::builder()
+        let builder = BlockManager::<T>::builder()
             .block_count(block_count)
             .block_size(block_size)
             .registry(registry)
-            .with_lru_backend()
-            .build()
-            .expect("Should build test manager")
+            .with_lru_backend();
+        let builder = match self.lane {
+            Some(lane) => builder.lane(lane),
+            None => builder,
+        };
+        builder.build().expect("Should build test manager")
     }
 }
 

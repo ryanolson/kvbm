@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use velo_ext::InstanceId;
 
-use crate::registry::{PeerRegistry, RegistryIncarnation};
+use velo_hub::store::{HubStore, Incarnation};
 
 const MODULES_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const MODULES_RPC_TIMEOUT: Duration = Duration::from_secs(2);
@@ -50,7 +50,7 @@ enum FetchOutcome {
 #[derive(Clone, Copy)]
 pub(super) struct ModuleTarget {
     instance_id: InstanceId,
-    incarnation: RegistryIncarnation,
+    incarnation: Incarnation,
 }
 
 #[derive(Clone, Copy)]
@@ -62,7 +62,7 @@ struct ModuleRefreshConfig {
 }
 
 impl ModuleTarget {
-    pub(super) const fn new(instance_id: InstanceId, incarnation: RegistryIncarnation) -> Self {
+    pub(super) const fn new(instance_id: InstanceId, incarnation: Incarnation) -> Self {
         Self {
             instance_id,
             incarnation,
@@ -73,7 +73,7 @@ impl ModuleTarget {
         self.instance_id
     }
 
-    pub(super) const fn incarnation(self) -> RegistryIncarnation {
+    pub(super) const fn incarnation(self) -> Incarnation {
         self.incarnation
     }
 }
@@ -81,7 +81,7 @@ impl ModuleTarget {
 impl ModuleRefreshRuntime {
     pub(super) fn new<C>(
         cancel: CancellationToken,
-        registry: Arc<dyn PeerRegistry>,
+        registry: Arc<dyn HubStore>,
         self_id: InstanceId,
         messenger: Arc<velo::Messenger>,
         commit: C,
@@ -95,12 +95,12 @@ impl ModuleRefreshRuntime {
             ModuleRefreshConfig::production(),
             move || {
                 snapshot_registry
-                    .registrations()
+                    .list()
                     .into_iter()
                     .filter_map(|registered| {
                         let instance_id = registered.peer().instance_id();
                         (instance_id != self_id)
-                            .then(|| ModuleTarget::new(instance_id, registered.incarnation()))
+                            .then(|| ModuleTarget::new(instance_id, registered.incarnation))
                     })
                     .collect()
             },
@@ -340,8 +340,8 @@ mod tests {
             config(),
             move || {
                 vec![
-                    ModuleTarget::new(hung, RegistryIncarnation::from_u64(1)),
-                    ModuleTarget::new(healthy, RegistryIncarnation::from_u64(1)),
+                    ModuleTarget::new(hung, Incarnation::from_u64(1)),
+                    ModuleTarget::new(healthy, Incarnation::from_u64(1)),
                 ]
             },
             {
@@ -392,7 +392,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_promptly_stops_periodic_and_on_register_fetches() {
-        let target = ModuleTarget::new(InstanceId::new_v4(), RegistryIncarnation::from_u64(1));
+        let target = ModuleTarget::new(InstanceId::new_v4(), Incarnation::from_u64(1));
         let started = Arc::new(tokio::sync::Semaphore::new(0));
         let dropped = Arc::new(AtomicUsize::new(0));
         let runtime = ModuleRefreshRuntime::from_parts(
@@ -435,7 +435,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_interrupts_on_register_retry_backoff() {
-        let target = ModuleTarget::new(InstanceId::new_v4(), RegistryIncarnation::from_u64(1));
+        let target = ModuleTarget::new(InstanceId::new_v4(), Incarnation::from_u64(1));
         let calls = Arc::new(AtomicUsize::new(0));
         let first_call = Arc::new(tokio::sync::Semaphore::new(0));
         let runtime = ModuleRefreshRuntime::from_parts(
@@ -474,8 +474,8 @@ mod tests {
 
     #[tokio::test]
     async fn on_register_fetches_share_the_global_concurrency_bound() {
-        let first = ModuleTarget::new(InstanceId::new_v4(), RegistryIncarnation::from_u64(1));
-        let second = ModuleTarget::new(InstanceId::new_v4(), RegistryIncarnation::from_u64(1));
+        let first = ModuleTarget::new(InstanceId::new_v4(), Incarnation::from_u64(1));
+        let second = ModuleTarget::new(InstanceId::new_v4(), Incarnation::from_u64(1));
         let calls = Arc::new(AtomicUsize::new(0));
         let dropped = Arc::new(AtomicUsize::new(0));
         let first_started = Arc::new(tokio::sync::Semaphore::new(0));
@@ -525,7 +525,7 @@ mod tests {
     #[tokio::test]
     async fn delayed_result_keeps_its_incarnation_for_commit_filtering() {
         let instance_id = InstanceId::new_v4();
-        let stale = RegistryIncarnation::from_u64(1);
+        let stale = Incarnation::from_u64(1);
         let current = Arc::new(AtomicU64::new(stale.as_u64()));
         let release = Arc::new(tokio::sync::Semaphore::new(0));
         let commits = Arc::new(AtomicUsize::new(0));

@@ -175,7 +175,7 @@ impl<T: BlockMetadata> BlockStore<T> {
         // This obtains the registry attachments lock. Do it after the store
         // mutex releases to preserve the documented lock ordering.
         for handle in handles {
-            handle.mark_absent::<T>();
+            handle.mark_absent::<T>(self.presence_lane());
         }
         Ok((blocks, evicted))
     }

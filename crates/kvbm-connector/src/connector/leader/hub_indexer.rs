@@ -4,7 +4,7 @@
 //! KV-index hub publisher wiring.
 //!
 //! The hub's KV-index ingest transport is discovered by the hub handshake
-//! ([`super::hub_handshake`]) from the aggregate `GET /v1/config`. When the
+//! ([`super::hub_handshake`]) from the aggregate `GET /v1/ext/kvbm/config`. When the
 //! Indexer feature is effective and block-size-compatible, the connector
 //! connects the advertised transport and wires a [`Publisher`] into
 //! the block-registry [`EventsManager`] so block create/remove events flow to

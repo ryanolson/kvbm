@@ -209,14 +209,15 @@ impl BlockRegistrationHandle {
         self.inner.attachments.lock().event_release = Some(release);
     }
 
-    /// Increment the physical-residency marker for tier `T`. Each
-    /// registration transition (`Staged → Primary`, `Staged → Duplicate`)
-    /// calls this exactly once. The marker remains set while a slot is
-    /// `Primary`, `Duplicate`, `Inactive`, or `Held`.
-    pub(crate) fn mark_present<T: BlockMetadata>(&self) {
+    /// Increment the physical-residency marker for tier `T` in the execution
+    /// lane `lane` of the store. Each registration transition
+    /// (`Staged → Primary`, `Staged → Duplicate`) calls this exactly once.
+    /// The marker remains set while a slot is `Primary`, `Duplicate`,
+    /// `Inactive`, or `Held`.
+    pub(crate) fn mark_present<T: BlockMetadata>(&self, lane: u8) {
         let type_id = TypeId::of::<T>();
         let mut attachments = self.inner.attachments.lock();
-        attachments.presence_markers.increment(type_id);
+        attachments.presence_markers.increment((type_id, lane));
     }
 
     /// Decrement the physical-residency marker for tier `T`. Each
@@ -224,10 +225,10 @@ impl BlockRegistrationHandle {
     /// eviction, `Held → Reset` via pressure commit, or `Duplicate → Reset`
     /// via last-duplicate drop) calls this exactly once. The entry is removed
     /// on reaching zero.
-    pub(crate) fn mark_absent<T: BlockMetadata>(&self) {
+    pub(crate) fn mark_absent<T: BlockMetadata>(&self, lane: u8) {
         let type_id = TypeId::of::<T>();
         let mut attachments = self.inner.attachments.lock();
-        let had_marker = attachments.presence_markers.decrement(type_id);
+        let had_marker = attachments.presence_markers.decrement((type_id, lane));
         debug_assert!(had_marker, "mark_absent with no presence marker present");
     }
 
@@ -248,7 +249,17 @@ impl BlockRegistrationHandle {
     pub fn has_block<T: BlockMetadata>(&self) -> bool {
         let type_id = TypeId::of::<T>();
         let attachments = self.inner.attachments.lock();
-        attachments.presence_markers.count(type_id) > 0
+        attachments.presence_markers.count_all_lanes(type_id) > 0
+    }
+
+    /// Returns `true` if a physical registered slot exists for this sequence
+    /// hash and tier `T` in the execution lane `lane`. A store reports its
+    /// slots in the lane that its manager was built with, and lane 0 is the
+    /// default. The consistency rules of [`Self::has_block`] apply.
+    pub fn has_block_in_lane<T: BlockMetadata>(&self, lane: u8) -> bool {
+        let type_id = TypeId::of::<T>();
+        let attachments = self.inner.attachments.lock();
+        attachments.presence_markers.count((type_id, lane)) > 0
     }
 
     /// Returns `true` if physical registered residency exists for at least
@@ -258,7 +269,7 @@ impl BlockRegistrationHandle {
         let attachments = self.inner.attachments.lock();
         type_ids
             .iter()
-            .any(|type_id| attachments.presence_markers.count(*type_id) > 0)
+            .any(|type_id| attachments.presence_markers.count_all_lanes(*type_id) > 0)
     }
 
     /// Register a callback to be invoked when this handle is touched.
