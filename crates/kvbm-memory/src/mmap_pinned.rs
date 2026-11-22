@@ -779,7 +779,8 @@ fn mbind_to_node(addr: usize, len: usize, node: NumaNode) -> std::result::Result
     set_range_policy(addr, len, libc::MPOL_BIND, node, MPOL_MF_STRICT)
 }
 
-/// `mbind(addr, len, mode, {node}, …, flags)` with a one-word node mask.
+/// `mbind(addr, len, mode, {node}, …, flags)`. The mask is as long as the
+/// node id needs, so the kernel, not this helper, decides which nodes exist.
 fn set_range_policy(
     addr: usize,
     len: usize,
@@ -787,23 +788,22 @@ fn set_range_policy(
     node: NumaNode,
     flags: libc::c_uint,
 ) -> std::result::Result<(), String> {
-    if node.0 >= 64 {
+    if node.0 >= NODE_ID_LIMIT {
         return Err(format!(
-            "mbind nodemask supports up to 64 nodes; got node id {}",
+            "node id {} is not below {NODE_ID_LIMIT}, beyond any kernel's node count",
             node.0
         ));
     }
-    let nodemask: u64 = 1u64 << node.0;
-    // The kernel reads `maxnode - 1` bits of the mask, so a full 64-bit mask
-    // needs 65 (as libnuma passes). With 64, bit 63 is silently dropped.
+    let (mask, maxnode) = node_mask(node);
+    // SAFETY: `mask` outlives the call and holds `maxnode - 1` bits.
     let r = unsafe {
         libc::syscall(
             libc::SYS_mbind,
             addr,
             len,
             mode as usize,
-            &nodemask as *const u64 as usize,
-            65usize,
+            mask.as_ptr() as usize,
+            maxnode,
             flags as usize,
         )
     };
@@ -811,6 +811,22 @@ fn set_range_policy(
         return Err(format!("mbind: {}", std::io::Error::last_os_error()));
     }
     Ok(())
+}
+
+/// Node ids at or above this are refused before `mbind`, so a stray id
+/// (such as [`NumaNode::UNKNOWN`]) cannot size a huge mask. Linux allows at
+/// most 1024 nodes (`CONFIG_NODES_SHIFT` <= 10).
+const NODE_ID_LIMIT: u32 = 4096;
+
+/// The node mask for one node, and the `maxnode` to pass with it. The kernel
+/// reads `maxnode - 1` bits, so `maxnode` is the mask's bit count plus one
+/// (as libnuma passes); one less would drop the top bit.
+fn node_mask(node: NumaNode) -> (Vec<u64>, usize) {
+    let word = node.0 as usize / 64;
+    let mut mask = vec![0u64; word + 1];
+    mask[word] = 1u64 << (node.0 % 64);
+    let maxnode = mask.len() * 64 + 1;
+    (mask, maxnode)
 }
 
 /// Touch one byte per page so first-touch lands pages on the calling
@@ -1045,7 +1061,46 @@ mod tests {
         assert_eq!(placed.placement.observed, Some(node));
     }
 
-    /// The policy helper hands the kernel every bit of its one-word mask.
+    /// Node ids of 64 and above reach the kernel: the helper does not refuse
+    /// them itself. This host lacks such nodes, so the kernel refuses them
+    /// with `EINVAL`.
+    #[test]
+    fn a_node_id_above_63_reaches_the_kernel() {
+        let g = mmap_anon(system_page_size()).unwrap();
+        for id in [64u32, 127, 1023] {
+            if std::path::Path::new(&format!("/sys/devices/system/node/node{id}")).exists() {
+                continue;
+            }
+            match set_range_policy(g.ptr, g.len, libc::MPOL_PREFERRED, NumaNode(id), 0) {
+                Err(e) => assert!(e.contains("Invalid argument"), "node {id}: {e}"),
+                Ok(()) => panic!("node {id} is absent, yet mbind accepted it"),
+            }
+        }
+    }
+
+    /// A stray node id is refused before any mask is built.
+    #[test]
+    fn a_stray_node_id_is_refused_before_mbind() {
+        let g = mmap_anon(system_page_size()).unwrap();
+        let e = set_range_policy(g.ptr, g.len, libc::MPOL_BIND, NumaNode::UNKNOWN, 0).unwrap_err();
+        assert!(e.contains("beyond any kernel's node count"), "error: {e}");
+    }
+
+    /// The node mask has exactly the requested bit set, in the word that
+    /// holds it, and `maxnode` covers every bit of the mask plus one.
+    #[test]
+    fn the_node_mask_holds_exactly_the_requested_bit() {
+        let (mask, maxnode) = node_mask(NumaNode(0));
+        assert_eq!((mask, maxnode), (vec![1], 65));
+        let (mask, maxnode) = node_mask(NumaNode(63));
+        assert_eq!((mask, maxnode), (vec![1 << 63], 65));
+        let (mask, maxnode) = node_mask(NumaNode(64));
+        assert_eq!((mask, maxnode), (vec![0, 1], 129));
+        let (mask, maxnode) = node_mask(NumaNode(130));
+        assert_eq!((mask, maxnode), (vec![0, 0, 1 << 2], 193));
+    }
+
+    /// The policy helper hands the kernel every bit of the mask.
     /// `MPOL_PREFERRED` with an empty mask becomes `MPOL_LOCAL`, so a dropped
     /// bit 63 shows as `MPOL_LOCAL`. Node 63 is absent on most hosts; then
     /// the kernel sees the bit and refuses it.
