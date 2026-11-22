@@ -88,8 +88,8 @@ use cudarc::driver::CudaContext;
 use nix::libc;
 use serde::{Deserialize, Serialize};
 
-use crate::numa::placement::{PlacementDecision, decide_placement};
-use crate::numa::{MemPolicyMode, NumaNode, PagePlacement};
+use crate::numa::placement::{PageReading, PlacementDecision, decide_placement};
+use crate::numa::{MemPolicyMode, NumaNode};
 use crate::{MemoryDescriptor, Result, StorageError, StorageKind, actions, nixl::NixlDescriptor};
 
 /// Hugepage allocation policy for one allocation.
@@ -462,7 +462,7 @@ fn place_pinned_host(
         decision,
         pinned,
         mbind_to_node,
-        crate::numa::page_placement,
+        crate::numa::placement::read_page,
         |ptr, len| {
             ctx.bind_to_thread().map_err(StorageError::Cuda)?;
             HostRegisterGuard::new(ptr, len, ctx.clone())
@@ -503,19 +503,21 @@ pub(crate) struct Placed<T> {
 ///
 /// `pinned` is whether the calling thread was pinned to the node; a pin
 /// failure is named in a refused bind's error. Only `bind` can change the
-/// placement: its error, or a kernel view (read with `observe` on the first,
-/// middle and last page) that does not show `MPOL_BIND` on the node, becomes
-/// [`PlacementFallback::BindRefused`]. An `observe` error is logged and
-/// recorded as `observed = None`, and the bind's own answer stands. A
+/// placement: its error, or any policy answer (read with `observe` on the
+/// first, middle and last page) that does not show `MPOL_BIND` on the node,
+/// becomes [`PlacementFallback::BindRefused`]. Each query's answer is kept on
+/// its own. A failed query is logged; `observed` is the first page's node if
+/// that query answered, and with no policy answer the bind's own result
+/// stands. A
 /// `register` error fails the call as is. The steps are parameters so tests
 /// can inject failures.
-pub(crate) fn map_place_register<T>(
+pub(crate) fn map_place_register<T, R: Into<PageReading>>(
     size: usize,
     requested: Option<NumaNode>,
     decision: PlacementDecision,
     pinned: std::result::Result<(), String>,
     bind: impl FnOnce(usize, usize, NumaNode) -> std::result::Result<(), String>,
-    observe: impl FnMut(usize) -> std::io::Result<PagePlacement>,
+    observe: impl FnMut(usize) -> R,
     register: impl FnOnce(usize, usize) -> Result<T>,
 ) -> Result<Placed<T>> {
     if size == 0 {
@@ -557,35 +559,41 @@ pub(crate) fn map_place_register<T>(
 
     // Read the kernel's view of the first, middle and last page before
     // registration (the driver may change the policy when it registers).
+    // Each answer is kept on its own: a failed query must not hide another
+    // query's answer.
     let page = system_page_size();
     let last = (mmap.len - 1) / page;
     let mut observe = observe;
-    let readings: std::io::Result<Vec<PagePlacement>> = [0, last / 2, last]
+    let readings: Vec<PageReading> = [0, last / 2, last]
         .into_iter()
-        .map(|index| observe(mmap.ptr + index * page))
+        .map(|index| observe(mmap.ptr + index * page).into())
         .collect();
-    let observed = match &readings {
-        Ok(readings) => Some(readings[0].node),
-        Err(e) => {
-            tracing::warn!(
-                "get_mempolicy on {:#x} failed ({}); the placement is not observed",
-                mmap.ptr,
-                e
-            );
-            None
-        }
-    };
+    let failed = readings
+        .iter()
+        .flat_map(|r| [r.policy.as_ref().err(), r.node.as_ref().err()])
+        .flatten()
+        .next();
+    if let Some(e) = failed {
+        tracing::warn!(
+            "get_mempolicy on the slab at {:#x} failed ({}); the placement is only partly observed",
+            mmap.ptr,
+            e
+        );
+    }
+    let observed = readings[0].node.as_ref().ok().copied();
 
-    // A bind counts only if the kernel shows it. A denied query keeps the
-    // bind's own answer.
-    if let (NumaPlacementPolicy::Bound(node), Ok(readings)) = (policy, &readings)
-        && let Some(wrong) = readings
+    // A bind counts only if the kernel shows it: any policy answer that is
+    // not MPOL_BIND on the node refuses it. With no policy answer at all,
+    // the bind's own result stands.
+    if let NumaPlacementPolicy::Bound(node) = policy
+        && let Some((mode, nodes)) = readings
             .iter()
-            .find(|p| p.mode != MemPolicyMode::Bind || p.nodes != [node])
+            .filter_map(|r| r.policy.as_ref().ok())
+            .find(|(mode, nodes)| *mode != MemPolicyMode::Bind || nodes.as_slice() != [node])
     {
         let error = format!(
             "mbind returned success, but the kernel reports {:?} on nodes {:?}",
-            wrong.mode, wrong.nodes
+            mode, nodes
         );
         tracing::warn!("bind to node {} did not take: {}", node.0, error);
         policy = NumaPlacementPolicy::OsDefault;
@@ -1112,6 +1120,56 @@ mod tests {
             placed.placement.fallback,
             Some(PlacementFallback::BindRefused { .. })
         ));
+    }
+
+    /// The two queries for a page are kept apart: a policy answer that shows
+    /// no bind refuses the bind even when the node query fails.
+    #[test]
+    fn a_failed_node_query_does_not_hide_a_policy_answer() {
+        let placed = map_place_register(
+            1 << 16,
+            Some(NumaNode(0)),
+            PlacementDecision::Bind(NumaNode(0)),
+            Ok(()),
+            |_, _, _| Ok(()),
+            |_| PageReading {
+                policy: Ok((MemPolicyMode::Default, vec![])),
+                node: Err(std::io::Error::from_raw_os_error(libc::EPERM)),
+            },
+            no_register,
+        )
+        .unwrap();
+        assert_eq!(placed.placement.policy, NumaPlacementPolicy::OsDefault);
+        assert!(matches!(
+            placed.placement.fallback,
+            Some(PlacementFallback::BindRefused { .. })
+        ));
+        assert_eq!(placed.placement.observed, None);
+    }
+
+    /// The other way round: a failed policy query keeps the bind's own
+    /// result, and the node answer is still observed.
+    #[test]
+    fn a_failed_policy_query_does_not_hide_the_page_node() {
+        let placed = map_place_register(
+            1 << 16,
+            Some(NumaNode(0)),
+            PlacementDecision::Bind(NumaNode(0)),
+            Ok(()),
+            |_, _, _| Ok(()),
+            |_| PageReading {
+                policy: Err(std::io::Error::from_raw_os_error(libc::EPERM)),
+                node: Ok(NumaNode(0)),
+            },
+            no_register,
+        )
+        .unwrap();
+        assert_eq!(
+            placed.placement.policy,
+            NumaPlacementPolicy::Bound(NumaNode(0))
+        );
+        assert_eq!(placed.placement.fallback, None);
+        assert_eq!(placed.placement.observed, Some(NumaNode(0)));
     }
 
     /// When the thread could not be pinned and the bind is refused, the

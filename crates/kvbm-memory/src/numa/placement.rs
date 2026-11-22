@@ -96,6 +96,57 @@ pub struct PagePlacement {
 /// in a page that is not yet present. Fails with the `get_mempolicy` error,
 /// for example `EPERM` under a seccomp profile that denies the call.
 pub fn page_placement(addr: usize) -> std::io::Result<PagePlacement> {
+    let PageReading { policy, node } = read_page(addr);
+    let (mode, nodes) = policy?;
+    Ok(PagePlacement {
+        mode,
+        nodes,
+        node: node?,
+    })
+}
+
+/// The two `get_mempolicy` answers for one page, each kept on its own, so a
+/// failure of one query does not hide the other's answer.
+#[derive(Debug)]
+pub(crate) struct PageReading {
+    /// The policy mode and node mask on the range (`MPOL_F_ADDR`).
+    pub(crate) policy: std::io::Result<(MemPolicyMode, Vec<NumaNode>)>,
+    /// The node that holds the page (`MPOL_F_NODE | MPOL_F_ADDR`).
+    pub(crate) node: std::io::Result<NumaNode>,
+}
+
+impl From<std::io::Result<PagePlacement>> for PageReading {
+    fn from(result: std::io::Result<PagePlacement>) -> Self {
+        match result {
+            Ok(p) => Self {
+                policy: Ok((p.mode, p.nodes)),
+                node: Ok(p.node),
+            },
+            Err(e) => Self {
+                policy: Err(copy_error(&e)),
+                node: Err(e),
+            },
+        }
+    }
+}
+
+fn copy_error(e: &std::io::Error) -> std::io::Error {
+    match e.raw_os_error() {
+        Some(code) => std::io::Error::from_raw_os_error(code),
+        None => std::io::Error::new(e.kind(), e.to_string()),
+    }
+}
+
+/// Make both `get_mempolicy` queries for the page at `addr`, and keep each
+/// answer.
+pub(crate) fn read_page(addr: usize) -> PageReading {
+    PageReading {
+        policy: read_policy(addr),
+        node: read_node(addr),
+    }
+}
+
+fn read_policy(addr: usize) -> std::io::Result<(MemPolicyMode, Vec<NumaNode>)> {
     let mut mode: libc::c_int = 0;
     let mut mask = [0u64; MASK_BITS / 64];
     // SAFETY: `mode` and `mask` outlive the call; `MASK_BITS` is the bit
@@ -113,7 +164,19 @@ pub fn page_placement(addr: usize) -> std::io::Result<PagePlacement> {
     if r != 0 {
         return Err(std::io::Error::last_os_error());
     }
+    let nodes = mask
+        .iter()
+        .enumerate()
+        .flat_map(|(word, bits)| {
+            (0..64u32)
+                .filter(move |bit| bits & (1u64 << bit) != 0)
+                .map(move |bit| NumaNode(word as u32 * 64 + bit))
+        })
+        .collect();
+    Ok((MemPolicyMode::from_raw(mode & !MPOL_MODE_FLAGS), nodes))
+}
 
+fn read_node(addr: usize) -> std::io::Result<NumaNode> {
     let mut node: libc::c_int = 0;
     // SAFETY: `node` outlives the call; no mask is passed.
     let r = unsafe {
@@ -129,22 +192,7 @@ pub fn page_placement(addr: usize) -> std::io::Result<PagePlacement> {
     if r != 0 {
         return Err(std::io::Error::last_os_error());
     }
-
-    let nodes = mask
-        .iter()
-        .enumerate()
-        .flat_map(|(word, bits)| {
-            (0..64u32)
-                .filter(move |bit| bits & (1u64 << bit) != 0)
-                .map(move |bit| NumaNode(word as u32 * 64 + bit))
-        })
-        .collect();
-
-    Ok(PagePlacement {
-        mode: MemPolicyMode::from_raw(mode & !MPOL_MODE_FLAGS),
-        nodes,
-        node: NumaNode(node as u32),
-    })
+    Ok(NumaNode(node as u32))
 }
 
 /// `get_mempolicy` flags from `<numaif.h>`; `libc` does not export them.
