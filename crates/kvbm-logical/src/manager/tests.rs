@@ -79,6 +79,45 @@ fn adjustable_capacity_grows_slot_metadata_and_inactive_index() {
 }
 
 #[test]
+fn release_request_blocks_releases_large_immutable_batches() {
+    const BLOCK_COUNT: usize = 600;
+    let manager = create_test_manager(BLOCK_COUNT);
+    let complete = manager
+        .allocate_blocks(BLOCK_COUNT)
+        .unwrap()
+        .into_iter()
+        .enumerate()
+        .map(|(index, block)| {
+            block
+                .complete(&create_test_token_block_from_iota(index as u32 * 4))
+                .unwrap()
+        })
+        .collect();
+    let immutable = manager.register_blocks(complete);
+    assert_eq!(immutable.len(), BLOCK_COUNT);
+
+    manager.release_request_blocks(
+        crate::integrations::RequestBlocks {
+            immutable,
+            complete: Vec::new(),
+            mutable: Vec::new(),
+        },
+        None,
+    );
+
+    assert_eq!(
+        manager.metrics().snapshot().inactive_pool_size,
+        BLOCK_COUNT as i64
+    );
+    assert_eq!(manager.occupied_blocks(), BLOCK_COUNT);
+    manager.reset_inactive_pool().unwrap();
+    assert_eq!(
+        manager.allocate_blocks(BLOCK_COUNT).unwrap().len(),
+        BLOCK_COUNT
+    );
+}
+
+#[test]
 fn adjustable_capacity_protects_live_and_cached_tail_blocks() {
     let manager = create_test_manager(3);
     let mut blocks = manager.allocate_blocks(3).unwrap();
