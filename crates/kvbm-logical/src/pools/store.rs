@@ -50,7 +50,7 @@ use crate::registry::BlockRegistrationHandle;
 // Identity hashing for `SequenceHash`-keyed maps lives in `pools` — it is
 // shared by `active_by_hash` here and by the inactive-pool backends.
 use super::advice::{InactiveCandidate, InactiveFeatures};
-use super::{ExactInactiveVictim, SeqHashMap};
+use super::{ExactInactiveVictim, IdBuildHasher, SeqHashMap};
 
 #[cfg(test)]
 mod exact_inactive;
@@ -757,6 +757,22 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
 
     pub(crate) fn inactive_len(&self) -> usize {
         self.inner.lock().inactive.len()
+    }
+
+    /// Test-only: allocated capacity of the live-primary index, in entries.
+    ///
+    /// A doubling of the map shows up here, and so does an in-place rebuild
+    /// (the value rises back to the allocation's limit). See
+    /// `manager::tests::store_growth`.
+    #[cfg(test)]
+    pub(crate) fn active_by_hash_capacity(&self) -> usize {
+        self.inner.lock().active_by_hash.capacity()
+    }
+
+    /// Test-only: number of live primaries in the hash index.
+    #[cfg(test)]
+    pub(crate) fn active_by_hash_len(&self) -> usize {
+        self.inner.lock().active_by_hash.len()
     }
 
     /// Number of eligible reset slots and inactive cached blocks.
