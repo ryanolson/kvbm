@@ -84,13 +84,15 @@ struct ChurnStats {
     growths: usize,
     /// Steps where the index rebuilt in place.
     ///
-    /// The reported `capacity()` is items plus growth left. A removal either
-    /// leaves a tombstone (both drop by one) or empties its probe group (the
-    /// entry drops, the budget gains one), so it never raises the report. An
-    /// insertion raises it by one only when it fills a tombstone without
-    /// taking a fresh slot. So a step can raise it by at most its number of
-    /// inserts, and only a rebuild restores it to the clean entry capacity
-    /// above that.
+    /// The reported `capacity()` is items plus growth left. A removal always
+    /// drops the item count by one, so the report drops by one when the slot
+    /// becomes a tombstone and holds when it becomes empty, because the
+    /// budget gains one back; the empty slots around the erased one decide
+    /// which. A removal therefore never raises the report. An insertion
+    /// raises it by one only when it fills a tombstone without taking a
+    /// fresh slot. So a step can raise it by at most its number of inserts,
+    /// and only a rebuild restores it to the clean entry capacity above
+    /// that.
     rehashes: usize,
 }
 

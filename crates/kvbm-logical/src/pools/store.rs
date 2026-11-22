@@ -359,19 +359,21 @@ impl<T: BlockMetadata> std::fmt::Debug for SlotState<T> {
 ///
 /// The index holds one entry per live primary: a registration inserts one,
 /// a release to the inactive pool removes one, and a cache hit inserts it
-/// again. Sizing it to `live` entries is not enough. A release usually
-/// leaves a tombstone in the erased entry's probe group — the exception is
-/// a group left with nothing in it — and a tombstone spends the same
-/// growth budget as a live entry. When a reservation finds the budget
-/// short, hashbrown rebuilds the table in place only when the requested
-/// entry count is at most half the clean entry capacity (the entries a
-/// tombstone-free table of that allocation holds); above that it doubles
-/// the table, rehashing every entry. Both happen under the store mutex,
-/// which is the pause this reservation exists to avoid. Two entries per
-/// live primary put the clean entry capacity at twice the live count, so a
-/// churn at capacity rebuilds in place at most instead of doubling. A
-/// rebuild still visits every bucket; `manager::tests::store_growth` counts
-/// and bounds those for a fixed workload.
+/// again. Sizing it to `live` entries is not enough. A removal always drops
+/// the live count by one. It gives one unit of growth budget back when the
+/// erased slot can be marked empty, and leaves the budget alone when the
+/// slot becomes a tombstone; the empty slots around the erased one decide
+/// which, so a churn can spend the table's budget. When a reservation
+/// finds the budget short, hashbrown rebuilds the table in place only when
+/// the requested entry count is at most half the clean entry capacity (the
+/// entries a tombstone-free table of that allocation holds); above that it
+/// doubles the table, rehashing every entry. Both happen under the store
+/// mutex, which is the pause this reservation exists to avoid. Two entries
+/// per live primary give at least twice the live count in clean entry
+/// capacity, so a churn at capacity rebuilds in place at most instead of
+/// doubling. A rebuild still visits every bucket;
+/// `manager::tests::store_growth` counts and bounds those for a fixed
+/// workload.
 ///
 /// Never size from the store's maximum: a manager is built with the maximum
 /// it might grow to (Rhino passes `u32::MAX`) and only its current capacity
@@ -420,18 +422,20 @@ pub(crate) struct BlockStoreInner<T: BlockMetadata> {
     /// maximum, not a live reading.
     ///
     /// `HashMap::capacity()` is a conditional report — items plus growth
-    /// left — so a release that leaves a tombstone lowers it by one, and
-    /// only a release that empties its probe group leaves it unchanged.
-    /// After a churn the report therefore reads below the clean entry
-    /// capacity (the full-release workload reads 429,849 for an allocation
-    /// that still holds 458,752 entries).
+    /// left. A removal always lowers the item count by one, so the report
+    /// falls by one when the erased slot becomes a tombstone, where the
+    /// budget stays put, and holds when the slot becomes empty, which gives
+    /// one unit of budget back. The empty slots around the erased one
+    /// decide which. After a churn the report can therefore read below the
+    /// clean entry capacity (the full-release workload reads 429,849 for an
+    /// allocation that still holds 458,752 entries).
     ///
     /// `set_capacity` compares [`room`] against this instead of calling
     /// `reserve` unconditionally. `HashMap::reserve` measures its request
     /// against the growth budget, not the allocation, and a short budget
     /// makes `reserve_rehash` rebuild in place only when the requested
     /// entry count is at most half the clean entry capacity; above that it
-    /// doubles the table. So reserving without this record reallocates a
+    /// doubles the table. So reserving without this record can reallocate a
     /// table that already fits, for example when growing back to a
     /// capacity this store has held since the churn that spent the budget.
     /// Comparing against the clean capacity keeps that check independent of
@@ -766,7 +770,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
             // rehashing under the lock. Skip it when the clean entry capacity
             // already covers the new capacity: after a churn has spent the
             // growth budget on tombstones, a reservation the table already
-            // fits would still double it. A shrink leaves both the record and
+            // fits can still double it. A shrink leaves both the record and
             // the layout alone.
             //
             // Fold in the reported capacity too: an insert path that ran out
@@ -837,11 +841,12 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
     /// Test-only: the live-primary index's reported capacity, in entries.
     ///
     /// This is `HashMap::capacity()`: items plus growth left, not the clean
-    /// entry capacity the allocation was built for. A release that leaves a
-    /// tombstone lowers it by one, and an insertion that fills one raises it
-    /// by one, so a churn moves it below the built value. A doubling shows
-    /// up as a rise above the value read after the build, and an in-place
-    /// rebuild as a rise back to the clean capacity. See
+    /// entry capacity the allocation was built for. A removal that leaves a
+    /// tombstone lowers it by one, a removal that leaves its slot empty
+    /// holds it, and an insertion that fills a tombstone raises it by one,
+    /// so a churn can leave it below the built value. A doubling shows up as
+    /// a rise above the value read after the build, and an in-place rebuild
+    /// as a rise back to the clean capacity. See
     /// `manager::tests::store_growth`.
     #[cfg(test)]
     pub(crate) fn active_by_hash_capacity(&self) -> usize {
