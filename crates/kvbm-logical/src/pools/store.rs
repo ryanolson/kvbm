@@ -367,11 +367,12 @@ impl<T: BlockMetadata> std::fmt::Debug for SlotState<T> {
 /// finds the budget short, hashbrown rebuilds the table in place only when
 /// the requested entry count is at most half the clean entry capacity (the
 /// entries a tombstone-free table of that allocation holds); above that it
-/// doubles the table, rehashing every entry. Both happen under the store
-/// mutex, which is the pause this reservation exists to avoid. Two entries
-/// per live primary give at least twice the live count in clean entry
-/// capacity, so a churn at capacity rebuilds in place at most instead of
-/// doubling. A rebuild still visits every bucket;
+/// grows the table — by a doubling or more, depending on the request —
+/// rehashing every entry. Both happen under the store mutex, which is the
+/// pause this reservation exists to avoid. Two entries per live primary
+/// give at least twice the live count in clean entry capacity, so a churn
+/// at capacity rebuilds in place at most instead of doubling. A rebuild
+/// still visits every bucket;
 /// `manager::tests::store_growth` counts and bounds those for a fixed
 /// workload.
 ///
@@ -435,11 +436,12 @@ pub(crate) struct BlockStoreInner<T: BlockMetadata> {
     /// against the growth budget, not the allocation, and a short budget
     /// makes `reserve_rehash` rebuild in place only when the requested
     /// entry count is at most half the clean entry capacity; above that it
-    /// doubles the table. So reserving without this record can reallocate a
-    /// table that already fits, for example when growing back to a
-    /// capacity this store has held since the churn that spent the budget.
-    /// Comparing against the clean capacity keeps that check independent of
-    /// how many tombstones are lying around.
+    /// grows the table, by a doubling or more depending on the request. So
+    /// reserving without this record can reallocate a table that already
+    /// fits, for example when growing back to a capacity this store has
+    /// held since the churn that spent the budget. Comparing against the
+    /// clean capacity keeps that check independent of how many tombstones
+    /// are lying around.
     active_by_hash_full: usize,
     /// Hashes whose canonical inactive lineage is owned by a pressure action.
     ///
