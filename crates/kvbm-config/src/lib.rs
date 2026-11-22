@@ -52,7 +52,7 @@ pub use discovery::{
 pub use events::{BatchingConfig as EventsBatchingConfig, EventPolicyConfig, EventsConfig};
 pub use hub::{DEFAULT_HUB_CONTROL_PORT, LeaderHubConfig};
 pub use kvbm_common::BlockLayoutMode;
-pub use messenger::{MessengerBackendConfig, MessengerConfig};
+pub use messenger::{LocalTransferCheckConfig, MessengerBackendConfig, MessengerConfig};
 pub use metrics::MetricsConfig;
 pub use nixl::NixlConfig;
 pub use object::{NixlObjectConfig, ObjectClientConfig, ObjectConfig, S3ObjectConfig};
@@ -242,6 +242,17 @@ impl KvbmConfig {
             .merge(
                 Env::prefixed("KVBM_MESSENGER_INIT_TIMEOUT_SECS")
                     .map(|_| "messenger.init_timeout_secs".into()),
+            )
+            // Local transfer check: KVBM_MESSENGER_LOCAL_TRANSFER_CHECK_WAIT_MS,
+            // KVBM_MESSENGER_LOCAL_TRANSFER_CHECK_DEADLINE_MS
+            .merge(
+                Env::prefixed("KVBM_MESSENGER_LOCAL_TRANSFER_CHECK_").map(|k| {
+                    format!(
+                        "messenger.local_transfer_check.{}",
+                        k.as_str().to_lowercase()
+                    )
+                    .into()
+                }),
             )
             // NixL config: KVBM_NIXL_BACKENDS (comma-separated list)
             .merge(
@@ -602,6 +613,24 @@ mod tests {
                 let config: KvbmConfig = figment.extract().unwrap();
                 assert_eq!(config.tokio.worker_threads, Some(2));
                 assert_eq!(config.tokio.max_blocking_threads, Some(32));
+            },
+        );
+    }
+
+    #[test]
+    fn test_env_override_local_transfer_check() {
+        temp_env::with_vars(
+            vec![
+                ("KVBM_MESSENGER_LOCAL_TRANSFER_CHECK_WAIT_MS", Some("250")),
+                (
+                    "KVBM_MESSENGER_LOCAL_TRANSFER_CHECK_DEADLINE_MS",
+                    Some("750"),
+                ),
+            ],
+            || {
+                let config: KvbmConfig = KvbmConfig::figment().extract().unwrap();
+                assert_eq!(config.messenger.local_transfer_check.wait_ms, 250);
+                assert_eq!(config.messenger.local_transfer_check.deadline_ms, 750);
             },
         );
     }

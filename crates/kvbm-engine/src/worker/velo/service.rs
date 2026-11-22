@@ -3,6 +3,7 @@
 
 use kvbm_physical::manager::SerializedLayout;
 
+use super::check::{CheckMessage, IncarnationReply, LocalTransferRecords};
 use super::{
     AbortLocalCollectivesMessage, Arc, ConnectRemoteMessage, DirectWorker,
     ExecuteRemoteOnboardForInstanceMessage, ExecuteRemoteOnboardForInstanceRankMessage,
@@ -19,18 +20,15 @@ use derive_builder::Builder;
 
 use ::velo::{Handler, Messenger};
 
-/// Decode one `LOCAL_TRANSFER` request and dispatch it to `transfers`.
+/// Dispatch one decoded `LOCAL_TRANSFER` request to `transfers`.
 ///
 /// An error from this function occurs before the worker launches a physical
 /// operation.
 fn dispatch_local_transfer(
-    payload: &[u8],
+    message: LocalTransferMessage,
     physical_worker: &DirectWorker,
     transfers: &dyn WorkerTransfers,
 ) -> Result<TransferCompleteNotification> {
-    // Deserialize the message
-    let message: LocalTransferMessage = serde_json::from_slice(payload)?;
-
     // Convert options and resolve bounce buffer if present
     let bounce_buffer_parts = message.options.bounce_buffer_parts();
     let mut options: TransferOptions = message.options.into();
@@ -57,6 +55,129 @@ fn dispatch_local_transfer(
     }
 }
 
+/// Dispatches one decoded local transfer on a worker.
+pub(super) type LocalTransferDispatch =
+    Arc<dyn Fn(LocalTransferMessage) -> Result<TransferCompleteNotification> + Send + Sync>;
+
+/// Run one local transfer and keep its record.
+///
+/// The transfer is recorded as active before it is dispatched, and its drain
+/// outcome is recorded after the drain. A dispatch error launched nothing, so
+/// it is recorded as drained with an error.
+async fn run_local_transfer(
+    records: &LocalTransferRecords,
+    dispatch: &LocalTransferDispatch,
+    message: LocalTransferMessage,
+) -> TransferDrainOutcome {
+    let transfer_id = message.transfer_id;
+    if let Some(transfer_id) = transfer_id {
+        records.begin(transfer_id);
+    }
+    let outcome = match dispatch(message) {
+        Ok(notification) => notification.await_drain().await,
+        Err(error) => TransferDrainOutcome::DrainedWithError(error),
+    };
+    if let Some(transfer_id) = transfer_id {
+        records.finish(transfer_id, &outcome);
+    }
+    outcome
+}
+
+fn local_transfer_reply(outcome: TransferDrainOutcome) -> Result<Option<Bytes>> {
+    // The reply carries the outcome. An RPC error tells the client that the
+    // outcome is unknown.
+    let reply = LocalTransferReply::from_outcome(outcome);
+    Ok(Some(Bytes::from(serde_json::to_vec(&reply)?)))
+}
+
+/// Register the local-transfer handlers of one worker: `LOCAL_TRANSFER`,
+/// `LOCAL_TRANSFER_CHECK`, and `WORKER_INCARNATION`, scoped by `worker_id`.
+///
+/// `records` holds this worker's incarnation and transfer records. Each
+/// worker of a process has its own.
+pub(super) fn register_local_transfer_handlers(
+    messenger: &Messenger,
+    worker_id: Option<u64>,
+    records: Arc<LocalTransferRecords>,
+    dispatch: LocalTransferDispatch,
+) -> Result<()> {
+    let transfer_records = Arc::clone(&records);
+    let transfer = Handler::unary_handler_async(
+        handler_names::scoped(handler_names::LOCAL_TRANSFER, worker_id),
+        move |ctx| {
+            let records = Arc::clone(&transfer_records);
+            let dispatch = Arc::clone(&dispatch);
+            async move {
+                let message: LocalTransferMessage = match serde_json::from_slice(&ctx.payload) {
+                    Ok(message) => message,
+                    Err(error) => {
+                        return local_transfer_reply(TransferDrainOutcome::DrainedWithError(
+                            error.into(),
+                        ));
+                    }
+                };
+                #[cfg(test)]
+                let deferred = records.hooks.defer_next.lock().take();
+                #[cfg(test)]
+                if let Some(gate) = deferred {
+                    tokio::spawn(async move {
+                        let _ = gate.await;
+                        let _ = run_local_transfer(&records, &dispatch, message).await;
+                    });
+                    anyhow::bail!("injected lost reply before the transfer was recorded");
+                }
+                let outcome = run_local_transfer(&records, &dispatch, message).await;
+                #[cfg(test)]
+                {
+                    use std::sync::atomic::Ordering;
+                    if records.hooks.evict_after_next.swap(false, Ordering::AcqRel) {
+                        records.evict_all();
+                    }
+                    if records.hooks.lose_next_reply.swap(false, Ordering::AcqRel) {
+                        anyhow::bail!("injected lost reply after the transfer finished");
+                    }
+                }
+                local_transfer_reply(outcome)
+            }
+        },
+    )
+    .build();
+    messenger.register_handler(transfer)?;
+
+    let check_records = Arc::clone(&records);
+    let check = Handler::unary_handler_async(
+        handler_names::scoped(handler_names::LOCAL_TRANSFER_CHECK, worker_id),
+        move |ctx| {
+            let records = Arc::clone(&check_records);
+            async move {
+                #[cfg(test)]
+                records
+                    .hooks
+                    .checks
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                let message: CheckMessage = serde_json::from_slice(&ctx.payload)?;
+                let reply = records.check(message.transfer_id);
+                Ok(Some(Bytes::from(serde_json::to_vec(&reply)?)))
+            }
+        },
+    )
+    .build();
+    messenger.register_handler(check)?;
+
+    let incarnation = Handler::unary_handler_async(
+        handler_names::scoped(handler_names::WORKER_INCARNATION, worker_id),
+        move |_ctx| {
+            let reply = IncarnationReply {
+                incarnation: records.incarnation(),
+            };
+            async move { Ok(Some(Bytes::from(serde_json::to_vec(&reply)?))) }
+        },
+    )
+    .build();
+    messenger.register_handler(incarnation)?;
+    Ok(())
+}
+
 /// Builder for VeloWorkerService - provides flexibility in construction.
 ///
 /// Use this builder when you need to:
@@ -77,6 +198,9 @@ pub struct VeloWorkerService {
     /// handler names.
     #[builder(default)]
     worker_id: Option<u64>,
+    /// This worker's incarnation and local-transfer records.
+    #[builder(setter(skip), default = "LocalTransferRecords::new()")]
+    records: Arc<LocalTransferRecords>,
 }
 
 impl VeloWorkerService {
@@ -86,6 +210,7 @@ impl VeloWorkerService {
             worker,
             transfers: None,
             worker_id: None,
+            records: LocalTransferRecords::new(),
         };
         service.register_handlers()?;
         Ok(service)
@@ -108,6 +233,7 @@ impl VeloWorkerService {
             worker,
             transfers,
             worker_id: Some(worker_id),
+            records: LocalTransferRecords::new(),
         };
         service.register_handlers()?;
         Ok(service)
@@ -134,6 +260,7 @@ impl VeloWorkerService {
             worker,
             transfers: Some(transfers),
             worker_id: None,
+            records: LocalTransferRecords::new(),
         };
         service.register_handlers()?;
         Ok(service)
@@ -217,34 +344,15 @@ impl VeloWorkerService {
     fn register_local_transfer_handler(&self) -> Result<()> {
         let transfers = self.transfers();
         let physical_worker = self.worker.clone();
-
-        // Use unary_handler_async for explicit response (client waits for transfer completion)
-        let handler = Handler::unary_handler_async(
-            self.handler_name(handler_names::LOCAL_TRANSFER),
-            move |ctx| {
-                let transfers = transfers.clone();
-                let physical_worker = physical_worker.clone();
-
-                async move {
-                    // Await the transfer completion and keep its drain proof.
-                    let dispatched =
-                        dispatch_local_transfer(&ctx.payload, &physical_worker, &*transfers);
-                    let outcome = match dispatched {
-                        Ok(notification) => notification.await_drain().await,
-                        Err(error) => TransferDrainOutcome::DrainedWithError(error),
-                    };
-
-                    // The reply carries the outcome. An RPC error tells the
-                    // client that the outcome is unknown.
-                    let reply = LocalTransferReply::from_outcome(outcome);
-                    Ok(Some(Bytes::from(serde_json::to_vec(&reply)?)))
-                }
-            },
+        let dispatch: LocalTransferDispatch = Arc::new(move |message| {
+            dispatch_local_transfer(message, &physical_worker, &*transfers)
+        });
+        register_local_transfer_handlers(
+            &self.messenger,
+            self.worker_id,
+            Arc::clone(&self.records),
+            dispatch,
         )
-        .build();
-
-        self.messenger.register_handler(handler)?;
-        Ok(())
     }
 
     fn register_remote_onboard_handler(&self) -> Result<()> {

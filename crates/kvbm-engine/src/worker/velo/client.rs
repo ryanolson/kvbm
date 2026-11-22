@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use super::check::{IncarnationReply, LocalTransferCheckTiming, LocalTransferRecheck};
 use super::*;
 use crate::object::ObjectBlockOps;
 use crate::worker::LocalTransferPlacements;
@@ -29,6 +30,79 @@ pub struct VeloWorkerClient {
     collective_failure: Arc<OnceLock<String>>,
     /// Track which remote instances we've connected to for has_remote_metadata()
     connected_instances: Arc<RwLock<HashSet<InstanceId>>>,
+    /// The wait and deadline of the check of a lost local-transfer reply.
+    check_timing: LocalTransferCheckTiming,
+    /// The remote worker's incarnation, learned before the first transfer.
+    incarnation: Arc<IncarnationBinding>,
+}
+
+/// How long a client waits before it asks again for the incarnation of a
+/// worker that did not give it. Transfers in that time run unbound.
+const INCARNATION_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The incarnation of one remote worker, learned once.
+#[derive(Default)]
+struct IncarnationBinding {
+    known: OnceLock<uuid::Uuid>,
+    /// Serializes the request, and remembers when it last failed.
+    request: tokio::sync::Mutex<Option<std::time::Instant>>,
+}
+
+impl IncarnationBinding {
+    /// The worker's incarnation, asking for it if it is not known yet.
+    /// `None` when the worker did not answer within `deadline` (for example an
+    /// older worker without the handler), or a recent request failed.
+    async fn bind(
+        &self,
+        messenger: &Messenger,
+        remote: InstanceId,
+        worker_id: Option<u64>,
+        deadline: std::time::Duration,
+    ) -> Option<uuid::Uuid> {
+        if let Some(incarnation) = self.known.get() {
+            return Some(*incarnation);
+        }
+        let mut failed_at = self.request.lock().await;
+        if let Some(incarnation) = self.known.get() {
+            return Some(*incarnation);
+        }
+        if failed_at.is_some_and(|at| at.elapsed() < INCARNATION_RETRY_AFTER) {
+            return None;
+        }
+        match Self::ask(messenger, remote, worker_id, deadline).await {
+            Ok(incarnation) => {
+                let _ = self.known.set(incarnation);
+                Some(incarnation)
+            }
+            Err(error) => {
+                tracing::debug!(
+                    %remote,
+                    ?worker_id,
+                    error = %format!("{error:#}"),
+                    "worker did not give its incarnation; local transfers run unbound"
+                );
+                *failed_at = Some(std::time::Instant::now());
+                None
+            }
+        }
+    }
+
+    async fn ask(
+        messenger: &Messenger,
+        remote: InstanceId,
+        worker_id: Option<u64>,
+        deadline: std::time::Duration,
+    ) -> Result<uuid::Uuid> {
+        let handler = handler_names::scoped(handler_names::WORKER_INCARNATION, worker_id);
+        let bytes = messenger
+            .unary(&handler)?
+            .raw_payload(Bytes::new())
+            .instance(remote)
+            .timeout(deadline)
+            .send()
+            .await?;
+        Ok(serde_json::from_slice::<IncarnationReply>(&bytes)?.incarnation)
+    }
 }
 
 impl VeloWorkerClient {
@@ -76,7 +150,9 @@ impl VeloWorkerClient {
         };
 
         // Create the message
+        let transfer_id = uuid::Uuid::new_v4();
         let message = LocalTransferMessage {
+            transfer_id: Some(transfer_id),
             resource,
             src,
             dst,
@@ -90,6 +166,8 @@ impl VeloWorkerClient {
         // Spawn a task for the remote instance
         let velo = self.messenger.clone();
         let remote_instance = self.remote;
+        let timing = self.check_timing;
+        let binding = Arc::clone(&self.incarnation);
 
         // The task sends the drain outcome of this operation to the receipt.
         let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
@@ -97,6 +175,17 @@ impl VeloWorkerClient {
         // Use unary (not am_sync) to wait for transfer completion
         self.messenger.tracker().spawn_on(
             async move {
+                // Bind the worker incarnation before the copy is sent, so a
+                // later check can tell the same worker from any other.
+                let incarnation = binding
+                    .bind(&velo, remote_instance, worker_id, timing.deadline)
+                    .await;
+                let recheck = LocalTransferRecheck {
+                    instance: remote_instance,
+                    worker_id,
+                    incarnation,
+                    transfer_id,
+                };
                 let handler = handler_names::scoped(handler_names::LOCAL_TRANSFER, worker_id);
                 let outcome = match velo.unary(&handler) {
                     Ok(request) => {
@@ -108,11 +197,17 @@ impl VeloWorkerClient {
                         match reply {
                             Ok(reply) => LocalTransferReply::decode(&reply),
                             // The request can be with the worker, and the
-                            // worker can have an active copy. The outcome is
-                            // unknown.
-                            Err(error) => TransferDrainOutcome::Unproven(anyhow::anyhow!(
-                                "local transfer RPC has an unknown outcome: {error}"
-                            )),
+                            // worker can have an active copy. Wait, then ask
+                            // the same worker once.
+                            Err(error) => {
+                                tracing::warn!(
+                                    %recheck,
+                                    error = %error,
+                                    "local transfer reply lost; checking with the worker"
+                                );
+                                tokio::time::sleep(timing.wait).await;
+                                recheck.check(&velo, timing.deadline).await
+                            }
                         }
                     }
                     // The request did not leave this process.
@@ -634,7 +729,16 @@ impl VeloWorkerClient {
             local_transfer_placements: Arc::new(OnceLock::new()),
             collective_failure: Arc::new(OnceLock::new()),
             connected_instances: Arc::new(RwLock::new(HashSet::new())),
+            check_timing: LocalTransferCheckTiming::default(),
+            incarnation: Arc::new(IncarnationBinding::default()),
         }
+    }
+
+    /// Set the wait and deadline of the check of a lost local-transfer reply.
+    /// The defaults are [`LocalTransferCheckTiming::default`].
+    pub fn with_local_transfer_check(mut self, timing: LocalTransferCheckTiming) -> Self {
+        self.check_timing = timing;
+        self
     }
 
     /// Configure layout handles from serialized metadata.
@@ -1157,6 +1261,10 @@ mod tests {
         let remote = pair.messenger_b.instance_id();
         let transfer = |worker_id| {
             VeloWorkerClient::new_for_worker(Arc::clone(&pair.messenger_a), remote, worker_id)
+                .with_local_transfer_check(LocalTransferCheckTiming {
+                    wait: std::time::Duration::from_millis(10),
+                    deadline: std::time::Duration::from_millis(200),
+                })
                 .execute_local_transfer(
                     LogicalLayoutHandle::G1,
                     LogicalLayoutHandle::G2,

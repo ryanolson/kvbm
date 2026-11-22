@@ -28,7 +28,10 @@ pub use kvbm_physical::{
     transfer::{PayloadDigest, TransferCompleteNotification},
 };
 
-pub use velo::{VeloWorkerClient, VeloWorkerService, VeloWorkerServiceBuilder};
+pub use velo::{
+    LocalTransferCheckTiming, LocalTransferRecheck, VeloWorkerClient, VeloWorkerService,
+    VeloWorkerServiceBuilder,
+};
 
 /// Boxed future for serialized layout responses - allows both typed_unary and raw unary results
 pub type SerializedResponseAwaiter = Pin<Box<dyn Future<Output = Result<SerializedLayout>> + Send>>;
