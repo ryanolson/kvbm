@@ -36,13 +36,26 @@ pub(crate) fn decide_placement(
     numa_disabled: bool,
     topology: Result<&NumaTopology, &str>,
 ) -> PlacementDecision {
-    let _ = (device_node, numa_disabled, topology);
-    todo!("decide_placement")
+    if numa_disabled {
+        return PlacementDecision::OsDefault(PlacementFallback::NumaDisabled);
+    }
+    let node = match device_node {
+        Some(node) if !node.is_unknown() => node,
+        _ => return PlacementDecision::OsDefault(PlacementFallback::NodeUnknown),
+    };
+    let Ok(topology) = topology else {
+        return PlacementDecision::OsDefault(PlacementFallback::TopologyUnavailable);
+    };
+    match topology.cpus_for_node(node.0) {
+        Some(cpus) if !cpus.is_empty() => PlacementDecision::Bind(node),
+        _ => PlacementDecision::OsDefault(PlacementFallback::NodeHasNoCpus(node)),
+    }
 }
 
 /// A NUMA memory policy mode, as `get_mempolicy` reports it, without the
 /// mode flags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum MemPolicyMode {
     /// `MPOL_DEFAULT`: no policy on the range; the task's policy applies.
     Default,
@@ -54,6 +67,12 @@ pub enum MemPolicyMode {
     Interleave,
     /// `MPOL_LOCAL`.
     Local,
+    /// `MPOL_PREFERRED_MANY`. On GB10 (driver 610.57.04),
+    /// `cuMemHostRegister` turns an `MPOL_BIND` range into this mode with
+    /// the same node mask.
+    PreferredMany,
+    /// `MPOL_WEIGHTED_INTERLEAVE`.
+    WeightedInterleave,
     /// Any other mode number.
     Other(i32),
 }
@@ -77,8 +96,83 @@ pub struct PagePlacement {
 /// in a page that is not yet present. Fails with the `get_mempolicy` error,
 /// for example `EPERM` under a seccomp profile that denies the call.
 pub fn page_placement(addr: usize) -> std::io::Result<PagePlacement> {
-    let _ = addr;
-    todo!("page_placement")
+    let mut mode: libc::c_int = 0;
+    let mut mask = [0u64; MASK_BITS / 64];
+    // SAFETY: `mode` and `mask` outlive the call; `MASK_BITS` is the bit
+    // length of `mask`.
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_get_mempolicy,
+            &mut mode as *mut libc::c_int,
+            mask.as_mut_ptr(),
+            MASK_BITS as libc::c_ulong,
+            addr,
+            MPOL_F_ADDR,
+        )
+    };
+    if r != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let mut node: libc::c_int = 0;
+    // SAFETY: `node` outlives the call; no mask is passed.
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_get_mempolicy,
+            &mut node as *mut libc::c_int,
+            std::ptr::null_mut::<u64>(),
+            0 as libc::c_ulong,
+            addr,
+            MPOL_F_NODE | MPOL_F_ADDR,
+        )
+    };
+    if r != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let nodes = mask
+        .iter()
+        .enumerate()
+        .flat_map(|(word, bits)| {
+            (0..64u32)
+                .filter(move |bit| bits & (1u64 << bit) != 0)
+                .map(move |bit| NumaNode(word as u32 * 64 + bit))
+        })
+        .collect();
+
+    Ok(PagePlacement {
+        mode: MemPolicyMode::from_raw(mode & !MPOL_MODE_FLAGS),
+        nodes,
+        node: NumaNode(node as u32),
+    })
+}
+
+/// `get_mempolicy` flags from `<numaif.h>`; `libc` does not export them.
+const MPOL_F_NODE: libc::c_ulong = 1;
+const MPOL_F_ADDR: libc::c_ulong = 2;
+/// Policy modes from `<linux/mempolicy.h>` that `libc` does not export.
+const MPOL_PREFERRED_MANY: libc::c_int = 5;
+const MPOL_WEIGHTED_INTERLEAVE: libc::c_int = 6;
+/// Mode flags the kernel may OR into the mode: `MPOL_F_NUMA_BALANCING`,
+/// `MPOL_F_RELATIVE_NODES` and `MPOL_F_STATIC_NODES`.
+const MPOL_MODE_FLAGS: libc::c_int = (1 << 13) | (1 << 14) | (1 << 15);
+/// Bit length of the node mask passed to `get_mempolicy`. The kernel rejects
+/// a mask shorter than its possible node count with `EINVAL`.
+const MASK_BITS: usize = 1024;
+
+impl MemPolicyMode {
+    fn from_raw(mode: libc::c_int) -> Self {
+        match mode {
+            libc::MPOL_DEFAULT => Self::Default,
+            libc::MPOL_PREFERRED => Self::Preferred,
+            libc::MPOL_BIND => Self::Bind,
+            libc::MPOL_INTERLEAVE => Self::Interleave,
+            libc::MPOL_LOCAL => Self::Local,
+            MPOL_PREFERRED_MANY => Self::PreferredMany,
+            MPOL_WEIGHTED_INTERLEAVE => Self::WeightedInterleave,
+            other => Self::Other(other),
+        }
+    }
 }
 
 #[cfg(test)]

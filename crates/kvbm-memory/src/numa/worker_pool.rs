@@ -408,29 +408,9 @@ impl NumaWorkerPool {
         let Some(node) = opt.numa_node else {
             return MmappedPinnedStorage::allocate(opt);
         };
-        let handle = thread::Builder::new()
-            .name(format!("mmap-pinned-node-{}", node.0))
-            .spawn(move || -> Result<MmappedPinnedStorage, StorageError> {
-                if let Err(e) = pin_thread_to_numa_node(node) {
-                    // Warn but proceed: subsequent verification + mbind
-                    // still constrain placement; we lose only the
-                    // first-touch optimization.
-                    tracing::warn!(
-                        "pin to node {}: {} — first-touch may be misplaced",
-                        node.0,
-                        e
-                    );
-                } else {
-                    // Yield once so the scheduler honors the new affinity
-                    // before we start faulting pages.
-                    thread::yield_now();
-                }
-                MmappedPinnedStorage::allocate(opt)
-            })
-            .map_err(|e| StorageError::AllocationFailed(format!("spawn mmap worker: {}", e)))?;
-        handle
-            .join()
-            .map_err(|_| StorageError::AllocationFailed("mmap worker panicked".into()))?
+        run_on_node_thread(node, format!("mmap-pinned-node-{}", node.0), move || {
+            MmappedPinnedStorage::allocate(opt)
+        })
     }
 
     /// Allocate CUDA pinned memory for a specific GPU (auto-detects NUMA node).
@@ -478,6 +458,43 @@ impl NumaWorkerPool {
             .allocate(size, gpu_id)
             .map(|send_ptr| Some(send_ptr.0))
     }
+}
+
+/// Run `f` on a new thread pinned to the CPUs of `node`, and return its
+/// result. Used so first touch lands pages on `node`.
+///
+/// If pinning fails (for example, a cpuset excludes the node), the thread
+/// logs a warning and runs `f` unpinned: an `mbind` in `f` still constrains
+/// the pages, and only the first-touch locality is lost.
+pub(crate) fn run_on_node_thread<T, F>(
+    node: NumaNode,
+    name: String,
+    f: F,
+) -> Result<T, StorageError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, StorageError> + Send + 'static,
+{
+    let handle = thread::Builder::new()
+        .name(name)
+        .spawn(move || {
+            if let Err(e) = pin_thread_to_numa_node(node) {
+                tracing::warn!(
+                    "pin to node {}: {} — first-touch may be misplaced",
+                    node.0,
+                    e
+                );
+            } else {
+                // Yield once so the scheduler honors the new affinity
+                // before we start faulting pages.
+                thread::yield_now();
+            }
+            f()
+        })
+        .map_err(|e| StorageError::AllocationFailed(format!("spawn node worker: {}", e)))?;
+    handle
+        .join()
+        .map_err(|_| StorageError::AllocationFailed("node worker panicked".into()))?
 }
 
 #[cfg(test)]
