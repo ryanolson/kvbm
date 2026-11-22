@@ -676,9 +676,11 @@ impl Leader {
         workers
             .connector_clients
             .push(ConnectorWorkerClient::new(messenger.clone(), instance_id));
-        workers
-            .transfer_clients
-            .push(VeloWorkerClient::new(messenger.clone(), instance_id));
+        workers.transfer_clients.push(
+            VeloWorkerClient::new(messenger.clone(), instance_id).with_local_transfer_check(
+                (&construction.runtime.config().messenger.local_transfer_check).into(),
+            ),
+        );
         Ok(())
     }
 
