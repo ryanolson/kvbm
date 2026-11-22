@@ -53,10 +53,11 @@ kvbm-service = { path = "kvbm-service" }
 # NOTE: dynamo-kv-router is intentionally featureless. The `runtime-protocols`
 # feature pulls `dynamo-runtime` (and its dynamo-core closure); kvbm-consolidator
 # only consumes `dynamo_kv_router::zmq_wire`, which is available without features.
-# Pinned to a rev on the public ai-dynamo/dynamo branch rhino-main.
-dynamo-tokens = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "6eb009fb929e50ef4cadbc5635f39ab22a4716f2" }
-dynamo-kv-router = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "6eb009fb929e50ef4cadbc5635f39ab22a4716f2" }
-dynamo-kv-hashing = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "6eb009fb929e50ef4cadbc5635f39ab22a4716f2" }
+# Pinned to a rev on the public ai-dynamo/dynamo branch rhino-main (upstream
+# plus the carrier stack). Rhino must resolve these to the same rev.
+dynamo-tokens = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "163dec195943bcb1cf01dc9ee0fbb2cb19cf8d31" }
+dynamo-kv-router = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "163dec195943bcb1cf01dc9ee0fbb2cb19cf8d31" }
+dynamo-kv-hashing = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "163dec195943bcb1cf01dc9ee0fbb2cb19cf8d31" }
 
 # velo, from one git tag: velo-hub is not on crates.io, and a crates.io velo
 # beside the git velo-hub would build two copies of the velo types.
@@ -86,9 +87,10 @@ hyper-util = { version = "=0.1.17" }
 indexmap = { version = "2" }
 libc = { version = "0.2" }
 libloading = "0.8.9"
-# nixl-sys is NIXL 1.4.1 plus the deregistration and compiler fixes, the same
-# rev as Rhino. TEMP-PIN: move to the public ai-dynamo/nixl branch once pushed.
-nixl-sys = { version = "=1.4.1", git = "https://github.com/NVIDIA-dev/warnold-nixl.git", rev = "a08e289bf065f0bf37c774c4a5c01d9f951a571e" }
+# nixl-sys comes from the public ai-dynamo/nixl branch rhino-1.4: NIXL 1.4.1
+# plus the deregistration and compiler fixes. Rhino runs the nixl-cu13 1.4.1
+# wheel, so this pin must stay at 1.4.1 until Rhino moves.
+nixl-sys = { version = "=1.4.1", git = "https://github.com/ai-dynamo/nixl.git", rev = "a08e289bf065f0bf37c774c4a5c01d9f951a571e" }
 oneshot = { version = "0.1.13", features = ["std", "async"] }
 parking_lot = "0.12.5"
 prometheus = { version = "0.14" }

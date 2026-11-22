@@ -54,7 +54,9 @@ day-to-day development; they are the forward work.
 ### Dynamo git-dependency pins
 - `crates/Cargo.toml` pins `dynamo-tokens` / `dynamo-kv-router` /
   `dynamo-kv-hashing` to immutable revs on the public `ai-dynamo/dynamo` branch
-  `rhino-main`. That branch is add-only, so pinned revs stay fetchable.
+  `rhino-main` (upstream plus the carrier stack). That branch is add-only, so
+  pinned revs stay fetchable. `nixl-sys` is `=1.4.1` on the public
+  `ai-dynamo/nixl` branch `rhino-1.4`, matching Rhino's nixl-cu13 1.4.1 runtime.
   (`dynamo-memory` was replaced by the locally-owned `kvbm-memory` crate — no
   longer a git dep.)
 
