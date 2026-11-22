@@ -7,7 +7,8 @@
 //! matching, registering and releasing all run under the one store mutex, so
 //! an insertion that exhausts the map's growth budget rehashes every entry
 //! with the lock held. These tests fill a lineage manager to its live
-//! capacity, then churn it at capacity, and watch the map's `capacity()`:
+//! capacity, then churn it at capacity, and watch the map's reported
+//! `capacity()` (items plus growth left, which tombstones lower):
 //!
 //! * a doubling (the map's allocation grows) fails, and
 //! * an in-place rebuild — which tombstones can force even when the map has
@@ -83,13 +84,13 @@ struct ChurnStats {
     growths: usize,
     /// Steps where the index rebuilt in place.
     ///
-    /// `capacity()` is items plus growth left. A removal either leaves a
-    /// tombstone (both drop by one) or empties its probe group (the entry
-    /// drops, the budget gains one), so it never raises `capacity()`. An
+    /// The reported `capacity()` is items plus growth left. A removal either
+    /// leaves a tombstone (both drop by one) or empties its probe group (the
+    /// entry drops, the budget gains one), so it never raises the report. An
     /// insertion raises it by one only when it fills a tombstone without
     /// taking a fresh slot. So a step can raise it by at most its number of
-    /// inserts, and only a rebuild restores the allocation's limit above
-    /// that.
+    /// inserts, and only a rebuild restores it to the clean entry capacity
+    /// above that.
     rehashes: usize,
 }
 
@@ -343,5 +344,31 @@ fn shrinking_after_a_full_release_keeps_the_index_allocation() {
     assert!(
         after <= built,
         "the grow back reallocated the index: {after} against the built {built}",
+    );
+}
+
+/// The post-reserve record matters. A store built below the capacity it
+/// grows to, then shrunk and churned, must not reserve a second time when it
+/// grows back: the first reservation already covers that capacity. Dropping
+/// the record after the reserve makes the grow back read the build-time
+/// allocation and reallocate the table.
+#[test]
+fn growing_back_after_a_shrink_keeps_the_post_reserve_allocation() {
+    let manager = lineage_manager(2048, 64 * 7168);
+    let store = manager.store_for_test();
+    manager.set_capacity(7168).expect("grow from 2048");
+    let grown = store.active_by_hash_capacity();
+    manager.set_capacity(6144).expect("shrink");
+    let stats = fill_and_churn(&manager, 6144, 2048, TURNOUTS);
+    report("grow, shrink, churn, grow back", &stats);
+    manager.set_capacity(7168).expect("grow back");
+    let after = store.active_by_hash_capacity();
+    println!(
+        "grow, shrink, churn, grow back: capacity after the grow back {after}, \
+         after the first grow {grown}"
+    );
+    assert!(
+        after <= grown,
+        "the grow back reallocated the index: {after} against {grown} after the first grow",
     );
 }
