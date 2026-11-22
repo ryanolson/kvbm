@@ -128,6 +128,8 @@ impl LocalConnectorEngine {
                 driver.execute_resource_onboards(resources).await;
             let outcome = fold_resource_onboard(dispatch_failure, completed);
             driver.finish_load_action(action_id, &request_id, outcome, terminal_block_ids);
+            #[cfg(test)]
+            crate::tiering::engine::test_support::note_onboard_driver_finished(action_id);
         });
 
         let engine: Arc<dyn LeaderEngine> = self;
