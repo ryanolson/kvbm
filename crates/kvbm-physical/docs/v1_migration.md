@@ -89,6 +89,11 @@ If a caller owns source memory, use `await_drain()`. A `DrainedWithError`
 result proves that every launched child drained. An `Unproven` result does not
 prove that every launched child drained.
 
+A failed receipt's error is an `AggregateTransferFailure`. It keeps each failed
+child's `anyhow::Error` whole, marked `DrainedWithError` or `Unproven`, so a
+caller can still downcast a child's context. Its text is each child's error
+joined with `"; "`.
+
 The event and runtime arguments remain in the public API. Aggregation does not
 allocate an event or start a task.
 
