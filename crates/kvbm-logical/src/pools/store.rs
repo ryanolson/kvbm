@@ -15,6 +15,8 @@
 //!   over slots in `Inactive` state.
 //! - `active_by_hash: SeqHashMap<BlockId>` — primary block_id for each
 //!   currently-registered hash (identity-hashed; see [`IdHasher`](super::IdHasher)).
+//!   Presized by [`room`] and reserved again whenever `set_capacity` grows
+//!   it, so filling or churning at capacity does not grow it under the lock.
 //!
 //! Active-pool lookup, slot transitions, and resurrection all happen
 //! under one lock, so no across-lock gap can leave a hash unreachable
@@ -353,6 +355,27 @@ impl<T: BlockMetadata> std::fmt::Debug for SlotState<T> {
     }
 }
 
+/// Entries the live-primary index must hold for `live` live primaries.
+///
+/// The index holds one entry per live primary: a registration inserts one,
+/// a release to the inactive pool removes one, and a cache hit inserts it
+/// again. Sizing it to `live` entries is not enough. A release leaves a
+/// tombstone in the erased entry's probe group, tombstones consume the same
+/// growth budget as live entries, and a map that runs out of budget above
+/// half load doubles — a rehash of every entry under the store mutex, which
+/// is exactly the pause this reservation exists to avoid. Two entries per
+/// live primary keep a churning map at or below half load, where hashbrown
+/// rebuilds in place rather than reallocating. A rebuild in place still
+/// visits every bucket; `manager::tests::store_growth` counts and bounds
+/// those for a fixed workload.
+///
+/// Never size from the store's maximum: a manager is built with the maximum
+/// it might grow to (Rhino passes `u32::MAX`) and only its current capacity
+/// bounds the live primaries.
+fn room(live: usize) -> usize {
+    live.saturating_mul(2)
+}
+
 #[derive(Debug)]
 pub(crate) struct BlockSlot<T: BlockMetadata> {
     pub(crate) block_size: usize,
@@ -383,7 +406,9 @@ pub(crate) struct BlockStoreInner<T: BlockMetadata> {
     /// Primary `block_id` for each currently-registered sequence hash.
     /// Updated atomically with the slot's `Primary`/`Inactive` state.
     /// Uses the identity [`IdHasher`](super::IdHasher) — the key is
-    /// already a content hash.
+    /// already a content hash. Holds at most one entry per live primary; its
+    /// reserve is sized from the live capacity with [`room`], never from the
+    /// store's maximum.
     active_by_hash: SeqHashMap<BlockId>,
     /// Hashes whose canonical inactive lineage is owned by a pressure action.
     ///
@@ -551,7 +576,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
             fenced: BTreeSet::new(),
             fence: None,
             inactive,
-            active_by_hash: SeqHashMap::default(),
+            active_by_hash: SeqHashMap::with_capacity_and_hasher(room(total_blocks), IdBuildHasher),
             held_by_hash: SeqHashMap::default(),
             reset_on_release,
         };
@@ -706,6 +731,13 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         }
         inner.capacity = capacity;
         if capacity > previous {
+            // Reserve before the slots and the inactive index grow, so a
+            // later registration finds room instead of rehashing under the
+            // lock. A shrink leaves the reserve in place: growing back to a
+            // capacity this store has already held allocates nothing.
+            let reserve_entries = room(capacity);
+            let additional = reserve_entries.saturating_sub(inner.active_by_hash.len());
+            inner.active_by_hash.reserve(additional);
             for id in previous..capacity {
                 push_reset_id_locked(&mut inner, id);
             }
