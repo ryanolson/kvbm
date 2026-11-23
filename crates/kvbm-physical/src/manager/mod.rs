@@ -27,7 +27,7 @@ pub(crate) use remote::RemoteLayout;
 use crate::layout::PhysicalLayout;
 use crate::transfer::BounceBufferInternal;
 use crate::transfer::TransferContext;
-use crate::transfer::context::TransferCompleteNotification;
+use crate::transfer::context::{TransferCompleteNotification, TransferDrainOutcome};
 use crate::transfer::executor::TransferOptionsInternal;
 use crate::transfer::options::TransferOptions;
 use crate::{BlockId, SequenceHash};
@@ -403,15 +403,15 @@ impl TransferManager {
         );
 
         match notification {
-            Ok(notification) => match (metric_route, transfer_start) {
+            Ok(notification) => Ok(match (metric_route, transfer_start) {
                 (Some(route), Some(started_at)) => self.wrap_notification_with_metrics(
                     route,
                     dst_blocks.len() as u64,
                     started_at,
                     notification,
                 ),
-                _ => Ok(notification),
-            },
+                _ => notification,
+            }),
             Err(error) => {
                 if let Some(route) = metric_route {
                     self.record_transfer_failure(route, "internal");
@@ -557,9 +557,9 @@ impl TransferManager {
         blocks: u64,
         started_at: Instant,
         notification: TransferCompleteNotification,
-    ) -> Result<TransferCompleteNotification> {
+    ) -> TransferCompleteNotification {
         let Some(observability) = self.context.observability().cloned() else {
-            return Ok(notification);
+            return notification;
         };
 
         observability.transfer_metrics().begin_transfer(route);
@@ -573,40 +573,36 @@ impl TransferManager {
                 started_at.elapsed(),
                 "success",
             );
-            return Ok(notification);
+            return notification;
         }
 
-        let event = self.context.event_system().new_event()?;
-        let awaiter = self.context.event_system().awaiter(event.handle())?;
-
+        let (send_outcome, receive_outcome) = tokio::sync::oneshot::channel();
         self.context.tokio().spawn(async move {
-            match notification.await {
-                Ok(()) => {
+            let outcome = notification.await_drain().await;
+            let metrics = observability.transfer_metrics();
+            let label = match &outcome {
+                TransferDrainOutcome::Completed => {
                     observability
                         .compat_metrics()
                         .record_transfer_success(route, blocks);
-                    observability.transfer_metrics().finish_transfer(
-                        route,
-                        started_at.elapsed(),
-                        "success",
-                    );
-                    let _ = event.trigger();
+                    "success"
                 }
-                Err(error) => {
-                    observability
-                        .transfer_metrics()
-                        .record_failure(route, "internal", 1);
-                    observability.transfer_metrics().finish_transfer(
-                        route,
-                        started_at.elapsed(),
-                        "failure",
-                    );
-                    let _ = event.poison(error.to_string());
+                TransferDrainOutcome::DrainedWithError(_) | TransferDrainOutcome::Unproven(_) => {
+                    metrics.record_failure(route, "internal", 1);
+                    "failure"
                 }
-            }
+            };
+            metrics.finish_transfer(route, started_at.elapsed(), label);
+            let _ = send_outcome.send(outcome);
         });
 
-        Ok(TransferCompleteNotification::from_awaiter(awaiter))
+        TransferCompleteNotification::from_drain_future(async move {
+            receive_outcome.await.unwrap_or_else(|_| {
+                TransferDrainOutcome::Unproven(anyhow!(
+                    "transfer metrics task stopped before reporting drain"
+                ))
+            })
+        })
     }
 
     /// Get access to the internal layout registry.

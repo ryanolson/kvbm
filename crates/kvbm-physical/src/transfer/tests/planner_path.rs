@@ -23,6 +23,7 @@
 //! wired.
 
 use anyhow::Result;
+use std::sync::Arc;
 
 use super::gate::gpu_serial;
 use super::local_transfers::{LayoutType, build_agent_for_kinds};
@@ -878,4 +879,74 @@ async fn cuda_dispatch_failure_before_enqueue_returns_error() -> Result<()> {
         .is_err()
     );
     Ok(())
+}
+
+#[tokio::test]
+async fn transfer_manager_preserves_cuda_drain_with_or_without_metrics() -> Result<()> {
+    use kvbm_observability::KvbmObservability;
+
+    gpu_serial!();
+    assert!(!kvbm_kernels::is_using_stubs(), "CUDA kernels required");
+    let (_manager, result) = dispatch_with_metrics(None)?;
+    assert_dispatch_failure_drained(result).await;
+    let metrics = Arc::new(KvbmObservability::new()?);
+    let (_manager, result) = dispatch_with_metrics(Some(metrics))?;
+    assert_dispatch_failure_drained(result).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn transfer_manager_records_cuda_failure_after_receipt_is_dropped() -> Result<()> {
+    use kvbm_observability::KvbmObservability;
+
+    gpu_serial!();
+    assert!(!kvbm_kernels::is_using_stubs(), "CUDA kernels required");
+    let metrics = Arc::new(KvbmObservability::new()?);
+    let (_manager, result) = dispatch_with_metrics(Some(metrics.clone()))?;
+    drop(result?);
+    let failure = metrics
+        .transfer_metrics()
+        .transfer_failures_total
+        .with_label_values(&["onboard", "d2d", "internal"]);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while failure.get() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    assert_eq!(failure.get(), 1);
+    Ok(())
+}
+
+fn dispatch_with_metrics(
+    metrics: Option<kvbm_observability::SharedKvbmObservability>,
+) -> Result<(
+    crate::manager::TransferManager,
+    Result<crate::transfer::TransferCompleteNotification>,
+)> {
+    use crate::manager::TransferManager;
+    use crate::transfer::TransferOptions;
+    use crate::transfer::executor::dispatch_fault::{Point, inject};
+    use kvbm_common::KvbmTransferRoute;
+
+    let agent = build_agent_for_kinds(&[StorageKind::Device(0)])?;
+    let src = build_layout_for_planner(agent.clone(), LayoutType::FC, StorageKind::Device(0), 1);
+    let dst = build_layout_for_planner(agent.clone(), LayoutType::FC, StorageKind::Device(0), 1);
+    fill_blocks(&src, &[0], FillPattern::Sequential)?;
+    let builder = TransferManager::builder().cuda_device_id(0);
+    let manager = match metrics {
+        Some(metrics) => builder.observability(metrics),
+        None => builder,
+    }
+    .nixl_agent(agent)
+    .build()?;
+    let src = manager.register_layout(src)?;
+    let dst = manager.register_layout(dst)?;
+    let options = TransferOptions::builder()
+        .metric_route(KvbmTransferRoute::OnboardD2D)
+        .build()?;
+    let result = inject(Point::CompletionEvent, 1, || {
+        manager.execute_transfer(src, &[0], dst, &[0], options)
+    });
+    Ok((manager, result))
 }
