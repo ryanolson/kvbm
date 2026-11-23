@@ -12,6 +12,7 @@
 //! - [`NumaNode`]: Represents a NUMA node ID
 //! - [`topology`]: Reads CPU-to-NUMA mapping from `/sys/devices/system/node`
 //! - [`worker_pool`]: Dedicated worker threads pinned to specific NUMA nodes
+//! - [`page_placement`]: The policy and node the kernel reports for a page
 //!
 //! ## Usage
 //!
@@ -26,8 +27,11 @@
 //! determined, allocation falls back to the non-NUMA path transparently.
 
 pub(crate) mod nvml;
+pub(crate) mod placement;
 pub mod topology;
 pub mod worker_pool;
+
+pub use placement::{MemPolicyMode, PagePlacement, page_placement};
 
 use cudarc::driver::{result::device as cuda_device, sys as cuda_sys};
 use nix::libc;
@@ -831,6 +835,9 @@ mod cuda_tests {
 
     #[test]
     fn test_get_pci_bus_address_from_cuda() {
+        // The driver answers only after it is initialized; a context does
+        // that. Without it, the result depends on which test ran first.
+        crate::device::cuda_context(0).expect("GPU 0 must be visible for this test");
         let addr = get_pci_bus_address_from_cuda(0).expect("should get PCI address for GPU 0");
         // Validate BDF format: DDDD:BB:DD.0
         let parts: Vec<&str> = addr.split(':').collect();
@@ -847,6 +854,9 @@ mod cuda_tests {
 
     #[test]
     fn test_read_numa_node_from_sysfs_real_gpu() {
+        // The driver answers only after it is initialized; a context does
+        // that. Without it, the result depends on which test ran first.
+        crate::device::cuda_context(0).expect("GPU 0 must be visible for this test");
         let addr = get_pci_bus_address_from_cuda(0).expect("should get PCI address for GPU 0");
         if let Some(node) = read_numa_node_from_sysfs(&addr) {
             assert!(node.0 < 16, "NUMA node {} seems unreasonably high", node.0);

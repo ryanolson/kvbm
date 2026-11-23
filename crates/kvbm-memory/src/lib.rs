@@ -53,10 +53,14 @@ pub use external::ExternalDeviceMemory;
 pub use hugepage::{HugepageInfo, HugepagePool, PerNodeHugepages, ThpMode};
 #[cfg(target_os = "linux")]
 pub use mmap_pinned::{
-    HugepageMode, HugepageTier, MmappedPinnedOptions, MmappedPinnedStorage, NumaPlacementPolicy,
+    HostPlacement, HugepageMode, HugepageTier, MmappedPinnedOptions, MmappedPinnedStorage,
+    NumaPlacementPolicy, PlacementFallback, allocate_pinned_host, allocate_pinned_host_regions,
 };
 #[cfg(target_os = "linux")]
-pub use numa::{NumaNode, PciAddress, is_numa_disabled, is_numa_enabled};
+pub use numa::{
+    MemPolicyMode, NumaNode, PagePlacement, PciAddress, is_numa_disabled, is_numa_enabled,
+    page_placement,
+};
 pub use offset::OffsetBuffer;
 pub use pinned::PinnedStorage;
 pub use pool::{CudaMemPool, CudaMemPoolBuilder};
