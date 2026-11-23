@@ -129,6 +129,81 @@ async fn ragged_pinned_device_roundtrip_copies_every_segment() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn registered_mmap_g2_is_mmap_backed_registered_and_round_trips() -> Result<()> {
+    use super::gate::nixl_serial;
+    use crate::layout::PinnedAllocator;
+    use anyhow::Context;
+    use kvbm_memory::{
+        MemPolicyMode, MemoryDescriptor, numa::get_device_numa_node, page_placement,
+    };
+
+    nixl_serial!();
+    let agent = NixlAgent::with_backends("registered_mmap_g2", &["UCX"])?;
+    let device_id = 0;
+    let layout_builder = || {
+        PhysicalLayout::builder(agent.clone())
+            .with_config(standard_config(4))
+            .layer_separate(BlockDimension::BlockIsFirstDim)
+    };
+    let g1 = layout_builder().allocate_device(device_id).build()?;
+    let legacy = layout_builder()
+        .allocate_pinned_with(Some(device_id), PinnedAllocator::CuMemHostAlloc)
+        .build()?;
+    let g2 = layout_builder()
+        .allocate_pinned_with(Some(device_id), PinnedAllocator::RegisteredMmap)
+        .build()?;
+    let node = get_device_numa_node(device_id).context("GPU 0 must have a known NUMA node")?;
+
+    for region in legacy.layout().memory_regions() {
+        let placement = page_placement(region.addr()).context("query cuMemHostAlloc region")?;
+        assert_eq!(placement.mode, MemPolicyMode::Default);
+        assert!(placement.nodes.is_empty(), "{placement:?}");
+    }
+    // The live policy distinguishes the allocators. CUDA can rewrite the
+    // policy during registration, so this cannot verify the earlier bind.
+    for region in g2.layout().memory_regions() {
+        assert!(region.nixl_descriptor().is_some(), "unregistered G2 region");
+        let placement = page_placement(region.addr()).context("query registered mmap region")?;
+        assert!(
+            matches!(
+                placement.mode,
+                MemPolicyMode::Bind | MemPolicyMode::PreferredMany
+            ),
+            "expected a node policy on the registered mmap region, got {placement:?}"
+        );
+        assert_eq!(placement.nodes, [node]);
+        assert_eq!(placement.node, node);
+    }
+
+    let src_blocks = [0, 1];
+    let device_blocks = [1, 3];
+    let dst_blocks = [2, 3];
+    let checksums = fill_and_checksum(&g2, &src_blocks, FillPattern::Sequential)?;
+    fill_blocks(&g2, &dst_blocks, FillPattern::Constant(0))?;
+    let ctx = create_transfer_context(agent, None)?;
+    execute_transfer(
+        &g2,
+        &g1,
+        &src_blocks,
+        &device_blocks,
+        TransferOptionsInternal::default(),
+        ctx.context(),
+    )?
+    .await?;
+    execute_transfer(
+        &g1,
+        &g2,
+        &device_blocks,
+        &dst_blocks,
+        TransferOptionsInternal::default(),
+        ctx.context(),
+    )?
+    .await?;
+
+    verify_checksums_by_position(&checksums, &src_blocks, &g2, &dst_blocks)
+}
+
 /// Check if a transfer between two storage kinds requires GDS_MT (Device ↔ Disk direct).
 fn requires_gds(src_kind: StorageKind, dst_kind: StorageKind) -> bool {
     matches!(

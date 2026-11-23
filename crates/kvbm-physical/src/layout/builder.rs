@@ -22,16 +22,16 @@ use crate::layout::serialize::BlockFormat;
 
 use anyhow::{Result, anyhow, bail};
 use kvbm_memory::{
-    Buffer, DiskStorage, OffsetBuffer, StorageKind, SystemStorage, create_buffer,
+    Buffer, DeviceStorage, DiskStorage, OffsetBuffer, PinnedStorage, StorageKind, SystemStorage,
+    allocate_pinned_host, create_buffer,
     nixl::{MemType, NixlAgent, NixlDescriptor, RegisterError, register_with_nixl},
     prelude::{NixlCompatible, RegisteredView},
 };
+use serde::{Deserialize, Serialize};
 #[allow(unused_imports)]
 use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::sync::Arc;
-
-use kvbm_memory::{DeviceStorage, PinnedStorage};
 
 const REGION_ALIGNMENT: usize = 512;
 
@@ -43,14 +43,28 @@ pub enum LayoutKind {
     RaggedLayerSeparate { bytes_per_layer_block: Vec<usize> },
 }
 
+/// How the builder allocates pinned host memory.
+///
+/// The builder defaults to [`Self::CuMemHostAlloc`]. Changing the default
+/// requires transfer measurements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PinnedAllocator {
+    /// Allocate page-locked host memory with CUDA's `cuMemHostAlloc`.
+    #[default]
+    CuMemHostAlloc,
+    /// Map host memory with `mmap` and pin it with CUDA's `cuMemHostRegister`.
+    RegisteredMmap,
+}
+
 /// Allocation strategies for builder-managed memory.
 #[derive(Debug, Clone)]
 enum AllocationKind {
     System,
-    /// Pinned (page-locked) host memory. If `device_id` is Some, NUMA-aware
-    /// allocation is used on the GPU's NUMA node (when NUMA is enabled).
+    /// Page-locked host memory.
     Pinned {
         device_id: Option<u32>,
+        allocator: PinnedAllocator,
     },
     Device {
         device_id: u32,
@@ -309,7 +323,27 @@ impl PhysicalLayoutBuilder<HasConfig, HasLayout, NoMemory> {
         self,
         device_id: Option<u32>,
     ) -> PhysicalLayoutBuilder<HasConfig, HasLayout, HasMemory> {
-        self.set_memory_plan(MemoryPlan::Allocate(AllocationKind::Pinned { device_id }))
+        self.allocate_pinned_with(device_id, PinnedAllocator::CuMemHostAlloc)
+    }
+
+    /// Allocate pinned host memory with the selected [`PinnedAllocator`].
+    ///
+    /// `CuMemHostAlloc` calls `cuMemHostAlloc` and stays the default until
+    /// transfer measurements support a change. `RegisteredMmap` uses `mmap`
+    /// and `cuMemHostRegister` with the device's CUDA context. It tries to
+    /// place pages on the device's NUMA node.
+    ///
+    /// # Errors
+    /// [`PhysicalLayoutBuilder::build`] fails if `RegisteredMmap` has no `device_id`.
+    pub fn allocate_pinned_with(
+        self,
+        device_id: Option<u32>,
+        allocator: PinnedAllocator,
+    ) -> PhysicalLayoutBuilder<HasConfig, HasLayout, HasMemory> {
+        self.set_memory_plan(MemoryPlan::Allocate(AllocationKind::Pinned {
+            device_id,
+            allocator,
+        }))
     }
 
     /// Allocate device memory on the specified CUDA device (or the context device if `None`).
@@ -584,9 +618,10 @@ fn allocate_regions(
 
     let base_entry = match strategy {
         AllocationKind::System => allocate_system_entry(reserve_size, agent)?,
-        AllocationKind::Pinned { device_id } => {
-            allocate_pinned_entry(reserve_size, agent, device_id)?
-        }
+        AllocationKind::Pinned {
+            device_id,
+            allocator,
+        } => allocate_pinned_entry(reserve_size, agent, device_id, allocator)?,
         AllocationKind::Device { device_id } => {
             allocate_device_entry(reserve_size, agent, device_id)?
         }
@@ -606,10 +641,25 @@ fn allocate_pinned_entry(
     size: usize,
     agent: &NixlAgent,
     device_id: Option<u32>,
+    allocator: PinnedAllocator,
 ) -> Result<MemoryEntry> {
-    let storage = PinnedStorage::new_for_device(size, device_id)
-        .map_err(|e| anyhow!("failed to allocate pinned memory ({size} bytes): {e}"))?;
-    register_storage(storage, agent)
+    match allocator {
+        PinnedAllocator::CuMemHostAlloc => {
+            let storage = PinnedStorage::new_for_device(size, device_id)
+                .map_err(|e| anyhow!("failed to allocate pinned memory ({size} bytes): {e}"))?;
+            register_storage(storage, agent)
+        }
+        PinnedAllocator::RegisteredMmap => {
+            let device_id = device_id
+                .ok_or_else(|| anyhow!("the registered-mmap allocator needs a CUDA device"))?;
+            let storage = allocate_pinned_host(size, device_id).map_err(|e| {
+                anyhow!(
+                    "failed to allocate registered-mmap pinned memory ({size} bytes) on device {device_id}: {e}"
+                )
+            })?;
+            register_storage(storage, agent)
+        }
+    }
 }
 
 fn allocate_device_entry(size: usize, agent: &NixlAgent, device_id: u32) -> Result<MemoryEntry> {
@@ -1014,6 +1064,22 @@ mod tests {
 
     fn per_layer_size(cfg: &LayoutConfig) -> usize {
         cfg.num_blocks * cfg.outer_dim * cfg.page_size * cfg.inner_dim * cfg.dtype_width_bytes
+    }
+
+    #[test]
+    fn registered_mmap_requires_a_device() {
+        let agent = NixlAgent::new("builder-test-mmap-device").expect("failed to create agent");
+        let error = PhysicalLayoutBuilder::new(agent)
+            .with_config(make_layout_config())
+            .fully_contiguous()
+            .allocate_pinned_with(None, PinnedAllocator::RegisteredMmap)
+            .build()
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "the registered-mmap allocator needs a CUDA device"
+        );
     }
 
     #[test]
