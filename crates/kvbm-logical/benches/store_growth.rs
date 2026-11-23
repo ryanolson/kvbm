@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Store growth: the slowest register, allocate and release chunk on a large
-//! manager, for two workloads.
+//! Store growth: time register, allocate, release and ceiling calls on a large
+//! manager.
 //!
 //! This bench has its own `main` and no criterion. Criterion reports means,
 //! and the defect this bench looks for is a rare, long pause: one chunk whose
@@ -19,11 +19,14 @@
 //! * `inactive` registers a chunk and drops it, until the inactive pool is
 //!   full, then churns the same way with eviction. At most one chunk is ever
 //!   live. This exercises the inactive (lineage) index and its slab.
+//! * `ceiling` holds the lower half of the blocks live and leaves the upper
+//!   half in reset. It times one repeated ceiling call and one lowering call
+//!   per sample pair. The initial ceiling is three quarters of capacity and
+//!   the lowering crosses one chunk of reset IDs. The run restores the
+//!   initial ceiling outside the timer after each pair.
 //!
-//! A turnover is one quarter of the block count, in both workloads. A run
-//! states its turnover count and claims nothing beyond it. The bench reports
-//! time and occupancy only; it does not tell a map growth from an in-place
-//! rehash.
+//! In `live` and `inactive`, a turnover is one quarter of the block count.
+//! In `ceiling`, `--turnovers` gives the number of sample pairs.
 //!
 //! Each workload checks that it did what it claims, so a run that does not
 //! hold or does not evict fails: `live` must peak at the block count of live
@@ -37,6 +40,8 @@
 //! cargo bench -p kvbm-logical --features testing --bench store_growth -- --quick
 //! cargo bench -p kvbm-logical --features testing --bench store_growth -- \
 //!     --blocks 262144 --turnovers 20 --workload live
+//! cargo bench -p kvbm-logical --features testing --bench store_growth -- \
+//!     --workload ceiling
 //! ```
 //!
 //! `--bench --self-test` checks the bench's own argument parsing and
@@ -70,9 +75,9 @@ const QUICK_BLOCKS: usize = 65_536;
 const QUICK_TURNOVERS: usize = 4;
 
 const USAGE: &str = "usage: store_growth --bench [--quick] [--blocks N] [--turnovers T] \
-                     [--workload live|inactive|all] [--self-test]\n  \
+                     [--workload live|inactive|ceiling|all] [--self-test]\n  \
                      --blocks N      block count; a multiple of 4096 (default 2097152)\n  \
-                     --turnovers T   churn turnovers of C/4 blocks each (default 100)\n  \
+                     --turnovers T   churn turnovers of C/4 blocks or ceiling sample pairs (default 100)\n  \
                      --quick         65536 blocks, 4 turnovers: a smoke check, not a measurement\n  \
                      --self-test     check the bench's argument parsing and percentiles, then exit";
 
@@ -83,6 +88,7 @@ type Guard = ImmutableBlock<TestMeta>;
 enum Which {
     Live,
     Inactive,
+    Ceiling,
     All,
 }
 
@@ -115,9 +121,12 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
                 which = match args.next().as_deref() {
                     Some("live") => Which::Live,
                     Some("inactive") => Which::Inactive,
+                    Some("ceiling") => Which::Ceiling,
                     Some("all") => Which::All,
                     other => {
-                        return Err(format!("--workload takes live, inactive or all: {other:?}"));
+                        return Err(format!(
+                            "--workload takes live, inactive, ceiling or all: {other:?}"
+                        ));
                     }
                 }
             }
@@ -251,6 +260,14 @@ fn self_test() {
         (quick.blocks, quick.turnovers),
         (QUICK_BLOCKS, QUICK_TURNOVERS)
     );
+    let ceiling = parse_args(&words(&["--bench", "--workload", "ceiling"]))
+        .unwrap()
+        .unwrap();
+    assert!(ceiling.which == Which::Ceiling);
+    assert_eq!(
+        (ceiling.blocks, ceiling.turnovers),
+        (DEFAULT_BLOCKS, DEFAULT_TURNOVERS)
+    );
     assert!(parse_args(&words(&["--bench", "--blocks", "100"])).is_err());
     assert!(parse_args(&words(&["--bench", "--bogus"])).is_err());
     // Two long pauses, both over u32::MAX nanoseconds, must stay distinct.
@@ -366,9 +383,13 @@ fn print_header(name: &str, blocks: usize, turnovers: usize) {
          {turnovers} turnovers of {} blocks",
         blocks / 4
     );
+    print_samples_header("chunks");
+}
+
+fn print_samples_header(count_label: &str) {
     println!(
         "  {:<6} {:<9} {:>8} {:>10} {:>10} {:>10}",
-        "phase", "call", "chunks", "p50 us", "p99 us", "max us"
+        "phase", "call", count_label, "p50 us", "p99 us", "max us"
     );
 }
 
@@ -506,6 +527,64 @@ fn run_inactive(blocks: usize, turnovers: usize) {
     );
 }
 
+fn timed_ceiling(manager: &Manager, ceiling: usize, samples: &mut Samples) {
+    let start = Instant::now();
+    let result = manager.set_allocation_ceiling(Some(ceiling));
+    samples.push(start.elapsed().as_nanos());
+    result.expect("set allocation ceiling");
+}
+
+fn run_ceiling(blocks: usize, pairs: usize) {
+    let manager = build_manager(blocks);
+    let live = blocks / 2;
+    let mut held = Vec::with_capacity(live);
+    for chunk in 0..live / CHUNK {
+        let mutable = manager
+            .allocate_blocks_from_reset(CHUNK)
+            .expect("allocate live chunk from reset pool");
+        held.extend(manager.register_blocks(stage(mutable, chunk as u64 + 1)));
+    }
+    assert_eq!(held.len(), live);
+    assert_eq!(manager.occupied_high_water(), live);
+    assert_eq!(manager.inactive_len(), 0);
+    let reset = manager.reset_len();
+    assert_eq!(reset, blocks - live);
+
+    let upper = blocks - blocks / 4;
+    let lower = upper - CHUNK;
+    let mut repeated = Samples::with_capacity(pairs);
+    let mut lowered = Samples::with_capacity(pairs);
+    manager
+        .set_allocation_ceiling(Some(upper))
+        .expect("set initial ceiling");
+    let eligible_upper = manager.available_blocks();
+    assert_eq!(eligible_upper, upper - live);
+    for _ in 0..pairs {
+        timed_ceiling(&manager, upper, &mut repeated);
+        assert_eq!(manager.available_blocks(), eligible_upper);
+        timed_ceiling(&manager, lower, &mut lowered);
+        assert_eq!(manager.available_blocks(), lower - live);
+        manager
+            .set_allocation_ceiling(Some(upper))
+            .expect("restore ceiling");
+    }
+    assert_eq!(manager.reset_len(), reset);
+
+    println!(
+        "\nworkload ceiling: {blocks} blocks, {BLOCK_SIZE} tokens each, {live} live, \
+         {reset} reset, {pairs} sample pairs"
+    );
+    print_samples_header("calls");
+    repeated.print("repeat", "ceiling");
+    lowered.print("lower", "ceiling");
+    println!(
+        "  repeat {upper} -> {upper}: 0 reset IDs change eligibility, \
+         lower {upper} -> {lower}: {} reset IDs change eligibility",
+        eligible_upper - (lower - live)
+    );
+    println!("  internal move and reinsert counts are unavailable through the public API");
+}
+
 /// Whether `--bench` is among the raw arguments. It looks at the undecoded
 /// arguments, so a non-UTF-8 argument from `cargo test` or a shell cannot make
 /// a run that is not a bench fail.
@@ -545,15 +624,15 @@ fn main() -> ExitCode {
         self_test();
         return ExitCode::SUCCESS;
     }
-    println!(
-        "store_growth: lineage backend, TinyLFU tracker, events manager, Reject duplicates; \
-         times are per call over a {CHUNK}-block chunk"
-    );
+    println!("store_growth: lineage backend, TinyLFU tracker, events manager, Reject duplicates");
     if matches!(args.which, Which::Live | Which::All) {
         run_live(args.blocks, args.turnovers);
     }
     if matches!(args.which, Which::Inactive | Which::All) {
         run_inactive(args.blocks, args.turnovers);
+    }
+    if matches!(args.which, Which::Ceiling | Which::All) {
+        run_ceiling(args.blocks, args.turnovers);
     }
     ExitCode::SUCCESS
 }
