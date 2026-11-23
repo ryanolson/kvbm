@@ -19,7 +19,7 @@ use parking_lot::Mutex as RegistryMutex;
 use tokio::time::{Instant, sleep_until};
 use velo::InstanceId;
 
-use crate::remote::cd::state::CdRequestState;
+use crate::remote::cd::{prefill::PrefillRequestState, state::CdRequestState};
 use crate::worker::velo::{
     CheckEvidence, DEFAULT_LOCAL_TRANSFER_CHECK_DEADLINE, LocalTransferWorker,
 };
@@ -50,6 +50,7 @@ pub(super) struct PausedLoad {
 pub(super) enum LoadContinuation {
     Resource(ResourceContinuation),
     CdDecode(CdDecodeContinuation),
+    CdPrefill(Arc<PrefillRequestState>),
 }
 
 /// The current resource and the work that has yet to reach admission.
@@ -88,6 +89,17 @@ impl PausedLoad {
         drop(self.holds);
         let cd_terminal = match self.continuation {
             Some(LoadContinuation::CdDecode(cd)) => Some((cd.state, status.clone())),
+            Some(LoadContinuation::CdPrefill(state)) => {
+                engine.finish_prefill_kick_after_drain(
+                    self.action,
+                    &self.request,
+                    &state,
+                    status,
+                    self.destinations,
+                    &self.physical_drain,
+                );
+                return;
+            }
             _ => None,
         };
         engine.finish_load_action(self.action, &self.request, status, self.destinations);
@@ -555,10 +567,15 @@ impl LocalConnectorEngine {
         let status = if let Some(LoadContinuation::CdDecode(cd)) = &load.continuation {
             cd.outcome(completed)
         } else {
-            match (completed, load.continuation.take()) {
-                (true, Some(LoadContinuation::Resource(resource)))
-                    if resource.remaining.len() != 0 =>
-                {
+            let resource = match load.continuation.take() {
+                Some(LoadContinuation::Resource(resource)) => Some(resource),
+                continuation => {
+                    load.continuation = continuation;
+                    None
+                }
+            };
+            match (completed, resource) {
+                (true, Some(resource)) if resource.remaining.len() != 0 => {
                     tracing::info!(
                         request_id = %load.request,
                         action_id = ?load.action,
@@ -569,9 +586,7 @@ impl LocalConnectorEngine {
                     return;
                 }
                 (true, _) => ActionStatus::Complete,
-                (false, Some(LoadContinuation::Resource(resource))) => {
-                    ActionStatus::Failed(resource.failure)
-                }
+                (false, Some(resource)) => ActionStatus::Failed(resource.failure),
                 (false, _) => ActionStatus::Failed(ActionFailure::AllBlocks),
             }
         };

@@ -4173,6 +4173,8 @@ mod tests {
         mod accepted_transfer;
         #[path = "drain_proof.rs"]
         mod drain_proof;
+        #[path = "prefill_drain.rs"]
+        mod prefill_drain;
         use super::*;
 
         use futures::FutureExt;
@@ -7204,12 +7206,16 @@ mod tests {
             wait_for(|| rig.puller_f.attach_calls().len() == 1).await;
 
             // Nothing committed yet: pulls are incomplete, so the kick parks.
-            let onboard = rig
+            let mut onboard = rig
                 .engine
                 .clone()
                 .prefill_onboard_by_id(&"rq".to_string(), handle.accept_id(), &[40usize, 50, 51])
                 .unwrap();
             assert!(!onboard.is_complete(), "kick parked until pulls complete");
+            let fence = onboard
+                .take_physical_drain_fence()
+                .expect("the parked kick carries a fence");
+            assert!(!fence.is_complete());
             assert!(rig.workers.transfer_calls().is_empty());
 
             holder.commit(rig.plhs.clone())?;
@@ -7217,6 +7223,9 @@ mod tests {
 
             wait_for(|| onboard.is_complete()).await;
             assert_eq!(onboard.outcome(), Some(LoadOutcome::Done));
+            wait_for(|| !rig.sink.loads().is_empty()).await;
+            assert!(fence.is_complete());
+            assert_eq!(rig.sink.loads(), vec![("rq".into(), LoadOutcome::Done)]);
             assert_eq!(
                 rig.workers.transfer_calls(),
                 vec![vec![50, 51]],
@@ -7248,19 +7257,25 @@ mod tests {
                 "pre-USAA failure keeps the state latched for the replay"
             );
 
-            let onboard = rig
+            let mut onboard = rig
                 .engine
                 .clone()
                 .prefill_onboard_by_id(&"rq".to_string(), handle.accept_id(), &[40usize, 50, 51])
                 .unwrap();
+            let fence = onboard
+                .take_physical_drain_fence()
+                .expect("replay carries a fence");
+            assert!(fence.is_complete(), "replay has no copy to drain");
             wait_for(|| onboard.is_complete()).await;
+            let failure = LoadOutcome::FailedPartial {
+                block_ids: vec![50, 51],
+            };
             assert_eq!(
                 onboard.outcome(),
-                Some(LoadOutcome::FailedPartial {
-                    block_ids: vec![50, 51]
-                }),
+                Some(failure.clone()),
                 "replay covers the external slice only — never the computed prefix"
             );
+            assert_eq!(rig.sink.loads(), vec![("rq".into(), failure)]);
             assert!(cdr.prefill.get("rq").is_none(), "state removed at replay");
             assert!(rig.workers.transfer_calls().is_empty(), "no transfer ran");
             Ok(())
@@ -7465,21 +7480,25 @@ mod tests {
             // Commits land, availability never does; USAA latches the kick;
             // then decode dies.
             holder.commit(rig.plhs.clone())?;
-            let onboard = rig
+            let mut onboard = rig
                 .engine
                 .clone()
                 .prefill_onboard_by_id(&"rq".to_string(), handle.accept_id(), &[40usize, 50, 51])
                 .unwrap();
+            let fence = onboard
+                .take_physical_drain_fence()
+                .expect("the latched kick carries a fence");
+            assert!(!fence.is_complete());
             holder.close(Some("decode died".to_string()));
 
             wait_for(|| onboard.is_complete()).await;
-            assert_eq!(
-                onboard.outcome(),
-                Some(LoadOutcome::FailedPartial {
-                    block_ids: vec![50, 51]
-                })
-            );
+            let failure = LoadOutcome::FailedPartial {
+                block_ids: vec![50, 51],
+            };
+            assert_eq!(onboard.outcome(), Some(failure.clone()));
             wait_for(|| cdr.prefill.get("rq").is_none()).await;
+            assert!(fence.is_complete(), "pipeline failure has no kick to drain");
+            assert_eq!(rig.sink.loads(), vec![("rq".into(), failure)]);
             let puller = rig.puller_f.last_attached().expect("attached");
             assert!(puller.closed_reason().is_some(), "engine closed its side");
             assert!(rig.workers.transfer_calls().is_empty(), "no transfer ran");
@@ -7566,6 +7585,18 @@ mod tests {
             let puller = rig.puller_f.last_attached().expect("attached");
             assert_eq!(puller.pull_calls().len(), 1, "cache-warming pull still ran");
             assert_eq!(puller.pull_calls()[0].0, rig.plhs);
+            // The public zero-stored route delegates to local search.
+            let mut onboard =
+                rig.engine
+                    .clone()
+                    .prefill_onboard_by_id(&"rq".into(), handle.accept_id(), &[])?;
+            let fence = onboard
+                .take_physical_drain_fence()
+                .expect("the zero-block kick carries a fence");
+            wait_for(|| !rig.sink.loads().is_empty()).await;
+            assert!(fence.is_complete());
+            assert_eq!(onboard.outcome(), Some(LoadOutcome::Done));
+            assert_eq!(rig.sink.loads(), vec![("rq".into(), LoadOutcome::Done)]);
             assert!(rig.workers.transfer_calls().is_empty(), "no kick");
 
             drop(handle);
@@ -7952,15 +7983,16 @@ mod tests {
 
             // USAA fires the kick; its G2→G1 dispatch fails, the Failed
             // terminal lands, and the sink gate parks the kick task there.
-            let onboard = engine
+            let mut onboard = engine
                 .clone()
                 .prefill_onboard_by_id(&"rq".to_string(), handle.accept_id(), &[40usize, 50, 51])
                 .unwrap();
+            let fence = onboard
+                .take_physical_drain_fence()
+                .expect("the failed kick carries a fence");
             wait_for(|| sink.entered()).await;
-            assert!(
-                onboard.is_complete(),
-                "terminal observable while the kick task is parked"
-            );
+            let terminal_visible = onboard.is_complete() && fence.is_complete();
+            let stashed = state.pending_failure();
 
             // The reap that terminal triggers: handles drop, the RAII release
             // runs inside the window.
@@ -7975,6 +8007,12 @@ mod tests {
             // strand a worker thread on the gate.
             sink.open();
 
+            assert!(terminal_visible, "the sink sees both terminals settled");
+            assert_eq!(
+                stashed.as_deref(),
+                Some("prefill onboard kick failed"),
+                "failure must be stashed before the terminals become visible"
+            );
             assert!(
                 closed.is_some(),
                 "racing release must CLOSE the failed lifecycle's session, got finalize={finished:?}"
@@ -8093,6 +8131,15 @@ mod tests {
         // ------------------------------------------------------------------
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn prefill_release_before_attach_resolves_latched_kick() -> Result<()> {
+            prefill_refused_park_settles(true).await
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn prefill_refused_park_sends_failed_load_without_eviction() -> Result<()> {
+            prefill_refused_park_settles(false).await
+        }
+
+        async fn prefill_refused_park_settles(evict: bool) -> Result<()> {
             let (holder_f, puller_f) = MockSessionFactory::make_paired();
             let gate = Arc::new(GatedResolver::default());
             let sink = RecordingSink::new();
@@ -8145,11 +8192,15 @@ mod tests {
 
             // USAA while the attach is in flight: the kick latches (pulls
             // incomplete) and the guard records the external suffix.
-            let onboard = engine
+            let mut onboard = engine
                 .clone()
                 .prefill_onboard_by_id(&"rq".to_string(), handle.accept_id(), &[40usize, 50, 51])
                 .unwrap();
             assert!(!onboard.is_complete(), "kick parked until pulls complete");
+            let physical = onboard
+                .take_physical_drain_fence()
+                .expect("the latched kick carries a fence");
+            assert!(!physical.is_complete());
             assert!(
                 engine
                     .inflight
@@ -8163,11 +8214,15 @@ mod tests {
             // eviction): the fence arms over the Pending action, then the
             // connector's view-detach drops the session handle — the release
             // claims cleanup and finds no session to close.
-            let fence = engine.evict(&rid).fence;
-            assert!(
-                !fence.per_worker.is_empty(),
-                "evict arms a fence over the live onboard"
-            );
+            let eviction = if evict {
+                let outcome = engine.evict(&rid);
+                assert!(!outcome.fence.per_worker.is_empty());
+                assert!(!outcome.handle.as_ref().unwrap().is_complete());
+                Some(outcome)
+            } else {
+                engine.prefill_release(&rid, handle.accept_id());
+                None
+            };
             assert!(
                 engine.inflight.lock().unwrap().is_empty(),
                 "evict's internal prefill teardown is a release funnel — it \
@@ -8178,21 +8233,24 @@ mod tests {
             // The attach lands AFTER the release: the park is Refused and the
             // pipeline exits cleanly — it owns resolving the orphaned kick.
             gate.open();
-            wait_for(|| onboard.is_complete()).await;
+            wait_for(|| physical.is_complete()).await;
+            let failure = LoadOutcome::FailedPartial {
+                block_ids: vec![50, 51],
+            };
             assert_eq!(
                 onboard.outcome(),
-                Some(LoadOutcome::FailedPartial {
-                    block_ids: vec![50, 51]
-                }),
+                Some(failure.clone()),
                 "the orphaned kick resolves Failed over the external slice"
             );
-            // The fence-armed terminal completes the eviction fence instead
-            // of firing `mark_load_finished`.
-            wait_for(|| sink.fences().len() == fence.per_worker.len()).await;
-            assert!(
-                sink.loads().is_empty(),
-                "a fenced terminal fires no load_finished"
-            );
+            if let Some(eviction) = eviction {
+                assert!(eviction.handle.unwrap().is_complete());
+                assert_eq!(sink.fences(), eviction.fence.per_worker);
+                assert!(sink.loads().is_empty());
+            } else {
+                wait_for(|| !sink.loads().is_empty()).await;
+                assert_eq!(sink.loads(), vec![(rid, failure)]);
+                assert!(sink.fences().is_empty());
+            }
             Ok(())
         }
 

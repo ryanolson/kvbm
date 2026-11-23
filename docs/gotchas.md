@@ -35,6 +35,18 @@ run's reply and prove it drained. The second run must never be pulled, and its
 destination must be reported for recompute.
 [CD decode drain tests](../crates/kvbm-engine/src/tiering/engine/local/tests/cd_tests/drain_proof.rs)
 
+## Stash a failed prefill kick before settling it
+
+After a prefill kick proves drain with an error, stash the failure, settle
+the logical terminal, then settle the physical terminal before cleanup.
+Connector release can race cleanup as soon as it sees a terminal. Without
+the stash it can finalize the session and tell the decode peer it succeeded.
+
+Test by blocking the worker sink on the failed terminal and releasing the
+prefill lifecycle while the kick task is still in the sink. The release
+must find the stash and close the session.
+[Prefill release test](../crates/kvbm-engine/src/tiering/engine/local.rs)
+
 ## Keep paused onboard blocks through connector teardown
 
 Keep the engine's pause registry alive while a worker can still touch its
