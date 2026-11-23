@@ -1,5 +1,18 @@
 # Coding gotchas
 
+## Keep both ends of a copy until drain is proven
+
+Await the receipt's drain outcome before releasing blocks. A lost reply can
+leave a worker reading the source and writing the destination. On an
+unproven outcome, keep the source blocks pinned and leave the destination
+fence incomplete. Sending a load failure too early lets the scheduler reuse
+blocks the worker can still overwrite.
+
+Test by losing the reply while holding the running copy. Check that the
+source stays pinned, the fence stays incomplete, and the scheduler gets no
+load terminal.
+[Lost-reply test](../crates/kvbm-engine/src/tiering/engine/local/tests/onboard_drain.rs)
+
 ## Keep paused onboard blocks through connector teardown
 
 Keep the engine's pause registry alive while a worker can still touch its

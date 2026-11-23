@@ -117,6 +117,14 @@ pub use client::VeloWorkerClient;
 pub use service::{VeloWorkerService, VeloWorkerServiceBuilder};
 pub use unresolved::{UnresolvedParticipant, UnresolvedTransfer};
 
+/// Identifies the remote worker even when a receipt has no re-check capability.
+#[derive(Debug, thiserror::Error)]
+#[error("local transfer on instance {instance}, worker {worker_id:?}")]
+pub(crate) struct LocalTransferWorker {
+    pub(crate) instance: velo::InstanceId,
+    pub(crate) worker_id: Option<u64>,
+}
+
 /// Canonical handler names for the Velo RPCs this worker exposes.
 ///
 /// Centralising these as constants keeps the client (`client.rs`) and

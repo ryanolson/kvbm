@@ -3,10 +3,6 @@
 
 //! Onboard ownership while a submitted copy has no drain proof.
 
-// The onboard drivers will hand their receipts to this module as they adopt
-// the shared drain fold.
-#![cfg_attr(not(test), allow(dead_code))]
-
 mod metrics;
 
 use std::collections::{HashMap, HashSet};
@@ -21,7 +17,9 @@ use parking_lot::Mutex as RegistryMutex;
 use tokio::time::{Instant, sleep_until};
 use velo::InstanceId;
 
-use crate::worker::velo::{CheckEvidence, DEFAULT_LOCAL_TRANSFER_CHECK_DEADLINE};
+use crate::worker::velo::{
+    CheckEvidence, DEFAULT_LOCAL_TRANSFER_CHECK_DEADLINE, LocalTransferWorker,
+};
 use crate::worker::{LocalTransferRecheck, UnresolvedTransfer};
 
 use super::local::LocalConnectorEngine;
@@ -123,9 +121,17 @@ struct Participant {
 }
 
 impl Participant {
-    fn new(recheck: Option<LocalTransferRecheck>, evidence: CheckEvidence) -> Self {
-        let worker = recheck.as_ref().map_or(Worker::Unknown, Worker::of);
+    fn new(recheck: Option<LocalTransferRecheck>, error: &anyhow::Error) -> Self {
+        let worker = recheck
+            .as_ref()
+            .map(Worker::of)
+            .or_else(|| {
+                let origin = error.downcast_ref::<LocalTransferWorker>()?;
+                Some(Worker::Velo(origin.instance, origin.worker_id))
+            })
+            .unwrap_or(Worker::Unknown);
         let recheck = recheck.filter(|check| check.incarnation.is_some());
+        let evidence = CheckEvidence::from_error(error);
         let state = match (&recheck, evidence.answered) {
             (None, _) => PauseState::NoRecoveryCapability,
             (_, Some(_)) => PauseState::WorkerNoProof,
@@ -281,12 +287,7 @@ impl PausedOnboards {
         let participants = unresolved
             .participants()
             .iter()
-            .map(|part| {
-                Participant::new(
-                    part.recheck().cloned(),
-                    CheckEvidence::from_error(part.error()),
-                )
-            })
+            .map(|part| Participant::new(part.recheck().cloned(), part.error()))
             .collect();
         let record = PausedRecord {
             load,

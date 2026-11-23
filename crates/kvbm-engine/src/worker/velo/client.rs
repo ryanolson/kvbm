@@ -235,11 +235,22 @@ impl VeloWorkerClient {
 
         Ok(TransferCompleteNotification::from_drain_future(
             async move {
-                outcome_rx.await.unwrap_or_else(|_| {
+                let outcome = outcome_rx.await.unwrap_or_else(|_| {
                     TransferDrainOutcome::Unproven(anyhow::anyhow!(
                         "local transfer RPC task stopped before it reported an outcome"
                     ))
-                })
+                });
+                match outcome {
+                    TransferDrainOutcome::Unproven(error)
+                        if error.downcast_ref::<LocalTransferRecheck>().is_none() =>
+                    {
+                        TransferDrainOutcome::Unproven(error.context(LocalTransferWorker {
+                            instance: remote_instance,
+                            worker_id,
+                        }))
+                    }
+                    outcome => outcome,
+                }
             },
         ))
     }

@@ -68,6 +68,16 @@ pub(super) async fn build_leader_with_workers(
     workers: Arc<dyn ParallelWorkers>,
 ) -> Result<(InstanceLeader, Arc<BlockManager<G2>>)> {
     let messenger = create_messenger_tcp().await?;
+    build_leader_with_messenger(messenger, resource, g2_blocks, block_size, workers)
+}
+
+pub(super) fn build_leader_with_messenger(
+    messenger: Arc<velo::Messenger>,
+    resource: LogicalResourceId,
+    g2_blocks: usize,
+    block_size: usize,
+    workers: Arc<dyn ParallelWorkers>,
+) -> Result<(InstanceLeader, Arc<BlockManager<G2>>)> {
     let registry = BlockRegistry::builder().build();
     let manager = Arc::new(
         TestManagerBuilder::<G2>::new()

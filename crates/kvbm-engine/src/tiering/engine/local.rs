@@ -45,7 +45,7 @@
 // consumers; one module-level allow covers that gap.
 #![allow(dead_code)]
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use anyhow::Result;
@@ -55,7 +55,7 @@ use kvbm_common::LogicalResourceId;
 use kvbm_protocols::cache_manifest::{BundleKey, CacheIdentity};
 use kvbm_protocols::connector::{
     AcceptId, ActionFailure, ActionId, ActionStatus, BundleOffloadPlan, BundleOnboardPlan,
-    EngineWorkerSink, EvictionFence, EvictionOutcome, FenceToken, FindBlocksHandle,
+    EngineWorkerSink, EvictionFence, EvictionOutcome, FenceHandle, FenceToken, FindBlocksHandle,
     FindBlocksOutcome, FindBlocksRequest, LeaderEngine, LeaderEngineError, OffloadHandle,
     OnboardHandle, RequestOffloadDrain, ResourceOnboard, SearchId, WorkerEngineDriver,
 };
@@ -74,7 +74,8 @@ use super::inflight::{InflightKey, InflightOnboards};
 use super::offload::{
     self, BufferedOffload, BufferedOffloadCompletion, DisabledOffloadSubmit, OffloadSubmit,
 };
-use super::onboard;
+use super::onboard::{self, OnboardDrain};
+use super::paused::{PauseCell, PausedLoad};
 use super::reconcile::{
     MatchCheckOutcome, OnboardingState, compute_outcome, issue_shard, reconcile_state,
 };
@@ -1366,9 +1367,8 @@ impl LocalConnectorEngine {
         };
 
         // Take ownership of the pinned state: the onboard now owns the sources'
-        // lifecycle. The blocks stay resident inside the driver task until the
-        // transfer completes (drain-not-drop — eviction handles in-flight
-        // onboards via `evict`, not via search-handle drop).
+        // lifecycle. The driver holds the source blocks through dispatch and
+        // passes them to the pause registry if the receipt cannot prove drain.
         let (_id, search_state) = self
             .searches
             .remove(&search_id)
@@ -1426,9 +1426,13 @@ impl LocalConnectorEngine {
         // the in-flight record BEFORE returning the handle so `evict` and the
         // by-id path observe a live `Pending` action, not the missing-key default.
         let cell = Arc::new(Mutex::new(ActionStatus::Pending));
+        let physical_drain = Arc::new(AtomicBool::new(false));
+        let pause = PauseCell::default();
         self.actions.insert(
             action_id,
-            ActionRecord::new(request_id.clone(), Arc::downgrade(&cell)),
+            // The local driver waits for the receipt even if this token is cancelled.
+            ActionRecord::new(request_id.clone(), Arc::downgrade(&cell))
+                .with_physical_drain(tokio_util::sync::CancellationToken::new()),
         );
         self.by_request
             .entry(request_id.clone())
@@ -1455,6 +1459,8 @@ impl LocalConnectorEngine {
         // into the handle (whose `outcome()` projection names them likewise).
         let handle_dest_ids = g1_block_ids.clone();
         let this = self.clone();
+        let drain_cell = physical_drain.clone();
+        let pause_cell = pause.clone();
         self.leader.runtime().spawn(async move {
             let dest_ids = g1_block_ids.clone();
             let outcome = onboard::run_onboard(
@@ -1468,22 +1474,38 @@ impl LocalConnectorEngine {
             .await;
             // Release every shard's server-side session (Ready pins are no-ops).
             onboarding.release_all(&this.leader);
-            // Write terminal into the cell + notify with no engine lock held.
-            this.finish_load_action(action_id, &request_id, outcome, dest_ids);
+            match outcome {
+                OnboardDrain::Proven(status) => {
+                    this.finish_load_action(action_id, &request_id, status, dest_ids);
+                    this.finish_physical_load_action(action_id, &drain_cell);
+                }
+                OnboardDrain::Unproven { error, holds } => this.pause_load_action(
+                    PausedLoad {
+                        action: action_id,
+                        request: request_id,
+                        destinations: dest_ids,
+                        physical_drain: drain_cell,
+                        pause: pause_cell,
+                        holds: Box::new(holds),
+                    },
+                    error,
+                ),
+            }
             #[cfg(test)]
             super::test_support::note_onboard_driver_finished(action_id);
         });
 
         // The handle owns the strong cell and a `Weak` back-ref; its RAII drop
-        // fires `release_action` to prune both the by-id `actions` map and the
-        // `by_request` index for this action (the entry lives until then).
+        // fires `release_action`. The action record stays until its drain is proven.
         let me: Arc<dyn LeaderEngine> = self;
-        Ok(OnboardHandle::new(
+        Ok(OnboardHandle::new_with_physical_drain(
             action_id,
             Arc::downgrade(&me),
             cell,
             handle_dest_ids,
-        ))
+            FenceHandle::new(physical_drain),
+        )
+        .with_pause_cell(pause))
     }
 }
 
@@ -1905,9 +1927,17 @@ impl LocalConnectorEngine {
             // LOCAL kick: the matched span sources `local_g1` only. An empty
             // `local_g1` (zero local match) short-circuits to Complete in
             // run_onboard without awaiting the staging futures.
-            let local_status =
-                onboard::run_onboard(&leader, &mut onboarding, local_g1, staging_futs, block_size, local_hit)
-                    .await;
+            let local_status = match onboard::run_onboard(
+                &leader, &mut onboarding, local_g1, staging_futs, block_size, local_hit,
+            )
+            .await
+            {
+                OnboardDrain::Proven(status) => status,
+                OnboardDrain::Unproven { error, .. } => {
+                    tracing::error!(%error, "onboard G2->G1 transfer failed");
+                    ActionStatus::Failed(ActionFailure::AllBlocks)
+                }
+            };
             onboarding.release_all(&leader);
 
             let outcome = if !matches!(local_status, ActionStatus::Complete) {

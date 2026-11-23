@@ -86,10 +86,8 @@ pub struct OnboardHandle {
     /// failure (vLLM invalidates by block id), so `outcome()` uses this set to
     /// project an unresolved `Failed(AllBlocks)` cell onto the full dest set.
     dest_block_ids: Vec<usize>,
-    /// Optional observational fence for an onboard whose logical terminal may
-    /// precede physical transfer drain (for example, a bounded bundle
-    /// watchdog). The connector consumes this fence and gates destination G1
-    /// reuse on it; ordinary onboards leave it absent.
+    /// Optional fence that stays incomplete until the engine proves physical
+    /// drain. A caller can take it to gate G1 reuse after dropping this handle.
     physical_drain: Option<FenceHandle>,
     pause: Option<PauseCell>,
 }
@@ -118,8 +116,8 @@ impl OnboardHandle {
     }
 
     /// Engine-minted onboard with a physical-drain fence. The fence is
-    /// leader-local and never crosses the wire; a connector that observes an
-    /// early logical failure consumes it before dropping the handle.
+    /// leader-local. A caller that needs to track physical drain can take it
+    /// before dropping the handle.
     #[doc(hidden)]
     pub fn new_with_physical_drain(
         id: ActionId,
@@ -198,8 +196,7 @@ impl OnboardHandle {
         }
     }
 
-    /// Consume the physical-drain fence, if this onboard can finish
-    /// logically before its launched transfer work drains.
+    /// Take the physical-drain fence if the engine provided one.
     #[doc(hidden)]
     pub fn take_physical_drain_fence(&mut self) -> Option<FenceHandle> {
         self.physical_drain.take()
