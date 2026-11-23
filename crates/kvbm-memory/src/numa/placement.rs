@@ -15,7 +15,7 @@ use nix::libc;
 use serde::{Deserialize, Serialize};
 
 use super::NumaNode;
-use super::topology::NumaTopology;
+use super::topology::{NodeMemorySnapshot, NumaTopology};
 use crate::mmap_pinned::PlacementFallback;
 
 /// The outcome of [`decide_placement`].
@@ -50,6 +50,54 @@ pub(crate) fn decide_placement(
         Some(cpus) if !cpus.is_empty() => PlacementDecision::Bind(node),
         _ => PlacementDecision::OsDefault(PlacementFallback::NodeHasNoCpus(node)),
     }
+}
+
+/// Check whether a node's reclaimable memory estimate covers the mapped range.
+pub(crate) fn check_node_memory_budget(
+    node: NumaNode,
+    mapped_bytes: u64,
+    page_size: u64,
+    read: impl FnOnce(NumaNode) -> Result<NodeMemorySnapshot, String>,
+) -> Result<(), PlacementFallback> {
+    let unavailable = |error| PlacementFallback::NodeMemoryBudgetUnavailable {
+        node,
+        mapped_bytes,
+        error,
+    };
+    let snapshot = read(node).map_err(unavailable)?;
+    let gross_bytes = [
+        snapshot.inactive_file,
+        snapshot.active_file,
+        snapshot.reclaimable_slab,
+    ]
+    .into_iter()
+    .try_fold(snapshot.free, u64::checked_add)
+    .ok_or_else(|| unavailable("node memory counters overflow".into()))?
+    .saturating_sub(snapshot.shmem)
+    .min(snapshot.total);
+    let reserve_bytes = snapshot
+        .total
+        .div_ceil(16)
+        .checked_next_multiple_of(page_size)
+        .ok_or_else(|| unavailable("node memory reserve cannot be rounded to a page".into()))?;
+    let usable_bytes = gross_bytes.saturating_sub(reserve_bytes);
+    tracing::debug!(
+        ?node,
+        mapped_bytes,
+        usable_bytes,
+        reserve_bytes,
+        "checked node memory budget"
+    );
+
+    if mapped_bytes > usable_bytes {
+        return Err(PlacementFallback::InsufficientNodeMemory {
+            node,
+            mapped_bytes,
+            usable_bytes,
+            reserve_bytes,
+        });
+    }
+    Ok(())
 }
 
 /// A NUMA memory policy mode, as `get_mempolicy` reports it, without the

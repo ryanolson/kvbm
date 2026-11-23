@@ -25,14 +25,14 @@
 //!
 //! The device's node comes from [`crate::numa::get_device_numa_node`]. The
 //! pages are bound only when NUMA placement is enabled, the node is known,
-//! and the node has CPUs. Otherwise the OS places them, and
-//! [`HostPlacement::fallback`] names the reason ([`PlacementFallback`]). A
-//! node without CPUs is refused because no thread can first-touch there.
+//! the node has CPUs, and the rounded mapping fits its memory budget.
+//! Otherwise the OS places the pages and [`HostPlacement::fallback`] names
+//! the reason. A node without CPUs cannot first-touch the pages locally.
 //!
-//! When the node qualifies, a one-shot thread pinned to it maps, binds
-//! (`mbind(MPOL_BIND)`), touches every page, and registers. If the kernel
-//! refuses the bind (a cpuset or seccomp profile can), the call does not
-//! fail. The same mapping is touched from the same pinned thread, so the
+//! When the node qualifies, a one-shot thread pinned to it maps the region
+//! and checks the node's memory budget before binding. It then touches every
+//! page and registers the region. A cpuset or seccomp profile can refuse
+//! the bind. The same mapping is touched from the same pinned thread, so the
 //! OS's default local policy normally still puts the pages on that node.
 //! The storage records [`PlacementFallback::BindRefused`]. If the thread
 //! could not be pinned either, first touch runs unpinned, and the
@@ -42,10 +42,8 @@
 //! pages went. The queries are best-effort: if `get_mempolicy` is denied,
 //! `observed` is `None` and the allocation goes on.
 //!
-//! Only a refused bind turns into a fallback. An `mmap`, CUDA context or
-//! `cuMemHostRegister` error fails the call and is not retried. A bound
-//! node with too little free memory is not checked: `MPOL_BIND` has no
-//! fallback once pages fault in, so first touch can end in an OOM kill.
+//! A short or unavailable budget also selects OS placement. An `mmap`,
+//! CUDA context or `cuMemHostRegister` error fails the call.
 //!
 //! [`HostPlacement::policy`] reflects the kernel before registration. After
 //! first touch the entry reads the policy of the first, middle and last page.
@@ -94,7 +92,10 @@ use cudarc::driver::CudaContext;
 use nix::libc;
 use serde::{Deserialize, Serialize};
 
-use crate::numa::placement::{PageReading, PlacementDecision, decide_placement};
+use crate::numa::placement::{
+    PageReading, PlacementDecision, check_node_memory_budget, decide_placement,
+};
+use crate::numa::topology::{NodeMemorySnapshot, read_node_meminfo};
 use crate::numa::{MemPolicyMode, NumaNode};
 use crate::{MemoryDescriptor, Result, StorageError, StorageKind, actions, nixl::NixlDescriptor};
 
@@ -157,6 +158,26 @@ pub enum PlacementFallback {
         /// The node the bind asked for.
         node: NumaNode,
         /// The error `mbind` returned.
+        error: String,
+    },
+    /// The rounded mapping exceeds the node's estimated usable memory.
+    InsufficientNodeMemory {
+        /// The node considered for the bind.
+        node: NumaNode,
+        /// The rounded mapping size in bytes.
+        mapped_bytes: u64,
+        /// The estimated bytes available after the reserve.
+        usable_bytes: u64,
+        /// The bytes reserved as headroom.
+        reserve_bytes: u64,
+    },
+    /// The node's memory budget could not be read or calculated.
+    NodeMemoryBudgetUnavailable {
+        /// The node considered for the bind.
+        node: NumaNode,
+        /// The rounded mapping size in bytes.
+        mapped_bytes: u64,
+        /// The read, parse or arithmetic error.
         error: String,
     },
 }
@@ -412,9 +433,22 @@ impl actions::Memset for MmappedPinnedStorage {
 ///
 /// Registered `mmap` on base pages ([`HugepageTier::None`]). The pages are
 /// bound with `mbind(MPOL_BIND)` to the device's NUMA node only when that
-/// node is known and has CPUs; the mapping, bind, first touch and
-/// `cuMemHostRegister` then run on a thread pinned to that node. Otherwise
-/// the OS places the pages, and [`HostPlacement::fallback`] says why.
+/// node is known, has CPUs and has a budget for the mapping. The mapping,
+/// budget check, bind, first touch and `cuMemHostRegister` run on a thread
+/// pinned to the eligible node. [`HostPlacement::fallback`] gives the reason
+/// when the entry chooses OS placement.
+///
+/// The budget uses one fresh node `meminfo` snapshot per eligible mapping.
+/// It adds `MemFree`, `Inactive(file)`, `Active(file)` and `SReclaimable`,
+/// subtracts `Shmem` with a floor of zero, and caps the result at `MemTotal`.
+/// Subtract headroom of 1/16 of `MemTotal`, rounded up to a base page.
+/// The rounded mapping must fit the remainder. This estimate reserves no pages.
+/// Concurrent allocations, limited reclaim or cgroup limits can still
+/// leave too little memory when first touch faults the pages in.
+///
+/// This entry and [`allocate_pinned_host_regions`] check the budget.
+/// [`MmappedPinnedStorage::allocate`] uses strict binding without a budget
+/// check, including when `kvbm-service` uses it for pool slabs.
 ///
 /// A refused `mbind` is not an error: the same mapping is touched from the
 /// same pinned thread and the OS places it, recorded as
@@ -479,6 +513,7 @@ fn place_pinned_host(
         requested,
         decision,
         pinned,
+        read_node_meminfo,
         mbind_to_node,
         crate::numa::placement::read_page,
         |ptr, len| {
@@ -502,10 +537,14 @@ pub fn allocate_pinned_host_regions(
     sizes: &[usize],
     device_id: u32,
 ) -> Result<Vec<MmappedPinnedStorage>> {
-    sizes
-        .iter()
-        .map(|&size| allocate_pinned_host(size, device_id))
-        .collect()
+    allocate_regions_in_order(sizes, |size| allocate_pinned_host(size, device_id))
+}
+
+fn allocate_regions_in_order<T>(
+    sizes: &[usize],
+    allocate: impl FnMut(usize) -> Result<T>,
+) -> Result<Vec<T>> {
+    sizes.iter().copied().map(allocate).collect()
 }
 
 /// A mapping that went through [`map_place_register`]. `registered` is
@@ -520,20 +559,21 @@ pub(crate) struct Placed<T> {
 /// calling thread, observe the first page, and register.
 ///
 /// `pinned` is whether the calling thread was pinned to the node; a pin
-/// failure is named in a refused bind's error. Only `bind` can change the
-/// placement: its error, or any policy answer (read with `observe` on the
-/// first, middle and last page) that does not show `MPOL_BIND` on the node,
-/// becomes [`PlacementFallback::BindRefused`]. Each query's answer is kept on
+/// failure is named in a refused bind's error. For a bind candidate, check
+/// the node budget after mapping and before calling `bind`. A bind error or
+/// any policy answer that contradicts the bind becomes
+/// [`PlacementFallback::BindRefused`]. Each query's answer is kept on
 /// its own. A failed query is logged; `observed` is the first page's node if
 /// that query answered, and with no policy answer the bind's own result
-/// stands. A
-/// `register` error fails the call as is. The steps are parameters so tests
-/// can inject failures.
+/// stands. A `register` error fails the call as is. Tests can inject failures
+/// through the step parameters.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn map_place_register<T, R: Into<PageReading>>(
     size: usize,
     requested: Option<NumaNode>,
     decision: PlacementDecision,
     pinned: std::result::Result<(), String>,
+    read_budget: impl FnOnce(NumaNode) -> std::result::Result<NodeMemorySnapshot, String>,
     bind: impl FnOnce(usize, usize, NumaNode) -> std::result::Result<(), String>,
     observe: impl FnMut(usize) -> R,
     register: impl FnOnce(usize, usize) -> Result<T>,
@@ -544,6 +584,15 @@ pub(crate) fn map_place_register<T, R: Into<PageReading>>(
         ));
     }
     let mmap = mmap_anon(size)?;
+    let page = system_page_size();
+    let decision = match decision {
+        PlacementDecision::Bind(node) => {
+            check_node_memory_budget(node, mmap.len as u64, page as u64, read_budget)
+                .err()
+                .map_or(PlacementDecision::Bind(node), PlacementDecision::OsDefault)
+        }
+        os_placement => os_placement,
+    };
 
     let (mut policy, mut fallback) = match decision {
         PlacementDecision::Bind(node) => match bind(mmap.ptr, mmap.len, node) {
@@ -579,7 +628,6 @@ pub(crate) fn map_place_register<T, R: Into<PageReading>>(
     // registration (the driver may change the policy when it registers).
     // Each answer is kept on its own: a failed query must not hide another
     // query's answer.
-    let page = system_page_size();
     let last = (mmap.len - 1) / page;
     let mut observe = observe;
     let readings: Vec<PageReading> = [0, last / 2, last]
@@ -1019,6 +1067,240 @@ mod tests {
         Ok(())
     }
 
+    fn ample_node_memory(_: NumaNode) -> std::result::Result<NodeMemorySnapshot, String> {
+        Ok(NodeMemorySnapshot {
+            total: 1 << 40,
+            free: 1 << 40,
+            inactive_file: 0,
+            active_file: 0,
+            reclaimable_slab: 0,
+            shmem: 0,
+        })
+    }
+
+    #[test]
+    fn node_memory_budget_is_checked_again_for_each_region() {
+        use std::cell::{Cell, RefCell};
+
+        let node = NumaNode(0);
+        let other_node = NumaNode(1);
+        let page = system_page_size();
+        let warm = NodeMemorySnapshot {
+            total: 64 * page as u64,
+            free: page as u64,
+            inactive_file: 5 * page as u64,
+            active_file: 0,
+            reclaimable_slab: 0,
+            shmem: 0,
+        };
+        let short = NodeMemorySnapshot {
+            inactive_file: 4 * page as u64,
+            ..warm
+        };
+        let mut snapshots = [warm, short].into_iter();
+        let events = RefCell::new(Vec::new());
+
+        let regions = allocate_regions_in_order(&[page + 1, page + 1], |size| {
+            let bound = Cell::new(false);
+            map_place_register(
+                size,
+                Some(node),
+                PlacementDecision::Bind(node),
+                Ok(()),
+                |requested| {
+                    assert_eq!(requested, node);
+                    events.borrow_mut().push("budget");
+                    Ok(snapshots.next().expect("one budget per region"))
+                },
+                |_, len, requested| {
+                    assert_eq!(len, 2 * page);
+                    assert_eq!(requested, node);
+                    bound.set(true);
+                    events.borrow_mut().push("bind");
+                    Ok(())
+                },
+                |_| {
+                    if bound.get() {
+                        PageReading {
+                            policy: Ok((MemPolicyMode::Bind, vec![node])),
+                            node: Ok(node),
+                        }
+                    } else {
+                        PageReading {
+                            policy: Ok((MemPolicyMode::Default, vec![])),
+                            node: Ok(other_node),
+                        }
+                    }
+                },
+                |_, len| {
+                    assert_eq!(len, 2 * page);
+                    events.borrow_mut().push("register");
+                    Ok(())
+                },
+            )
+        })
+        .unwrap();
+
+        assert_eq!(
+            regions[0].placement.policy,
+            NumaPlacementPolicy::Bound(node)
+        );
+        assert_eq!(regions[0].placement.fallback, None);
+        assert_eq!(regions[1].placement.policy, NumaPlacementPolicy::OsDefault);
+        assert_eq!(regions[1].placement.requested, Some(node));
+        assert_eq!(regions[1].placement.observed, Some(other_node));
+        assert_eq!(
+            regions[1].placement.fallback,
+            Some(PlacementFallback::InsufficientNodeMemory {
+                node,
+                mapped_bytes: 2 * page as u64,
+                usable_bytes: page as u64,
+                reserve_bytes: 4 * page as u64,
+            })
+        );
+        assert_eq!(
+            events.into_inner(),
+            ["budget", "bind", "register", "budget", "register"]
+        );
+    }
+
+    // 120 GiB total, 46 GiB free, 49 GiB file LRU, 15 GiB slab, 1 GiB shmem.
+    const WARM_NODE_MEMINFO: &str = "\
+Node 0 MemTotal:       125829120 kB
+Node 0 MemFree:         48234496 kB
+Node 0 Active(file):    32505856 kB
+Node 0 Inactive(file):  18874368 kB
+Node 0 SReclaimable:    15728640 kB
+Node 0 Shmem:            1048576 kB
+Node 0 HugePages_Total:        0
+";
+
+    #[test]
+    fn node_memory_budget_uses_reclaimable_memory_on_a_warm_node() {
+        const GIB: u64 = 1 << 30;
+        let node = NumaNode(0);
+        let read = |node| NodeMemorySnapshot::parse_meminfo(node, WARM_NODE_MEMINFO);
+        assert_eq!(check_node_memory_budget(node, 60 * GIB, 4096, read), Ok(()));
+        assert_eq!(
+            check_node_memory_budget(node, 102 * GIB, 4096, read),
+            Err(PlacementFallback::InsufficientNodeMemory {
+                node,
+                mapped_bytes: 102 * GIB,
+                usable_bytes: 101 * GIB + GIB / 2,
+                reserve_bytes: 7 * GIB + GIB / 2,
+            })
+        );
+    }
+
+    #[test]
+    fn node_memory_budget_caps_gross_and_rounds_reserve_up() {
+        let node = NumaNode(0);
+        let page = 4096;
+        let total = 16 * page + 1;
+        let snapshot = NodeMemorySnapshot {
+            total,
+            free: 2 * total,
+            ..ample_node_memory(node).unwrap()
+        };
+        assert_eq!(
+            check_node_memory_budget(node, 15 * page, page, |_| Ok(snapshot)),
+            Err(PlacementFallback::InsufficientNodeMemory {
+                node,
+                mapped_bytes: 15 * page,
+                usable_bytes: 14 * page + 1,
+                reserve_bytes: 2 * page,
+            })
+        );
+    }
+
+    #[test]
+    fn node_memory_budget_saturates_at_zero() {
+        let node = NumaNode(0);
+        let page = 4096;
+        let snapshot = NodeMemorySnapshot {
+            total: 16 * page,
+            free: page,
+            shmem: 2 * page,
+            ..ample_node_memory(node).unwrap()
+        };
+        assert_eq!(
+            check_node_memory_budget(node, page, page, |_| Ok(snapshot)),
+            Err(PlacementFallback::InsufficientNodeMemory {
+                node,
+                mapped_bytes: page,
+                usable_bytes: 0,
+                reserve_bytes: page,
+            })
+        );
+    }
+
+    #[test]
+    fn node_memory_budget_rejects_invalid_counters() {
+        let node = NumaNode(0);
+        let page = 4096;
+        for (memtotal, error) in [
+            ("MemUsed: 125829120 kB", "missing MemTotal"),
+            ("MemTotal: invalid kB", "invalid MemTotal"),
+            ("MemTotal: 125829120 MB", "invalid MemTotal"),
+            (
+                "MemTotal: 18446744073709551615 kB",
+                "MemTotal overflows bytes",
+            ),
+        ] {
+            let meminfo = WARM_NODE_MEMINFO.replace("MemTotal:       125829120 kB", memtotal);
+            assert!(matches!(
+                check_node_memory_budget(node, page, page, |node| {
+                    NodeMemorySnapshot::parse_meminfo(node, &meminfo)
+                }),
+                Err(PlacementFallback::NodeMemoryBudgetUnavailable { error: actual, .. })
+                    if actual.contains(error)
+            ));
+        }
+        let overflow = NodeMemorySnapshot {
+            free: u64::MAX,
+            active_file: 1,
+            ..ample_node_memory(node).unwrap()
+        };
+        assert_eq!(
+            check_node_memory_budget(node, page, page, |_| Ok(overflow)),
+            Err(PlacementFallback::NodeMemoryBudgetUnavailable {
+                node,
+                mapped_bytes: page,
+                error: "node memory counters overflow".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn node_memory_budget_read_failure_still_registers_with_os_placement() {
+        let node = NumaNode(0);
+        let page = system_page_size();
+        let placed = map_place_register(
+            1,
+            Some(node),
+            PlacementDecision::Bind(node),
+            Ok(()),
+            |_| Err("read node meminfo: permission denied".into()),
+            |_, _, _| panic!("no bind without a memory budget"),
+            |_| PageReading {
+                policy: Ok((MemPolicyMode::Default, vec![])),
+                node: Ok(node),
+            },
+            |_, len| Ok(len),
+        )
+        .unwrap();
+        assert_eq!(placed.registered, page);
+        assert_eq!(placed.placement.policy, NumaPlacementPolicy::OsDefault);
+        assert_eq!(
+            placed.placement.fallback,
+            Some(PlacementFallback::NodeMemoryBudgetUnavailable {
+                node,
+                mapped_bytes: page as u64,
+                error: "read node meminfo: permission denied".into(),
+            })
+        );
+    }
+
     /// A real `mbind` to a node the host lacks is refused. The entry keeps the
     /// mapping, records `BindRefused`, and the kernel reports no policy on it.
     #[test]
@@ -1029,6 +1311,7 @@ mod tests {
             Some(node),
             PlacementDecision::Bind(node),
             Ok(()),
+            ample_node_memory,
             mbind_to_node,
             crate::numa::page_placement,
             no_register,
@@ -1066,6 +1349,7 @@ mod tests {
             Some(node),
             PlacementDecision::Bind(node),
             Ok(()),
+            ample_node_memory,
             mbind_to_node,
             crate::numa::page_placement,
             no_register,
@@ -1151,6 +1435,7 @@ mod tests {
             Some(NumaNode(0)),
             PlacementDecision::Bind(NumaNode(0)),
             Ok(()),
+            ample_node_memory,
             |_, _, _| Ok(()),
             crate::numa::page_placement,
             no_register,
@@ -1176,6 +1461,7 @@ mod tests {
             Some(node),
             PlacementDecision::Bind(node),
             Ok(()),
+            ample_node_memory,
             |_, _, _| Ok(()),
             |addr| {
                 if first_reading.is_some() {
@@ -1210,6 +1496,7 @@ mod tests {
             Some(NumaNode(0)),
             PlacementDecision::Bind(NumaNode(0)),
             Ok(()),
+            ample_node_memory,
             |_, _, _| Ok(()),
             |_| PageReading {
                 policy: Ok((MemPolicyMode::Default, vec![])),
@@ -1236,6 +1523,7 @@ mod tests {
             Some(NumaNode(0)),
             PlacementDecision::Bind(NumaNode(0)),
             Ok(()),
+            ample_node_memory,
             |_, _, _| Ok(()),
             |_| PageReading {
                 policy: Err(std::io::Error::from_raw_os_error(libc::EPERM)),
@@ -1262,6 +1550,7 @@ mod tests {
             Some(NumaNode(0)),
             PlacementDecision::Bind(NumaNode(0)),
             Ok(()),
+            ample_node_memory,
             |_, _, _| Ok(()),
             |_| {
                 calls += 1;
@@ -1295,6 +1584,7 @@ mod tests {
             None,
             PlacementDecision::OsDefault(PlacementFallback::NodeUnknown),
             Ok(()),
+            |_| panic!("no budget read for an OS-placement decision"),
             |_, _, _| panic!("no bind for an OS-placement decision"),
             |_| PageReading {
                 policy: Err(std::io::Error::from_raw_os_error(libc::EPERM)),
@@ -1316,6 +1606,7 @@ mod tests {
             Some(NumaNode(0)),
             PlacementDecision::Bind(NumaNode(0)),
             Err("Failed to set CPU affinity: Operation not permitted".into()),
+            ample_node_memory,
             |_, _, _| Err("mbind: Operation not permitted (os error 1)".into()),
             crate::numa::page_placement,
             no_register,
@@ -1350,6 +1641,7 @@ mod tests {
             Some(NumaNode(0)),
             PlacementDecision::Bind(NumaNode(0)),
             Ok(()),
+            ample_node_memory,
             |_, _, _| {
                 binds.set(binds.get() + 1);
                 Ok(())
@@ -1379,6 +1671,7 @@ mod tests {
             Some(NumaNode(0)),
             PlacementDecision::Bind(NumaNode(0)),
             Ok(()),
+            ample_node_memory,
             |_, _, _| {
                 Err(format!(
                     "mbind: {}",
@@ -1413,6 +1706,7 @@ mod tests {
             None,
             PlacementDecision::OsDefault(PlacementFallback::NodeUnknown),
             Ok(()),
+            |_| panic!("no budget read for an OS-placement decision"),
             |_, _, _| panic!("no bind for an OS-placement decision"),
             crate::numa::page_placement,
             no_register,
