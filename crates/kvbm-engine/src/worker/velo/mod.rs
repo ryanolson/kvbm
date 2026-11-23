@@ -32,10 +32,69 @@
 //! Until the `am_sync` completion path is validated, prefer the simpler and
 //! more predictable patterns: `am_send` for fire-and-forget, `unary` for
 //! request-response.
+//!
+//! # The local-transfer contract
+//!
+//! A local transfer is a `LOCAL_TRANSFER` unary RPC. The worker runs the copy
+//! and replies with its drain outcome: completed, drained with an error, or
+//! unproven.
+//!
+//! - **Transfer id.** The client gives each transfer a random id, sent in the
+//!   request. The worker records the id as active when the request arrives,
+//!   before it dispatches the copy, and records the drain outcome after the
+//!   drain. A dispatch error launched nothing, so it is recorded as drained
+//!   with an error.
+//! - **Incarnation.** Each worker service has an incarnation: a random id
+//!   fixed when the service starts. Before its first transfer, the client asks
+//!   for it with `WORKER_INCARNATION`, under the check deadline, and keeps it
+//!   once it has an answer.
+//!   Every transfer is bound to the incarnation the client held when it sent
+//!   the transfer.
+//! - **The check.** If the RPC fails after the request was handed to velo,
+//!   the copy may still run: velo cannot prove that a failed send stayed
+//!   unsent. Only a failure to build the request proves nothing left the
+//!   process, and gives `DrainedWithError`. The client waits (`LocalTransferCheckTiming::wait`), then
+//!   asks the same instance and worker once with `LOCAL_TRANSFER_CHECK`, under
+//!   an explicit velo deadline (`LocalTransferCheckTiming::deadline`). The
+//!   defaults are 2 s and 5 s; `messenger.local_transfer_check` in
+//!   `kvbm-config` overrides them. A copy still active at the check stays
+//!   unknown; the engine pauses the request, and only a later check of the
+//!   same target lifts it.
+//! - **What decides.** Only a record from the same incarnation decides: a
+//!   record "completed" gives `Completed`, and a record "drained with error"
+//!   gives `DrainedWithError`. Everything else gives `Unproven`: no answer by
+//!   the deadline, a record still active, no record (the check came first, or
+//!   the record was evicted), a different incarnation, or no bound
+//!   incarnation. A reconnect, a restart or a replacement worker proves
+//!   nothing, because kvbm has no signal that the original copy stopped.
+//! - **The re-check capability.** An `Unproven` outcome from this path
+//!   carries a [`LocalTransferRecheck`] as error context: the instance, the
+//!   worker id, the bound incarnation and the transfer id.
+//!   [`LocalTransferRecheck::check`] repeats the same check, and it is the only
+//!   route that can later prove the outcome.
+//! - **Records.** A worker keeps at most 65,536 records, and keeps a finished
+//!   record for 10 minutes. When full, it evicts the oldest finished record
+//!   first. An evicted record answers "unknown".
+//! - **Compatibility.** All wire changes are additive. A request from an older
+//!   client has no transfer id, and the worker keeps no record for it. An older
+//!   worker has no `WORKER_INCARNATION` handler; velo rejects the call at once.
+//!   The client cannot tell that from a worker still starting, so it sends the
+//!   transfer unbound and asks again on the next one. The whole incarnation
+//!   request, including any wait behind another transfer's request, stays
+//!   within the check deadline. A lost reply from an unbound transfer is
+//!   `Unproven` at once, with no incarnation in its capability and no check
+//!   sent, because no answer could decide it.
 
+mod check;
 mod client;
+#[cfg(test)]
+mod lost_reply_tests;
 mod service;
 
+pub use check::{
+    DEFAULT_LOCAL_TRANSFER_CHECK_DEADLINE, DEFAULT_LOCAL_TRANSFER_CHECK_WAIT,
+    LocalTransferCheckTiming, LocalTransferRecheck,
+};
 pub use client::VeloWorkerClient;
 pub use service::{VeloWorkerService, VeloWorkerServiceBuilder};
 
@@ -48,6 +107,10 @@ pub use service::{VeloWorkerService, VeloWorkerServiceBuilder};
 /// `service.rs`, and use the const at the call site in `client.rs`.
 pub(crate) mod handler_names {
     pub const LOCAL_TRANSFER: &str = "kvbm.worker.local_transfer";
+    /// Ask a worker for the record of one local transfer.
+    pub const LOCAL_TRANSFER_CHECK: &str = "kvbm.worker.local_transfer_check";
+    /// Ask a worker for its incarnation.
+    pub const WORKER_INCARNATION: &str = "kvbm.worker.incarnation";
     pub const ABORT_LOCAL_COLLECTIVES: &str = "kvbm.worker.abort_local_collectives";
     pub const REMOTE_ONBOARD: &str = "kvbm.worker.remote_onboard";
     pub const REMOTE_OFFLOAD: &str = "kvbm.worker.remote_offload";
@@ -195,6 +258,10 @@ impl From<TransferOptions> for SerializableTransferOptions {
 // Message types for remote worker operations
 #[derive(Serialize, Deserialize)]
 struct LocalTransferMessage {
+    /// The id the client gave this transfer. The worker keeps a record under
+    /// it. A message from an older client has none, and keeps no record.
+    #[serde(default)]
+    transfer_id: Option<uuid::Uuid>,
     #[serde(default)]
     resource: Option<kvbm_common::LogicalResourceId>,
     src: LogicalLayoutHandle,
@@ -278,6 +345,7 @@ mod local_transfer_message_tests {
 
     fn message(resource: LogicalResourceId) -> LocalTransferMessage {
         LocalTransferMessage {
+            transfer_id: None,
             resource: Some(resource),
             src: LogicalLayoutHandle::G1,
             dst: LogicalLayoutHandle::G2,
@@ -292,6 +360,14 @@ mod local_transfer_message_tests {
                 copy_engine: WireCopyEngine::Auto,
             },
         }
+    }
+
+    #[test]
+    fn a_legacy_local_transfer_message_has_no_transfer_id() {
+        let mut legacy = serde_json::to_value(message(LogicalResourceId(7))).unwrap();
+        legacy.as_object_mut().unwrap().remove("transfer_id");
+        let decoded: LocalTransferMessage = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.transfer_id, None);
     }
 
     #[test]

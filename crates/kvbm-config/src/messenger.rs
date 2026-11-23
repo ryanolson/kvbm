@@ -39,6 +39,49 @@ pub struct MessengerConfig {
     #[serde(default = "default_init_timeout_secs")]
     #[validate(range(min = 1))]
     pub init_timeout_secs: u64,
+
+    /// The check of a local transfer whose worker reply was lost.
+    #[serde(default)]
+    #[validate(nested)]
+    pub local_transfer_check: LocalTransferCheckConfig,
+}
+
+fn default_local_transfer_check_wait_ms() -> u64 {
+    2_000
+}
+
+fn default_local_transfer_check_deadline_ms() -> u64 {
+    5_000
+}
+
+/// The check of a local transfer whose worker reply was lost.
+///
+/// When the RPC of a local transfer fails after the request left, the leader
+/// waits `wait_ms`, then asks the same worker once, with a deadline of
+/// `deadline_ms`, whether the copy finished. A lost reply becomes a known
+/// outcome or a visible pause at most `wait_ms + deadline_ms` after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Validate)]
+pub struct LocalTransferCheckConfig {
+    /// Time between the lost reply and the check, in milliseconds. It gives a
+    /// copy that is still running time to finish and record its outcome.
+    /// Default: 2000.
+    #[serde(default = "default_local_transfer_check_wait_ms")]
+    pub wait_ms: u64,
+
+    /// Deadline of the check RPC, and of the request that learns the worker's
+    /// incarnation, in milliseconds. Default: 5000.
+    #[serde(default = "default_local_transfer_check_deadline_ms")]
+    #[validate(range(min = 1))]
+    pub deadline_ms: u64,
+}
+
+impl Default for LocalTransferCheckConfig {
+    fn default() -> Self {
+        Self {
+            wait_ms: default_local_transfer_check_wait_ms(),
+            deadline_ms: default_local_transfer_check_deadline_ms(),
+        }
+    }
 }
 
 impl Default for MessengerConfig {
@@ -47,6 +90,7 @@ impl Default for MessengerConfig {
             backend: MessengerBackendConfig::default(),
             discovery: None,
             init_timeout_secs: default_init_timeout_secs(),
+            local_transfer_check: LocalTransferCheckConfig::default(),
         }
     }
 }
@@ -144,6 +188,21 @@ fn get_interface_ip(interface_name: &str) -> Result<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_transfer_check_defaults_and_overrides() {
+        let config = MessengerConfig::default();
+        assert_eq!(
+            config.local_transfer_check,
+            LocalTransferCheckConfig {
+                wait_ms: 2_000,
+                deadline_ms: 5_000,
+            }
+        );
+        let check: LocalTransferCheckConfig = serde_json::from_str(r#"{"wait_ms": 10}"#).unwrap();
+        assert_eq!(check.wait_ms, 10);
+        assert_eq!(check.deadline_ms, 5_000);
+    }
 
     #[test]
     fn test_default_backend_config() {
