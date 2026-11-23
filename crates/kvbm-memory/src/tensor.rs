@@ -138,11 +138,11 @@ impl MemoryDescriptor for Arc<dyn TensorDescriptor> {
     }
 
     fn as_any(&self) -> &dyn Any {
-        self
+        (**self).as_any()
     }
 
     fn nixl_descriptor(&self) -> Option<NixlDescriptor> {
-        None
+        (**self).nixl_descriptor()
     }
 }
 
@@ -191,11 +191,11 @@ impl MemoryDescriptor for Arc<dyn TensorDescriptor + Send + Sync> {
     }
 
     fn as_any(&self) -> &dyn Any {
-        self
+        (**self).as_any()
     }
 
     fn nixl_descriptor(&self) -> Option<NixlDescriptor> {
-        None
+        (**self).nixl_descriptor()
     }
 }
 

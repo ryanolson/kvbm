@@ -135,7 +135,7 @@ enum Registration {
     /// [`MemoryDescriptor::nixl_descriptor`]); its registration lifetime is
     /// managed elsewhere and there is nothing for this wrapper to
     /// deregister.
-    PreRegistered,
+    PreRegistered(NixlDescriptor),
 }
 
 /// Wrapper for storage that has been registered with NIXL.
@@ -255,7 +255,11 @@ impl<S: MemoryDescriptor + NixlCompatible> RegisteredView for NixlRegistered<S> 
     }
 
     fn descriptor(&self) -> NixlDescriptor {
-        let (ptr, size, mem_type, device_id) = self.storage().nixl_params();
+        let (storage, registration) = self.inner.as_ref().expect("registered storage is present");
+        if let Registration::PreRegistered(descriptor) = registration {
+            return descriptor.clone();
+        }
+        let (ptr, size, mem_type, device_id) = storage.nixl_params();
         NixlDescriptor {
             addr: ptr as u64,
             size,
@@ -385,9 +389,9 @@ where
     // alternatively, the object storage holds it's own internal metadata but does not
     // expose as a nixl descriptor, thus ObjectStorag will by default like all other storage
     // types have a None for nixl_descriptor(), and we will use the internal
-    if storage.nixl_descriptor().is_some() {
+    if let Some(descriptor) = storage.nixl_descriptor() {
         return Ok(NixlRegistered {
-            inner: Some((storage, Registration::PreRegistered)),
+            inner: Some((storage, Registration::PreRegistered(descriptor))),
             agent_name: agent.name().to_string(),
         });
     }
@@ -505,8 +509,14 @@ mod tests {
     #[test]
     fn pre_registered_is_registered_but_not_owned() {
         let storage = SystemStorage::new(1024).expect("allocation should succeed");
+        let descriptor = NixlDescriptor {
+            addr: storage.addr() as u64,
+            size: storage.size(),
+            mem_type: MemType::Dram,
+            device_id: 0,
+        };
         let registered = NixlRegistered {
-            inner: Some((storage, Registration::PreRegistered)),
+            inner: Some((storage, Registration::PreRegistered(descriptor))),
             agent_name: "test-agent".to_string(),
         };
 
