@@ -993,6 +993,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         let mut inactive = HashSet::new();
         let mut registered = 0;
         for (id, slot) in inner.slots.iter().enumerate() {
+            // A duplicate keeps its primary alive, and that primary contributes the key.
             match slot.state {
                 SlotState::Primary { seq_hash, .. } | SlotState::Held { seq_hash, .. } => {
                     let position = seq_hash.position();
