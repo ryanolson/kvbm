@@ -65,11 +65,9 @@ pub(crate) struct LeaderState {
     /// than one fence in a cycle (same-cycle restore + re-evict); tokens are
     /// per-(generation, worker) UUIDs, so the worker awaits the union.
     pending_fences: Vec<EvictionFence>,
-    /// Requests that finished with work still in flight (the
-    /// [`Self::request_finished`] `Pending` decision). The emission was handed
-    /// to the engine in-call (drain commit); this worklist only drives the
-    /// handle-gated reap in [`Self::update_connector_output`].
-    finishing: HashSet<String>,
+    /// Requests the engine is finishing. The value records whether its
+    /// single release signal has reached the scheduler.
+    finishing: HashMap<String, bool>,
     iteration: u64,
     /// Prometheus counter for GNMT-matched tokens. `None` in unit-test
     /// contexts that construct `LeaderState` without a live runtime (the
@@ -93,7 +91,7 @@ impl LeaderState {
             block_size,
             pending_evictions: HashSet::new(),
             pending_fences: Vec::new(),
-            finishing: HashSet::new(),
+            finishing: HashMap::new(),
             iteration: 0,
             matched_tokens,
         }
@@ -110,12 +108,15 @@ impl LeaderState {
     /// path. Since the placeholder never mints, this is always satisfied at the
     /// legitimate install point and only trips a genuine swap-under-live-handles.
     pub(crate) fn has_live_handles(&self) -> bool {
-        self.slots.values().any(|s| {
-            s.proposal.is_some()
-                || s.onboard.is_some()
-                || !s.offloads.is_empty()
-                || !s.drain_holders.is_empty()
-        })
+        !self.finishing.is_empty()
+            || self.slots.values().any(|s| {
+                s.proposal.is_some()
+                    || s.onboard.is_some()
+                    || !s.offloads.is_empty()
+                    || !s.drain_holders.is_empty()
+                    || !s.evicted_onboards.is_empty()
+                    || !s.fence_holders.is_empty()
+            })
     }
 
     /// Swap in the real engine built by deferred construction, replacing the
@@ -361,64 +362,24 @@ impl LeaderState {
             .ok_or_else(|| Error::SlotNotFound(request_id.to_string()))
     }
 
-    /// vLLM's `request_finished` (terminal). Inspects the slot's in-flight
-    /// handles and maps to the 3-variant API status per REFACTOR.md §4 (D
-    /// refinement) — no blocking or remote engine call (`is_complete()` is a
-    /// local cell read; the drain take/commit are local map ops):
-    ///
-    /// - no slot ⇒ `UntrackedRequest` (benign: vLLM finishes WAITING-aborted
-    ///   requests that never got a slot);
-    /// - slot with no in-flight onboard/offload ⇒ reap **inline** and report
-    ///   `Finished`;
-    /// - slot with an in-flight onboard or offload ⇒ hand the engine the
-    ///   terminal coordination IN-CALL — `take_offload_drain` + `commit` (commit
-    ///   ARMS the engine's emit-on-last-terminal; the engine fires the single
-    ///   `finished_sending` when the last pending-at-commit action drains,
-    ///   immediately if none are) — keep the slot, report `Pending`. The
-    ///   handle-gated reap is deferred to [`Self::update_connector_output`].
-    ///   A request with only an in-flight onboard and no registered offloads
-    ///   has no drain; its load terminal surfaces via `finished_recving`, which
-    ///   vLLM also frees a finished request's blocks on.
+    /// Ask the engine to decide whether this tracked request still needs a
+    /// release signal. Keep a Pending request's slot until that signal arrives.
     pub(crate) fn request_finished(&mut self, request_id: &str) -> ApiFinishedStatus {
-        let Some(slot) = self.slots.get(request_id) else {
+        let Some(slot) = self.slots.get_mut(request_id) else {
             return ApiFinishedStatus::UntrackedRequest;
         };
-        // Do NOT null `slot.proposal` here: an in-flight onboard is still
-        // reading the lifecycle's pinned source, and the release happens only
-        // at reap (RAII) — never before the handle reading it is terminal
-        // (REFACTOR.md §4, "no early search null" / issue A).
-        let pending = slot.onboard.as_ref().is_some_and(|h| !h.is_complete())
-            || slot.offloads.iter().any(|h| !h.is_complete());
-        if pending {
-            // D: the engine owns the emission from here. Consume-once: a drain
-            // exists iff offloads were registered and it was not taken before.
-            if let Some(drain) = self.engine.take_offload_drain(&request_id.to_string()) {
-                drain.commit();
-            }
-            self.finishing.insert(request_id.to_string());
+        slot.observe_onboard_pauses();
+        if self.finishing.contains_key(request_id) {
+            return ApiFinishedStatus::Pending;
+        }
+        let request = request_id.to_owned();
+        if self.engine.begin_request_finish(&request) {
+            self.finishing.insert(request, false);
             ApiFinishedStatus::Pending
         } else {
-            // Scrub an unconsumed drain registration WITHOUT committing: vLLM
-            // frees the blocks on this `Finished` answer immediately, and a
-            // later `finished_sending` for an already-freed request asserts in
-            // its scheduler. Dropping the un-committed drain emits nothing.
-            drop(self.engine.take_offload_drain(&request_id.to_string()));
-            if slot.drain_holder_draining() {
-                // Evicted-then-finished (the A×E finish-during-drain twin):
-                // the VISIBLE handles are empty, but the drain-holder's onboard
-                // is still reading the held lifecycle pin. The directive answer
-                // is still `Finished` — the reap alone defers to the sweep.
-                self.finishing.insert(request_id.to_string());
-            } else {
-                // Immediate reap: dropping the slot releases its RAII handles
-                // (the parked `proposal` via its kind-routed release, tracked
-                // actions via `release_action`). Nothing in flight is reading
-                // a pin — `pending` was false and the drain-holders are not
-                // draining. The handle drops here fire the lifecycle
-                // releases, which also clear the engine's deferral-guard
-                // entries.
-                self.slots.remove(request_id);
-            }
+            // This also handles a pause that resolved during the engine call.
+            slot.observe_onboard_pauses();
+            self.slots.remove(request_id);
             ApiFinishedStatus::Finished
         }
     }
@@ -496,10 +457,11 @@ impl LeaderState {
             let onboard = slot.onboard.take();
             slot.drain_holders.push((proposal, onboard, fence_handle));
         } else if let Some(handle) = fence_handle {
-            // Holderless eviction (no proposal was parked, but the engine
-            // armed in-flight work): keep the leader's observational view of
-            // the drain on the slot; the sweep drops it once complete.
-            slot.fence_holders.push(handle);
+            if let Some(onboard) = slot.onboard.take() {
+                slot.evicted_onboards.push((onboard, handle));
+            } else {
+                slot.fence_holders.push(handle);
+            }
         }
 
         // Reset the VISIBLE match state so the next GNMT runs fresh. The
@@ -750,46 +712,34 @@ impl LeaderState {
         }
     }
 
-    /// vLLM's `update_connector_output`. Runs the deferred, HANDLE-gated reap
-    /// for the `Pending` case of [`Self::request_finished`]: the emission was
-    /// handed to the engine at finish time, so this sweep only reaps each
-    /// finishing slot once its onboard + every offload handle reports terminal.
-    /// The vLLM sets are the wake-up cadence, never the gate.
+    /// Consume the engine's single release signal for a finishing slot.
     pub(crate) fn update_connector_output(
         &mut self,
         finished_sending: HashSet<String>,
         finished_recving: HashSet<String>,
     ) {
-        // The emission (engine-armed at request_finished) produced this set;
-        // nothing here keys off it — handles are the gate.
-        let _ = finished_sending;
+        for slot in self.slots.values_mut() {
+            slot.observe_onboard_pauses();
+        }
 
-        let finishing = std::mem::take(&mut self.finishing);
-        for req in finishing {
-            match self.slots.get(&req) {
-                // Already gone (defensive; reap is sweep-only for Pending slots).
-                None => {}
-                Some(slot) => {
-                    // Visible handles terminal AND the eviction drain-holder
-                    // (if any) fully drained — reaping drops the holder, which
-                    // releases the held lifecycle pin (A×E).
-                    let terminal = slot.onboard.as_ref().is_none_or(OnboardHandle::is_complete)
-                        && slot.offloads.iter().all(|h| h.is_complete())
-                        && !slot.drain_holder_draining();
-                    if terminal {
-                        // Dropping the slot releases the RAII handles — the
-                        // parked `proposal` via its kind-routed release (only
-                        // now is nothing reading it), tracked actions via
-                        // `release_action`; the lifecycle releases also
-                        // clear the engine's deferral-guard entries.
-                        self.slots.remove(&req);
-                    } else {
-                        // Still draining: keep it on the worklist.
-                        self.finishing.insert(req);
-                    }
-                }
+        for request in finished_sending.iter().chain(&finished_recving) {
+            if let Some(released) = self.finishing.get_mut(request) {
+                *released = true;
             }
         }
+        self.finishing.retain(|request, released| {
+            if *released
+                && self
+                    .slots
+                    .get(request)
+                    .is_none_or(|slot| !slot.eviction_draining())
+            {
+                self.slots.remove(request);
+                false
+            } else {
+                true
+            }
+        });
 
         // Recv-side release. vLLM reporting a request's async load done is the
         // cadence; the handle is the authority — only a TERMINAL onboard is
@@ -801,7 +751,8 @@ impl LeaderState {
         // stays (the request is still decoding); a finishing request was
         // already reaped by the sweep above on the same gates.
         for req in &finished_recving {
-            if let Some(slot) = self.slots.get_mut(req)
+            if !self.finishing.contains_key(req)
+                && let Some(slot) = self.slots.get_mut(req)
                 && slot
                     .onboard
                     .as_ref()
@@ -824,6 +775,8 @@ impl LeaderState {
         for slot in self.slots.values_mut() {
             slot.drain_holders.retain(super::slot::holder_draining);
             slot.fence_holders.retain(|fence| !fence.is_complete());
+            slot.evicted_onboards
+                .retain(|(_, fence)| !fence.is_complete());
         }
     }
 }
