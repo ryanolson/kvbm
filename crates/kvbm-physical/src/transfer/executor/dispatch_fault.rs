@@ -9,6 +9,11 @@ pub(crate) enum Point {
     RaggedCopy,
     TransformUpload,
     VectorizedFree,
+    BeforeWholeBlockBatch,
+    BeforeTransformUpload,
+    PlannerBatch,
+    BeforeGraphLaunch,
+    VectorizedAlloc,
 }
 
 thread_local! {

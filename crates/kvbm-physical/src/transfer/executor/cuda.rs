@@ -354,6 +354,8 @@ fn execute_whole_block_cuda(
         dst_ptrs.push(dst_region.addr() as *mut std::ffi::c_void);
     }
 
+    #[cfg(all(test, feature = "testing-kvbm"))]
+    super::dispatch_fault::check(super::dispatch_fault::Point::BeforeWholeBlockBatch)?;
     // The batch fallback may enqueue copies before reporting an error.
     *submitted = true;
     let status = unsafe {
@@ -486,8 +488,14 @@ fn launch_vectorized_copy(
 ) -> Result<()> {
     let total_chunks = src_ptrs.len();
 
-    let src_ptrs_device = pool.alloc_async(std::mem::size_of_val(src_ptrs.as_slice()), stream)?;
     *submitted = true;
+    let src_ptrs_device = pool.alloc_async(std::mem::size_of_val(src_ptrs.as_slice()), stream)?;
+    #[cfg(all(test, feature = "testing-kvbm"))]
+    if let Err(error) = super::dispatch_fault::check(super::dispatch_fault::Point::VectorizedAlloc)
+    {
+        let _ = pool.free_async(src_ptrs_device, stream);
+        return Err(error);
+    }
     let dst_ptrs_device = match pool.alloc_async(std::mem::size_of_val(dst_ptrs.as_slice()), stream)
     {
         Ok(ptr) => ptr,

@@ -266,3 +266,49 @@ async fn cuda_graph_replay_address_rebind_works() -> Result<()> {
 
     Ok(())
 }
+
+#[rstest::rstest]
+#[case(false, true)]
+#[case(true, true)]
+#[case(false, false)]
+#[case(true, false)]
+#[tokio::test]
+async fn cuda_graph_replay_dispatch_failure_tracks_launch(
+    #[case] warm_cache: bool,
+    #[case] before_launch: bool,
+) -> Result<()> {
+    use crate::transfer::executor::dispatch_fault::{Point, inject};
+
+    gpu_serial!();
+    assert!(!kvbm_kernels::is_using_stubs(), "CUDA kernels required");
+    let agent = super::local_transfers::build_agent_for_kinds(&[StorageKind::Device(0)])?;
+    let src = device_fc(agent.clone(), 2);
+    let dst = device_fc(agent.clone(), 2);
+    let manager = ctx_with_graph_replay(agent);
+    let ctx = manager.context();
+    let checksums = fill_and_checksum(&src, &[0], FillPattern::Sequential)?;
+    if warm_cache {
+        let warmup = transfer_direct_planner(&src, &dst, &[0], &[0], ctx);
+        tokio::time::timeout(std::time::Duration::from_secs(5), warmup).await??;
+    }
+    assert_eq!(ctx.graph_cache().len(), usize::from(warm_cache));
+    let options = TransferOptionsInternal::builder()
+        .use_planner(true)
+        .build()?;
+    let point = if before_launch {
+        Point::BeforeGraphLaunch
+    } else {
+        Point::CompletionEvent
+    };
+    let result = inject(point, 1, || {
+        execute_transfer(&src, &dst, &[0], &[1], options, ctx)
+    });
+    assert_eq!(ctx.graph_cache().len(), 1);
+    if before_launch {
+        assert!(result.is_err(), "no graph was launched");
+    } else {
+        super::planner_path::assert_dispatch_failure_drained(result).await;
+        verify_checksums_by_position(&checksums, &[0], &dst, &[1])?;
+    }
+    Ok(())
+}

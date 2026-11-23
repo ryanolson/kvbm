@@ -77,6 +77,8 @@ where
     let (a, b) = lease.both_mut();
     fill(a, b)?;
 
+    #[cfg(all(test, feature = "testing-kvbm"))]
+    super::dispatch_fault::check(super::dispatch_fault::Point::BeforeTransformUpload)?;
     // clone_htod combines allocation and upload in a single call.
     *submitted = true;
     let uploaded = (|| -> Result<_> {
@@ -2084,6 +2086,8 @@ fn dispatch_ops_grouped_by_size(
                 stream_raw,
             )
         };
+        #[cfg(all(test, feature = "testing-kvbm"))]
+        super::dispatch_fault::check(super::dispatch_fault::Point::PlannerBatch)?;
         if status != cudarc::runtime::sys::cudaError::cudaSuccess {
             return Err(anyhow!(
                 "execute_planner_cuda_transfer: memcpy_batch failed with size={size}, \
@@ -2198,16 +2202,7 @@ fn dispatch_cuda_graph_replay_planner(
                 );
             }
         }
-        // Launch on the caller's work stream.
-        *submitted = true;
-        let result = unsafe { cu_sys::cuGraphLaunch(exec, work_stream.cu_stream()) };
-        if result != cu_sys::CUresult::CUDA_SUCCESS {
-            bail!(
-                "dispatch_cuda_graph_replay_planner: cuGraphLaunch (cache hit) \
-                 failed with result={result:?}"
-            );
-        }
-        return Ok(());
+        return launch_cuda_graph(exec, work_stream, submitted);
     }
 
     // ── 2. Cache miss: capture the graph ─────────────────────────────────────
@@ -2456,14 +2451,21 @@ fn dispatch_cuda_graph_replay_planner(
         }
     }
 
-    let result = unsafe { cu_sys::cuGraphLaunch(cu_graph_exec, work_stream.cu_stream()) };
-    if result != cu_sys::CUresult::CUDA_SUCCESS {
-        bail!(
-            "dispatch_cuda_graph_replay_planner: cuGraphLaunch (first launch) \
-             failed with result={result:?}"
-        );
-    }
+    launch_cuda_graph(cu_graph_exec, work_stream, submitted)
+}
 
+fn launch_cuda_graph(
+    exec: cu_sys::CUgraphExec,
+    stream: &CudaStream,
+    submitted: &mut bool,
+) -> Result<()> {
+    #[cfg(all(test, feature = "testing-kvbm"))]
+    super::dispatch_fault::check(super::dispatch_fault::Point::BeforeGraphLaunch)?;
+    *submitted = true;
+    let status = unsafe { cu_sys::cuGraphLaunch(exec, stream.cu_stream()) };
+    if status != cu_sys::CUresult::CUDA_SUCCESS {
+        bail!("cuGraphLaunch failed: {status:?}");
+    }
     Ok(())
 }
 

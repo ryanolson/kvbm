@@ -950,3 +950,84 @@ fn dispatch_with_metrics(
     });
     Ok((manager, result))
 }
+
+#[rstest::rstest]
+#[case(false)]
+#[case(true)]
+#[tokio::test]
+async fn cuda_dispatch_failure_inside_executor_before_first_enqueue(
+    #[case] planner: bool,
+) -> Result<()> {
+    use crate::transfer::executor::dispatch_fault::{Point, inject};
+
+    gpu_serial!();
+    assert!(!kvbm_kernels::is_using_stubs(), "CUDA kernels required");
+    let agent = build_agent_for_kinds(&[StorageKind::Device(0)])?;
+    let src = build_fc_dtype_none(agent.clone(), KvBlockLayout::OperationalNHD, 1);
+    let dst_layout = if planner {
+        KvBlockLayout::Universal
+    } else {
+        KvBlockLayout::OperationalNHD
+    };
+    let dst = build_fc_dtype_none(agent.clone(), dst_layout, 1);
+    let ctx = create_transfer_context(agent, None)?;
+    let point = if planner {
+        Point::BeforeTransformUpload
+    } else {
+        Point::BeforeWholeBlockBatch
+    };
+    let result = inject(point, 1, || {
+        execute_transfer(
+            &src,
+            &dst,
+            &[0],
+            &[0],
+            TransferOptionsInternal::default(),
+            ctx.context(),
+        )
+    });
+    let error = result.err().expect("dispatch failed before queuing work");
+    assert!(error.to_string().contains("injected CUDA dispatch failure"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn cuda_dispatch_failure_after_planner_direct_batch() -> Result<()> {
+    use crate::transfer::executor::dispatch_fault::{Point, inject};
+
+    gpu_serial!();
+    assert!(!kvbm_kernels::is_using_stubs(), "CUDA kernels required");
+    let agent = build_agent_for_kinds(&[StorageKind::Device(0)])?;
+    let src = build_layout_for_planner(agent.clone(), LayoutType::FC, StorageKind::Device(0), 1);
+    let dst = build_layout_for_planner(agent.clone(), LayoutType::FC, StorageKind::Device(0), 1);
+    let checksums = fill_and_checksum(&src, &[0], FillPattern::Sequential)?;
+    let ctx = create_transfer_context(agent, None)?;
+    let options = TransferOptionsInternal::builder()
+        .use_planner(true)
+        .build()?;
+    let result = inject(Point::PlannerBatch, 1, || {
+        execute_transfer(&src, &dst, &[0], &[0], options, ctx.context())
+    });
+    assert_dispatch_failure_drained(result).await;
+    verify_checksums_by_position(&checksums, &[0], &dst, &[0])
+}
+
+#[tokio::test]
+async fn cuda_dispatch_failure_after_vectorized_allocation() -> Result<()> {
+    use crate::transfer::executor::dispatch_fault::{Point, inject};
+
+    gpu_serial!();
+    assert!(!kvbm_kernels::is_using_stubs(), "CUDA kernels required");
+    let agent = build_agent_for_kinds(&[StorageKind::Device(0)])?;
+    let src = build_layout_for_planner(agent.clone(), LayoutType::FC, StorageKind::Device(0), 1);
+    let dst = build_layout_for_planner(agent.clone(), LayoutType::FC, StorageKind::Device(0), 1);
+    let ctx = create_transfer_context(agent, None)?;
+    let options = TransferOptionsInternal::builder()
+        .copy_engine(crate::transfer::CopyEngine::VectorizedKernel)
+        .build()?;
+    let result = inject(Point::VectorizedAlloc, 1, || {
+        execute_transfer(&src, &dst, &[0], &[0], options, ctx.context())
+    });
+    assert_dispatch_failure_drained(result).await;
+    Ok(())
+}
