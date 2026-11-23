@@ -26,6 +26,7 @@ use crate::worker::velo::{
 use crate::worker::{LocalTransferRecheck, UnresolvedTransfer};
 
 use super::local::LocalConnectorEngine;
+use super::onboard::include_undispatched_destinations;
 use metrics::PauseMetrics;
 
 pub(super) const PROBE_INTERVAL: Duration = Duration::from_secs(10);
@@ -60,7 +61,7 @@ pub(super) struct ResourceContinuation {
     pub(super) remaining: std::vec::IntoIter<ResourceOnboard>,
 }
 
-/// Preserve the old bundle failure and the destinations no copy ever reached.
+/// The current resource's failure and the destinations no copy ever reached.
 pub(super) struct BundleContinuation {
     pub(super) failure: ActionFailure,
     pub(super) unfilled: Vec<usize>,
@@ -72,15 +73,12 @@ impl BundleContinuation {
         if self.logical_done {
             return None;
         }
-        Some(if !completed {
-            ActionStatus::Failed(self.failure)
-        } else if self.unfilled.is_empty() {
+        let status = if completed {
             ActionStatus::Complete
         } else {
-            ActionStatus::Failed(ActionFailure::Partial {
-                block_ids: self.unfilled,
-            })
-        })
+            ActionStatus::Failed(self.failure)
+        };
+        Some(include_undispatched_destinations(status, self.unfilled))
     }
 }
 
@@ -589,7 +587,12 @@ impl LocalConnectorEngine {
                 return;
             }
             Some(LoadContinuation::Resource(resource)) if !completed => {
-                Some(ActionStatus::Failed(resource.failure))
+                Some(include_undispatched_destinations(
+                    ActionStatus::Failed(resource.failure),
+                    resource
+                        .remaining
+                        .flat_map(|transfer| transfer.destination_block_ids),
+                ))
             }
             continuation => {
                 load.continuation = continuation;

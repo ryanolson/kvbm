@@ -13,6 +13,17 @@ source stays pinned, the fence stays incomplete, and the scheduler gets no
 load terminal.
 [Lost-reply test](../crates/kvbm-engine/src/tiering/engine/local/tests/onboard_drain.rs)
 
+## Report the undispatched tail of a failed onboard
+
+If a serial resource or bundle onboard stops, report the failed copy and every
+destination the driver never dispatched. vLLM invalidates only the named
+blocks. A completion proof for a paused bundle copy preserves its landed
+blocks and leaves the undispatched tail for recompute.
+
+Test by failing the second of three resource copies. The first destination
+stays valid and the failure names both the second and third.
+[Bundle failure test](../crates/kvbm-engine/src/tiering/engine/bundle/integration_tests.rs)
+
 ## Resume the remaining resources after a lost reply
 
 Proof for one resource copy covers only that copy. Keep the request pending

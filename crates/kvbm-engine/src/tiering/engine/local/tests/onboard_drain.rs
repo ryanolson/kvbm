@@ -549,7 +549,7 @@ async fn resource_onboard_pauses_again_after_a_second_lost_reply() -> Result<()>
     Ok(())
 }
 
-async fn resource_failure_keeps_its_destination_ids(lost_reply: bool) -> Result<()> {
+async fn resource_failure_names_the_undispatched_tail(lost_reply: bool) -> Result<()> {
     let mut restore = resource_restore(lost_reply).await?;
     let proof = restore.worker.copy(RESOURCE).await;
     let action = *restore.handle.id();
@@ -588,21 +588,21 @@ async fn resource_failure_keeps_its_destination_ids(lost_reply: bool) -> Result<
         wait_onboard_driver_finished(action).await;
     }
     assert!(fence.is_complete());
-    assert_eq!(
-        restore.engine.poll_action(&action),
-        ActionStatus::Failed(ActionFailure::Resource {
-            resource: RESOURCE,
-            block_ids: Some(vec![G1_DESTINATION]),
-        }),
-    );
+    let failed_ids = vec![G1_DESTINATION, G1_DESTINATION + 1];
     assert_eq!(
         restore.sink.loads(),
         vec![(
             REQUEST.into(),
             LoadOutcome::FailedPartial {
-                block_ids: vec![G1_DESTINATION]
+                block_ids: failed_ids.clone(),
             }
         )],
+    );
+    assert_eq!(
+        restore.engine.poll_action(&action),
+        ActionStatus::Failed(ActionFailure::Partial {
+            block_ids: failed_ids
+        }),
     );
     assert!(restore.handle.paused().is_none());
     assert!(restore.worker.copies.try_recv().is_err());
@@ -610,11 +610,11 @@ async fn resource_failure_keeps_its_destination_ids(lost_reply: bool) -> Result<
 }
 
 #[tokio::test]
-async fn resource_onboard_reports_the_failed_resource_after_recheck() -> Result<()> {
-    resource_failure_keeps_its_destination_ids(true).await
+async fn resource_onboard_reports_undispatched_ids_after_recheck() -> Result<()> {
+    resource_failure_names_the_undispatched_tail(true).await
 }
 
 #[tokio::test]
-async fn resource_onboard_releases_at_once_after_a_drained_failure() -> Result<()> {
-    resource_failure_keeps_its_destination_ids(false).await
+async fn resource_onboard_reports_undispatched_ids_after_a_drained_failure() -> Result<()> {
+    resource_failure_names_the_undispatched_tail(false).await
 }

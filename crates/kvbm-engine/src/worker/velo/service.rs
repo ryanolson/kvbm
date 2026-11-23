@@ -126,6 +126,16 @@ pub(super) fn register_local_transfer_handlers(
                     });
                     anyhow::bail!("injected lost reply before the transfer was recorded");
                 }
+                #[cfg(test)]
+                let lose_running_reply = records.hooks.lose_running_reply.lock().take();
+                #[cfg(test)]
+                if let Some(gate) = lose_running_reply {
+                    tokio::spawn(async move {
+                        let _ = run_local_transfer(&records, &dispatch, message).await;
+                    });
+                    gate.await?;
+                    anyhow::bail!("injected lost reply for a running transfer");
+                }
                 let outcome = run_local_transfer(&records, &dispatch, message).await;
                 #[cfg(test)]
                 {

@@ -120,6 +120,31 @@ pub(super) enum OnboardDrain<H, T = ActionStatus> {
     Unproven { error: anyhow::Error, holds: H },
 }
 
+/// Include destinations the serial resource loop never dispatched.
+pub(super) fn include_undispatched_destinations(
+    status: ActionStatus,
+    tail: impl IntoIterator<Item = BlockId>,
+) -> ActionStatus {
+    let mut tail = tail.into_iter().peekable();
+    if tail.peek().is_none() {
+        return status;
+    }
+    let mut block_ids = match status {
+        ActionStatus::Complete => Vec::new(),
+        ActionStatus::Failed(
+            ActionFailure::Resource {
+                block_ids: Some(ids),
+                ..
+            }
+            | ActionFailure::Partial { block_ids: ids },
+        ) => ids,
+        // Total failures already include the full destination set at settlement.
+        status => return status,
+    };
+    block_ids.extend(tail);
+    ActionStatus::Failed(ActionFailure::Partial { block_ids })
+}
+
 /// Keep the source holds until the receipt proves drain or the caller takes ownership.
 async fn await_onboard_drain<H>(
     notification: TransferCompleteNotification,
@@ -257,8 +282,8 @@ impl LocalConnectorEngine {
     /// Run route-specific preparation and copies under a single terminal owner.
     /// The bundle watchdog or cancel can settle the logical result early. The
     /// copy task continues to proof or a pause in either case. A bundle pause
-    /// never dispatches its tail: a Completed proof preserves landed blocks
-    /// and fails the unfilled ids; a drained error keeps the resource failure.
+    /// never dispatches its tail. Proof names the unfilled destinations;
+    /// a drained error also names the failed copy.
     pub(super) async fn drive_onboard(
         self: &Arc<Self>,
         mut load: PausedLoad,

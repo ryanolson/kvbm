@@ -17,7 +17,7 @@ use super::{BundleOnboard, OnboardTransition};
 use crate::G2;
 use crate::tiering::engine::local::LocalConnectorEngine;
 use crate::tiering::engine::onboard::{
-    OnboardDrain, OnboardWatchdog, OnboardWork, dispatch_onboard,
+    OnboardDrain, OnboardWatchdog, OnboardWork, dispatch_onboard, include_undispatched_destinations,
 };
 use crate::tiering::engine::paused::{
     BundleContinuation, LoadContinuation, PausedLoad, ResourceContinuation,
@@ -214,32 +214,47 @@ impl LocalConnectorEngine {
             .execute_resource_onboards(&mut resources, &bundle)
             .await;
         match stop {
-            ResourceStop::Proven(failure) => OnboardWork::Proven(match bundle {
-                Some(transaction) => fold_bundle_onboard(transaction, failure, completed),
-                None => fold_resource_onboard(failure, completed),
-            }),
+            ResourceStop::Proven(failure) => {
+                let status = match bundle {
+                    Some(transaction) => fold_bundle_onboard(transaction, failure, completed),
+                    None => fold_resource_onboard(failure, completed),
+                };
+                OnboardWork::Proven(include_undispatched_destinations(
+                    status,
+                    resources.flat_map(|transfer| transfer.destination_block_ids),
+                ))
+            }
             ResourceStop::Unproven {
                 resource,
                 destination_block_ids,
                 error,
             } => {
+                if let Some(bundle) = bundle {
+                    let unfilled = destination_ids(resources.as_slice());
+                    let continuation = LoadContinuation::Bundle(BundleContinuation {
+                        failure: ActionFailure::Resource {
+                            resource,
+                            block_ids: Some(destination_block_ids),
+                        },
+                        unfilled,
+                        logical_done: false,
+                    });
+                    return OnboardWork::unproven(
+                        error,
+                        bundle.into_paused_reservation(resource),
+                        Some(continuation),
+                    );
+                }
+
                 let failure = ActionFailure::Resource {
                     resource,
                     block_ids: Some(destination_block_ids),
                 };
-                let continuation = if bundle.is_some() {
-                    LoadContinuation::Bundle(BundleContinuation {
-                        failure,
-                        unfilled: destination_ids(resources.as_slice()),
-                        logical_done: false,
-                    })
-                } else {
-                    LoadContinuation::Resource(ResourceContinuation {
-                        failure,
-                        remaining: resources,
-                    })
-                };
-                OnboardWork::unproven(error, bundle, Some(continuation))
+                let continuation = LoadContinuation::Resource(ResourceContinuation {
+                    failure,
+                    remaining: resources,
+                });
+                OnboardWork::unproven(error, (), Some(continuation))
             }
         }
     }

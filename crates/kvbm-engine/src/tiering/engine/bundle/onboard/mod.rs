@@ -41,6 +41,11 @@ impl<R> BundleOnboard<R> {
         self.barrier.start().into()
     }
 
+    /// Abandon the bundle while keeping the only copy that still needs proof.
+    fn into_paused_reservation(self, resource: LogicalResourceId) -> Option<R> {
+        self.reservations.and_then(|mut all| all.remove(&resource))
+    }
+
     pub(in crate::tiering::engine) fn complete(
         &mut self,
         resource: LogicalResourceId,

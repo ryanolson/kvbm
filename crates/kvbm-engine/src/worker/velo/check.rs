@@ -522,6 +522,8 @@ pub(super) struct TestHooks {
     /// Hold the next transfer, unrecorded, until this gate opens, and fail
     /// its reply at once.
     pub(super) defer_next: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    /// Run the next transfer and fail its reply when this gate opens.
+    pub(super) lose_running_reply: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     /// Evict every record after the next transfer is recorded.
     pub(super) evict_after_next: std::sync::atomic::AtomicBool,
     /// Checks received.
