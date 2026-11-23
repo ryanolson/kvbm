@@ -139,8 +139,7 @@ pub(super) struct ActionRecord {
     /// A clone of the shared [`FenceBarrier`], set by [`LocalConnectorEngine::evict`]
     /// when this action is armed cancelled-for-emission. While held, the action's
     /// terminal fires no `mark_load_finished`/`mark_save_finished`; instead the
-    /// action's drain terminal (logical for ordinary actions, physical for a
-    /// bundle onboard) *takes* this clone and drops it, completing the shared
+    /// action's drain terminal *takes* this clone and drops it, completing the shared
     /// fence only once it is the last armed action to drain. The
     /// logical terminal status is still written to the cell promptly, so the
     /// by-id path stays correct.
@@ -163,7 +162,7 @@ pub(super) struct ActionRecord {
     /// Optional in-flight onboard generation cleared with this action record.
     /// While present, an early handle drop defers removal until terminal.
     pub(super) inflight: Option<super::inflight::InflightKey>,
-    /// True while a bundle onboard owns launched transfer notifications.
+    /// True while an onboard's physical work still needs a drain proof.
     /// Logical completion can occur before this physical state clears.
     pub(super) physical_pending: bool,
     /// The action type and its terminal state.
@@ -444,7 +443,7 @@ impl LocalConnectorEngine {
         }
     }
 
-    /// Mark only the physical-drain half of a bundle onboard complete.
+    /// Mark the physical-drain half of an onboard complete.
     ///
     /// The logical terminal is deliberately owned by [`Self::finish_load_action`].
     /// This method never writes the handle cell. It releases eviction/request-

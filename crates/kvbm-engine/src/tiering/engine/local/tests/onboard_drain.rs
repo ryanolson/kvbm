@@ -21,6 +21,7 @@ use super::super::super::test_support::{
 use super::*;
 use kvbm_common::LogicalResourceId;
 use kvbm_logical::BlockManager;
+use kvbm_protocols::connector::LoadOutcome;
 
 const RESOURCE: LogicalResourceId = LogicalResourceId(0);
 const G2_BLOCKS: usize = 2;
@@ -50,10 +51,13 @@ async fn build() -> Result<Onboard> {
 /// Register one G2 block and hand it to a matched search. Returns the search
 /// handle and the source block id. The test keeps no reference to the block:
 /// only the onboard holds it once it starts.
-fn matched_search(onboard: &Onboard) -> Result<(FindBlocksHandle, BlockId)> {
+pub(super) fn matched_search(
+    engine: &Arc<LocalConnectorEngine>,
+    g2: &BlockManager<crate::G2>,
+    request: &str,
+) -> Result<(FindBlocksHandle, BlockId)> {
     let tokens = crate::testing::token_blocks::create_token_sequence(1, BS, 7);
-    let block = onboard
-        .g2
+    let block = g2
         .allocate_blocks(1)
         .ok_or_else(|| anyhow::anyhow!("no free G2 block"))?
         .pop()
@@ -61,7 +65,7 @@ fn matched_search(onboard: &Onboard) -> Result<(FindBlocksHandle, BlockId)> {
     let block = block
         .complete(&tokens.blocks()[0])
         .map_err(|error| anyhow::anyhow!("complete G2 block: {error:?}"))?;
-    let source = onboard.g2.register_block(block);
+    let source = g2.register_block(block);
     let source_id = source.block_id();
     let ready = FindMatchesResult::Ready(ReadyResult::new(
         vec![source],
@@ -72,10 +76,10 @@ fn matched_search(onboard: &Onboard) -> Result<(FindBlocksHandle, BlockId)> {
     ));
 
     let search_id = SearchId::new();
-    onboard.engine.searches.insert(
+    engine.searches.insert(
         search_id,
         SearchState {
-            request_id: REQUEST.into(),
+            request_id: request.into(),
             status: Arc::new(Mutex::new(MatchStatus::Matched { hit_blocks: 1 })),
             onboarding: OnboardingState::new(
                 0,
@@ -89,8 +93,8 @@ fn matched_search(onboard: &Onboard) -> Result<(FindBlocksHandle, BlockId)> {
             buffer: plhs_for(0, 1),
         },
     );
-    let owner: Arc<dyn LeaderEngine> = onboard.engine.clone();
-    let handle = FindBlocksHandle::search(REQUEST.into(), search_id, Arc::downgrade(&owner));
+    let owner: Arc<dyn LeaderEngine> = engine.clone();
+    let handle = FindBlocksHandle::search(request.into(), search_id, Arc::downgrade(&owner));
     Ok((handle, source_id))
 }
 
@@ -117,10 +121,9 @@ fn assert_primary(failures: Vec<String>) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "a local onboard does not yet keep its resources when a lost worker reply leaves the copy unproven"]
 async fn onboard_blocks_keeps_sources_and_destinations_after_a_lost_reply() -> Result<()> {
     let fixture = build().await?;
-    let (search, source_id) = matched_search(&fixture)?;
+    let (search, source_id) = matched_search(&fixture.engine, &fixture.g2, REQUEST)?;
     let mut onboard = fixture
         .engine
         .clone()
@@ -229,7 +232,7 @@ async fn onboard_resource_blocks_keeps_destinations_after_a_lost_reply() -> Resu
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn onboard_blocks_releases_at_once_after_a_drained_failure() -> Result<()> {
     let fixture = build().await?;
-    let (search, source_id) = matched_search(&fixture)?;
+    let (search, source_id) = matched_search(&fixture.engine, &fixture.g2, REQUEST)?;
     let onboard = fixture
         .engine
         .clone()
@@ -265,5 +268,44 @@ async fn onboard_blocks_releases_at_once_after_a_drained_failure() -> Result<()>
         reusable.contains(&source_id),
         "a drained failure must return the G2 source {source_id} (reusable ids {reusable:?})"
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_onboard_handle_keeps_the_fence_until_drain() -> Result<()> {
+    let fixture = build().await?;
+    let (search, source_id) = matched_search(&fixture.engine, &fixture.g2, REQUEST)?;
+    let mut onboard = fixture
+        .engine
+        .clone()
+        .onboard_blocks(&search, &[G1_DESTINATION], BS)?;
+    let action_id = *onboard.id();
+    fixture.hanging.wait_started().await;
+    let fence = onboard
+        .take_physical_drain_fence()
+        .expect("the local onboard must give its caller a physical fence");
+    drop(onboard);
+    assert!(!fence.is_complete());
+    assert!(fixture.hanging.copy_running());
+    assert!(!reusable_g2_ids(&fixture.g2).contains(&source_id));
+    assert!(fixture.sink.loads().is_empty());
+    assert!(
+        fixture
+            .engine
+            .actions
+            .get(&action_id)
+            .is_some_and(|record| record.physical_pending),
+        "handle drop must leave physical work pending"
+    );
+
+    fixture.hanging.release()?;
+    wait_onboard_driver_finished(action_id).await;
+    assert!(fence.is_complete());
+    assert!(reusable_g2_ids(&fixture.g2).contains(&source_id));
+    assert_eq!(
+        fixture.sink.loads(),
+        vec![(REQUEST.into(), LoadOutcome::Done)]
+    );
+    assert!(!fixture.engine.actions.contains_key(&action_id));
     Ok(())
 }

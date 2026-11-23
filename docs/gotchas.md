@@ -1,5 +1,18 @@
 # Coding gotchas
 
+## Keep both ends of a copy until drain is proven
+
+Await the receipt's drain outcome before releasing blocks. A lost reply can
+leave a worker reading the source and writing the destination. On an
+unproven outcome, keep the source blocks pinned and leave the destination
+fence incomplete. Sending a load failure too early lets the scheduler reuse
+blocks the worker can still overwrite.
+
+Test by losing the reply while holding the running copy. Check that the
+source stays pinned, the fence stays incomplete, and the scheduler gets no
+load terminal.
+[Lost-reply test](../crates/kvbm-engine/src/tiering/engine/local/tests/onboard_drain.rs)
+
 ## Keep paused onboard blocks through connector teardown
 
 Keep the engine's pause registry alive while a worker can still touch its
@@ -61,3 +74,13 @@ body calls code that can take the same lock or wait for another thread.
 Test both orders of a reset and re-registration marker update. Pause each
 operation after it releases the store mutex and verify that the other can
 reach its own pause. [Presence ordering test](../crates/kvbm-logical/src/manager/tests/lineage_ghosts.rs)
+
+## Keep scoped trace captures visible to parallel tests
+
+Keep a second, disabled tracing dispatch alive during a scoped capture.
+With a single dispatch, another test thread can register the same event
+first and cache it as disabled because that thread lacks the capture.
+
+Run the log assertion in the full parallel suite. It checks the worker
+label even if another test logs a pause first.
+[Pause worker test](../crates/kvbm-engine/src/tiering/engine/local/tests/onboard_pause.rs)

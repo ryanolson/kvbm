@@ -3,13 +3,12 @@
 
 //! The local G1←G2 onboard driver.
 //!
-//! This is the async tail of [`super::local::LocalConnectorEngine::onboard`]:
+//! This is the async tail of [`super::local::LocalConnectorEngine::local_onboard`]:
 //! it runs **off** the forward-pass thread (spawned on the leader's tokio
 //! runtime), awaits every shard's staging future, folds the reconciled
 //! [`OnboardingState`] into a concrete G2 source list via the matched span,
 //! and issues the G2→G1 transfer through the leader's parallel worker. It
-//! returns a terminal [`ActionStatus`]; the caller records it and fires the
-//! worker sink with no engine lock held (see [`super::driver`]).
+//! returns a proven status or the source blocks and error for a paused copy.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -20,6 +19,7 @@ use futures::future::{BoxFuture, Either, Ready};
 use kvbm_common::LogicalLayoutHandle;
 use kvbm_logical::blocks::ImmutableBlock;
 use kvbm_physical::TransferOptions;
+use kvbm_physical::transfer::{TransferCompleteNotification, TransferDrainOutcome};
 use kvbm_protocols::connector::{ActionFailure, ActionStatus};
 use kvbm_protocols::connector::{BlockId, SequenceHash};
 
@@ -106,17 +106,27 @@ fn collect_g2_blocks(
     Ok(collected)
 }
 
-/// Drive one onboard to a terminal [`ActionStatus`].
-///
-/// Runs on the leader's runtime, off the forward-pass thread. Awaits every
-/// shard's staging future, collects the matched G2 sources (held resident
-/// across the copy via `_g2_hold`), and issues the G2→G1 transfer. Any failure
-/// is folded into `Failed(AllBlocks)`; the onboard driver in `engine::onboard`
-/// then RESOLVES that to `Failed(Partial { dest ids })` — vLLM invalidates
-/// failed loads by block_id, so the concrete dest set must reach the worker
-/// (an empty failed set finishes the recv with nothing invalidated). Per-block
-/// granularity within a transfer is left for when the transfer layer reports
-/// per-block status.
+pub(super) enum OnboardDrain<H> {
+    Proven(ActionStatus),
+    Unproven { error: anyhow::Error, holds: H },
+}
+
+/// Keep the source holds until the receipt proves drain or the caller takes ownership.
+pub(super) async fn await_onboard_drain<H>(
+    notification: TransferCompleteNotification,
+    holds: H,
+) -> OnboardDrain<H> {
+    match notification.await_drain().await {
+        TransferDrainOutcome::Completed => OnboardDrain::Proven(ActionStatus::Complete),
+        TransferDrainOutcome::DrainedWithError(error) => {
+            tracing::error!(%error, "onboard transfer drained with an error");
+            OnboardDrain::Proven(ActionStatus::Failed(ActionFailure::AllBlocks))
+        }
+        TransferDrainOutcome::Unproven(error) => OnboardDrain::Unproven { error, holds },
+    }
+}
+
+/// Wait for staging and drive the G2 to G1 copy on the leader's runtime.
 pub(super) async fn run_onboard(
     leader: &Arc<InstanceLeader>,
     onboarding: &mut OnboardingState,
@@ -124,26 +134,26 @@ pub(super) async fn run_onboard(
     staging_futs: Vec<StagingCompletion>,
     block_size: usize,
     accepted_blocks: usize,
-) -> ActionStatus {
+) -> OnboardDrain<Vec<ImmutableBlock<G2>>> {
     if g1_block_ids.len() != accepted_blocks {
         tracing::error!(
             accepted = accepted_blocks,
             destinations = g1_block_ids.len(),
             "onboard allocation does not cover the accepted prefix"
         );
-        return ActionStatus::Failed(ActionFailure::AllBlocks);
+        return OnboardDrain::Proven(ActionStatus::Failed(ActionFailure::AllBlocks));
     }
     // Nothing external to move (e.g. a `Matched { hit_blocks: 0 }` onboard):
     // immediately terminal, no transfer issued.
     if g1_block_ids.is_empty() {
-        return ActionStatus::Complete;
+        return OnboardDrain::Proven(ActionStatus::Complete);
     }
 
     // Wait for every shard's find_session to reach a terminal state.
     for fut in staging_futs {
         if let Err(e) = fut.await {
             tracing::error!(error = %e, "onboard staging future failed");
-            return ActionStatus::Failed(ActionFailure::AllBlocks);
+            return OnboardDrain::Proven(ActionStatus::Failed(ActionFailure::AllBlocks));
         }
     }
 
@@ -152,7 +162,7 @@ pub(super) async fn run_onboard(
         Ok(blocks) => blocks,
         Err(e) => {
             tracing::error!(error = %e, "onboard G2 collect failed");
-            return ActionStatus::Failed(ActionFailure::AllBlocks);
+            return OnboardDrain::Proven(ActionStatus::Failed(ActionFailure::AllBlocks));
         }
     };
     let src_block_ids: Vec<BlockId> = g2_blocks.iter().map(|b| b.block_id()).collect();
@@ -162,12 +172,9 @@ pub(super) async fn run_onboard(
             dst = g1_block_ids.len(),
             "onboard G2/G1 block count mismatch"
         );
-        return ActionStatus::Failed(ActionFailure::AllBlocks);
+        return OnboardDrain::Proven(ActionStatus::Failed(ActionFailure::AllBlocks));
     }
 
-    // The ImmutableBlock<G2> Drop returns the block to the pool, so the source
-    // Vec must outlive the transfer await.
-    let _g2_hold = g2_blocks;
     match leader.execute_local_transfer(
         LogicalLayoutHandle::G2,
         LogicalLayoutHandle::G1,
@@ -175,16 +182,10 @@ pub(super) async fn run_onboard(
         g1_block_ids,
         TransferOptions::default(),
     ) {
-        Ok(notification) => match notification.await {
-            Ok(()) => ActionStatus::Complete,
-            Err(e) => {
-                tracing::error!(error = %e, "onboard G2->G1 transfer failed");
-                ActionStatus::Failed(ActionFailure::AllBlocks)
-            }
-        },
+        Ok(notification) => await_onboard_drain(notification, g2_blocks).await,
         Err(e) => {
             tracing::error!(error = %e, "onboard G2->G1 transfer dispatch failed");
-            ActionStatus::Failed(ActionFailure::AllBlocks)
+            OnboardDrain::Proven(ActionStatus::Failed(ActionFailure::AllBlocks))
         }
     }
 }
