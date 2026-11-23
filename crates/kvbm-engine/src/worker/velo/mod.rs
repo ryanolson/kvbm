@@ -108,6 +108,46 @@ mod lost_reply_tests;
 mod service;
 mod unresolved;
 
+#[cfg(test)]
+pub(crate) struct HeldLocalTransfers(Arc<check::LocalTransferRecords>);
+
+#[cfg(test)]
+impl HeldLocalTransfers {
+    pub(crate) fn lose_next_reply(&self) {
+        let (open, gate) = tokio::sync::oneshot::channel();
+        open.send(()).expect("deferred copy gate");
+        assert!(self.0.hooks.defer_next.lock().replace(gate).is_none());
+    }
+
+    pub(crate) fn active(&self) -> bool {
+        !self.0.active_ids().is_empty()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn serve_held_local_transfers(
+    messenger: &::velo::Messenger,
+    worker_id: u64,
+    lose_first_reply: bool,
+    dispatch: impl Fn(kvbm_common::LogicalResourceId) -> Result<TransferCompleteNotification>
+    + Send
+    + Sync
+    + 'static,
+) -> Result<HeldLocalTransfers> {
+    let records = check::LocalTransferRecords::new();
+    let transfers = HeldLocalTransfers(records.clone());
+    if lose_first_reply {
+        transfers.lose_next_reply();
+    }
+    service::register_local_transfer_handlers(
+        messenger,
+        Some(worker_id),
+        records.clone(),
+        Arc::new(move |message| dispatch(message.resource.expect("resource transfer"))),
+    )?;
+    Ok(transfers)
+}
+
 pub(crate) use check::CheckEvidence;
 pub use check::{
     DEFAULT_LOCAL_TRANSFER_CHECK_DEADLINE, DEFAULT_LOCAL_TRANSFER_CHECK_WAIT,

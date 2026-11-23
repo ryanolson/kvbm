@@ -5,7 +5,7 @@
 
 #![allow(clippy::disallowed_macros)]
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::Duration;
 
@@ -28,35 +28,71 @@ use crate::worker::{
     SerializedLayoutResponse, Worker, WorkerTransfers,
 };
 
-/// Onboard driver tasks that have returned, by action id. Ids are unique, so
-/// tests that run at the same time do not see each other's entries.
-static FINISHED_ONBOARD_DRIVERS: LazyLock<Mutex<HashSet<ActionId>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
+/// Unconsumed driver completions by action ID. A resumed driver reports
+/// another completion under the same ID.
+static FINISHED_ONBOARD_DRIVERS: LazyLock<Mutex<HashMap<ActionId, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Record that the onboard driver task for `action_id` has done all its work.
 /// The onboard tasks call this as their last statement.
 pub(super) fn note_onboard_driver_finished(action_id: ActionId) {
-    FINISHED_ONBOARD_DRIVERS.lock().unwrap().insert(action_id);
+    *FINISHED_ONBOARD_DRIVERS
+        .lock()
+        .unwrap()
+        .entry(action_id)
+        .or_default() += 1;
 }
 
-/// Wait until the onboard driver task for `action_id` has returned.
+/// Wait for and consume the next completion reported for `action_id`.
 ///
 /// The driver writes the handle's cell before it calls the worker sink, so a
 /// test that waits only for a terminal on the handle can read the sink too
-/// early. This waits for the end of the task instead. It polls a set, so a
-/// task that finished before the wait began is still seen.
+/// early. Reports stay queued until observed, so two waits on a resumed
+/// action see two distinct driver runs.
 pub(super) async fn wait_onboard_driver_finished(action_id: ActionId) {
     for _ in 0..500 {
-        if FINISHED_ONBOARD_DRIVERS
-            .lock()
-            .unwrap()
-            .contains(&action_id)
         {
-            return;
+            let mut finished = FINISHED_ONBOARD_DRIVERS.lock().unwrap();
+            if let Some(count) = finished.get_mut(&action_id) {
+                *count -= 1;
+                if *count == 0 {
+                    finished.remove(&action_id);
+                }
+                return;
+            }
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("the onboard driver task for {action_id:?} did not return");
+}
+
+#[tokio::test(start_paused = true)]
+async fn onboard_driver_wait_consumes_one_completion() {
+    let action = ActionId::new();
+    note_onboard_driver_finished(action);
+    wait_onboard_driver_finished(action).await;
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            wait_onboard_driver_finished(action)
+        )
+        .await
+        .is_err(),
+        "a resumed driver must report a new completion",
+    );
+
+    note_onboard_driver_finished(action);
+    note_onboard_driver_finished(action);
+    wait_onboard_driver_finished(action).await;
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            wait_onboard_driver_finished(action)
+        )
+        .await
+        .is_ok(),
+        "both reported completions must survive until their waits",
+    );
 }
 
 /// Build a leader with one G2 manager of `g2_blocks` blocks for `resource`
@@ -78,24 +114,40 @@ pub(super) fn build_leader_with_messenger(
     block_size: usize,
     workers: Arc<dyn ParallelWorkers>,
 ) -> Result<(InstanceLeader, Arc<BlockManager<G2>>)> {
+    let (leader, mut managers) =
+        build_leader_with_resources(messenger, &[resource], g2_blocks, block_size, workers)?;
+    Ok((leader, managers.remove(0)))
+}
+
+pub(super) fn build_leader_with_resources(
+    messenger: Arc<velo::Messenger>,
+    resources: &[LogicalResourceId],
+    g2_blocks: usize,
+    block_size: usize,
+    workers: Arc<dyn ParallelWorkers>,
+) -> Result<(InstanceLeader, Vec<Arc<BlockManager<G2>>>)> {
     let registry = BlockRegistry::builder().build();
-    let manager = Arc::new(
-        TestManagerBuilder::<G2>::new()
-            .block_count(g2_blocks)
-            .block_size(block_size)
-            .registry(registry.clone())
-            .build(),
-    );
     let mut set = BlockManagerSet::new();
-    set.insert(resource, Arc::clone(&manager))?;
+    let mut managers = Vec::with_capacity(resources.len());
+    for &resource in resources {
+        let manager = Arc::new(
+            TestManagerBuilder::<G2>::new()
+                .block_count(g2_blocks)
+                .block_size(block_size)
+                .registry(registry.clone())
+                .build(),
+        );
+        set.insert(resource, manager.clone())?;
+        managers.push(manager);
+    }
     let leader = InstanceLeader::builder()
         .messenger(messenger)
         .registry(registry)
-        .g2_manager_set(Arc::new(set), resource)
+        .g2_manager_set(Arc::new(set), resources[0])
         .parallel_worker(workers)
         .observability(Arc::new(KvbmObservability::default()))
         .build()?;
-    Ok((leader, manager))
+    Ok((leader, managers))
 }
 
 pub(super) struct CompletedParallelWorkers;

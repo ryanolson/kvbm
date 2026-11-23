@@ -203,6 +203,7 @@ impl Fixture {
             physical_drain: action.physical.clone(),
             pause: action.pause.clone(),
             holds: Box::new(self.g2.allocate_blocks(1).expect("one G2 block")),
+            resource: None,
         }
     }
 
@@ -331,13 +332,13 @@ fn metric(registry: &prometheus::Registry, family: &str, labels: &[&str]) -> Opt
         })
 }
 
-async fn tick(duration: Duration) {
+pub(super) async fn tick(duration: Duration) {
     // Tokio's timer wheel rounds deadlines up to the next millisecond.
     advance(duration + Duration::from_millis(1)).await;
     tokio::task::yield_now().await;
 }
 
-async fn eventually(reason: &str, check: impl Fn() -> bool) {
+pub(super) async fn eventually(reason: &str, mut check: impl FnMut() -> bool) {
     let limit = std::time::Instant::now() + WALL_LIMIT;
     while !check() {
         // Keep the fake clock fixed while loopback I/O wakes a task.

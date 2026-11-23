@@ -106,8 +106,8 @@ fn collect_g2_blocks(
     Ok(collected)
 }
 
-pub(super) enum OnboardDrain<H> {
-    Proven(ActionStatus),
+pub(super) enum OnboardDrain<H, T = ActionStatus> {
+    Proven(T),
     Unproven { error: anyhow::Error, holds: H },
 }
 
@@ -115,13 +115,10 @@ pub(super) enum OnboardDrain<H> {
 pub(super) async fn await_onboard_drain<H>(
     notification: TransferCompleteNotification,
     holds: H,
-) -> OnboardDrain<H> {
+) -> OnboardDrain<H, Result<()>> {
     match notification.await_drain().await {
-        TransferDrainOutcome::Completed => OnboardDrain::Proven(ActionStatus::Complete),
-        TransferDrainOutcome::DrainedWithError(error) => {
-            tracing::error!(%error, "onboard transfer drained with an error");
-            OnboardDrain::Proven(ActionStatus::Failed(ActionFailure::AllBlocks))
-        }
+        TransferDrainOutcome::Completed => OnboardDrain::Proven(Ok(())),
+        TransferDrainOutcome::DrainedWithError(error) => OnboardDrain::Proven(Err(error)),
         TransferDrainOutcome::Unproven(error) => OnboardDrain::Unproven { error, holds },
     }
 }
@@ -182,7 +179,14 @@ pub(super) async fn run_onboard(
         g1_block_ids,
         TransferOptions::default(),
     ) {
-        Ok(notification) => await_onboard_drain(notification, g2_blocks).await,
+        Ok(notification) => match await_onboard_drain(notification, g2_blocks).await {
+            OnboardDrain::Proven(Ok(())) => OnboardDrain::Proven(ActionStatus::Complete),
+            OnboardDrain::Proven(Err(error)) => {
+                tracing::error!(%error, "onboard transfer drained with an error");
+                OnboardDrain::Proven(ActionStatus::Failed(ActionFailure::AllBlocks))
+            }
+            OnboardDrain::Unproven { error, holds } => OnboardDrain::Unproven { error, holds },
+        },
         Err(e) => {
             tracing::error!(error = %e, "onboard G2->G1 transfer dispatch failed");
             OnboardDrain::Proven(ActionStatus::Failed(ActionFailure::AllBlocks))

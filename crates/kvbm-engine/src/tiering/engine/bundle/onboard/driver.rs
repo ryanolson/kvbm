@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use kvbm_common::{BlockId, LogicalLayoutHandle, LogicalResourceId, SequenceHash};
 use kvbm_logical::ImmutableBlock;
-use kvbm_physical::transfer::{TransferCompleteNotification, TransferDrainOutcome};
+use kvbm_physical::transfer::TransferCompleteNotification;
 use kvbm_protocols::cache_manifest::{ResourceRequirement, ResourceRole};
 use kvbm_protocols::connector::{
     ActionFailure, ActionId, ActionStatus, BundleOnboardPlan, FenceHandle, FindBlocksHandle,
@@ -21,6 +21,8 @@ use crate::G2;
 use crate::tiering::engine::driver::ActionRecord;
 use crate::tiering::engine::inflight::InflightKey;
 use crate::tiering::engine::local::LocalConnectorEngine;
+use crate::tiering::engine::onboard::{OnboardDrain, await_onboard_drain};
+use crate::tiering::engine::paused::{PauseCell, PausedLoad, ResourceContinuation};
 
 type ResourcePins = Vec<ImmutableBlock<G2>>;
 type SourceLeases = BTreeMap<LogicalResourceId, ResourcePins>;
@@ -41,6 +43,15 @@ struct CompletedResource {
     resource: LogicalResourceId,
     destination_block_ids: Vec<BlockId>,
     result: anyhow::Result<()>,
+}
+
+enum ResourceStop {
+    Proven(Option<DispatchFailure>),
+    Unproven {
+        resource: LogicalResourceId,
+        destination_block_ids: Vec<BlockId>,
+        error: anyhow::Error,
+    },
 }
 
 /// The result of the physical phase of one bundle onboard.
@@ -106,9 +117,12 @@ impl LocalConnectorEngine {
         validate_resource_transfers(self.as_ref(), &resources)?;
         let action_id = ActionId::new();
         let cell = Arc::new(Mutex::new(ActionStatus::Pending));
+        let physical_drain = Arc::new(AtomicBool::new(false));
+        let pause = PauseCell::default();
         self.actions.insert(
             action_id,
-            ActionRecord::new(req.clone(), Arc::downgrade(&cell)),
+            ActionRecord::new(req.clone(), Arc::downgrade(&cell))
+                .with_physical_drain(CancellationToken::new()),
         );
         self.by_request
             .entry(req.clone())
@@ -118,27 +132,64 @@ impl LocalConnectorEngine {
             .iter()
             .flat_map(|transfer| transfer.destination_block_ids.iter().copied())
             .collect::<Vec<_>>();
-        let request_id = req.clone();
-        let driver = Arc::clone(&self);
-        let terminal_block_ids = destination_block_ids.clone();
-        self.leader.runtime().spawn(async move {
-            // This action has no physical-drain fence, so it does not use the
-            // drain proof.
-            let (dispatch_failure, completed, _drain_proven) =
-                driver.execute_resource_onboards(resources).await;
-            let outcome = fold_resource_onboard(dispatch_failure, completed);
-            driver.finish_load_action(action_id, &request_id, outcome, terminal_block_ids);
-            #[cfg(test)]
-            crate::tiering::engine::test_support::note_onboard_driver_finished(action_id);
-        });
+        self.spawn_resource_onboard(
+            PausedLoad {
+                action: action_id,
+                request: req.clone(),
+                destinations: destination_block_ids.clone(),
+                physical_drain: physical_drain.clone(),
+                pause: pause.clone(),
+                // This path takes block IDs. The caller keeps the G2 pins.
+                holds: Box::new(()),
+                resource: None,
+            },
+            resources.into_iter(),
+        );
 
         let engine: Arc<dyn LeaderEngine> = self;
-        Ok(OnboardHandle::new(
+        Ok(OnboardHandle::new_with_physical_drain(
             action_id,
             Arc::downgrade(&engine),
             cell,
             destination_block_ids,
-        ))
+            FenceHandle::new(physical_drain),
+        )
+        .with_pause_cell(pause))
+    }
+
+    pub(in crate::tiering::engine) fn spawn_resource_onboard(
+        self: &Arc<Self>,
+        mut load: PausedLoad,
+        mut resources: std::vec::IntoIter<ResourceOnboard>,
+    ) {
+        let driver = self.clone();
+        self.leader.runtime().spawn(async move {
+            #[cfg(test)]
+            let action = load.action;
+            let (completed, stop) = driver.execute_resource_onboards(&mut resources).await;
+            match stop {
+                ResourceStop::Proven(dispatch_failure) => {
+                    let status = fold_resource_onboard(dispatch_failure, completed);
+                    load.finish(&driver, status);
+                }
+                ResourceStop::Unproven {
+                    resource,
+                    destination_block_ids,
+                    error,
+                } => {
+                    load.resource = Some(ResourceContinuation {
+                        failure: ActionFailure::Resource {
+                            resource,
+                            block_ids: Some(destination_block_ids),
+                        },
+                        remaining: resources,
+                    });
+                    driver.pause_load_action(load, error);
+                }
+            }
+            #[cfg(test)]
+            crate::tiering::engine::test_support::note_onboard_driver_finished(action);
+        });
     }
 
     fn start_bundle_onboard_with_sources(
@@ -332,8 +383,24 @@ impl LocalConnectorEngine {
         resources: Vec<ResourceOnboard>,
         transaction: BundleOnboardTransaction,
     ) -> BundlePhysicalOutcome {
-        let (dispatch_failure, completed, drain_proven) =
-            self.execute_resource_onboards(resources).await;
+        let (mut completed, stop) = self
+            .execute_resource_onboards(&mut resources.into_iter())
+            .await;
+        let (dispatch_failure, drain_proven) = match stop {
+            ResourceStop::Proven(failure) => (failure, true),
+            ResourceStop::Unproven {
+                resource,
+                destination_block_ids,
+                error,
+            } => {
+                completed.push(CompletedResource {
+                    resource,
+                    destination_block_ids,
+                    result: Err(error),
+                });
+                (None, false)
+            }
+        };
         BundlePhysicalOutcome {
             status: fold_bundle_onboard(transaction, dispatch_failure, completed),
             drain_proven,
@@ -342,23 +409,26 @@ impl LocalConnectorEngine {
 
     async fn execute_resource_onboards(
         &self,
-        resources: Vec<ResourceOnboard>,
-    ) -> (Option<DispatchFailure>, Vec<CompletedResource>, bool) {
+        resources: &mut std::vec::IntoIter<ResourceOnboard>,
+    ) -> (Vec<CompletedResource>, ResourceStop) {
         let _admission = self.resource_onboard_admission.lock().await;
         let mut completed = Vec::with_capacity(resources.len());
-        // `false` after a receipt that did not prove physical drain.
-        let mut drain_proven = true;
         for transfer in resources {
             let dispatched = match self.dispatch_resource_onboard(transfer) {
                 Ok(dispatched) => dispatched,
-                Err(failure) => return (Some(failure), completed, drain_proven),
+                Err(failure) => return (completed, ResourceStop::Proven(Some(failure))),
             };
-            let result = match dispatched.notification.await_drain().await {
-                TransferDrainOutcome::Completed => Ok(()),
-                TransferDrainOutcome::DrainedWithError(error) => Err(error),
-                TransferDrainOutcome::Unproven(error) => {
-                    drain_proven = false;
-                    Err(error)
+            let result = match await_onboard_drain(dispatched.notification, ()).await {
+                OnboardDrain::Proven(result) => result,
+                OnboardDrain::Unproven { error, .. } => {
+                    return (
+                        completed,
+                        ResourceStop::Unproven {
+                            resource: dispatched.resource,
+                            destination_block_ids: dispatched.destination_block_ids,
+                            error,
+                        },
+                    );
                 }
             };
             let completion = CompletedResource {
@@ -372,7 +442,7 @@ impl LocalConnectorEngine {
                 break;
             }
         }
-        (None, completed, drain_proven)
+        (completed, ResourceStop::Proven(None))
     }
 
     fn dispatch_resource_onboard(
