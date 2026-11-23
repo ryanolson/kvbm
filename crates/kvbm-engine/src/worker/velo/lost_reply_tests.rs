@@ -23,6 +23,8 @@ use super::service::{LocalTransferDispatch, register_local_transfer_handlers};
 use super::*;
 use crate::testing::messenger::{MessengerPair, create_messenger_pair_tcp, create_messenger_tcp};
 
+mod multi_worker;
+
 const WORKER: u64 = 1;
 const TIMING: LocalTransferCheckTiming = LocalTransferCheckTiming {
     wait: Duration::from_millis(100),

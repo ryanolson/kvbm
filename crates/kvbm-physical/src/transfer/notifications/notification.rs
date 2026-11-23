@@ -38,6 +38,137 @@ impl TransferDrainOutcome {
     }
 }
 
+/// One failed part of an aggregate receipt, with its drain certainty.
+///
+/// Only [`Self::DrainedWithError`] is a drain proof. A caller that meets a
+/// variant it does not know must treat the part as unproven and opaque: keep
+/// it whole, and never look inside it for a proof or a capability.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum TransferPartFailure {
+    /// The part launched nothing, or every operation it launched drained.
+    DrainedWithError(Error),
+    /// The part did not prove that its work drained.
+    Unproven(Error),
+    /// A kind this crate's own tests use to stand for a future variant.
+    #[cfg(test)]
+    #[doc(hidden)]
+    UnknownForTest(Error),
+}
+
+impl TransferPartFailure {
+    /// The error of this part.
+    pub fn error(&self) -> &Error {
+        match self {
+            Self::DrainedWithError(error) | Self::Unproven(error) => error,
+            #[cfg(test)]
+            Self::UnknownForTest(error) => error,
+        }
+    }
+
+    /// Take the error of this part.
+    pub fn into_error(self) -> Error {
+        match self {
+            Self::DrainedWithError(error) | Self::Unproven(error) => error,
+            #[cfg(test)]
+            Self::UnknownForTest(error) => error,
+        }
+    }
+
+    /// Whether this part has no drain proof.
+    ///
+    /// Every kind except [`Self::DrainedWithError`] is unproven. A part marked
+    /// drained is unproven too when its error holds an unproven
+    /// [`AggregateTransferFailure`]: a nested part keeps its own certainty
+    /// whatever its parent claims.
+    pub fn is_unproven(&self) -> bool {
+        match self {
+            Self::DrainedWithError(error) => error
+                .downcast_ref::<AggregateTransferFailure>()
+                .is_some_and(AggregateTransferFailure::is_unproven),
+            _ => true,
+        }
+    }
+}
+
+/// The error of an aggregate receipt that failed: every failed part, in
+/// order, each with its own typed error.
+///
+/// The aggregate keeps each part's [`anyhow::Error`] whole, so a caller can
+/// still downcast a part's context, for example the re-check capability of a
+/// worker whose reply was lost. Find it with
+/// `error.downcast_ref::<AggregateTransferFailure>()`. Its text is the
+/// optional label, then each part's error (`{:#}`) joined with `"; "`.
+#[derive(Debug)]
+pub struct AggregateTransferFailure {
+    label: Option<String>,
+    parts: Vec<TransferPartFailure>,
+}
+
+impl AggregateTransferFailure {
+    /// An aggregate failure with an optional label before the part errors.
+    pub fn new(label: Option<String>, parts: Vec<TransferPartFailure>) -> Self {
+        Self { label, parts }
+    }
+
+    /// The failed parts, in order.
+    pub fn parts(&self) -> &[TransferPartFailure] {
+        &self.parts
+    }
+
+    /// The label before the part errors, if any.
+    pub fn label(&self) -> Option<&str> {
+        self.label.as_deref()
+    }
+
+    /// Take the failed parts, in order.
+    pub fn into_parts(self) -> Vec<TransferPartFailure> {
+        self.parts
+    }
+
+    /// Whether any part has no drain proof, nested parts included (see
+    /// [`TransferPartFailure::is_unproven`]).
+    pub fn is_unproven(&self) -> bool {
+        self.parts.iter().any(TransferPartFailure::is_unproven)
+    }
+
+    /// The drain outcome of an aggregate whose failed parts are `parts`:
+    /// `Completed` when there are none, `Unproven` when any part is
+    /// unproven, and `DrainedWithError` otherwise.
+    pub fn outcome(label: Option<String>, parts: Vec<TransferPartFailure>) -> TransferDrainOutcome {
+        if parts.is_empty() {
+            return TransferDrainOutcome::Completed;
+        }
+        let failure = Self::new(label, parts);
+        if failure.is_unproven() {
+            TransferDrainOutcome::Unproven(Error::new(failure))
+        } else {
+            TransferDrainOutcome::DrainedWithError(Error::new(failure))
+        }
+    }
+}
+
+impl std::fmt::Display for AggregateTransferFailure {
+    /// The text is built first and then padded, so width, fill, alignment and
+    /// precision apply to it as they did to the joined `String` before.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use std::fmt::Write as _;
+        let mut text = String::new();
+        if let Some(label) = &self.label {
+            write!(text, "{label}: ")?;
+        }
+        for (index, part) in self.parts.iter().enumerate() {
+            if index > 0 {
+                text.push_str("; ");
+            }
+            write!(text, "{:#}", part.error())?;
+        }
+        f.pad(&text)
+    }
+}
+
+impl std::error::Error for AggregateTransferFailure {}
+
 pub enum TransferAwaiter {
     Local(EventAwaiter),
     Aggregate(Pin<Box<dyn Future<Output = TransferDrainOutcome> + Send>>),
@@ -209,7 +340,7 @@ impl TransferCompleteNotification {
 /// then combines synchronous dispatch and asynchronous completion errors.
 async fn await_all_notifications(
     notifications: Vec<TransferCompleteNotification>,
-    mut errors: Vec<Error>,
+    dispatch_errors: Vec<Error>,
 ) -> TransferDrainOutcome {
     let outcomes = futures::future::join_all(
         notifications
@@ -217,42 +348,37 @@ async fn await_all_notifications(
             .map(TransferCompleteNotification::await_drain),
     )
     .await;
-    let mut unproven = false;
-
+    // A synchronous dispatch error launched nothing, so it is drained.
+    let mut parts: Vec<_> = dispatch_errors
+        .into_iter()
+        .map(TransferPartFailure::DrainedWithError)
+        .collect();
     for outcome in outcomes {
         match outcome {
             TransferDrainOutcome::Completed => {}
-            TransferDrainOutcome::DrainedWithError(error) => errors.push(error),
+            TransferDrainOutcome::DrainedWithError(error) => {
+                parts.push(TransferPartFailure::DrainedWithError(error));
+            }
             TransferDrainOutcome::Unproven(error) => {
-                unproven = true;
-                errors.push(error);
+                parts.push(TransferPartFailure::Unproven(error));
             }
         }
     }
-
-    if errors.is_empty() {
-        TransferDrainOutcome::Completed
-    } else if unproven {
-        TransferDrainOutcome::Unproven(anyhow::anyhow!(combined_error_message(&errors)))
-    } else {
-        TransferDrainOutcome::DrainedWithError(anyhow::anyhow!(combined_error_message(&errors)))
-    }
+    AggregateTransferFailure::outcome(None, parts)
 }
 
 fn errors_or_completed(errors: Vec<anyhow::Error>) -> Result<TransferCompleteNotification> {
     if errors.is_empty() {
         Ok(TransferCompleteNotification::completed())
     } else {
-        Err(anyhow::anyhow!(combined_error_message(&errors)))
+        Err(Error::new(AggregateTransferFailure::new(
+            None,
+            errors
+                .into_iter()
+                .map(TransferPartFailure::DrainedWithError)
+                .collect(),
+        )))
     }
-}
-
-fn combined_error_message(errors: &[anyhow::Error]) -> String {
-    errors
-        .iter()
-        .map(|error| format!("{error:#}"))
-        .collect::<Vec<_>>()
-        .join("; ")
 }
 
 impl std::future::IntoFuture for TransferCompleteNotification {
@@ -272,7 +398,10 @@ mod tests {
     use anyhow::{Result, anyhow};
     use velo::EventManager;
 
-    use super::{TransferCompleteNotification, TransferDrainOutcome};
+    use super::{
+        AggregateTransferFailure, TransferCompleteNotification, TransferDrainOutcome,
+        TransferPartFailure,
+    };
 
     #[tokio::test]
     async fn dispatch_error_after_child_drain_preserves_drain_proof() -> Result<()> {
@@ -440,5 +569,167 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    /// A typed context a caller attaches to one part's error.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Worker(u32);
+
+    impl std::fmt::Display for Worker {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "worker {}", self.0)
+        }
+    }
+
+    fn unproven_on(worker: u32) -> TransferCompleteNotification {
+        TransferCompleteNotification::from_drain_future(async move {
+            TransferDrainOutcome::Unproven(anyhow!("lost reply").context(Worker(worker)))
+        })
+    }
+
+    fn workers_of(failure: &AggregateTransferFailure) -> Vec<(bool, Option<Worker>)> {
+        failure
+            .parts()
+            .iter()
+            .map(|part| {
+                (
+                    part.is_unproven(),
+                    part.error().downcast_ref::<Worker>().copied(),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_unproven_aggregate_keeps_every_part_error_typed() -> Result<()> {
+        let events = Arc::new(EventManager::local());
+        let aggregate = TransferCompleteNotification::aggregate_results(
+            vec![
+                Ok(unproven_on(1)),
+                Err(anyhow!("dispatch failed")),
+                Ok(unproven_on(2)),
+            ],
+            &events,
+            &tokio::runtime::Handle::current(),
+        )?;
+
+        let TransferDrainOutcome::Unproven(error) = aggregate.await_drain().await else {
+            panic!("an unproven part keeps the aggregate unproven");
+        };
+        let failure = error
+            .downcast_ref::<AggregateTransferFailure>()
+            .expect("the aggregate error keeps its parts");
+        assert_eq!(
+            workers_of(failure),
+            vec![
+                (false, None),
+                (true, Some(Worker(1))),
+                (true, Some(Worker(2))),
+            ]
+        );
+        assert_eq!(
+            error.to_string(),
+            "dispatch failed; worker 1: lost reply; worker 2: lost reply"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_completed_part_leaves_only_the_unproven_part() -> Result<()> {
+        let events = Arc::new(EventManager::local());
+        let delayed_event = events.new_event()?;
+        let delayed =
+            TransferCompleteNotification::from_awaiter(events.awaiter(delayed_event.handle())?);
+        let aggregate = TransferCompleteNotification::aggregate_results(
+            vec![Ok(delayed), Ok(unproven_on(2))],
+            &events,
+            &tokio::runtime::Handle::current(),
+        )?;
+        delayed_event.trigger()?;
+
+        let TransferDrainOutcome::Unproven(error) = aggregate.await_drain().await else {
+            panic!("an unproven part keeps the aggregate unproven");
+        };
+        let failure = error
+            .downcast_ref::<AggregateTransferFailure>()
+            .expect("the aggregate error keeps its parts");
+        assert_eq!(workers_of(failure), vec![(true, Some(Worker(2)))]);
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_failure_text_is_the_label_and_the_joined_parts() {
+        let failure = AggregateTransferFailure::new(
+            Some("group failed".to_owned()),
+            vec![
+                TransferPartFailure::DrainedWithError(anyhow!("inner").context("outer")),
+                TransferPartFailure::Unproven(anyhow!("lost")),
+            ],
+        );
+        assert_eq!(failure.to_string(), "group failed: outer: inner; lost");
+        assert!(failure.is_unproven());
+    }
+
+    #[tokio::test]
+    async fn aggregate_error_display_preserves_width_and_precision() {
+        let result = TransferCompleteNotification::aggregate_results(
+            vec![Err(anyhow!("worker failed"))],
+            &Arc::new(EventManager::local()),
+            &tokio::runtime::Handle::current(),
+        );
+        let Err(error) = result else {
+            panic!("dispatch failed");
+        };
+        let error: &dyn std::error::Error = error.as_ref();
+
+        assert_eq!(
+            format!("{error:>20.6}"),
+            format!("{:>20.6}", "worker failed")
+        );
+    }
+
+    /// Only an explicitly drained part is a proof. A kind the fold does not
+    /// know keeps the aggregate unproven.
+    #[test]
+    fn an_unknown_part_kind_is_unproven() {
+        let unknown = TransferPartFailure::UnknownForTest(anyhow!("a future kind"));
+        assert!(unknown.is_unproven());
+
+        let only_unknown = AggregateTransferFailure::outcome(None, vec![unknown]);
+        assert!(matches!(only_unknown, TransferDrainOutcome::Unproven(_)));
+
+        let mixed = AggregateTransferFailure::outcome(
+            None,
+            vec![
+                TransferPartFailure::DrainedWithError(anyhow!("drained")),
+                TransferPartFailure::UnknownForTest(anyhow!("a future kind")),
+            ],
+        );
+        assert!(matches!(mixed, TransferDrainOutcome::Unproven(_)));
+    }
+
+    /// A part marked drained that holds an unproven aggregate keeps the
+    /// outer aggregate unproven.
+    #[test]
+    fn a_drained_part_holding_an_unproven_aggregate_is_unproven() {
+        let inner = anyhow::Error::new(AggregateTransferFailure::new(
+            None,
+            vec![TransferPartFailure::Unproven(anyhow!("lost reply"))],
+        ))
+        .context("a nested group");
+        let part = TransferPartFailure::DrainedWithError(inner);
+        assert!(part.is_unproven());
+        assert!(matches!(
+            AggregateTransferFailure::outcome(None, vec![part]),
+            TransferDrainOutcome::Unproven(_)
+        ));
+
+        let drained = TransferPartFailure::DrainedWithError(anyhow::Error::new(
+            AggregateTransferFailure::new(
+                None,
+                vec![TransferPartFailure::DrainedWithError(anyhow!("drained"))],
+            ),
+        ));
+        assert!(!drained.is_unproven());
     }
 }
