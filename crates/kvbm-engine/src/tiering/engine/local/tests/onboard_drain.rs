@@ -114,7 +114,7 @@ pub(super) fn matched_search(
 /// because allocation reuses inactive blocks. Panics if the pool cannot give
 /// out the blocks it reports available, so the reuse checks never pass on an
 /// empty allocation.
-fn reusable_g2_ids(g2: &BlockManager<crate::G2>) -> Vec<BlockId> {
+pub(super) fn reusable_g2_ids(g2: &BlockManager<crate::G2>) -> Vec<BlockId> {
     let available = g2.available_blocks();
     let blocks = g2.allocate_blocks(available).unwrap_or_else(|| {
         panic!("the G2 pool could not allocate its {available} available blocks")
@@ -353,8 +353,11 @@ struct ResourceRestore {
 async fn resource_restore(lose_first_reply: bool) -> Result<ResourceRestore> {
     let pair = create_messenger_pair_tcp().await?;
     let (started, copies) = mpsc::unbounded_channel();
-    let worker_transfers =
-        serve_held_local_transfers(&pair.messenger_b, 0, lose_first_reply, move |resource| {
+    let worker_transfers = serve_held_local_transfers(
+        &pair.messenger_b,
+        0,
+        lose_first_reply,
+        move |resource, _, _| {
             let (proof, receipt) = oneshot::channel();
             started.send((resource, proof))?;
             Ok(TransferCompleteNotification::from_drain_future(
@@ -364,7 +367,8 @@ async fn resource_restore(lose_first_reply: bool) -> Result<ResourceRestore> {
                         .unwrap_or_else(|error| TransferDrainOutcome::Unproven(error.into()))
                 },
             ))
-        })?;
+        },
+    )?;
     let client = VeloWorkerClient::new_for_worker(
         pair.messenger_a.clone(),
         pair.messenger_b.instance_id(),

@@ -23,6 +23,18 @@ Test with two resources. Lose the first reply, prove the first copy drained,
 and hold the second copy open. The sink must wait for the second proof.
 [Resource restore test](../crates/kvbm-engine/src/tiering/engine/local/tests/onboard_drain.rs)
 
+## Stop CD decode pulls when a copy loses its reply
+
+Keep the source pinned and the destination fenced until the worker proves
+the copy drained. End the CD onboard at that proof and preserve the blocks
+that landed. vLLM recomputes the rest, including any runs that were still
+queued. Settle the originating CD session before releasing the fence.
+
+Test with two disjoint remote runs in one availability batch. Lose the first
+run's reply and prove it drained. The second run must never be pulled, and its
+destination must be reported for recompute.
+[CD decode drain tests](../crates/kvbm-engine/src/tiering/engine/local/tests/cd_tests/drain_proof.rs)
+
 ## Keep paused onboard blocks through connector teardown
 
 Keep the engine's pause registry alive while a worker can still touch its
