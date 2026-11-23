@@ -735,16 +735,12 @@ fn scan_resistance_final_sweep_at_least_lru() {
     );
 }
 
-// ---- B5: deep-chain eviction is O(depth), proved by operation count ----
+// ---- B5: unplace iterations during deep-chain eviction ----
 
-/// Draining a deep single-lineage chain via `allocate(len)` must be linear in
-/// the chain depth. We prove it with a **machine-independent operation count**
-/// (not wall-clock): the total prune-loop iterations executed by
-/// `remove_node_at`. A linear leaf-first drain re-leafs one parent per evicted
-/// block, so it does ~1 prune step per block ⇒ total ≈ depth and the 4x-depth
-/// ratio is ≈ 4. An O(depth^2) regression (e.g. re-walking the whole chain per
-/// eviction) would push the ratio toward ~16. Counting operations removes all
-/// timer/CPU-frequency sensitivity, so the band can be tight.
+/// Count loop iterations in `unplace` during a leaf-first drain.
+/// Each eviction visits one node in that loop. A chain four times as deep
+/// should take about four times as many iterations. Sibling scans and child
+/// link writes have separate counters.
 #[test]
 fn deep_chain_eviction_is_operation_count_linear() {
     fn prune_iters_for(depth: u32) -> u64 {
@@ -762,7 +758,7 @@ fn deep_chain_eviction_is_operation_count_linear() {
         for (id, &h) in hashes.iter().enumerate() {
             backend.insert(h, id);
         }
-        // Only count the eviction drain, not the inserts (inserts don't prune).
+        // Start counting before the drain.
         backend.reset_prune_iters();
         let evicted = backend.allocate(hashes.len());
         assert_eq!(evicted.len(), hashes.len(), "the whole chain must evict");
@@ -773,7 +769,7 @@ fn deep_chain_eviction_is_operation_count_linear() {
     let small = prune_iters_for(d);
     let large = prune_iters_for(4 * d);
 
-    // Sanity: linear drain does ~1 prune step per evicted block.
+    // Expect about one `unplace` iteration per evicted block.
     assert!(
         small >= d as u64 && small <= 2 * d as u64,
         "expected ~1 prune step per block: d={d} did {small} prune iterations"

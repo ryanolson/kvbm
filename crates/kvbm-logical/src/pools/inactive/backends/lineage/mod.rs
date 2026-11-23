@@ -174,10 +174,7 @@ pub(crate) struct LineageBackend {
     leaves: LeafPolicy,
     /// Number of `Real` nodes (ghosts excluded).
     count: usize,
-    /// Test-only: total prune-loop iterations executed by `remove_node_at`
-    /// since the last reset. Basis for the machine-independent O(depth)
-    /// amortization proof (see the `trace_tests` deep-chain test). Zero cost
-    /// and absent in non-test builds.
+    /// Test-only count of loop iterations in `unplace` since the last reset.
     #[cfg(test)]
     prune_iters: u64,
     #[cfg(test)]
@@ -1034,15 +1031,12 @@ impl InactiveIndex for LineageBackend {
 
 #[cfg(test)]
 impl LineageBackend {
-    /// Test-only: total prune-loop iterations executed by `remove_node_at`
-    /// since the last [`reset_prune_iters`](Self::reset_prune_iters) — the
-    /// operation-count basis for the O(depth) amortization proof. Visible to
-    /// the sibling `trace_tests` module (hence module-level, not in `tests`).
+    /// Count of loop iterations in `unplace` since the last reset.
     pub(crate) fn prune_iters(&self) -> u64 {
         self.prune_iters
     }
 
-    /// Test-only: reset the prune-iteration counter to zero.
+    /// Reset the `unplace` iteration count.
     pub(crate) fn reset_prune_iters(&mut self) {
         self.prune_iters = 0;
     }
