@@ -25,9 +25,9 @@
 //!
 //! The device's node comes from [`crate::numa::get_device_numa_node`]. The
 //! pages are bound only when NUMA placement is enabled, the node is known,
-//! and the node has CPUs. Otherwise the OS places them, and
-//! [`HostPlacement::fallback`] names the reason ([`PlacementFallback`]). A
-//! node without CPUs is refused because no thread can first-touch there.
+//! the node has CPUs, and the rounded mapping fits its memory budget.
+//! Otherwise the OS places the pages and [`HostPlacement::fallback`] names
+//! the reason. A node without CPUs cannot first-touch the pages locally.
 //!
 //! When the node qualifies, a one-shot thread pinned to it maps the region
 //! and checks the node's memory budget before binding. It then touches every
@@ -445,6 +445,10 @@ impl actions::Memset for MmappedPinnedStorage {
 /// The rounded mapping must fit the remainder. This estimate reserves no pages.
 /// Concurrent allocations, limited reclaim or cgroup limits can still
 /// leave too little memory when first touch faults the pages in.
+///
+/// This entry and [`allocate_pinned_host_regions`] check the budget.
+/// [`MmappedPinnedStorage::allocate`] uses strict binding without a budget
+/// check, including when `kvbm-service` uses it for pool slabs.
 ///
 /// A refused `mbind` is not an error: the same mapping is touched from the
 /// same pinned thread and the OS places it, recorded as

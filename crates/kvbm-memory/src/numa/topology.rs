@@ -273,6 +273,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn node_memory_budget_reads_live_meminfo() {
+        let path = std::path::Path::new("/sys/devices/system/node/node0/meminfo");
+        if !path.try_exists().expect("check node 0 meminfo path") {
+            eprintln!(
+                "Skipping live node meminfo check because {} is absent",
+                path.display()
+            );
+            return;
+        }
+        read_node_meminfo(NumaNode(0)).expect("read live node 0 meminfo");
+    }
+
+    #[test]
     fn test_parse_cpulist_range() {
         let cpus = parse_cpulist("0-3").unwrap();
         assert_eq!(cpus, vec![0, 1, 2, 3]);
