@@ -15,8 +15,8 @@ use super::actions::{EngineWorkerSink, LoadOutcome, SaveOutcome};
 use super::engine::LeaderEngine;
 use super::handles::{FindBlocksHandle, OffloadHandle, OnboardHandle, RequestOffloadDrain};
 use super::protocol::{
-    ActionId, ActionStatus, BlockId, EvictionFence, EvictionOutcome, FenceToken, FindBlocksOutcome,
-    FindBlocksRequest, LeaderEngineError, RequestId, SearchId, SequenceHash,
+    ActionFailure, ActionId, ActionStatus, BlockId, EvictionFence, EvictionOutcome, FenceToken,
+    FindBlocksOutcome, FindBlocksRequest, LeaderEngineError, RequestId, SearchId, SequenceHash,
 };
 
 /// Engine that caches nothing.
@@ -57,7 +57,9 @@ impl LeaderEngine for NoopBlockEngine {
     }
 
     fn poll_action(&self, _id: &ActionId) -> ActionStatus {
-        ActionStatus::Complete
+        // Fail closed: the stand-in tracks no actions, so it cannot prove that
+        // an unknown id has no physical work.
+        ActionStatus::Failed(ActionFailure::AllBlocks)
     }
 
     fn release_search(&self, _id: &SearchId) {}
@@ -106,4 +108,20 @@ impl EngineWorkerSink for NoopWorkerSink {
     fn mark_load_finished(&self, _req: &RequestId, _outcome: LoadOutcome) {}
     fn mark_save_finished(&self, _req: &RequestId, _outcome: SaveOutcome) {}
     fn mark_fence_complete(&self, _token: FenceToken) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The stand-in engine must not report success for an id it never tracked:
+    /// polling cannot prove that no physical work exists for it.
+    #[test]
+    fn poll_action_unknown_id_fails_closed() {
+        let engine = NoopBlockEngine::new();
+        assert_eq!(
+            engine.poll_action(&ActionId::new()),
+            ActionStatus::Failed(ActionFailure::AllBlocks)
+        );
+    }
 }

@@ -934,13 +934,13 @@ mod tests {
         BundleResourceLineage, CacheManifest, ModelIdentity, ResourceRequirement, ResourceRole,
         validate_bundle_lineages,
     };
-    use kvbm_protocols::connector::{ActionId, SearchId};
     use kvbm_protocols::connector::{
-        ActionStatus, BundleOffloadPlan, CacheScope, EvictionFence, EvictionOutcome, FenceHandle,
-        FenceToken, FindBlocksHandle, FindBlocksOutcome, FindBlocksRequest, LeaderEngine,
-        LeaderEngineError, OffloadHandle, OnboardHandle, RequestId, RequestOffloadDrain,
-        ResourceDestination,
+        ActionFailure, ActionStatus, BundleOffloadPlan, CacheScope, EvictionFence, EvictionOutcome,
+        FenceHandle, FenceToken, FindBlocksHandle, FindBlocksOutcome, FindBlocksRequest,
+        LeaderEngine, LeaderEngineError, OffloadHandle, OnboardHandle, RequestId,
+        RequestOffloadDrain, ResourceDestination,
     };
+    use kvbm_protocols::connector::{ActionId, SearchId};
     use kvbm_protocols::disagg::{RemotePrefillParams, SessionEndpoint, TransferParams};
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -4139,7 +4139,7 @@ mod tests {
         }
 
         fn poll_action(&self, _id: &ActionId) -> ActionStatus {
-            ActionStatus::Complete
+            ActionStatus::Failed(ActionFailure::AllBlocks)
         }
 
         fn release_search(&self, id: &SearchId) {

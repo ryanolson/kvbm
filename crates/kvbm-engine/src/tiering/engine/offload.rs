@@ -344,6 +344,12 @@ pub(super) fn build_external_blocks(pairs: &[(SequenceHash, BlockId)]) -> Vec<Ex
 /// best-effort save — the blocks that landed live on in G2). `Failed` →
 /// `Failed`, naming the failed G1 ids when the transfer reports them, else the
 /// whole-request `AllBlocks`.
+///
+/// A non-terminal status is not a normal terminal wait result (`run_offload`
+/// awaits terminal first); it is reachable only when the transfer's status
+/// sender drops without a terminal flip. It fails closed to
+/// `Failed(AllBlocks)` and logs at error level, because no transfer has proven
+/// the save is done.
 pub(super) fn project_offload_status(
     status: TransferStatus,
     failed_blocks: Vec<BlockId>,
@@ -359,11 +365,16 @@ pub(super) fn project_offload_status(
                 })
             }
         }
-        // Non-terminal cannot legitimately reach here (`run_offload` awaits
-        // terminal first); degrade to `Complete` rather than reporting a false
-        // failure.
+        // Not a normal terminal wait result (`run_offload` awaits terminal
+        // first); reachable only when the status sender dropped without a
+        // terminal flip. Fail closed rather than report a false success: no
+        // transfer has proven that the save is done.
         TransferStatus::Evaluating | TransferStatus::Queued | TransferStatus::Transferring => {
-            ActionStatus::Complete
+            tracing::error!(
+                ?status,
+                "offload projected a non-terminal transfer; failing closed to Failed(AllBlocks)"
+            );
+            ActionStatus::Failed(ActionFailure::AllBlocks)
         }
     }
 }
@@ -578,5 +589,28 @@ mod bundle_drain_tests {
         assert_eq!(drain.finish_child(Some(failure.clone())), None);
         assert_eq!(drain.finish_child(None), None);
         assert_eq!(drain.finish_child(None), Some(failure));
+    }
+}
+
+#[cfg(test)]
+mod status_projection_tests {
+    use super::*;
+
+    /// A non-terminal transfer proves nothing about the save: it must fail
+    /// closed instead of projecting `Complete` for work that may still be
+    /// running (or may never have started).
+    #[test]
+    fn nonterminal_transfer_status_fails_closed() {
+        for status in [
+            TransferStatus::Evaluating,
+            TransferStatus::Queued,
+            TransferStatus::Transferring,
+        ] {
+            assert_eq!(
+                project_offload_status(status, vec![]),
+                ActionStatus::Failed(ActionFailure::AllBlocks),
+                "non-terminal {status:?} must not project a successful save"
+            );
+        }
     }
 }

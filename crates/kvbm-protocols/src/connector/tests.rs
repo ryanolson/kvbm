@@ -498,7 +498,7 @@ impl LeaderEngine for FindBlocksReleaseRecorder {
         None
     }
     fn poll_action(&self, _id: &ActionId) -> ActionStatus {
-        ActionStatus::Complete
+        ActionStatus::Failed(ActionFailure::AllBlocks)
     }
     fn release_search(&self, id: &SearchId) {
         self.searches.lock().unwrap().push(*id);

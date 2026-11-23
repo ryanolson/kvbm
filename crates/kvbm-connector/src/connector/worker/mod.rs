@@ -529,13 +529,13 @@ impl ConnectorWorkerInterface for Worker {
 #[cfg(test)]
 mod tests {
     use super::{ConnectorMetadata, ConnectorWorkerInterface, Worker, WorkerLeaderActions};
-    use kvbm_protocols::connector::{ActionId, SearchId};
     use kvbm_protocols::connector::{
-        ActionStatus, BlockId, EvictionFence, EvictionOutcome, FenceToken, FindBlocksHandle,
-        FindBlocksOutcome, FindBlocksRequest, LeaderEngine, LeaderEngineError, LoadOutcome,
-        OffloadHandle, OnboardHandle, RequestId, RequestOffloadDrain, SaveOutcome, SequenceHash,
-        WorkerEngineDriver,
+        ActionFailure, ActionStatus, BlockId, EvictionFence, EvictionOutcome, FenceToken,
+        FindBlocksHandle, FindBlocksOutcome, FindBlocksRequest, LeaderEngine, LeaderEngineError,
+        LoadOutcome, OffloadHandle, OnboardHandle, RequestId, RequestOffloadDrain, SaveOutcome,
+        SequenceHash, WorkerEngineDriver,
     };
+    use kvbm_protocols::connector::{ActionId, SearchId};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -744,7 +744,7 @@ mod tests {
             None
         }
         fn poll_action(&self, _id: &ActionId) -> ActionStatus {
-            ActionStatus::Complete
+            ActionStatus::Failed(ActionFailure::AllBlocks)
         }
         fn release_search(&self, _id: &SearchId) {}
         fn release_action(&self, _action: &ActionId) {}

@@ -129,7 +129,14 @@ async fn poll_does_not_remove_dropped_buffered_save() -> Result<()> {
     let action_id = *handle.id();
     drop(handle);
 
-    assert_eq!(engine.poll_action(&action_id), ActionStatus::Complete);
+    // The handle is dropped while its record is still live (the flush has not
+    // run), so the record's completion cell no longer upgrades. Polling cannot
+    // prove that the dead cell has no physical work, so the unknown status
+    // fails closed instead of reporting `Complete`.
+    assert_eq!(
+        engine.poll_action(&action_id),
+        ActionStatus::Failed(ActionFailure::AllBlocks)
+    );
     assert!(
         engine.actions.contains_key(&action_id),
         "poll must retain pending physical work"
