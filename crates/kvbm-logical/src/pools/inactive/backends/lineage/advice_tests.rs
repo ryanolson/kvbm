@@ -496,7 +496,10 @@ fn interior_nodes_are_advice_visible_but_never_peeked() {
 
     // Resurrect the interior block: it degrades to a Ghost placeholder, which
     // stores no hash and therefore has no advice.
-    assert!(backend.take(c[1].1, c[1].0), "c1 resurrected out");
+    assert!(
+        backend.find_match(c[1].1, false).is_some(),
+        "c1 resurrected out"
+    );
     assert!(
         backend.advice(c[1].1).is_none(),
         "a ghost placeholder is not resident-inactive"

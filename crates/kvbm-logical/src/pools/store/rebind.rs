@@ -131,6 +131,7 @@ impl<T: BlockMetadata> RebindPlan<T> {
                 self.handle.clone(),
             );
             inner.reset_on_release[self.dst] = reset_on_release;
+            inner.parent_hashes[self.dst] = inner.parent_hashes[self.src].take();
             inner.reset_on_release[self.src] = store.default_reset_on_release;
             store.reset_slot_locked(&mut inner, self.src);
             self.armed = false;
@@ -204,6 +205,7 @@ impl<T: BlockMetadata> RebindPlan<T> {
                 self.handle.clone(),
             );
             inner.reset_on_release[self.dst] = reset_on_release;
+            inner.parent_hashes[self.dst] = inner.parent_hashes[self.src].take();
             inner.reset_on_release[self.src] = store.default_reset_on_release;
             store.reset_slot_locked(&mut inner, self.src);
             self.armed = false;
@@ -271,6 +273,7 @@ impl<T: BlockMetadata> RebindPlan<T> {
         inner.slots[self.dst].state = moved_state;
         let reset_on_release = inner.reset_on_release[self.src];
         inner.reset_on_release[self.dst] = reset_on_release;
+        inner.parent_hashes[self.dst] = inner.parent_hashes[self.src].take();
         inner.reset_on_release[self.src] = store.default_reset_on_release;
         if is_primary {
             let previous = inner.active_by_hash.insert(self.seq_hash, self.dst);

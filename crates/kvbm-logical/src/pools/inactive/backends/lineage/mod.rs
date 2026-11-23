@@ -6,14 +6,12 @@
 //!
 //! # Structure
 //!
-//! Every node (real block or out-of-order ghost placeholder) lives in a
-//! single pre-sized `Vec<LineageSlot>` arena addressed by `u32` index.
-//! Inserts reuse freed slots through a free list. The slab and leaf policy
-//! can grow when out-of-order ghosts push the slot count past capacity.
+//! Every node lives in a pre-sized slab. Real nodes represent inactive
+//! blocks, and ghosts represent live blocks. A reset frees the ghost and
+//! moves its children to an ordered waiting table until their parent returns.
 //!
-//! - `parent` / `first_child` / `next_sibling` — an intrusive parent→child
-//!   tree. A single-child chain (the common KV-prefix shape) is just
-//!   `first_child`; branches extend the `next_sibling` chain.
+//! The node's place records its parent slab index or the fragment it waits
+//! for. Child lists and waiting lists share the intrusive sibling link.
 //!
 //! A single `index: HashMap<(position, fragment), u32>` resolves a
 //! `(position, fragment)` pair to a slot — needed because lineage
@@ -45,7 +43,7 @@ mod valued;
 pub(crate) use eviction::LeafPolicy;
 pub use valued::ScorerParams;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::{BuildHasher, Hasher};
 
 use dynamo_tokens::PositionalLineageHash;
@@ -106,11 +104,23 @@ enum SlotData {
         block_id: BlockId,
         seq_hash: SequenceHash,
     },
-    /// Out-of-order placeholder: a parent referenced by a child that was
-    /// inserted before it. Always has at least one child while it exists.
+    /// Placeholder backed by a primary or held block.
     Ghost,
     /// Slot is on the free list; `next_sibling` is the free-list link.
     Free,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Place {
+    Unlinked,
+    Child(u32),
+    Waiting(u64),
+}
+
+#[derive(Clone, Copy)]
+enum Removal {
+    Keep,
+    Evict,
 }
 
 /// One arena slot. Graph edges are `u32` slab indices. `position` /
@@ -122,9 +132,7 @@ struct LineageSlot {
     data: SlotData,
     position: u64,
     fragment: u64,
-    /// Parent node's slot index (real or ghost). `None` for a root
-    /// (`position == 0`) or a not-yet-linked node.
-    parent: Option<u32>,
+    place: Place,
     /// Head of this node's intrusive child list.
     first_child: Option<u32>,
     /// Next sibling in the parent's child list. Reused as the free-list
@@ -133,6 +141,17 @@ struct LineageSlot {
 }
 
 impl LineageSlot {
+    fn key(&self) -> (u64, u64) {
+        (self.position, self.fragment)
+    }
+
+    fn parent(&self) -> Option<u32> {
+        match self.place {
+            Place::Child(parent) => Some(parent),
+            _ => None,
+        }
+    }
+
     fn is_leaf(&self) -> bool {
         self.first_child.is_none()
     }
@@ -147,6 +166,8 @@ pub(crate) struct LineageBackend {
     index: IndexMap,
     /// Largest clean entry capacity observed so far.
     index_full: usize,
+    /// Missing parent key to the head of its waiting list.
+    waiting: BTreeMap<(u64, u64), u32>,
     /// Pluggable leaf-eviction ordering. The backend feeds it the
     /// inserted / leaf-added / leaf-demoted / removed transitions and asks
     /// it for the next eviction victim.
@@ -159,6 +180,10 @@ pub(crate) struct LineageBackend {
     /// and absent in non-test builds.
     #[cfg(test)]
     prune_iters: u64,
+    #[cfg(test)]
+    list_steps: usize,
+    #[cfg(test)]
+    child_writes: usize,
 }
 
 impl Default for LineageBackend {
@@ -190,10 +215,15 @@ impl LineageBackend {
             free_head: None,
             index_full: index.capacity(),
             index,
+            waiting: BTreeMap::new(),
             leaves,
             count: 0,
             #[cfg(test)]
             prune_iters: 0,
+            #[cfg(test)]
+            list_steps: 0,
+            #[cfg(test)]
+            child_writes: 0,
         }
     }
 
@@ -231,29 +261,145 @@ impl LineageBackend {
         self.free_head = Some(idx);
     }
 
-    // ---- child list ----
-
-    /// Remove `child` from `parent`'s intrusive child list. O(siblings) —
-    /// KV-prefix branch factors are small.
-    fn detach_child(&mut self, parent: u32, child: u32) {
-        let head = self.slots[parent as usize].first_child;
-        if head == Some(child) {
-            self.slots[parent as usize].first_child = self.slots[child as usize].next_sibling;
-            return;
-        }
-        let mut cur = head;
-        while let Some(c) = cur {
-            let next = self.slots[c as usize].next_sibling;
-            if next == Some(child) {
-                self.slots[c as usize].next_sibling = self.slots[child as usize].next_sibling;
-                return;
+    /// Unlink one node and return the list's new head.
+    fn unlink_sibling(&mut self, head: u32, index: u32) -> Option<u32> {
+        let mut current = head;
+        let mut previous = None;
+        loop {
+            #[cfg(test)]
+            {
+                self.list_steps += 1;
             }
-            cur = next;
+            if current == index {
+                break;
+            }
+            previous = Some(current);
+            current = self.slots[current as usize]
+                .next_sibling
+                .expect("node missing from its lineage list");
         }
-        debug_assert!(
-            false,
-            "detach_child: {child} not found under parent {parent}"
-        );
+        let next = self.slots[index as usize].next_sibling.take();
+        if let Some(previous) = previous {
+            self.slots[previous as usize].next_sibling = next;
+            Some(head)
+        } else {
+            next
+        }
+    }
+
+    fn adopt_waiting(&mut self, parent: u32) {
+        let key = self.slots[parent as usize].key();
+        let head = self.waiting.remove(&key);
+        self.slots[parent as usize].first_child = head;
+        let mut child = head;
+        while let Some(index) = child {
+            let slot = &mut self.slots[index as usize];
+            slot.place = Place::Child(parent);
+            child = slot.next_sibling;
+        }
+    }
+
+    fn release_children(&mut self, parent: u32) {
+        let slot = &mut self.slots[parent as usize];
+        let key = slot.key();
+        let Some(head) = slot.first_child.take() else {
+            return;
+        };
+        let mut child = Some(head);
+        while let Some(index) = child {
+            let slot = &mut self.slots[index as usize];
+            slot.place = Place::Waiting(key.1);
+            child = slot.next_sibling;
+            #[cfg(test)]
+            {
+                self.child_writes += 1;
+            }
+        }
+        let previous = self.waiting.insert(key, head);
+        debug_assert!(previous.is_none());
+    }
+
+    fn place_node(&mut self, index: u32, key: (u64, u64)) {
+        if let Some(&parent) = self.index.get(&key) {
+            let head = self.slots[parent as usize].first_child.replace(index);
+            let slot = &mut self.slots[index as usize];
+            slot.place = Place::Child(parent);
+            slot.next_sibling = head;
+            if head.is_none() && matches!(self.slots[parent as usize].data, SlotData::Real { .. }) {
+                self.leaves.on_leaf_demoted(parent);
+            }
+        } else {
+            let slot = &mut self.slots[index as usize];
+            slot.place = Place::Waiting(key.1);
+            slot.next_sibling = self.waiting.insert(key, index);
+        }
+    }
+
+    /// A childless ghost stays in the index while its backing block is live.
+    /// Unlink it so it does not keep its ancestors out of the leaf order.
+    fn unplace(&mut self, mut index: u32) {
+        loop {
+            #[cfg(test)]
+            {
+                self.prune_iters += 1;
+            }
+            let slot = &mut self.slots[index as usize];
+            match std::mem::replace(&mut slot.place, Place::Unlinked) {
+                Place::Unlinked => return,
+                Place::Waiting(fragment) => {
+                    let key = (slot.position - 1, fragment);
+                    let head = self.waiting[&key];
+                    match self.unlink_sibling(head, index) {
+                        None => {
+                            self.waiting.remove(&key);
+                        }
+                        Some(next) if next != head => {
+                            self.waiting.insert(key, next);
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+                Place::Child(parent) => {
+                    let head = self.slots[parent as usize]
+                        .first_child
+                        .expect("linked child");
+                    let next = self.unlink_sibling(head, index);
+                    let parent_slot = &mut self.slots[parent as usize];
+                    parent_slot.first_child = next;
+                    if next.is_some() {
+                        return;
+                    }
+                    if matches!(parent_slot.data, SlotData::Real { .. }) {
+                        self.leaves.on_leaf_added(parent);
+                        return;
+                    }
+                    debug_assert!(matches!(parent_slot.data, SlotData::Ghost));
+                    index = parent;
+                }
+            }
+        }
+    }
+
+    fn remove_slot(&mut self, index: u32) {
+        self.release_children(index);
+        self.unplace(index);
+        self.index.remove(&self.slots[index as usize].key());
+        self.free_slot(index);
+    }
+
+    fn add_node(&mut self, key: (u64, u64), data: SlotData) -> u32 {
+        let index = self.alloc_slot(LineageSlot {
+            data,
+            position: key.0,
+            fragment: key.1,
+            place: Place::Unlinked,
+            first_child: None,
+            next_sibling: None,
+        });
+        self.index.insert(key, index);
+        self.adopt_waiting(index);
+        index
     }
 
     // ---- core mutation ----
@@ -310,57 +456,19 @@ impl LineageBackend {
                 idx
             }
             None => {
-                let idx = self.alloc_slot(LineageSlot {
-                    data: SlotData::Real { block_id, seq_hash },
-                    position,
-                    fragment,
-                    parent: None,
-                    first_child: None,
-                    next_sibling: None,
-                });
-                self.index.insert((position, fragment), idx);
+                let idx =
+                    self.add_node((position, fragment), SlotData::Real { block_id, seq_hash });
                 self.count += 1;
                 self.leaves.on_node_inserted(idx, seq_hash);
                 idx
             }
         };
 
-        // 2. Link to parent (creating a ghost parent if it does not exist
-        //    yet). A fresh node and a just-promoted ghost both have
-        //    `parent == None` here, so this links exactly once.
-        if let Some(p_frag) = parent_fragment
-            && self.slots[node_idx as usize].parent.is_none()
+        // A ghost that already has a place keeps it when promoted.
+        if let Some(fragment) = parent_fragment
+            && self.slots[node_idx as usize].place == Place::Unlinked
         {
-            let p_pos = position - 1;
-            let parent_idx = match self.index.get(&(p_pos, p_frag)) {
-                Some(&pidx) => pidx,
-                None => {
-                    let pidx = self.alloc_slot(LineageSlot {
-                        data: SlotData::Ghost,
-                        position: p_pos,
-                        fragment: p_frag,
-                        parent: None,
-                        first_child: None,
-                        next_sibling: None,
-                    });
-                    self.index.insert((p_pos, p_frag), pidx);
-                    pidx
-                }
-            };
-
-            let parent_was_leaf = self.slots[parent_idx as usize].is_leaf();
-            // Prepend node_idx into parent's child list.
-            self.slots[node_idx as usize].parent = Some(parent_idx);
-            self.slots[node_idx as usize].next_sibling =
-                self.slots[parent_idx as usize].first_child;
-            self.slots[parent_idx as usize].first_child = Some(node_idx);
-
-            // A Real parent that was a leaf is now an interior node.
-            if parent_was_leaf
-                && matches!(self.slots[parent_idx as usize].data, SlotData::Real { .. })
-            {
-                self.leaves.on_leaf_demoted(parent_idx);
-            }
+            self.place_node(node_idx, (position - 1, fragment));
         }
 
         // 3. If this node is a Real leaf, it enters the eviction order.
@@ -380,22 +488,21 @@ impl LineageBackend {
     fn remove_by_hash(
         &mut self,
         lineage_hash: &PositionalLineageHash,
+        removal: Removal,
     ) -> Option<(SequenceHash, BlockId)> {
         let position = lineage_hash.position();
         let fragment = lineage_hash.parent_fragment_for_child_position(position + 1);
         let idx = *self.index.get(&(position, fragment))?;
         match self.slots[idx as usize].data {
             SlotData::Real { seq_hash, .. } if seq_hash == *lineage_hash => {
-                Some(self.remove_node_at(idx))
+                Some(self.remove_node_at(idx, removal))
             }
             _ => None,
         }
     }
 
-    /// Turn the `Real` node at `idx` into a `Ghost`, then iteratively prune
-    /// any now-childless ghost up the parent chain. Returns the evicted
-    /// `(seq_hash, block_id)`.
-    fn remove_node_at(&mut self, idx: u32) -> (SequenceHash, BlockId) {
+    /// Keep the slot on a cache hit or hold. Eviction frees it.
+    fn remove_node_at(&mut self, idx: u32, removal: Removal) -> (SequenceHash, BlockId) {
         let payload = match std::mem::replace(&mut self.slots[idx as usize].data, SlotData::Ghost) {
             SlotData::Real { seq_hash, block_id } => (seq_hash, block_id),
             _ => unreachable!("remove_node_at called on a non-Real slot"),
@@ -405,49 +512,10 @@ impl LineageBackend {
         // (no-op if it was an interior node) and clear its policy state.
         self.leaves.on_node_removed(idx);
 
-        // Prune: a childless Ghost is removed from the graph entirely; if
-        // that orphans its parent, recurse. A node that still has children
-        // simply stays as a Ghost.
-        let mut cur = idx;
-        loop {
-            #[cfg(test)]
-            {
-                self.prune_iters += 1;
-            }
-            if self.slots[cur as usize].first_child.is_some() {
-                break;
-            }
-            let parent = self.slots[cur as usize].parent;
-            let key = (
-                self.slots[cur as usize].position,
-                self.slots[cur as usize].fragment,
-            );
-            if let Some(p) = parent {
-                self.detach_child(p, cur);
-            }
-            self.index.remove(&key);
-            self.free_slot(cur);
-
-            match parent {
-                None => break,
-                Some(p) => {
-                    if self.slots[p as usize].first_child.is_some() {
-                        break; // parent still has other children
-                    }
-                    match self.slots[p as usize].data {
-                        SlotData::Real { .. } => {
-                            // Parent is a Real leaf again — back into the
-                            // eviction order.
-                            self.leaves.on_leaf_added(p);
-                            break;
-                        }
-                        SlotData::Ghost => {
-                            cur = p; // childless ghost — prune it too
-                        }
-                        SlotData::Free => unreachable!("parent slot is free"),
-                    }
-                }
-            }
+        match removal {
+            Removal::Keep if self.slots[idx as usize].is_leaf() => self.unplace(idx),
+            Removal::Keep => {}
+            Removal::Evict => self.remove_slot(idx),
         }
         payload
     }
@@ -490,7 +558,7 @@ impl LineageBackend {
                 break; // shared branch point — never poisoned
             }
             self.leaves.mark_poisoned(cur);
-            match self.slots[cur as usize].parent {
+            match self.slots[cur as usize].parent() {
                 Some(parent) => cur = parent,
                 None => break,
             }
@@ -542,6 +610,30 @@ impl LineageBackend {
 }
 
 impl InactiveIndex for LineageBackend {
+    fn live_added(&mut self, hash: SequenceHash) {
+        let position = hash.position();
+        let key = (
+            position,
+            hash.parent_fragment_for_child_position(position + 1),
+        );
+        if !self.index.contains_key(&key) {
+            self.add_node(key, SlotData::Ghost);
+        }
+    }
+
+    fn forget_live(&mut self, hash: SequenceHash) {
+        let position = hash.position();
+        let key = (
+            position,
+            hash.parent_fragment_for_child_position(position + 1),
+        );
+        if let Some(&index) = self.index.get(&key)
+            && matches!(self.slots[index as usize].data, SlotData::Ghost)
+        {
+            self.remove_slot(index);
+        }
+    }
+
     fn grow_capacity(&mut self, capacity: usize) {
         // Tombstones can lower the reported capacity without freeing buckets.
         self.index_full = self.index_full.max(self.index.capacity());
@@ -568,6 +660,92 @@ impl InactiveIndex for LineageBackend {
         ))
     }
 
+    #[cfg(test)]
+    fn audit_lineage(
+        &self,
+        live_keys: &std::collections::HashSet<(u64, u64)>,
+        inactive: &std::collections::HashSet<(SequenceHash, BlockId)>,
+        registered: usize,
+        collisions: bool,
+    ) -> Option<crate::pools::store::LineageAudit> {
+        use std::collections::HashSet;
+
+        let mut actual_inactive = HashSet::new();
+        let mut linked = HashSet::new();
+        let mut leaves = HashSet::new();
+        let mut ghosts = 0;
+        for (&key, &index) in &self.index {
+            let slot = &self.slots[index as usize];
+            assert_eq!(key, slot.key());
+            match slot.data {
+                SlotData::Ghost => {
+                    assert!(live_keys.contains(&key), "unowned ghost at {key:?}");
+                    assert!(!slot.is_leaf() || slot.place == Place::Unlinked);
+                    ghosts += 1;
+                }
+                SlotData::Real { seq_hash, block_id } => {
+                    assert!(actual_inactive.insert((seq_hash, block_id)));
+                    if slot.is_leaf() {
+                        leaves.insert(index);
+                    }
+                    if !collisions && slot.position > 0 {
+                        let fragment = seq_hash.parent_hash_fragment();
+                        let expected = self
+                            .index
+                            .get(&(slot.position - 1, fragment))
+                            .map_or(Place::Waiting(fragment), |&parent| Place::Child(parent));
+                        assert_eq!(slot.place, expected);
+                    }
+                }
+                SlotData::Free => panic!("index points to a free slot"),
+            }
+            if slot.place == Place::Unlinked {
+                assert!(slot.next_sibling.is_none());
+            }
+            let mut child = slot.first_child;
+            while let Some(child_index) = child {
+                let child_slot = &self.slots[child_index as usize];
+                assert_eq!(child_slot.position, slot.position + 1);
+                assert_eq!(child_slot.place, Place::Child(index));
+                assert!(linked.insert(child_index), "repeated child link");
+                child = child_slot.next_sibling;
+            }
+        }
+        for (&key, &head) in &self.waiting {
+            assert!(!self.index.contains_key(&key));
+            let mut next = Some(head);
+            while let Some(index) = next {
+                let slot = &self.slots[index as usize];
+                assert_eq!(slot.position, key.0 + 1);
+                assert_eq!(slot.place, Place::Waiting(key.1));
+                assert!(linked.insert(index), "repeated waiting link");
+                next = slot.next_sibling;
+            }
+        }
+        for (index, slot) in self.slots.iter().enumerate() {
+            if !matches!(slot.data, SlotData::Free) {
+                let index = index as u32;
+                assert_eq!(self.index.get(&slot.key()), Some(&index));
+                assert_eq!(linked.contains(&index), slot.place != Place::Unlinked);
+            }
+        }
+        assert_eq!(&actual_inactive, inactive);
+        assert_eq!(actual_inactive.len(), self.count);
+        assert_eq!(self.index.len(), actual_inactive.len() + ghosts);
+        assert!(self.index.len() <= registered);
+        assert_eq!(self.leaves.len(), leaves.len());
+        for leaf in self.leaves.peek_slots(leaves.len()) {
+            assert!(leaves.remove(&leaf), "repeated or ineligible policy entry");
+        }
+        Some(crate::pools::store::LineageAudit {
+            nodes: self.index.len(),
+            ghosts,
+            waiting_keys: self.waiting.len(),
+            list_steps: self.list_steps,
+            child_writes: self.child_writes,
+        })
+    }
+
     fn find_matches(
         &mut self,
         hashes: &[SequenceHash],
@@ -575,7 +753,7 @@ impl InactiveIndex for LineageBackend {
     ) -> Vec<(SequenceHash, BlockId)> {
         let mut matches = Vec::with_capacity(hashes.len());
         for hash in hashes {
-            if let Some(pair) = self.remove_by_hash(hash) {
+            if let Some(pair) = self.remove_by_hash(hash, Removal::Keep) {
                 matches.push(pair);
             } else {
                 break;
@@ -585,7 +763,7 @@ impl InactiveIndex for LineageBackend {
     }
 
     fn find_match(&mut self, hash: SequenceHash, _touch: bool) -> Option<(SequenceHash, BlockId)> {
-        self.remove_by_hash(&hash)
+        self.remove_by_hash(&hash, Removal::Keep)
     }
 
     fn scan_matches(
@@ -595,7 +773,7 @@ impl InactiveIndex for LineageBackend {
     ) -> Vec<(SequenceHash, BlockId)> {
         let mut matches = Vec::new();
         for hash in hashes {
-            if let Some(pair) = self.remove_by_hash(hash) {
+            if let Some(pair) = self.remove_by_hash(hash, Removal::Keep) {
                 matches.push(pair);
             }
         }
@@ -608,7 +786,7 @@ impl InactiveIndex for LineageBackend {
             // Next leaf in policy order. `remove_node_at` drops it from the
             // policy and may expose its parent as the next victim.
             match self.leaves.next_victim() {
-                Some(idx) => allocated.push(self.remove_node_at(idx)),
+                Some(idx) => allocated.push(self.remove_node_at(idx, Removal::Evict)),
                 None => break,
             }
         }
@@ -683,7 +861,7 @@ impl InactiveIndex for LineageBackend {
             }
         });
         if hit {
-            self.remove_by_hash(&seq_hash).is_some()
+            self.remove_by_hash(&seq_hash, Removal::Evict).is_some()
         } else {
             false
         }
@@ -732,7 +910,7 @@ impl InactiveIndex for LineageBackend {
 
         order
             .into_iter()
-            .map(|idx| self.remove_node_at(idx))
+            .map(|idx| self.remove_node_at(idx, Removal::Evict))
             .collect()
     }
 
@@ -918,6 +1096,12 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn lineage_place_keeps_the_slab_cell_at_80_bytes() {
+        assert_eq!(std::mem::size_of::<LineageSlot>(), 80);
+    }
+
     #[test]
     fn lineage_policy_grows_with_slab() {
         const CAPACITY: usize = 4;
@@ -944,12 +1128,13 @@ mod tests {
                 trace.push(capacities(&backend));
             }
 
-            // The child uses slot 3 and its ghost parent uses slot 4.
+            // The child waits in slot 3. Register its parent in slot 4.
             backend.insert(child, 3);
+            backend.live_added(parent);
             assert_eq!(backend.slots.len(), 5);
             trace.push(capacities(&backend));
             for hash in &roots[..2] {
-                assert!(backend.remove_by_hash(hash).is_some());
+                assert!(backend.remove_by_hash(hash, Removal::Evict).is_some());
                 trace.push(capacities(&backend));
             }
 
@@ -1178,7 +1363,7 @@ mod tests {
         backend.insert(h1, id1);
         assert_eq!(backend.len(), 1);
 
-        let removed = backend.remove_by_hash(&h1);
+        let removed = backend.remove_by_hash(&h1, Removal::Evict);
         assert!(removed.is_some());
         assert_eq!(removed.unwrap().1, 0);
         assert_eq!(backend.len(), 0);
@@ -1199,7 +1384,7 @@ mod tests {
         assert_eq!(backend.len(), depth);
         assert_eq!(backend.get_queue_len(), 1);
 
-        backend.remove_by_hash(&last_hash);
+        backend.remove_by_hash(&last_hash, Removal::Evict);
 
         assert_eq!(backend.len(), depth - 1);
         assert_eq!(backend.get_queue_len(), 1);
@@ -1213,7 +1398,7 @@ mod tests {
 
         assert_eq!(backend.len(), 1);
 
-        backend.remove_by_hash(&leaf_h);
+        backend.remove_by_hash(&leaf_h, Removal::Evict);
 
         assert_eq!(backend.len(), 0);
         assert!(backend.is_graph_empty());
@@ -1278,7 +1463,7 @@ mod tests {
         );
 
         assert!(
-            backend.remove_by_hash(&impostor).is_none(),
+            backend.remove_by_hash(&impostor, Removal::Evict).is_none(),
             "remove_by_hash matched impostor PLH and deleted stored block"
         );
         assert_eq!(backend.len(), 1);
@@ -1294,7 +1479,7 @@ mod tests {
         assert!(!backend.take(impostor, 42));
         assert_eq!(backend.len(), 1);
 
-        let removed = backend.remove_by_hash(&stored);
+        let removed = backend.remove_by_hash(&stored, Removal::Evict);
         assert_eq!(removed, Some((stored, 42)));
         assert_eq!(backend.len(), 0);
         assert!(backend.is_graph_empty());
@@ -1345,7 +1530,7 @@ mod tests {
 
         // Remove A1 → A0 re-becomes a leaf and goes to the TAIL:
         // FIFO is now [B1, A0], not [A0, B1].
-        assert!(backend.remove_by_hash(&a1_h).is_some());
+        assert!(backend.remove_by_hash(&a1_h, Removal::Evict).is_some());
         let _ = a0_id;
         let _ = b0_id;
 
@@ -1554,7 +1739,10 @@ mod tests {
         }
         // Resurrect the interior b1: it becomes a Ghost (still has child b2), so the chain
         // is now b2(Real leaf) -> ghost(b1) -> b0(Real root).
-        assert!(backend.take(chain[1].1, chain[1].0), "b1 resurrected out");
+        assert!(
+            backend.find_match(chain[1].1, false).is_some(),
+            "b1 resurrected out"
+        );
 
         backend.poison(chain[2].1);
         assert!(backend.test_is_poisoned(chain[2].1), "the leaf is poisoned");

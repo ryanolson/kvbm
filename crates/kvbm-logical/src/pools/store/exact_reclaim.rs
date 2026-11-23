@@ -69,11 +69,7 @@ impl<T: BlockMetadata> BlockStore<T> {
         {
             return Err(ExactReclaimNameError::StaleCandidate);
         }
-        if inner
-            .inactive
-            .complete_lineage(seq_hash, block_id)
-            .is_none()
-        {
+        if inner.verified_lineage(seq_hash, block_id).is_none() {
             return Err(ExactReclaimNameError::NotCompleteInactiveEntry);
         }
         Ok(ExactReclaimEntryPlan::new(
@@ -122,9 +118,7 @@ impl<T: BlockMetadata> BlockStore<T> {
                 }
             }
 
-            let Some(source_blocks) = inner
-                .inactive
-                .complete_lineage(entry.leaf_hash, entry.leaf_block_id)
+            let Some(source_blocks) = inner.verified_lineage(entry.leaf_hash, entry.leaf_block_id)
             else {
                 return Err(ExactReclaimRefreshError::EntryUnavailable { index: entry_index });
             };

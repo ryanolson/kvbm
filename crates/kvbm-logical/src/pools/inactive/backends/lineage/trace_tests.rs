@@ -208,6 +208,7 @@ impl Harness {
     /// evicted or reused-away without being re-cached).
     fn remove(&mut self, hash: SequenceHash) {
         if let Some((h, _id)) = self.backend.find_match(hash, false) {
+            self.backend.forget_live(h);
             self.oracle.on_block_removed(h);
             self.registered.remove(&h.as_u128());
         }

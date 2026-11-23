@@ -83,7 +83,7 @@ impl LineageBackend {
         child_position: usize,
         plan_positions: &HashMap<u32, usize>,
     ) -> Result<(), ExactReclaimPlanError> {
-        let mut parent = self.slots[index as usize].parent;
+        let mut parent = self.slots[index as usize].parent();
         while let Some(parent_index) = parent {
             match self.slots[parent_index as usize].data {
                 SlotData::Real { block_id, .. } => {
@@ -106,7 +106,7 @@ impl LineageBackend {
                     unreachable!("a lineage ancestor cannot be a free slot")
                 }
             }
-            parent = self.slots[parent_index as usize].parent;
+            parent = self.slots[parent_index as usize].parent();
         }
         Ok(())
     }
@@ -172,7 +172,7 @@ impl LineageBackend {
             self.complete_lineage_indices(seq_hash, block_id)?;
 
         for index in indices_leaf_first {
-            self.remove_node_at(index);
+            self.remove_node_at(index, super::Removal::Keep);
         }
         Some(source_blocks)
     }
@@ -205,7 +205,7 @@ impl LineageBackend {
                 return None;
             }
             indices_leaf_first.push(index);
-            current = slot.parent;
+            current = slot.parent();
             if current.is_none() && slot.position != 0 {
                 return None;
             }

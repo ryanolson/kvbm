@@ -51,3 +51,13 @@ can fail after the backend starts accessing the bounce buffer.
 Test by failing the status reservation on a staged read. Check that
 dispatch returns the reservation error before NIXL posts a request.
 [Staged status test](../crates/kvbm-physical/src/transfer/tests/planner_nixl.rs)
+
+## Drop the mutex guard before an if let body can re-enter
+
+An `if let` scrutinee can keep a temporary mutex guard alive through the
+matching body. Copy or take the value in a separate statement before that
+body calls code that can take the same lock or wait for another thread.
+
+Test both orders of a reset and re-registration marker update. Pause each
+operation after it releases the store mutex and verify that the other can
+reach its own pause. [Presence ordering test](../crates/kvbm-logical/src/manager/tests/lineage_ghosts.rs)
