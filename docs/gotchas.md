@@ -42,10 +42,11 @@ the logical terminal, then settle the physical terminal before cleanup.
 Connector release can race cleanup as soon as it sees a terminal. Without
 the stash it can finalize the session and tell the decode peer it succeeded.
 
-Test by blocking the worker sink on the failed terminal and releasing the
-prefill lifecycle while the kick task is still in the sink. The release
-must find the stash and close the session.
-[Prefill release test](../crates/kvbm-engine/src/tiering/engine/local.rs)
+Test by releasing the prefill lifecycle as soon as the handle's logical
+terminal is visible, while the physical fence is still pending. The release
+must find the failure stash and close the session. The worker sink runs
+after the physical terminal.
+[Prefill logical-terminal test](../crates/kvbm-engine/src/tiering/engine/local/tests/cd_tests/prefill_drain.rs)
 
 ## Keep paused onboard blocks through connector teardown
 

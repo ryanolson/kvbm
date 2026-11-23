@@ -774,6 +774,9 @@ impl LocalConnectorEngine {
         state: Arc<PrefillRequestState>,
         kick: PrefillKick,
     ) {
+        // USAA rejects a second onboard before minting an action. The USAA
+        // and pipeline owners take the only kick from the same gate, leaving
+        // one caller to win this claim for the generation.
         if !state.claim_kick() {
             return;
         }

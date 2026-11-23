@@ -283,6 +283,57 @@ async fn cd_prefill_kick_pauses_when_the_worker_reply_is_lost() -> Result<()> {
 }
 
 #[tokio::test]
+async fn cd_prefill_kick_stashes_failure_before_logical_terminal() -> Result<()> {
+    let mut prefill = PrefillDrain::prepare(true).await?;
+    let (handle, kick, fence) = prefill.onboard_until_paused().await?;
+    let state = prefill.state().expect("prefill lifecycle latched");
+    let action = *handle.id();
+    let engine = Arc::downgrade(&prefill.engine);
+    let (observe, observed) = oneshot::channel();
+    prefill
+        .engine
+        .actions
+        .get_mut(&action)
+        .expect("the paused action is retained")
+        .on_logical_load_terminal = Some(Box::new(move || {
+        let engine = engine.upgrade().expect("the test owns the engine");
+        let status = engine.poll_action(&action);
+        let physical_pending = engine.actions.get(&action).unwrap().physical_pending;
+        let stash = state.pending_failure();
+        // Release at the first point where the connector can see failure.
+        engine.release_prefill_session(&"rq".into(), state.accept_id());
+        assert!(observe.send((status, physical_pending, stash)).is_ok());
+    }));
+
+    prefill.prove(&handle, kick, kick_error()).await;
+    let (status, physical_pending, stash) =
+        tokio::time::timeout(Duration::from_secs(5), observed).await??;
+    assert_eq!(
+        status,
+        ActionStatus::Failed(ActionFailure::Partial {
+            block_ids: EXTERNAL.to_vec(),
+        })
+    );
+    assert!(
+        physical_pending,
+        "the release races before the physical terminal"
+    );
+    assert_eq!(
+        stash.as_deref(),
+        Some("prefill onboard kick failed"),
+        "the logical terminal must already have a failure stash"
+    );
+    eventually("the worker sees the kick's physical terminal", || {
+        fence.is_complete() && !prefill.sink.loads().is_empty()
+    })
+    .await;
+    assert!(prefill.state().is_none());
+    assert!(prefill.session.closed_reason().is_some());
+    assert!(prefill.session.finished_reason().is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn cd_prefill_kick_completed_recheck_keeps_output_session_parked() -> Result<()> {
     let mut prefill = PrefillDrain::prepare(true).await?;
     let (handle, kick, fence) = prefill.onboard_until_paused().await?;
