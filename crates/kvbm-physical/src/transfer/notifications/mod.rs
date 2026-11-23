@@ -24,7 +24,7 @@ pub mod notification;
 
 pub use cuda_event::CudaEventChecker;
 pub use nixl_events::{RegisterNixlNotification, process_nixl_notification_events};
-pub use nixl_status::NixlStatusChecker;
+pub(crate) use nixl_status::{NixlRequestHold, NixlStatusChecker};
 pub use notification::{
     AggregateTransferFailure, TransferCompleteNotification, TransferDrainOutcome,
     TransferPartFailure,
@@ -35,6 +35,8 @@ pub use notification::{
 pub trait CompletionChecker: Send {
     /// Returns true if the transfer is complete, false if still pending.
     fn is_complete(&self) -> Result<bool>;
+
+    fn completion_notified(&self) {}
 }
 
 /// Per-worker telemetry for a single NIXL transfer, threaded from the
@@ -228,6 +230,8 @@ pub async fn process_polling_notifications<C: CompletionChecker>(
                                         error = %e,
                                         "Failed to trigger completion event"
                                     );
+                                } else {
+                                    transfer.checker.completion_notified();
                                 }
                             }
                             Err(e) => {
@@ -268,7 +272,9 @@ pub async fn process_polling_notifications<C: CompletionChecker>(
                 }
                 match result {
                     Ok(()) => {
-                        let _ = system.trigger(transfer.event_handle);
+                        if system.trigger(transfer.event_handle).is_ok() {
+                            transfer.checker.completion_notified();
+                        }
                     }
                     Err(e) => {
                         let _ = system.poison(transfer.event_handle, e.to_string());

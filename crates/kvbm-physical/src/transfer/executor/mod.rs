@@ -283,7 +283,7 @@ impl TransferOptionsInternalBuilder {
 /// A dispatch error means no copy was submitted. Once a copy may have
 /// started, the receipt reports any error and whether the work drained.
 ///
-////// # Arguments
+/// # Arguments
 /// * `src` - Source physical layout
 /// * `dst` - Destination physical layout
 /// * `src_block_ids` - Source block IDs to transfer

@@ -473,14 +473,9 @@ pub(crate) fn execute_planner_nixl_transfer(
     let xfer_req = nixl_agent.create_xfer_req(xfer_op, &src_dl, &dst_dl, remote_agent, None)?;
     let tel_ctrl_us = t_ctrl0.elapsed().as_micros() as u64;
     let t_post0 = std::time::Instant::now();
-    let (xfer_req, guards) = match post_transfer(
-        nixl_agent,
-        xfer_req,
-        guards,
-        ctx.observability().map(|obs| obs.as_ref()),
-    ) {
-        PostResult::Pending(request, guards) => (Some(request), guards),
-        PostResult::Completed => (None, Vec::new()),
+    let hold = match post_transfer(nixl_agent, xfer_req, guards, ctx.observability()) {
+        PostResult::Pending(hold) => Some(hold),
+        PostResult::Completed => None,
         PostResult::Unproven(receipt) => return Ok(receipt),
     };
     let tel_post_us = t_post0.elapsed().as_micros() as u64;
@@ -527,8 +522,8 @@ pub(crate) fn execute_planner_nixl_transfer(
         submitted_at: tel_submitted_at,
     };
 
-    if let Some(xfer_req) = xfer_req {
-        Ok(ctx.register_nixl_status(xfer_req, Some(telemetry), registration, guards))
+    if let Some(hold) = hold {
+        Ok(ctx.register_nixl_status(hold, Some(telemetry), registration))
     } else {
         // Synchronous completion never enters the poller — emit inline.
         telemetry.emit_complete(true);
@@ -1474,6 +1469,15 @@ impl StagedCompletion {
         })
     }
 
+    fn reserve_nixl(
+        event_system: &velo::EventManager,
+        queue: &PollingRegistrationQueue<crate::transfer::notifications::NixlStatusChecker>,
+    ) -> Result<Self> {
+        #[cfg(all(test, feature = "testing-kvbm"))]
+        super::dispatch_fault::check(super::dispatch_fault::Point::NixlStatusEvent)?;
+        Self::reserve(event_system, queue)
+    }
+
     fn register<C: crate::transfer::notifications::CompletionChecker>(
         self,
         queue: &PollingRegistrationQueue<C>,
@@ -1659,9 +1663,7 @@ impl OwnedStagedContext {
             XferOp::Write => dst_metadata.agent_name(),
             XferOp::Read => src_metadata.agent_name(),
         };
-        #[cfg(all(test, feature = "testing-kvbm"))]
-        super::dispatch_fault::check(super::dispatch_fault::Point::NixlStatusEvent)?;
-        let completion = StagedCompletion::reserve(&self.event_system, &self.tx_nixl_status)?;
+        let completion = StagedCompletion::reserve_nixl(&self.event_system, &self.tx_nixl_status)?;
         let request =
             self.nixl_agent
                 .create_xfer_req(xfer_op, &src_dl, &dst_dl, remote_agent, None)?;
@@ -1670,13 +1672,12 @@ impl OwnedStagedContext {
             &self.nixl_agent,
             request,
             guards,
-            self.observability.as_deref(),
+            self.observability.as_ref(),
         ) {
-            PostResult::Pending(request, guards) => {
+            PostResult::Pending(hold) => {
                 let checker = crate::transfer::notifications::NixlStatusChecker::new(
                     self.raw_agent.clone(),
-                    request,
-                    guards,
+                    hold,
                 );
                 Ok(completion.register(&self.tx_nixl_status, checker))
             }
