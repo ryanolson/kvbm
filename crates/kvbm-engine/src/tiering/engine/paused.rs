@@ -716,3 +716,15 @@ async fn watch_pauses(engine: Weak<LocalConnectorEngine>, mut next: Instant) {
         }
     }
 }
+
+#[cfg(test)]
+#[test]
+fn pause_without_any_worker_identity_is_unrecoverable() {
+    // Velo always attaches the reporting worker to a lost transfer reply.
+    let error = anyhow::anyhow!("in-process drain failed");
+    let participant = Participant::new(None, &error);
+    assert_eq!(participant.worker, Worker::Unknown);
+    assert_eq!(participant.state, PauseState::NoRecoveryCapability);
+    assert!(participant.recheck.is_none());
+    assert!(participant.last_attempt.is_none());
+}

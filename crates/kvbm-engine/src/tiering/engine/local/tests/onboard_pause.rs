@@ -1,27 +1,33 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::fs::File;
 use std::io::{Read, Seek};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::anyhow;
+use bytes::Bytes;
+use futures::future::BoxFuture;
 use kvbm_logical::BlockManager;
-use kvbm_physical::transfer::{
-    AggregateTransferFailure, TransferDrainOutcome, TransferPartFailure,
-};
+use kvbm_physical::transfer::{TransferCompleteNotification, TransferDrainOutcome};
 use kvbm_protocols::connector::FenceHandle;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, advance, timeout};
-use velo::Messenger;
+use velo::{Handler, Messenger};
 
-use super::super::super::paused::{PROBE_INTERVAL, PauseCell, PausedLoad};
-use super::super::super::test_support::{CompletedParallelWorkers, build_leader_with_messenger};
-use super::onboard_drain::matched_search;
+use super::super::super::paused::PROBE_INTERVAL;
+use super::super::super::test_support::{
+    build_leader_with_messenger, wait_onboard_driver_finished,
+};
+use super::onboard_drain::{matched_search, reusable_g2_ids};
 use super::*;
 use crate::testing::messenger::create_messenger_tcp;
-use crate::worker::LocalTransferRecheck;
-use crate::worker::group::{ParallelWorkers, SpmdParallelWorkers};
-use crate::worker::velo::{LocalTransferCheckTiming, VeloWorkerClient, handler_names};
+use crate::worker::group::SpmdParallelWorkers;
+use crate::worker::velo::{
+    HeldLocalTransfers, LocalTransferCheckTiming, VeloWorkerClient, handler_names,
+    serve_held_local_transfers,
+};
 
 const REQUEST: &str = "paused-onboard";
 const DEST: BlockId = 50;
@@ -33,279 +39,332 @@ const SAMPLE_START: &str = "kvbm_onboard_oldest_pause_timestamp_seconds";
 const SAMPLE_ATTEMPT: &str = "kvbm_onboard_last_probe_attempt_timestamp_seconds";
 const SAMPLE_ANSWER: &str = "kvbm_onboard_last_probe_answer_timestamp_seconds";
 const SAMPLE_CHECKS: &str = "kvbm_onboard_probe_checks_total";
+const SAMPLE_STUCK: &str = "kvbm_onboard_probe_stuck_total";
+const SILENT: &str = "worker_not_answering";
+const NO_PROOF: &str = "worker_no_proof";
+const NO_CAPABILITY: &str = "no_recovery_capability";
+const IMMEDIATE: LocalTransferCheckTiming = LocalTransferCheckTiming {
+    wait: Duration::ZERO,
+    deadline: DEADLINE,
+};
 
 struct Fixture {
     engine: Arc<LocalConnectorEngine>,
     sink: Arc<RecordingSink>,
     g2: Arc<BlockManager<G2>>,
     registry: prometheus::Registry,
-    worker: Arc<Messenger>,
+    relay: Arc<Messenger>,
+    server: Arc<Messenger>,
 }
 
 impl Fixture {
-    async fn new() -> Result<Self> {
-        Self::with_workers(|_, _| Arc::new(CompletedParallelWorkers)).await
-    }
-
-    async fn with_velo_worker(timing: LocalTransferCheckTiming) -> Result<Self> {
-        Self::with_workers(|messenger, worker| {
-            let client =
-                VeloWorkerClient::new_for_worker(messenger.clone(), worker.instance_id(), 0)
-                    .with_local_transfer_check(timing);
-            Arc::new(SpmdParallelWorkers::new(
-                vec![Arc::new(client)],
-                Arc::new(velo::EventManager::local()),
-                messenger.runtime().clone(),
-            ))
-        })
-        .await
-    }
-
-    async fn with_workers(
-        workers: impl FnOnce(&Arc<Messenger>, &Arc<Messenger>) -> Arc<dyn ParallelWorkers>,
-    ) -> Result<Self> {
+    async fn new(timing: LocalTransferCheckTiming, workers: u64) -> Result<Self> {
         let messenger = timeout(WALL_LIMIT, create_messenger_tcp()).await??;
-        let worker = timeout(WALL_LIMIT, create_messenger_tcp()).await??;
-        worker.register_peer(messenger.peer_info())?;
-        messenger.register_peer(worker.peer_info())?;
-        let workers = workers(&messenger, &worker);
+        let relay = timeout(WALL_LIMIT, create_messenger_tcp()).await??;
+        let server = timeout(WALL_LIMIT, create_messenger_tcp()).await??;
+        link(&messenger, &relay)?;
+        link(&relay, &server)?;
+        let clients = (0..workers)
+            .map(|id| {
+                Arc::new(
+                    VeloWorkerClient::new_for_worker(messenger.clone(), relay.instance_id(), id)
+                        .with_local_transfer_check(timing),
+                ) as Arc<dyn crate::worker::Worker>
+            })
+            .collect();
+        let workers = Arc::new(SpmdParallelWorkers::new(
+            clients,
+            Arc::new(velo::EventManager::local()),
+            messenger.runtime().clone(),
+        ));
         let (leader, g2) =
             build_leader_with_messenger(messenger, LogicalResourceId(0), 2, BS, workers)?;
-        let sink = RecordingSink::new();
         let registry = leader.observability().unwrap().registry().clone();
+        let sink = RecordingSink::new();
         let engine = LocalConnectorEngine::new(Arc::new(leader), sink.clone(), BS, true);
         Ok(Self {
             engine,
             sink,
             g2,
             registry,
-            worker,
+            relay,
+            server,
         })
     }
 
-    async fn worker(&self, id: u64) -> Result<TestWorker> {
-        let incarnation = Uuid::new_v4();
-        let check = LocalTransferRecheck {
-            instance: self.worker.instance_id(),
-            worker_id: Some(id),
-            incarnation: Some(incarnation),
-            transfer_id: Uuid::new_v4(),
-        };
-        let answer = Arc::new(Mutex::new((
-            Duration::ZERO,
-            Some(reply(incarnation, serde_json::json!("Unknown"))),
-        )));
-        let checks = Arc::new(AtomicUsize::new(0));
-        let handler = velo::Handler::unary_handler_async(
-            handler_names::scoped(handler_names::LOCAL_TRANSFER_CHECK, Some(id)),
-            {
-                let answer = answer.clone();
-                let checks = checks.clone();
-                move |_| {
-                    let (delay, answer) = answer.lock().unwrap().clone();
-                    let reply_at = Instant::now() + delay;
-                    checks.fetch_add(1, Ordering::Relaxed);
+    fn worker(&self, id: u64, bind_incarnation: bool) -> Result<TestWorker> {
+        let (started, copies) = mpsc::unbounded_channel();
+        let transfers = serve_held_local_transfers(
+            &self.server,
+            id,
+            false,
+            move |resource, sources, destinations| {
+                assert_eq!(resource, LogicalResourceId(0));
+                let (finish, receipt) = oneshot::channel();
+                started.send(HeldCopy {
+                    sources,
+                    destinations,
+                    finish,
+                })?;
+                Ok(TransferCompleteNotification::from_drain_future(
                     async move {
-                        if !delay.is_zero() {
-                            tokio::time::sleep_until(reply_at).await;
-                        }
-                        Ok(answer)
-                    }
-                }
+                        receipt
+                            .await
+                            .unwrap_or_else(|error| TransferDrainOutcome::Unproven(error.into()))
+                    },
+                ))
             },
-        )
-        .build();
-        self.worker.register_handler(handler)?;
-        // Establish the route before pausing the clock. The tests control the
-        // deadline of the check itself.
-        let initial = check.check(self.engine.leader.messenger(), DEADLINE).await;
-        assert!(matches!(initial, TransferDrainOutcome::Unproven(_)));
-        assert_eq!(checks.load(Ordering::Relaxed), 1);
-        *answer.lock().unwrap() = (PROBE_INTERVAL * 4, None);
-        Ok(TestWorker {
-            answer,
-            check,
-            checks,
-        })
-    }
-
-    fn serve_local_onboard(
-        &self,
-        worker: &TestWorker,
-        response: Option<bytes::Bytes>,
-    ) -> Result<()> {
-        let incarnation = serde_json::to_vec(&serde_json::json!({
-            "incarnation": worker.check.incarnation.unwrap(),
-        }))?;
-        for (name, reply) in [
-            (handler_names::WORKER_INCARNATION, Some(incarnation.into())),
-            (handler_names::LOCAL_TRANSFER, response),
-        ] {
-            let handler = velo::Handler::unary_handler_async(
-                handler_names::scoped(name, worker.check.worker_id),
-                move |_| {
-                    let reply = reply.clone();
-                    async move {
-                        reply
-                            .map(Some)
-                            .ok_or_else(|| anyhow!("injected lost reply"))
-                    }
-                },
-            )
-            .build();
-            self.worker.register_handler(handler)?;
+        )?;
+        let worker = TestWorker {
+            id,
+            relay: self.relay.clone(),
+            server: self.server.clone(),
+            transfers,
+            copies,
+            probe_reply: Arc::new(Mutex::new(ProbeReply::Forward)),
+            checks: Arc::new(AtomicUsize::new(0)),
+        };
+        worker.forward(handler_names::LOCAL_TRANSFER)?;
+        if bind_incarnation {
+            worker.forward(handler_names::WORKER_INCARNATION)?;
         }
-        Ok(())
+        Ok(worker)
     }
 
-    fn start_local_onboard(&self) -> Result<(FindBlocksHandle, OnboardHandle)> {
-        let (search, _) = matched_search(&self.engine, &self.g2, REQUEST)?;
-        let onboard = self.engine.clone().onboard_blocks(&search, &[DEST], BS)?;
-        Ok((search, onboard))
-    }
-
-    fn mint(&self) -> Action {
-        let id = ActionId::new();
-        let status = Arc::new(Mutex::new(ActionStatus::Pending));
-        let physical = Arc::new(AtomicBool::new(false));
-        let pause = PauseCell::default();
-        self.engine.actions.insert(
-            id,
-            ActionRecord::new(REQUEST.into(), Arc::downgrade(&status))
-                .with_physical_drain(tokio_util::sync::CancellationToken::new()),
-        );
-        self.engine
-            .by_request
-            .entry(REQUEST.into())
-            .or_default()
-            .push(id);
-        let owner: Arc<dyn LeaderEngine> = self.engine.clone();
-        let handle = OnboardHandle::new_with_physical_drain(
-            id,
-            Arc::downgrade(&owner),
-            status,
-            vec![DEST],
-            FenceHandle::new(physical.clone()),
-        )
-        .with_pause_cell(pause.clone());
-        Action {
+    fn onboard(&self) -> Result<Onboard> {
+        let (search, source) = matched_search(&self.engine, &self.g2, REQUEST)?;
+        let mut handle = self.engine.clone().onboard_blocks(&search, &[DEST], BS)?;
+        let fence = handle
+            .take_physical_drain_fence()
+            .expect("local drain fence");
+        Ok(Onboard {
             handle,
-            physical,
-            pause,
-        }
-    }
-
-    fn load(&self, action: &Action) -> PausedLoad {
-        PausedLoad {
-            action: *action.handle.id(),
-            request: REQUEST.into(),
-            destinations: vec![DEST],
-            physical_drain: action.physical.clone(),
-            pause: action.pause.clone(),
-            holds: Box::new(self.g2.allocate_blocks(1).expect("one G2 block")),
-            continuation: None,
-        }
-    }
-
-    fn lose_reply(&self, action: &Action, worker: &TestWorker, deadline: Duration) {
-        let engine = self.engine.clone();
-        let load = self.load(action);
-        let check = worker.check.clone();
-        tokio::spawn(async move {
-            // Inject a lost reply at the test driver's receipt boundary, then
-            // run the real bounded proof check.
-            tokio::time::sleep(WAIT).await;
-            let TransferDrainOutcome::Unproven(error) =
-                check.check(engine.leader.messenger(), deadline).await
-            else {
-                panic!("the initial check must leave the outcome unproven");
-            };
-            engine.pause_load_action(load, error);
-        });
-    }
-
-    async fn pause(&self, worker: &TestWorker) -> Action {
-        self.pause_after_check(worker, DEADLINE, DEADLINE).await
-    }
-
-    async fn pause_after_check(
-        &self,
-        worker: &TestWorker,
-        deadline: Duration,
-        check_elapsed: Duration,
-    ) -> Action {
-        let action = self.mint();
-        self.lose_reply(&action, worker, deadline);
-        tokio::task::yield_now().await;
-        tick(WAIT).await;
-        eventually("initial check reaches the worker", || {
-            worker.checks.load(Ordering::Relaxed) >= 2
+            fence,
+            source,
         })
-        .await;
-        tick(check_elapsed).await;
-        eventually("paused handle", || action.handle.paused().is_some()).await;
-        action
     }
 
-    fn assert_paused(&self, action: &Action, worker: &TestWorker) {
-        assert_eq!(action.handle.outcome(), None, "the scheduler stays pending");
-        assert_eq!(action.handle.paused().unwrap().worker(), worker.label());
-        assert!(self.sink.loads().is_empty(), "no scheduler release");
-        assert!(
-            !action.physical.load(Ordering::Acquire),
-            "the fence stays armed"
-        );
-        assert_eq!(self.g2.available_blocks(), 1, "the engine owns the block");
-        assert_eq!(
-            metric(&self.registry, SAMPLE_COUNT, &["worker_not_answering"]),
-            Some(1.0)
-        );
+    fn assert_held(&self, onboard: &Onboard) {
+        assert_eq!(onboard.handle.outcome(), None);
+        assert!(!onboard.fence.is_complete());
+        assert!(self.sink.loads().is_empty());
+        assert_eq!(self.g2.available_blocks(), 1);
+        assert!(!reusable_g2_ids(&self.g2).contains(&onboard.source));
+    }
+
+    fn assert_paused(&self, onboard: &Onboard, worker: &TestWorker, state: &str) {
+        self.assert_held(onboard);
+        assert_eq!(onboard.handle.paused().unwrap().worker(), worker.label());
+        assert_eq!(worker.metric(self, SAMPLE_COUNT, &[state]), Some(1.0));
+    }
+
+    async fn assert_settled(&self, onboard: &Onboard, outcome: LoadOutcome) {
+        eventually("scheduler release", || !self.sink.loads().is_empty()).await;
+        assert_eq!(onboard.handle.outcome(), Some(outcome.clone()));
+        assert!(onboard.handle.paused().is_none());
+        assert!(onboard.fence.is_complete());
+        assert_eq!(self.sink.loads(), vec![(REQUEST.into(), outcome)]);
+        assert_eq!(self.g2.available_blocks(), 2);
+        assert!(reusable_g2_ids(&self.g2).contains(&onboard.source));
     }
 }
 
-struct Action {
+fn link(a: &Messenger, b: &Messenger) -> Result<()> {
+    a.register_peer(b.peer_info())?;
+    b.register_peer(a.peer_info())?;
+    Ok(())
+}
+
+struct Onboard {
     handle: OnboardHandle,
-    physical: Arc<AtomicBool>,
-    pause: PauseCell,
+    fence: FenceHandle,
+    source: BlockId,
+}
+
+impl Onboard {
+    async fn wait_for_pause(&self) {
+        eventually("production onboard pause", || {
+            self.handle.paused().is_some() || self.handle.is_complete()
+        })
+        .await;
+        assert!(
+            self.handle.paused().is_some(),
+            "lost RPC must park the onboard"
+        );
+        wait_onboard_driver_finished(*self.handle.id()).await;
+    }
+}
+
+struct HeldCopy {
+    sources: Vec<BlockId>,
+    destinations: Vec<BlockId>,
+    finish: oneshot::Sender<TransferDrainOutcome>,
+}
+
+#[derive(Clone, Copy)]
+enum ProbeReply {
+    Forward,
+    Silent,
+    Delayed(Duration),
+    WrongIncarnation,
+    Error,
 }
 
 struct TestWorker {
-    answer: Arc<Mutex<(Duration, Option<bytes::Bytes>)>>,
-    check: LocalTransferRecheck,
+    id: u64,
+    relay: Arc<Messenger>,
+    server: Arc<Messenger>,
+    transfers: HeldLocalTransfers,
+    copies: mpsc::UnboundedReceiver<HeldCopy>,
+    probe_reply: Arc<Mutex<ProbeReply>>,
     checks: Arc<AtomicUsize>,
 }
 
 impl TestWorker {
     fn label(&self) -> String {
-        format!("{}#{}", self.check.instance, self.check.worker_id.unwrap())
+        format!("{}#{}", self.relay.instance_id(), self.id)
     }
 
-    fn answer(&self, record: serde_json::Value) {
-        self.answer_as(self.check.incarnation.unwrap(), record);
+    fn forward(&self, name: &str) -> Result<()> {
+        let name = handler_names::scoped(name, Some(self.id));
+        let route = self.route(name.clone());
+        self.relay.register_handler(
+            Handler::unary_handler_async(&name, move |ctx| route(ctx.payload)).build(),
+        )
     }
 
-    fn answer_as(&self, incarnation: Uuid, record: serde_json::Value) {
-        *self.answer.lock().unwrap() = (Duration::ZERO, Some(reply(incarnation, record)));
+    // The relay can withhold a check or advertise no handler. Forwarded
+    // checks still read the original worker's record for the transfer ID.
+    fn register_check(&self) -> Result<()> {
+        let name = self.check_name();
+        let route = self.route(name.clone());
+        let reply = self.probe_reply.clone();
+        let checks = self.checks.clone();
+        self.relay.register_handler(
+            Handler::unary_handler_async(&name, move |ctx| {
+                let reply = *reply.lock().unwrap();
+                let delay_until = match reply {
+                    ProbeReply::Delayed(delay) => Some(Instant::now() + delay),
+                    _ => None,
+                };
+                checks.fetch_add(1, Ordering::Relaxed);
+                let forward = route(ctx.payload);
+                async move {
+                    match reply {
+                        ProbeReply::Silent => return std::future::pending().await,
+                        ProbeReply::Error => return Err(anyhow!("injected check RPC error")),
+                        ProbeReply::WrongIncarnation => {
+                            return Ok(Some(
+                                serde_json::to_vec(&serde_json::json!({
+                                    "incarnation": Uuid::new_v4(),
+                                    "record": "Completed",
+                                }))?
+                                .into(),
+                            ));
+                        }
+                        _ => {}
+                    }
+                    if let Some(until) = delay_until {
+                        tokio::time::sleep_until(until).await;
+                    }
+                    forward.await
+                }
+            })
+            .build(),
+        )
     }
 
-    fn answer_after(&self, delay: Duration, record: serde_json::Value) {
-        *self.answer.lock().unwrap() =
-            (delay, Some(reply(self.check.incarnation.unwrap(), record)));
+    fn route(
+        &self,
+        name: String,
+    ) -> impl Fn(Bytes) -> BoxFuture<'static, Result<Option<Bytes>>> + use<> {
+        let relay = Arc::downgrade(&self.relay);
+        let server = self.server.instance_id();
+        move |payload| {
+            let relay = relay.clone();
+            let name = name.clone();
+            Box::pin(async move {
+                let relay = relay.upgrade().expect("the relay is serving the request");
+                let bytes = relay
+                    .unary(&name)?
+                    .raw_payload(payload)
+                    .instance(server)
+                    .send()
+                    .await?;
+                Ok(Some(bytes))
+            })
+        }
     }
 
-    fn go_silent(&self) {
-        *self.answer.lock().unwrap() = (PROBE_INTERVAL * 4, None);
+    fn check_name(&self) -> String {
+        handler_names::scoped(handler_names::LOCAL_TRANSFER_CHECK, Some(self.id))
     }
 
-    fn unproven(&self) -> anyhow::Error {
-        anyhow!("lost copy receipt").context(self.check.clone())
+    fn reply(&self, reply: ProbeReply) {
+        *self.probe_reply.lock().unwrap() = reply;
+    }
+
+    async fn wait_for_check(&self, count: usize) {
+        eventually("check reaches the named worker", || {
+            self.checks.load(Ordering::Relaxed) >= count
+        })
+        .await;
+        assert_eq!(self.checks.load(Ordering::Relaxed), count);
+    }
+
+    fn lose_next_reply(&self) -> oneshot::Sender<()> {
+        self.transfers.gate_reply_loss()
+    }
+
+    async fn running_copy(&mut self, onboard: &Onboard) -> HeldCopy {
+        let copy = timeout(WALL_LIMIT, self.copies.recv())
+            .await
+            .expect("worker starts the copy")
+            .expect("worker keeps the dispatch channel open");
+        assert_eq!(copy.sources, vec![onboard.source]);
+        assert_eq!(copy.destinations, vec![DEST]);
+        assert!(self.transfers.active());
+        copy
+    }
+
+    async fn finish_copy(&self, copy: HeldCopy, outcome: TransferDrainOutcome) {
+        assert!(
+            copy.finish.send(outcome).is_ok(),
+            "worker holds the running copy"
+        );
+        eventually("worker records the drain", || !self.transfers.active()).await;
+    }
+
+    fn metric(&self, fixture: &Fixture, family: &str, labels: &[&str]) -> Option<f64> {
+        let label = self.label();
+        let labels = [&[label.as_str()][..], labels].concat();
+        metric(&fixture.registry, family, &labels)
     }
 }
 
-fn reply(incarnation: Uuid, record: serde_json::Value) -> bytes::Bytes {
-    serde_json::to_vec(&serde_json::json!({"incarnation": incarnation, "record": record}))
-        .unwrap()
-        .into()
+// Wait for dispatch before opening the Velo error gate. The copy keeps
+// running independently of that reply.
+async fn start_held(
+    fixture: &Fixture,
+    worker: &mut TestWorker,
+) -> Result<(Onboard, HeldCopy, oneshot::Sender<()>)> {
+    let lose_reply = worker.lose_next_reply();
+    let onboard = fixture.onboard()?;
+    let copy = worker.running_copy(&onboard).await;
+    fixture.assert_held(&onboard);
+    Ok((onboard, copy, lose_reply))
+}
+
+async fn lose_reply_and_pause(
+    fixture: &Fixture,
+    worker: &mut TestWorker,
+) -> Result<(Onboard, HeldCopy)> {
+    let (onboard, copy, lose_reply) = start_held(fixture, worker).await?;
+    lose_reply.send(()).expect("the transfer RPC is waiting");
+    onboard.wait_for_pause().await;
+    assert!(worker.transfers.active());
+    tokio::time::pause();
+    Ok((onboard, copy))
 }
 
 fn metric(registry: &prometheus::Registry, family: &str, labels: &[&str]) -> Option<f64> {
@@ -350,249 +409,345 @@ pub(super) async fn eventually(reason: &str, mut check: impl FnMut() -> bool) {
     }
 }
 
+struct Logs {
+    file: File,
+    _capture: tracing::subscriber::DefaultGuard,
+    _quiet: tracing::Dispatch,
+}
+
+impl Logs {
+    fn capture() -> Result<Self> {
+        let file = tempfile::tempfile()?;
+        // A second dispatch keeps scoped capture interest visible to parallel tests.
+        let quiet = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::level_filters::LevelFilter::OFF)
+                .finish(),
+        );
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(file.try_clone()?)
+            .finish();
+        Ok(Self {
+            file,
+            _capture: tracing::subscriber::set_default(subscriber),
+            _quiet: quiet,
+        })
+    }
+
+    fn read(&mut self) -> String {
+        self.file.rewind().unwrap();
+        let mut text = String::new();
+        self.file.read_to_string(&mut text).unwrap();
+        text
+    }
+
+    async fn wait_for_loss(&mut self) {
+        eventually("the Velo client sees the lost RPC reply", || {
+            self.read()
+                .contains("local transfer reply lost; checking with the worker")
+        })
+        .await;
+    }
+
+    fn assert_event(&mut self, message: &str, worker: &TestWorker, state: &str) {
+        let log = self.read();
+        assert!(
+            log.lines().any(|line| line.contains(message)
+                && line.contains(&worker.label())
+                && line.contains(state)),
+            "{log}"
+        );
+    }
+}
+
 #[tokio::test]
-#[allow(clippy::disallowed_macros)]
 async fn paused_onboard_retains_holds_by_the_initial_check_deadline() -> Result<()> {
-    let fixture = Fixture::new().await?;
-    let worker = fixture.worker(0).await?;
+    let mut logs = Logs::capture()?;
+    let fixture = Fixture::new(LocalTransferCheckTiming::default(), 1).await?;
+    let mut worker = fixture.worker(0, true)?;
+    worker.register_check()?;
+    worker.reply(ProbeReply::Silent);
+    let (onboard, copy, lose_reply) = start_held(&fixture, &mut worker).await?;
+
     tokio::time::pause();
     let lost_at = Instant::now();
-    let action = fixture.pause(&worker).await;
-    assert!(lost_at.elapsed() <= WAIT + DEADLINE + Duration::from_millis(2));
-    fixture.assert_paused(&action, &worker);
-    let since = action.handle.paused().unwrap().since();
-    let start = metric(&fixture.registry, SAMPLE_START, &["worker_not_answering"]).unwrap();
-    let attempt = metric(&fixture.registry, SAMPLE_ATTEMPT, &[]).unwrap();
+    lose_reply.send(()).unwrap();
+    logs.wait_for_loss().await;
+    let before_deadline = Duration::from_millis(10);
+    tick(WAIT - before_deadline).await;
+    assert_eq!(worker.checks.load(Ordering::Relaxed), 0);
+    tick(before_deadline).await;
+    worker.wait_for_check(1).await;
+    tick(DEADLINE - before_deadline).await;
+    fixture.assert_held(&onboard);
+    assert!(onboard.handle.paused().is_none());
+    assert_eq!(worker.metric(&fixture, SAMPLE_COUNT, &[SILENT]), None);
+
+    tick(before_deadline).await;
+    onboard.wait_for_pause().await;
+    assert!(lost_at.elapsed() <= WAIT + DEADLINE + Duration::from_millis(4));
+    fixture.assert_paused(&onboard, &worker, SILENT);
+    assert!(worker.transfers.active());
+    let since = onboard.handle.paused().unwrap().since();
+    let start = worker.metric(&fixture, SAMPLE_START, &[SILENT]).unwrap();
+    let attempt = worker.metric(&fixture, SAMPLE_ATTEMPT, &[]).unwrap();
     assert!((start - attempt - DEADLINE.as_secs_f64()).abs() < 0.01);
-    assert_eq!(metric(&fixture.registry, SAMPLE_ANSWER, &[]), None);
-    assert_eq!(Instant::now().into_std() - since, Duration::ZERO);
+    assert_eq!(worker.metric(&fixture, SAMPLE_ANSWER, &[]), None);
+    assert_eq!(Instant::now().into_std(), since);
     tick(Duration::from_secs(1)).await;
     assert_eq!(
-        metric(&fixture.registry, SAMPLE_START, &["worker_not_answering"]),
+        worker.metric(&fixture, SAMPLE_START, &[SILENT]),
         Some(start)
     );
     assert_eq!(
         Instant::now().into_std() - since,
         Duration::from_millis(1001)
     );
-    let metrics = prometheus::TextEncoder::new().encode_to_string(&fixture.registry.gather())?;
-    for line in metrics
-        .lines()
-        .filter(|line| line.contains("worker_not_answering") || line.starts_with(SAMPLE_ATTEMPT))
-        .filter(|line| !line.starts_with('#'))
-    {
-        println!("{line}");
-    }
+    logs.assert_event("onboard paused", &worker, SILENT);
 
-    worker.answer(serde_json::json!("Completed"));
+    worker.reply(ProbeReply::Forward);
+    worker
+        .finish_copy(copy, TransferDrainOutcome::Completed)
+        .await;
     tick(PROBE_INTERVAL).await;
-    eventually("logical terminal", || action.handle.is_complete()).await;
+    fixture.assert_settled(&onboard, LoadOutcome::Done).await;
     Ok(())
 }
 
 #[tokio::test]
 async fn paused_onboard_resumes_after_arrival_proof() -> Result<()> {
-    let fixture = Fixture::new().await?;
-    let worker = fixture.worker(0).await?;
-    tokio::time::pause();
-    let action = fixture.pause(&worker).await;
-    fixture.assert_paused(&action, &worker);
-    worker.answer(serde_json::json!("Completed"));
+    let mut logs = Logs::capture()?;
+    let fixture = Fixture::new(IMMEDIATE, 1).await?;
+    let mut worker = fixture.worker(0, true)?;
+    worker.register_check()?;
+    let (onboard, copy) = lose_reply_and_pause(&fixture, &mut worker).await?;
+    fixture.assert_paused(&onboard, &worker, NO_PROOF);
+
+    worker
+        .finish_copy(copy, TransferDrainOutcome::Completed)
+        .await;
     tick(PROBE_INTERVAL).await;
-    eventually("physical terminal", || {
-        action.physical.load(Ordering::Acquire)
-    })
-    .await;
-    assert_eq!(action.handle.outcome(), Some(LoadOutcome::Done));
-    assert!(action.handle.paused().is_none());
+    fixture.assert_settled(&onboard, LoadOutcome::Done).await;
     assert_eq!(
-        fixture.sink.loads(),
-        vec![(REQUEST.into(), LoadOutcome::Done)]
-    );
-    assert_eq!(fixture.g2.available_blocks(), 2);
-    assert_eq!(
-        metric(&fixture.registry, SAMPLE_COUNT, &["worker_not_answering"]),
+        worker.metric(&fixture, SAMPLE_COUNT, &[NO_PROOF]),
         Some(0.0)
     );
     assert_eq!(
-        metric(
-            &fixture.registry,
-            "kvbm_onboard_probe_checks_total",
-            &["completed"]
-        ),
+        worker.metric(&fixture, SAMPLE_CHECKS, &["completed"]),
         Some(1.0)
     );
+    assert!(logs.read().lines().any(|line| {
+        line.contains("onboard pause cleared") && line.contains("result=\"completed\"")
+    }));
     Ok(())
 }
 
 #[tokio::test]
 async fn paused_onboard_fails_after_drained_error_proof() -> Result<()> {
-    let fixture = Fixture::new().await?;
-    let worker = fixture.worker(0).await?;
-    tokio::time::pause();
-    let action = fixture.pause(&worker).await;
-    fixture.assert_paused(&action, &worker);
-    worker.answer(serde_json::json!({"DrainedWithError": {"error": "injected worker failure"}}));
+    let fixture = Fixture::new(IMMEDIATE, 1).await?;
+    let mut worker = fixture.worker(0, true)?;
+    worker.register_check()?;
+    let (onboard, copy) = lose_reply_and_pause(&fixture, &mut worker).await?;
+    fixture.assert_paused(&onboard, &worker, NO_PROOF);
+
+    worker
+        .finish_copy(
+            copy,
+            TransferDrainOutcome::DrainedWithError(anyhow!("injected copy failure")),
+        )
+        .await;
     tick(PROBE_INTERVAL).await;
-    eventually("physical terminal", || {
-        action.physical.load(Ordering::Acquire)
-    })
-    .await;
-    let failed = LoadOutcome::FailedPartial {
-        block_ids: vec![DEST],
-    };
-    assert_eq!(action.handle.outcome(), Some(failed.clone()));
-    assert!(action.handle.paused().is_none());
-    assert_eq!(fixture.sink.loads(), vec![(REQUEST.into(), failed)]);
-    assert_eq!(fixture.g2.available_blocks(), 2);
+    fixture.assert_settled(&onboard, failed_load()).await;
+    assert_eq!(
+        worker.metric(&fixture, SAMPLE_CHECKS, &["drained_with_error"]),
+        Some(1.0)
+    );
     Ok(())
+}
+
+fn failed_load() -> LoadOutcome {
+    LoadOutcome::FailedPartial {
+        block_ids: vec![DEST],
+    }
 }
 
 #[tokio::test]
 async fn paused_onboard_distinguishes_a_worker_without_proof() -> Result<()> {
-    let fixture = Fixture::new().await?;
-    let worker = fixture.worker(0).await?;
+    let fixture = Fixture::new(IMMEDIATE, 1).await?;
+    let mut worker = fixture.worker(0, true)?;
+    worker.register_check()?;
+    worker.reply(ProbeReply::Silent);
+    let (onboard, copy, lose_reply) = start_held(&fixture, &mut worker).await?;
+    lose_reply.send(()).unwrap();
+    worker.wait_for_check(1).await;
     tokio::time::pause();
-    let action = fixture.pause(&worker).await;
-    worker.answer_as(Uuid::new_v4(), serde_json::json!("Completed"));
+    tick(DEADLINE).await;
+    onboard.wait_for_pause().await;
+    fixture.assert_paused(&onboard, &worker, SILENT);
+
+    worker.reply(ProbeReply::WrongIncarnation);
     tick(PROBE_INTERVAL).await;
-    eventually("pause metrics", || {
-        metric(&fixture.registry, SAMPLE_COUNT, &["worker_no_proof"]) == Some(1.0)
+    eventually("wrong incarnation is recorded as no proof", || {
+        worker.metric(&fixture, SAMPLE_COUNT, &[NO_PROOF]) == Some(1.0)
+            || onboard.fence.is_complete()
     })
     .await;
-    assert_eq!(
-        metric(&fixture.registry, SAMPLE_COUNT, &["worker_not_answering"]),
-        Some(0.0)
-    );
-    assert!(metric(&fixture.registry, SAMPLE_ANSWER, &[]).is_some());
-    assert_eq!(action.handle.outcome(), None);
-    assert_eq!(fixture.g2.available_blocks(), 1);
-    worker.answer(serde_json::json!("Completed"));
+    fixture.assert_paused(&onboard, &worker, NO_PROOF);
+    assert_eq!(worker.metric(&fixture, SAMPLE_COUNT, &[SILENT]), Some(0.0));
+    assert!(worker.metric(&fixture, SAMPLE_ANSWER, &[]).is_some());
+    assert!(worker.transfers.active());
+
+    worker.reply(ProbeReply::Forward);
+    worker
+        .finish_copy(copy, TransferDrainOutcome::Completed)
+        .await;
     tick(PROBE_INTERVAL).await;
-    eventually("logical terminal", || action.handle.is_complete()).await;
+    fixture.assert_settled(&onboard, LoadOutcome::Done).await;
     Ok(())
 }
 
 #[tokio::test]
 async fn paused_onboard_watchdog_reports_a_wedged_probe() -> Result<()> {
-    let fixture = Fixture::new().await?;
-    let worker = fixture.worker(0).await?;
-    tokio::time::pause();
-    let action = fixture.pause(&worker).await;
+    let mut logs = Logs::capture()?;
+    let fixture = Fixture::new(IMMEDIATE, 1).await?;
+    let mut worker = fixture.worker(0, true)?;
+    worker.register_check()?;
+    let (onboard, copy) = lose_reply_and_pause(&fixture, &mut worker).await?;
     fixture.engine.paused_onboards.stop_probes();
-    let since = action.handle.paused().unwrap().since();
-    let start = metric(&fixture.registry, SAMPLE_START, &["worker_not_answering"]);
-    let attempt = metric(&fixture.registry, SAMPLE_ATTEMPT, &[]);
+    let since = onboard.handle.paused().unwrap().since();
+    let start = worker.metric(&fixture, SAMPLE_START, &[NO_PROOF]);
+    let attempt = worker.metric(&fixture, SAMPLE_ATTEMPT, &[]);
     tick(PROBE_INTERVAL * 3).await;
-    assert_eq!(
-        metric(&fixture.registry, "kvbm_onboard_probe_stuck_total", &[]),
-        Some(1.0)
-    );
-    assert_eq!(
-        metric(&fixture.registry, SAMPLE_START, &["worker_not_answering"]),
-        start
-    );
-    assert_eq!(metric(&fixture.registry, SAMPLE_ATTEMPT, &[]), attempt);
+    assert_eq!(worker.metric(&fixture, SAMPLE_STUCK, &[]), Some(1.0));
+    assert_eq!(worker.metric(&fixture, SAMPLE_START, &[NO_PROOF]), start);
+    assert_eq!(worker.metric(&fixture, SAMPLE_ATTEMPT, &[]), attempt);
     assert!(Instant::now().into_std() - since >= PROBE_INTERVAL * 3);
+    logs.assert_event("onboard probe is stuck", &worker, "since_attempt_seconds");
+    logs.assert_event("onboards remain paused", &worker, NO_PROOF);
+
     tick(PROBE_INTERVAL).await;
-    assert_eq!(
-        metric(&fixture.registry, "kvbm_onboard_probe_stuck_total", &[]),
-        Some(1.0)
-    );
-    fixture.assert_paused(&action, &worker);
+    assert_eq!(worker.metric(&fixture, SAMPLE_STUCK, &[]), Some(1.0));
+    fixture.assert_paused(&onboard, &worker, NO_PROOF);
+    assert!(worker.transfers.active());
+    worker
+        .finish_copy(copy, TransferDrainOutcome::Completed)
+        .await;
     Ok(())
 }
 
 #[tokio::test]
 async fn paused_onboard_waits_for_every_worker_before_releasing() -> Result<()> {
-    let fixture = Fixture::new().await?;
-    let first = fixture.worker(0).await?;
-    let second = fixture.worker(1).await?;
+    let fixture = Fixture::new(IMMEDIATE, 2).await?;
+    let mut first = fixture.worker(0, true)?;
+    let mut second = fixture.worker(1, true)?;
+    first.register_check()?;
+    second.register_check()?;
+    let lose_second_reply = second.lose_next_reply();
+    let (onboard, first_copy, lose_first_reply) = start_held(&fixture, &mut first).await?;
+    let second_copy = second.running_copy(&onboard).await;
+    lose_first_reply.send(()).unwrap();
+    lose_second_reply.send(()).unwrap();
+    onboard.wait_for_pause().await;
     tokio::time::pause();
-    let action = fixture.mint();
-    let error = anyhow::Error::new(AggregateTransferFailure::new(
-        None,
-        [first.unproven(), second.unproven()]
-            .into_iter()
-            .map(TransferPartFailure::Unproven)
-            .collect(),
-    ));
-    first.answer(serde_json::json!({"DrainedWithError": {"error": "first worker drained"}}));
-    fixture
-        .engine
-        .pause_load_action(fixture.load(&action), error);
-    tokio::task::yield_now().await;
-    tick(PROBE_INTERVAL).await;
-    eventually("pause metrics", || {
-        metric(
-            &fixture.registry,
-            SAMPLE_COUNT,
-            &[&first.label(), "worker_not_answering"],
-        ) == Some(0.0)
-    })
-    .await;
-    assert_eq!(action.handle.outcome(), None);
-    assert_eq!(action.handle.paused().unwrap().worker(), second.label());
-    assert!(!action.physical.load(Ordering::Acquire));
-    assert_eq!(fixture.g2.available_blocks(), 1);
-    second.answer(serde_json::json!("Completed"));
-    tick(DEADLINE).await;
-    tick(PROBE_INTERVAL).await;
-    eventually("physical terminal", || {
-        action.physical.load(Ordering::Acquire)
-    })
-    .await;
+    assert_eq!(first.metric(&fixture, SAMPLE_COUNT, &[NO_PROOF]), Some(1.0));
     assert_eq!(
-        action.handle.outcome(),
-        Some(LoadOutcome::FailedPartial {
-            block_ids: vec![DEST]
-        })
+        second.metric(&fixture, SAMPLE_COUNT, &[NO_PROOF]),
+        Some(1.0)
     );
-    assert_eq!(fixture.g2.available_blocks(), 2);
+
+    first
+        .finish_copy(
+            first_copy,
+            TransferDrainOutcome::DrainedWithError(anyhow!("first worker drained")),
+        )
+        .await;
+    tick(PROBE_INTERVAL).await;
+    eventually("both workers' recovery checks settle", || {
+        first.metric(&fixture, SAMPLE_COUNT, &[NO_PROOF]) == Some(0.0)
+            && second.metric(&fixture, SAMPLE_CHECKS, &[NO_PROOF]) == Some(2.0)
+    })
+    .await;
+    fixture.assert_paused(&onboard, &second, NO_PROOF);
+    assert!(second.transfers.active());
+
+    second
+        .finish_copy(second_copy, TransferDrainOutcome::Completed)
+        .await;
+    tick(PROBE_INTERVAL).await;
+    fixture.assert_settled(&onboard, failed_load()).await;
+    assert_eq!(
+        first.metric(&fixture, SAMPLE_CHECKS, &["drained_with_error"]),
+        Some(1.0)
+    );
+    assert_eq!(
+        second.metric(&fixture, SAMPLE_CHECKS, &["completed"]),
+        Some(1.0)
+    );
+    assert_eq!(
+        second.metric(&fixture, SAMPLE_COUNT, &[NO_PROOF]),
+        Some(0.0)
+    );
     Ok(())
 }
 
 #[tokio::test]
 async fn paused_onboard_pins_engine_through_teardown_until_proven() -> Result<()> {
-    let fixture = Fixture::new().await?;
-    let worker = fixture.worker(0).await?;
-    tokio::time::pause();
+    let mut logs = Logs::capture()?;
+    let fixture = Fixture::new(IMMEDIATE, 1).await?;
+    let mut worker = fixture.worker(0, true)?;
+    worker.register_check()?;
     let baseline = Arc::strong_count(&fixture.engine);
-    let first = fixture.pause(&worker).await;
+    let (first, first_copy) = lose_reply_and_pause(&fixture, &mut worker).await?;
     assert_eq!(Arc::strong_count(&fixture.engine), baseline + 1);
-    worker.answer(serde_json::json!("Completed"));
+    worker
+        .finish_copy(first_copy, TransferDrainOutcome::Completed)
+        .await;
     tick(PROBE_INTERVAL).await;
-    eventually("first physical terminal", || {
-        first.physical.load(Ordering::Acquire)
-    })
-    .await;
+    fixture.assert_settled(&first, LoadOutcome::Done).await;
     assert_eq!(Arc::strong_count(&fixture.engine), baseline);
     drop(first);
+    tokio::time::resume();
 
-    let second = fixture.mint();
-    worker.go_silent();
-    fixture
-        .engine
-        .pause_load_action(fixture.load(&second), worker.unproven());
+    let prior_loads = fixture.sink.loads();
+    let lose_reply = worker.lose_next_reply();
+    let second = fixture.onboard()?;
+    let second_copy = worker.running_copy(&second).await;
+    lose_reply.send(()).unwrap();
+    second.wait_for_pause().await;
     assert_eq!(Arc::strong_count(&fixture.engine), baseline + 1);
-    let eviction_fence = fixture.engine.evict(&REQUEST.into()).handle.unwrap();
+    tokio::time::pause();
+
+    let eviction = fixture.engine.evict(&REQUEST.into());
+    let eviction_fence = eviction.handle.unwrap();
+    let tokens = eviction.fence.per_worker;
+    assert!(!tokens.is_empty());
+    let Onboard {
+        handle,
+        fence,
+        source,
+    } = second;
     assert!(!eviction_fence.is_complete());
+    assert!(!fence.is_complete());
     let weak_engine = Arc::downgrade(&fixture.engine);
     let Fixture {
         engine,
         g2,
         registry,
-        worker: transport,
+        sink,
         ..
     } = fixture;
-    drop(second);
+    drop(handle);
     drop(engine);
     assert!(weak_engine.upgrade().is_some());
-    assert_eq!(g2.available_blocks(), 1);
+    assert!(!reusable_g2_ids(&g2).contains(&source));
     assert_eq!(
-        metric(&registry, SAMPLE_COUNT, &["worker_not_answering"]),
+        metric(&registry, SAMPLE_COUNT, &[&worker.label(), NO_PROOF]),
         Some(1.0)
     );
+    assert_eq!(sink.loads(), prior_loads);
+    assert!(sink.fences().is_empty());
 
     tick(PROBE_INTERVAL).await;
     assert!(
@@ -602,370 +757,290 @@ async fn paused_onboard_pins_engine_through_teardown_until_proven() -> Result<()
             .paused_onboards
             .teardown_reported()
     );
-    eventually("the post-teardown probe reaches the worker", || {
-        worker.checks.load(Ordering::Relaxed) >= 4
+    logs.assert_event(
+        "connector owners dropped with paused onboards",
+        &worker,
+        NO_PROOF,
+    );
+    eventually("active copy is checked after teardown", || {
+        metric(&registry, SAMPLE_CHECKS, &[&worker.label(), NO_PROOF]) == Some(3.0)
     })
     .await;
-    // Keep the worker service alive after the connector is gone.
-    worker.answer(serde_json::json!("Completed"));
-    tick(DEADLINE).await;
+    worker
+        .finish_copy(second_copy, TransferDrainOutcome::Completed)
+        .await;
     tick(PROBE_INTERVAL).await;
-    eventually("engine drop", || weak_engine.upgrade().is_none()).await;
-    assert_eq!(g2.available_blocks(), 2);
+    eventually("last engine owner released", || {
+        weak_engine.upgrade().is_none()
+    })
+    .await;
+    assert!(reusable_g2_ids(&g2).contains(&source));
     assert!(eviction_fence.is_complete());
-    drop(transport);
-    Ok(())
-}
-
-#[tokio::test]
-async fn paused_onboard_without_a_capability_stays_fatal() -> Result<()> {
-    let fixture = Fixture::new().await?;
-    tokio::time::pause();
-    let action = fixture.mint();
-    fixture
-        .engine
-        .pause_load_action(fixture.load(&action), anyhow!("in-process drain failed"));
-    tick(PROBE_INTERVAL * 3).await;
-    assert_eq!(action.handle.paused().unwrap().worker(), "unknown");
-    assert_eq!(action.handle.outcome(), None);
-    assert_eq!(fixture.g2.available_blocks(), 1);
+    assert!(fence.is_complete());
+    assert_eq!(sink.loads(), prior_loads);
+    assert_eq!(sink.fences(), tokens);
     assert_eq!(
-        metric(&fixture.registry, SAMPLE_COUNT, &["no_recovery_capability"]),
-        Some(1.0)
-    );
-    assert_eq!(metric(&fixture.registry, SAMPLE_ATTEMPT, &[]), None);
-    assert_eq!(
-        metric(&fixture.registry, "kvbm_onboard_probe_stuck_total", &[]),
+        metric(&registry, SAMPLE_COUNT, &[&worker.label(), NO_PROOF]),
         None
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn paused_onboard_honors_configured_probe_deadline() -> Result<()> {
-    let fixture = Fixture::new().await?;
-    let worker = fixture.worker(0).await?;
-    let config = kvbm_config::LocalTransferCheckConfig {
-        deadline_ms: 20_000,
-        ..Default::default()
-    };
-    let deadline = crate::worker::velo::LocalTransferCheckTiming::from(&config).deadline;
-    let reply_delay = Duration::from_secs(7);
-    tokio::time::pause();
+async fn paused_onboard_without_a_capability_stays_fatal() -> Result<()> {
+    let mut logs = Logs::capture()?;
+    let fixture = Fixture::new(IMMEDIATE, 1).await?;
+    let mut worker = fixture.worker(0, false)?;
+    worker.register_check()?;
+    let (onboard, copy) = lose_reply_and_pause(&fixture, &mut worker).await?;
+    fixture.assert_paused(&onboard, &worker, NO_CAPABILITY);
 
-    worker.answer_after(reply_delay, serde_json::json!("Active"));
-    let action = fixture
-        .pause_after_check(&worker, deadline, reply_delay)
+    worker
+        .finish_copy(copy, TransferDrainOutcome::Completed)
         .await;
-    let no_answer = || {
-        metric(
-            &fixture.registry,
-            "kvbm_onboard_probe_checks_total",
-            &["worker_not_answering"],
-        )
-    };
-    assert_eq!(
-        metric(&fixture.registry, SAMPLE_COUNT, &["worker_no_proof"]),
-        Some(1.0)
-    );
-
-    worker.answer_after(reply_delay, serde_json::json!("Completed"));
-    tick(PROBE_INTERVAL).await;
-    eventually("recovery probe reaches the worker", || {
-        worker.checks.load(Ordering::Relaxed) == 3
-    })
-    .await;
-    tick(reply_delay).await;
-    eventually("recovery proof or probe deadline", || {
-        action.physical.load(Ordering::Acquire) || no_answer().is_some()
-    })
-    .await;
-    assert_eq!(action.handle.outcome(), Some(LoadOutcome::Done));
-    assert_eq!(no_answer(), None);
-    assert_eq!(fixture.g2.available_blocks(), 2);
+    worker.forward(handler_names::WORKER_INCARNATION)?;
+    tick(PROBE_INTERVAL * 3).await;
+    fixture.assert_paused(&onboard, &worker, NO_CAPABILITY);
+    assert_eq!(worker.checks.load(Ordering::Relaxed), 0);
+    assert_eq!(worker.metric(&fixture, SAMPLE_ATTEMPT, &[]), None);
+    assert_eq!(worker.metric(&fixture, SAMPLE_STUCK, &[]), None);
+    logs.assert_event("onboard paused", &worker, NO_CAPABILITY);
     Ok(())
 }
 
 #[tokio::test]
-async fn local_onboard_pause_names_the_reporting_worker() -> Result<()> {
-    let mut log = tempfile::tempfile()?;
-    // Keep a second dispatch alive so tracing checks the capture's interest
-    // when another test thread registers the event first.
-    let _quiet = tracing::Dispatch::new(
-        tracing_subscriber::fmt()
-            .with_max_level(tracing::level_filters::LevelFilter::OFF)
-            .finish(),
-    );
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .without_time()
-        .with_writer(log.try_clone()?)
-        .finish();
-    let _capture = tracing::subscriber::set_default(subscriber);
-    let fixture = Fixture::with_velo_worker(LocalTransferCheckTiming::default()).await?;
-    let worker = fixture.worker(0).await?;
-    fixture.serve_local_onboard(
-        &worker,
-        Some(bytes::Bytes::from_static(
-            br#"{"Unproven":{"error":"injected worker drain failure"}}"#,
-        )),
-    )?;
-    let (_search, onboard) = fixture.start_local_onboard()?;
-    eventually("local onboard disposition", || {
-        onboard.paused().is_some() || onboard.is_complete()
-    })
-    .await;
+async fn paused_onboard_honors_configured_probe_deadline() -> Result<()> {
+    let fixture = Fixture::new(configured_timing(), 1).await?;
+    let mut worker = fixture.worker(0, true)?;
+    worker.register_check()?;
+    let slow = Duration::from_secs(7);
+    worker.reply(ProbeReply::Delayed(slow));
+    let (onboard, copy, lose_reply) = start_held(&fixture, &mut worker).await?;
+    lose_reply.send(()).unwrap();
+    worker.wait_for_check(1).await;
+    tokio::time::pause();
 
-    let pause = onboard.paused().expect("the local onboard must pause");
-    let label = worker.label();
-    assert_eq!(pause.worker(), label);
-    assert!(onboard.outcome().is_none());
-    assert!(fixture.sink.loads().is_empty());
-    assert_eq!(
-        metric(
-            &fixture.registry,
-            SAMPLE_COUNT,
-            &[&label, "no_recovery_capability"]
-        ),
-        Some(1.0)
-    );
-    assert_eq!(metric(&fixture.registry, SAMPLE_ATTEMPT, &[]), None);
-    log.rewind()?;
-    let mut lines = String::new();
-    log.read_to_string(&mut lines)?;
-    assert!(
-        lines.lines().any(|line| {
-            line.contains("onboard paused")
-                && line.contains(&format!("worker={label}"))
-                && line.contains("no_recovery_capability")
-        }),
-        "{lines}"
-    );
+    tick(DEADLINE).await;
+    fixture.assert_held(&onboard);
+    assert!(onboard.handle.paused().is_none());
+    tick(slow - DEADLINE).await;
+    onboard.wait_for_pause().await;
+    fixture.assert_paused(&onboard, &worker, NO_PROOF);
+    assert_eq!(worker.metric(&fixture, SAMPLE_CHECKS, &[SILENT]), None);
+
+    worker
+        .finish_copy(copy, TransferDrainOutcome::Completed)
+        .await;
+    tick(PROBE_INTERVAL).await;
+    worker.wait_for_check(2).await;
+    tick(slow).await;
+    fixture.assert_settled(&onboard, LoadOutcome::Done).await;
+    assert_eq!(worker.metric(&fixture, SAMPLE_CHECKS, &[SILENT]), None);
+    Ok(())
+}
+
+fn configured_timing() -> LocalTransferCheckTiming {
+    LocalTransferCheckTiming::from(&kvbm_config::LocalTransferCheckConfig {
+        wait_ms: 0,
+        deadline_ms: 20_000,
+    })
+}
+
+#[tokio::test]
+async fn local_onboard_pause_names_the_reporting_worker() -> Result<()> {
+    let mut logs = Logs::capture()?;
+    let fixture = Fixture::new(IMMEDIATE, 1).await?;
+    let worker = fixture.worker(0, true)?;
+    fixture.relay.register_handler(
+        Handler::unary_handler_async(
+            handler_names::scoped(handler_names::LOCAL_TRANSFER, Some(worker.id)),
+            |_| async {
+                Ok(Some(Bytes::from_static(
+                    br#"{"Unproven":{"error":"injected worker drain failure"}}"#,
+                )))
+            },
+        )
+        .build(),
+    )?;
+    let onboard = fixture.onboard()?;
+    onboard.wait_for_pause().await;
+    fixture.assert_paused(&onboard, &worker, NO_CAPABILITY);
+    assert_eq!(worker.metric(&fixture, SAMPLE_ATTEMPT, &[]), None);
+    logs.assert_event("onboard paused", &worker, NO_CAPABILITY);
     Ok(())
 }
 
 #[tokio::test]
 async fn local_onboard_recovery_uses_the_configured_probe_deadline() -> Result<()> {
-    let timing = LocalTransferCheckTiming::from(&kvbm_config::LocalTransferCheckConfig {
-        wait_ms: 0,
-        deadline_ms: 20_000,
-    });
-    let fixture = Fixture::with_velo_worker(timing).await?;
-    let worker = fixture.worker(0).await?;
-    fixture.serve_local_onboard(&worker, None)?;
-    worker.answer(serde_json::json!("Active"));
-    let (_search, mut onboard) = fixture.start_local_onboard()?;
-    // Use wall time until the TCP reply is lost and the first check responds.
-    // Advance only the probe timers once the driver has parked the copy.
-    eventually("local onboard disposition", || {
-        onboard.paused().is_some() || onboard.is_complete()
-    })
-    .await;
-    let pause = onboard.paused().expect("the local onboard must pause");
-    assert_eq!(pause.worker(), worker.label());
-    assert!(fixture.sink.loads().is_empty());
-    assert_eq!(fixture.g2.available_blocks(), 1);
-    let fence = onboard.take_physical_drain_fence().expect("local fence");
-    assert!(!fence.is_complete());
-    let check_count = |state: &str| metric(&fixture.registry, SAMPLE_CHECKS, &[state]);
-    assert_eq!(check_count("worker_no_proof"), Some(1.0));
-
-    let slow_reply = Duration::from_secs(7);
-    tokio::time::pause();
-    worker.answer_after(slow_reply, serde_json::json!("Active"));
-    tick(PROBE_INTERVAL).await;
-    eventually("first recovery check reached the worker", || {
-        worker.checks.load(Ordering::Relaxed) == 3
-    })
-    .await;
-    tick(slow_reply).await;
-    eventually("first recovery check disposition", || {
-        check_count("worker_no_proof") == Some(2.0) || check_count("worker_not_answering").is_some()
-    })
-    .await;
-    assert_eq!(check_count("worker_not_answering"), None);
+    let fixture = Fixture::new(configured_timing(), 1).await?;
+    let mut worker = fixture.worker(0, true)?;
+    worker.register_check()?;
+    let (onboard, copy) = lose_reply_and_pause(&fixture, &mut worker).await?;
+    fixture.assert_paused(&onboard, &worker, NO_PROOF);
     assert_eq!(
-        metric(&fixture.registry, SAMPLE_COUNT, &["worker_no_proof"]),
+        worker.metric(&fixture, SAMPLE_CHECKS, &[NO_PROOF]),
         Some(1.0)
     );
-    assert!(onboard.paused().is_some());
-    assert!(!fence.is_complete());
-    assert_eq!(fixture.g2.available_blocks(), 1);
 
-    worker.answer_after(slow_reply, serde_json::json!("Completed"));
+    let slow = Duration::from_secs(7);
+    worker.reply(ProbeReply::Delayed(slow));
     tick(PROBE_INTERVAL).await;
-    eventually("second recovery check reached the worker", || {
-        worker.checks.load(Ordering::Relaxed) == 4
+    worker.wait_for_check(2).await;
+    tick(slow).await;
+    eventually("slow active reply or timeout", || {
+        worker.metric(&fixture, SAMPLE_CHECKS, &[NO_PROOF]) == Some(2.0)
+            || worker.metric(&fixture, SAMPLE_CHECKS, &[SILENT]).is_some()
     })
     .await;
-    tick(slow_reply).await;
-    eventually("onboard terminal", || !fixture.sink.loads().is_empty()).await;
-    assert_eq!(onboard.outcome(), Some(LoadOutcome::Done));
-    assert!(onboard.paused().is_none());
-    assert!(fence.is_complete());
-    assert_eq!(fixture.g2.available_blocks(), 2);
-    assert_eq!(
-        fixture.sink.loads(),
-        vec![(REQUEST.into(), LoadOutcome::Done)]
-    );
+    assert_eq!(worker.metric(&fixture, SAMPLE_CHECKS, &[SILENT]), None);
+    fixture.assert_paused(&onboard, &worker, NO_PROOF);
+
+    worker
+        .finish_copy(copy, TransferDrainOutcome::Completed)
+        .await;
+    tick(PROBE_INTERVAL).await;
+    worker.wait_for_check(3).await;
+    tick(slow).await;
+    fixture.assert_settled(&onboard, LoadOutcome::Done).await;
     Ok(())
 }
 
 #[tokio::test]
 async fn paused_onboard_watchdog_allows_configured_probe_budget() -> Result<()> {
-    let fixture = Fixture::new().await?;
-    let worker = fixture.worker(0).await?;
-    let deadline = Duration::from_secs(20);
-    tokio::time::pause();
-
-    let action = fixture.pause_after_check(&worker, deadline, deadline).await;
+    let mut logs = Logs::capture()?;
+    let timing = configured_timing();
+    let fixture = Fixture::new(timing, 1).await?;
+    let mut worker = fixture.worker(0, true)?;
+    worker.register_check()?;
+    let (onboard, copy) = lose_reply_and_pause(&fixture, &mut worker).await?;
+    worker.reply(ProbeReply::Silent);
     tick(PROBE_INTERVAL).await;
-    eventually("first recovery probe reaches the worker", || {
-        worker.checks.load(Ordering::Relaxed) == 3
-    })
-    .await;
+    worker.wait_for_check(2).await;
     fixture.engine.paused_onboards.stop_probes();
 
-    let stuck = || metric(&fixture.registry, "kvbm_onboard_probe_stuck_total", &[]);
-    tick(deadline + Duration::from_secs(1)).await;
-    assert_eq!(
-        stuck(),
-        None,
-        "the next attempt may take the full deadline and interval"
-    );
+    tick(timing.deadline + Duration::from_secs(1)).await;
+    assert_eq!(worker.metric(&fixture, SAMPLE_STUCK, &[]), None);
+    assert!(!logs.read().contains("onboard probe is stuck"));
     tick(PROBE_INTERVAL + Duration::from_secs(1)).await;
-    assert_eq!(stuck(), Some(1.0));
-    assert_eq!(action.handle.outcome(), None);
+    assert_eq!(worker.metric(&fixture, SAMPLE_STUCK, &[]), Some(1.0));
+    logs.assert_event("onboard probe is stuck", &worker, "since_attempt_seconds");
+    fixture.assert_paused(&onboard, &worker, NO_PROOF);
+    assert!(worker.transfers.active());
+    worker
+        .finish_copy(copy, TransferDrainOutcome::Completed)
+        .await;
     Ok(())
-}
-
-fn check_target(fixture: &Fixture, worker: u64) -> LocalTransferRecheck {
-    LocalTransferRecheck {
-        instance: fixture.worker.instance_id(),
-        worker_id: Some(worker),
-        incarnation: Some(Uuid::new_v4()),
-        transfer_id: Uuid::new_v4(),
-    }
-}
-
-async fn check_and_pause(fixture: &Fixture, check: &LocalTransferRecheck) -> Action {
-    let action = fixture.mint();
-    let TransferDrainOutcome::Unproven(error) = check
-        .check(fixture.engine.leader.messenger(), DEADLINE)
-        .await
-    else {
-        panic!("this check cannot prove the copy drained");
-    };
-    fixture
-        .engine
-        .pause_load_action(fixture.load(&action), error);
-    action
 }
 
 #[tokio::test]
 async fn paused_onboard_reports_missing_handler_until_it_registers() -> Result<()> {
-    let fixture = Fixture::new().await?;
-    let check = check_target(&fixture, 99);
-    let action = check_and_pause(&fixture, &check).await;
+    let fixture = Fixture::new(IMMEDIATE, 1).await?;
+    let mut worker = fixture.worker(0, true)?;
+    let (onboard, copy) = lose_reply_and_pause(&fixture, &mut worker).await?;
+    fixture.assert_paused(&onboard, &worker, NO_PROOF);
+    assert!(worker.metric(&fixture, SAMPLE_ANSWER, &[]).is_some());
 
-    assert_eq!(
-        metric(&fixture.registry, SAMPLE_COUNT, &["worker_no_proof"]),
-        Some(1.0)
-    );
-    assert_eq!(action.handle.outcome(), None);
-    assert_eq!(fixture.g2.available_blocks(), 1);
-    assert!(metric(&fixture.registry, SAMPLE_ANSWER, &[]).is_some());
-
-    let payload = reply(check.incarnation.unwrap(), serde_json::json!("Completed"));
-    let handler = velo::Handler::unary_handler_async(
-        handler_names::scoped(handler_names::LOCAL_TRANSFER_CHECK, check.worker_id),
-        move |_| {
-            let payload = payload.clone();
-            async move { Ok(Some(payload)) }
-        },
-    )
-    .build();
-    fixture.worker.register_handler(handler)?;
-    tokio::time::pause();
+    worker.register_check()?;
+    worker
+        .finish_copy(copy, TransferDrainOutcome::Completed)
+        .await;
     tick(PROBE_INTERVAL).await;
-    eventually("the newly registered handler proves the copy", || {
-        action.physical.load(Ordering::Acquire)
-    })
-    .await;
-    assert_eq!(action.handle.outcome(), Some(LoadOutcome::Done));
-    assert_eq!(fixture.g2.available_blocks(), 2);
+    fixture.assert_settled(&onboard, LoadOutcome::Done).await;
+    worker.wait_for_check(1).await;
     Ok(())
 }
 
 #[tokio::test]
 async fn paused_onboard_keeps_transport_failure_waiting() -> Result<()> {
-    let fixture = Fixture::new().await?;
-    let worker = fixture.worker(0).await?;
-    fixture
-        .engine
-        .leader
-        .messenger()
-        .unregister_peer(worker.check.instance);
-    let action = check_and_pause(&fixture, &worker.check).await;
-    fixture.assert_paused(&action, &worker);
-    assert_eq!(metric(&fixture.registry, SAMPLE_ANSWER, &[]), None);
+    let mut logs = Logs::capture()?;
+    let fixture = Fixture::new(LocalTransferCheckTiming::default(), 1).await?;
+    let mut worker = fixture.worker(0, true)?;
+    worker.register_check()?;
+    let (onboard, copy, lose_reply) = start_held(&fixture, &mut worker).await?;
+    tokio::time::pause();
+    lose_reply.send(()).unwrap();
+    logs.wait_for_loss().await;
+    let messenger = fixture.engine.leader.messenger();
+    messenger.unregister_peer(fixture.relay.instance_id());
+    tick(WAIT).await;
+    onboard.wait_for_pause().await;
+    fixture.assert_paused(&onboard, &worker, SILENT);
+    assert_eq!(worker.metric(&fixture, SAMPLE_ANSWER, &[]), None);
+    assert_eq!(worker.checks.load(Ordering::Relaxed), 0);
+    assert!(worker.transfers.active());
+
+    messenger.register_peer(fixture.relay.peer_info())?;
+    worker
+        .finish_copy(copy, TransferDrainOutcome::Completed)
+        .await;
+    tick(PROBE_INTERVAL).await;
+    fixture.assert_settled(&onboard, LoadOutcome::Done).await;
     Ok(())
 }
 
 #[tokio::test]
 async fn paused_onboard_uses_fresh_handler_list_instead_of_cached_list() -> Result<()> {
-    let fixture = Fixture::new().await?;
-    let absent = check_target(&fixture, 1);
-    let present = check_target(&fixture, 2);
-    let absent_name = handler_names::scoped(handler_names::LOCAL_TRANSFER_CHECK, absent.worker_id);
-    let present_name =
-        handler_names::scoped(handler_names::LOCAL_TRANSFER_CHECK, present.worker_id);
-    fixture.worker.register_handler(
-        velo::Handler::unary_handler_async(&present_name, |_| async {
-            Err::<Option<bytes::Bytes>, _>(anyhow!("the check failed"))
+    let fixture = Fixture::new(IMMEDIATE, 2).await?;
+    let mut absent = fixture.worker(0, true)?;
+    let mut present = fixture.worker(1, true)?;
+    present.register_check()?;
+    present.reply(ProbeReply::Error);
+    // The handshake advertises the opposite of the actual handler list.
+    let absent_name = absent.check_name();
+    let present_name = present.check_name();
+    let stale = Arc::new(AtomicBool::new(true));
+    fixture.relay.register_streaming_handler(
+        Handler::typed_unary_async("_hello", {
+            let stale = stale.clone();
+            let absent = absent_name.clone();
+            let present = present_name.clone();
+            move |ctx: velo::TypedContext<serde_json::Value>| {
+                let mut handlers = ctx.msg.list_local_handlers();
+                if stale.load(Ordering::Relaxed) {
+                    handlers.retain(|name| *name != present);
+                    handlers.push(absent.clone());
+                }
+                async move { Ok::<_, anyhow::Error>(serde_json::json!({"handlers": handlers})) }
+            }
         })
         .build(),
     )?;
-    // Simulate a stale handshake view. The worker's actual handler list has
-    // the opposite answer for both checks.
-    let cached_name = absent_name.clone();
-    fixture.worker.register_streaming_handler(
-        velo::Handler::typed_unary_async(
-            "_hello",
-            move |_: velo::TypedContext<serde_json::Value>| {
-                let name = cached_name.clone();
-                async move { Ok::<_, anyhow::Error>(serde_json::json!({"handlers": [name]})) }
-            },
-        )
-        .build(),
-    )?;
     let messenger = fixture.engine.leader.messenger();
-    timeout(DEADLINE, messenger.refresh_handlers(absent.instance)).await??;
-    let cached = timeout(DEADLINE, messenger.available_handlers(absent.instance)).await??;
+    let instance = fixture.relay.instance_id();
+    timeout(DEADLINE, messenger.refresh_handlers(instance)).await??;
+    let cached = timeout(DEADLINE, messenger.available_handlers(instance)).await??;
     assert!(cached.contains(&absent_name));
     assert!(!cached.contains(&present_name));
 
-    let absent_action = check_and_pause(&fixture, &absent).await;
-    let present_action = check_and_pause(&fixture, &present).await;
-    let absent_worker = format!("{}#1", absent.instance);
-    let present_worker = format!("{}#2", present.instance);
+    let lose_present_reply = present.lose_next_reply();
+    let (onboard, absent_copy, lose_absent_reply) = start_held(&fixture, &mut absent).await?;
+    let present_copy = present.running_copy(&onboard).await;
+    lose_absent_reply.send(()).unwrap();
+    lose_present_reply.send(()).unwrap();
+    onboard.wait_for_pause().await;
+    fixture.assert_held(&onboard);
     assert_eq!(
-        [
-            metric(
-                &fixture.registry,
-                SAMPLE_COUNT,
-                &[&absent_worker, "worker_no_proof"]
-            ),
-            metric(
-                &fixture.registry,
-                SAMPLE_COUNT,
-                &[&present_worker, "worker_not_answering"]
-            ),
-        ],
-        [Some(1.0), Some(1.0)]
+        absent.metric(&fixture, SAMPLE_COUNT, &[NO_PROOF]),
+        Some(1.0)
     );
-    assert_eq!(absent_action.handle.outcome(), None);
-    assert_eq!(present_action.handle.outcome(), None);
-    assert_eq!(fixture.g2.available_blocks(), 0);
+    assert!(absent.metric(&fixture, SAMPLE_ANSWER, &[]).is_some());
+    assert_eq!(present.metric(&fixture, SAMPLE_COUNT, &[SILENT]), Some(1.0));
+    assert_eq!(present.metric(&fixture, SAMPLE_ANSWER, &[]), None);
+
+    assert!(absent.transfers.active());
+    assert!(present.transfers.active());
+    absent.register_check()?;
+    present.reply(ProbeReply::Forward);
+    stale.store(false, Ordering::Relaxed);
+    timeout(DEADLINE, messenger.refresh_handlers(instance)).await??;
+    absent
+        .finish_copy(absent_copy, TransferDrainOutcome::Completed)
+        .await;
+    present
+        .finish_copy(present_copy, TransferDrainOutcome::Completed)
+        .await;
+    tokio::time::pause();
+    tick(PROBE_INTERVAL).await;
+    fixture.assert_settled(&onboard, LoadOutcome::Done).await;
     Ok(())
 }
