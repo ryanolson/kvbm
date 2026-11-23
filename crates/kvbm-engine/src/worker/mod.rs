@@ -155,7 +155,11 @@ pub trait WorkerTransfers: Send + Sync {
     /// * `options` - Transfer options (layer range, bounce buffers, etc.)
     ///
     /// # Returns
-    /// A future that completes when the transfer is complete
+    /// A receipt that reports the transfer's drain outcome.
+    ///
+    /// For CUDA copies, a dispatch error means no copy was submitted. A
+    /// submission that may have reached the stream reports errors through
+    /// its receipt.
     fn execute_local_transfer(
         &self,
         src: LogicalLayoutHandle,

@@ -23,10 +23,9 @@ stall. [Probe budget test](../crates/kvbm-engine/src/tiering/engine/local/tests/
 
 ## Drain CUDA work before releasing its buffers
 
-After a CUDA copy reaches a stream, an error recording its completion event
-does not prove that the copy drained. Keep the registrations if synchronizing
-the stream fails. A transform must also keep its scratch table if an upload
-can still read it.
+Recording a completion event can fail while a CUDA copy is still in flight.
+Keep the registrations if synchronizing the stream fails. A transform must
+also keep its scratch table if an upload can still read it.
 
 Test by failing completion event recording after launch. The dispatch must
 return a receipt. Fail the stream synchronization to check that the receipt

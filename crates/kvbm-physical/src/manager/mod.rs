@@ -235,7 +235,10 @@ impl TransferManager {
     /// Returns an error if:
     /// - Either handle is invalid
     /// - Block IDs are out of bounds
-    /// - Transfer execution fails
+    /// - Dispatch fails before submitting a CUDA copy
+    ///
+    /// After possible CUDA submission, the receipt reports any dispatch error
+    /// and whether the work drained.
     pub fn execute_transfer(
         &self,
         src_handle: LayoutHandle,
