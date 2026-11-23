@@ -146,6 +146,10 @@ pub trait LeaderEngine: Send + Sync + 'static {
     /// or consuming a cross-request bundle identity. This compatibility seam
     /// is for same-request suspension/resume ownership; reusable prefix hits
     /// must use [`Self::onboard_bundle`] or [`Self::onboard_resources`].
+    ///
+    /// Keep the G2 source blocks and G1 destinations until the returned
+    /// handle's physical-drain fence completes, even if the handle is dropped.
+    /// An unproven transfer leaves the handle pending and the fence incomplete.
     fn onboard_resource_blocks(
         self: Arc<Self>,
         req: &RequestId,

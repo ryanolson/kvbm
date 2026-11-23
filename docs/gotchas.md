@@ -13,6 +13,16 @@ source stays pinned, the fence stays incomplete, and the scheduler gets no
 load terminal.
 [Lost-reply test](../crates/kvbm-engine/src/tiering/engine/local/tests/onboard_drain.rs)
 
+## Resume the remaining resources after a lost reply
+
+Proof for one resource copy covers only that copy. Keep the request pending
+and route any remaining resources through admission before completing its
+drain fence.
+
+Test with two resources. Lose the first reply, prove the first copy drained,
+and hold the second copy open. The sink must wait for the second proof.
+[Resource restore test](../crates/kvbm-engine/src/tiering/engine/local/tests/onboard_drain.rs)
+
 ## Keep paused onboard blocks through connector teardown
 
 Keep the engine's pause registry alive while a worker can still touch its

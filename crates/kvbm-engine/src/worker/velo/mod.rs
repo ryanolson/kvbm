@@ -108,6 +108,31 @@ mod lost_reply_tests;
 mod service;
 mod unresolved;
 
+#[cfg(test)]
+pub(crate) fn serve_held_local_transfers(
+    messenger: &::velo::Messenger,
+    worker_id: u64,
+    lose_first_reply: bool,
+    dispatch: impl Fn(kvbm_common::LogicalResourceId) -> Result<TransferCompleteNotification>
+    + Send
+    + Sync
+    + 'static,
+) -> Result<Box<dyn Fn() -> bool>> {
+    let records = check::LocalTransferRecords::new();
+    if lose_first_reply {
+        let (open, gate) = tokio::sync::oneshot::channel();
+        open.send(()).expect("deferred copy gate");
+        *records.hooks.defer_next.lock() = Some(gate);
+    }
+    service::register_local_transfer_handlers(
+        messenger,
+        Some(worker_id),
+        records.clone(),
+        Arc::new(move |message| dispatch(message.resource.expect("resource transfer"))),
+    )?;
+    Ok(Box::new(move || !records.active_ids().is_empty()))
+}
+
 pub(crate) use check::CheckEvidence;
 pub use check::{
     DEFAULT_LOCAL_TRANSFER_CHECK_DEADLINE, DEFAULT_LOCAL_TRANSFER_CHECK_WAIT,

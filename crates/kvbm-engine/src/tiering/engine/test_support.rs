@@ -78,24 +78,40 @@ pub(super) fn build_leader_with_messenger(
     block_size: usize,
     workers: Arc<dyn ParallelWorkers>,
 ) -> Result<(InstanceLeader, Arc<BlockManager<G2>>)> {
+    let (leader, mut managers) =
+        build_leader_with_resources(messenger, &[resource], g2_blocks, block_size, workers)?;
+    Ok((leader, managers.remove(0)))
+}
+
+pub(super) fn build_leader_with_resources(
+    messenger: Arc<velo::Messenger>,
+    resources: &[LogicalResourceId],
+    g2_blocks: usize,
+    block_size: usize,
+    workers: Arc<dyn ParallelWorkers>,
+) -> Result<(InstanceLeader, Vec<Arc<BlockManager<G2>>>)> {
     let registry = BlockRegistry::builder().build();
-    let manager = Arc::new(
-        TestManagerBuilder::<G2>::new()
-            .block_count(g2_blocks)
-            .block_size(block_size)
-            .registry(registry.clone())
-            .build(),
-    );
     let mut set = BlockManagerSet::new();
-    set.insert(resource, Arc::clone(&manager))?;
+    let mut managers = Vec::with_capacity(resources.len());
+    for &resource in resources {
+        let manager = Arc::new(
+            TestManagerBuilder::<G2>::new()
+                .block_count(g2_blocks)
+                .block_size(block_size)
+                .registry(registry.clone())
+                .build(),
+        );
+        set.insert(resource, manager.clone())?;
+        managers.push(manager);
+    }
     let leader = InstanceLeader::builder()
         .messenger(messenger)
         .registry(registry)
-        .g2_manager_set(Arc::new(set), resource)
+        .g2_manager_set(Arc::new(set), resources[0])
         .parallel_worker(workers)
         .observability(Arc::new(KvbmObservability::default()))
         .build()?;
-    Ok((leader, manager))
+    Ok((leader, managers))
 }
 
 pub(super) struct CompletedParallelWorkers;

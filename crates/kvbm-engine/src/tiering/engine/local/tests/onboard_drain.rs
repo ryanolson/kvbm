@@ -14,14 +14,23 @@
 //! sink. The driver writes the handle's cell before it calls the sink, so a
 //! wait on the handle alone could read the sink too early.
 
+use std::time::Duration;
+
 use super::super::super::test_support::{
-    DeliveredOutcome, HangingParallelWorkers, build_leader_with_workers,
-    wait_onboard_driver_finished,
+    DeliveredOutcome, HangingParallelWorkers, build_leader_with_resources,
+    build_leader_with_workers, wait_onboard_driver_finished,
 };
+use super::onboard_pause::{eventually, tick};
 use super::*;
 use kvbm_common::LogicalResourceId;
-use kvbm_logical::BlockManager;
+use kvbm_logical::{BlockManager, MutableBlock};
+use kvbm_physical::transfer::{TransferCompleteNotification, TransferDrainOutcome};
 use kvbm_protocols::connector::LoadOutcome;
+use tokio::sync::{mpsc, oneshot};
+
+use crate::testing::messenger::create_messenger_pair_tcp;
+use crate::worker::group::SpmdParallelWorkers;
+use crate::worker::velo::{LocalTransferCheckTiming, VeloWorkerClient, serve_held_local_transfers};
 
 const RESOURCE: LogicalResourceId = LogicalResourceId(0);
 const G2_BLOCKS: usize = 2;
@@ -177,7 +186,6 @@ async fn onboard_blocks_keeps_sources_and_destinations_after_a_lost_reply() -> R
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "a local onboard does not yet keep its resources when a lost worker reply leaves the copy unproven"]
 async fn onboard_resource_blocks_keeps_destinations_after_a_lost_reply() -> Result<()> {
     let fixture = build().await?;
     let mut onboard = fixture.engine.clone().onboard_resource_blocks(
@@ -308,4 +316,233 @@ async fn dropping_onboard_handle_keeps_the_fence_until_drain() -> Result<()> {
     );
     assert!(!fixture.engine.actions.contains_key(&action_id));
     Ok(())
+}
+
+const TAIL: LogicalResourceId = LogicalResourceId(1);
+
+struct ResourceWorker {
+    _server: Arc<velo::Messenger>,
+    active: Box<dyn Fn() -> bool>,
+    copies: mpsc::UnboundedReceiver<(LogicalResourceId, oneshot::Sender<TransferDrainOutcome>)>,
+}
+
+impl ResourceWorker {
+    async fn copy(&mut self, expected: LogicalResourceId) -> oneshot::Sender<TransferDrainOutcome> {
+        let mut copy = None;
+        eventually("the resource copy to start", || {
+            copy = self.copies.try_recv().ok();
+            copy.is_some()
+        })
+        .await;
+        let (resource, proof) = copy.unwrap();
+        assert_eq!(resource, expected);
+        proof
+    }
+}
+
+struct ResourceRestore {
+    engine: Arc<LocalConnectorEngine>,
+    sink: Arc<RecordingSink>,
+    worker: ResourceWorker,
+    handle: OnboardHandle,
+    caller_pins: Vec<MutableBlock<crate::G2>>,
+}
+
+async fn resource_restore(lose_first_reply: bool) -> Result<ResourceRestore> {
+    let pair = create_messenger_pair_tcp().await?;
+    let (started, copies) = mpsc::unbounded_channel();
+    let active =
+        serve_held_local_transfers(&pair.messenger_b, 0, lose_first_reply, move |resource| {
+            let (proof, receipt) = oneshot::channel();
+            started.send((resource, proof))?;
+            Ok(TransferCompleteNotification::from_drain_future(
+                async move {
+                    receipt
+                        .await
+                        .unwrap_or_else(|error| TransferDrainOutcome::Unproven(error.into()))
+                },
+            ))
+        })?;
+    let client = VeloWorkerClient::new_for_worker(
+        pair.messenger_a.clone(),
+        pair.messenger_b.instance_id(),
+        0,
+    )
+    .with_local_transfer_check(LocalTransferCheckTiming {
+        wait: Duration::from_millis(10),
+        ..LocalTransferCheckTiming::default()
+    });
+    let workers = Arc::new(SpmdParallelWorkers::new(
+        vec![Arc::new(client)],
+        Arc::new(velo::EventManager::local()),
+        pair.messenger_a.runtime().clone(),
+    ));
+    let resources = [RESOURCE, TAIL];
+    let (leader, managers) =
+        build_leader_with_resources(pair.messenger_a, &resources, 1, BS, workers)?;
+    let sink = RecordingSink::new();
+    let engine = LocalConnectorEngine::new(Arc::new(leader), sink.clone(), BS, true);
+    let caller_pins: Vec<_> = managers
+        .iter()
+        .map(|manager| manager.allocate_blocks(1).unwrap().pop().unwrap())
+        .collect();
+    let transfers = resources
+        .into_iter()
+        .zip(&caller_pins)
+        .enumerate()
+        .map(|(index, (resource, pin))| ResourceOnboard {
+            resource,
+            source_block_ids: vec![pin.block_id()],
+            destination_block_ids: vec![G1_DESTINATION + index],
+        })
+        .collect();
+    let handle = engine
+        .clone()
+        .onboard_resource_blocks(&REQUEST.into(), transfers)?;
+    Ok(ResourceRestore {
+        engine,
+        sink,
+        worker: ResourceWorker {
+            _server: pair.messenger_b,
+            active,
+            copies,
+        },
+        handle,
+        caller_pins,
+    })
+}
+
+#[tokio::test]
+async fn resource_onboard_resumes_the_tail_after_proof() -> Result<()> {
+    let ResourceRestore {
+        engine,
+        sink,
+        mut worker,
+        mut handle,
+        caller_pins,
+    } = resource_restore(true).await?;
+    let first = worker.copy(RESOURCE).await;
+    wait_onboard_driver_finished(*handle.id()).await;
+    assert!(
+        handle.paused().is_some(),
+        "lost reply must pause the resource restore"
+    );
+    assert!(sink.loads().is_empty());
+    assert!(
+        worker.copies.try_recv().is_err(),
+        "the tail must wait for proof"
+    );
+    let fence = handle.take_physical_drain_fence().expect("resource fence");
+    assert!(!fence.is_complete());
+
+    let weak = Arc::downgrade(&engine);
+    drop(engine);
+    let engine = weak
+        .upgrade()
+        .expect("the paused restore must hold the engine");
+    let admission = tokio::time::timeout(
+        Duration::from_secs(5),
+        engine.resource_onboard_admission.lock(),
+    )
+    .await?;
+    assert!(first.send(TransferDrainOutcome::Completed).is_ok());
+    eventually("the worker records first-copy proof", || !(worker.active)()).await;
+    tokio::time::pause();
+    tick(super::super::super::paused::PROBE_INTERVAL).await;
+    eventually("the first proof clears the pause", || {
+        handle.paused().is_none()
+    })
+    .await;
+    assert!(
+        worker.copies.try_recv().is_err(),
+        "the tail must wait for admission"
+    );
+    assert!(
+        handle.outcome().is_none(),
+        "one proof cannot complete the restore"
+    );
+    assert!(!fence.is_complete());
+    drop(admission);
+    drop(engine);
+
+    let tail = worker.copy(TAIL).await;
+    assert!(sink.loads().is_empty());
+    assert!(!fence.is_complete());
+    assert!(tail.send(TransferDrainOutcome::Completed).is_ok());
+    eventually("terminal after tail proof", || !sink.loads().is_empty()).await;
+    assert_eq!(handle.outcome(), Some(LoadOutcome::Done));
+    assert!(fence.is_complete());
+    assert_eq!(sink.loads(), vec![(REQUEST.into(), LoadOutcome::Done)]);
+    drop(caller_pins);
+    Ok(())
+}
+
+async fn resource_failure_keeps_its_destination_ids(lost_reply: bool) -> Result<()> {
+    let mut restore = resource_restore(lost_reply).await?;
+    let proof = restore.worker.copy(RESOURCE).await;
+    let action = *restore.handle.id();
+    if lost_reply {
+        wait_onboard_driver_finished(action).await;
+        assert!(
+            restore.handle.paused().is_some(),
+            "lost reply must pause the resource restore"
+        );
+        assert!(restore.sink.loads().is_empty());
+    }
+    let fence = restore
+        .handle
+        .take_physical_drain_fence()
+        .expect("resource fence");
+    assert!(!fence.is_complete());
+    assert!(
+        proof
+            .send(TransferDrainOutcome::DrainedWithError(anyhow::anyhow!(
+                "worker copy failed"
+            )))
+            .is_ok()
+    );
+    if lost_reply {
+        eventually("the worker records the drained failure", || {
+            !(restore.worker.active)()
+        })
+        .await;
+        tokio::time::pause();
+        tick(super::super::super::paused::PROBE_INTERVAL).await;
+        eventually("resource failure terminal", || {
+            !restore.sink.loads().is_empty()
+        })
+        .await;
+    } else {
+        wait_onboard_driver_finished(action).await;
+    }
+    assert!(fence.is_complete());
+    assert_eq!(
+        restore.engine.poll_action(&action),
+        ActionStatus::Failed(ActionFailure::Resource {
+            resource: RESOURCE,
+            block_ids: Some(vec![G1_DESTINATION]),
+        }),
+    );
+    assert_eq!(
+        restore.sink.loads(),
+        vec![(
+            REQUEST.into(),
+            LoadOutcome::FailedPartial {
+                block_ids: vec![G1_DESTINATION]
+            }
+        )],
+    );
+    assert!(restore.handle.paused().is_none());
+    assert!(restore.worker.copies.try_recv().is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn resource_onboard_reports_the_failed_resource_after_recheck() -> Result<()> {
+    resource_failure_keeps_its_destination_ids(true).await
+}
+
+#[tokio::test]
+async fn resource_onboard_releases_at_once_after_a_drained_failure() -> Result<()> {
+    resource_failure_keeps_its_destination_ids(false).await
 }

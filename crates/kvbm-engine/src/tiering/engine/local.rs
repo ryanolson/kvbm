@@ -1487,6 +1487,7 @@ impl LocalConnectorEngine {
                         physical_drain: drain_cell,
                         pause: pause_cell,
                         holds: Box::new(holds),
+                        resource: None,
                     },
                     error,
                 ),

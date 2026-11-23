@@ -12,7 +12,9 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use kvbm_physical::transfer::TransferDrainOutcome;
-use kvbm_protocols::connector::{ActionFailure, ActionId, ActionStatus, RequestId};
+use kvbm_protocols::connector::{
+    ActionFailure, ActionId, ActionStatus, RequestId, ResourceOnboard,
+};
 use parking_lot::Mutex as RegistryMutex;
 use tokio::time::{Instant, sleep_until};
 use velo::InstanceId;
@@ -41,6 +43,21 @@ pub(super) struct PausedLoad {
     pub(super) physical_drain: Arc<AtomicBool>,
     pub(super) pause: PauseCell,
     pub(super) holds: Box<dyn Send>,
+    pub(super) resource: Option<ResourceContinuation>,
+}
+
+/// The current resource and the work that has yet to reach admission.
+pub(super) struct ResourceContinuation {
+    pub(super) failure: ActionFailure,
+    pub(super) remaining: std::vec::IntoIter<ResourceOnboard>,
+}
+
+impl PausedLoad {
+    pub(super) fn finish(self, engine: &LocalConnectorEngine, status: ActionStatus) {
+        drop(self.holds);
+        engine.finish_load_action(self.action, &self.request, status, self.destinations);
+        engine.finish_physical_load_action(self.action, &self.physical_drain);
+    }
 }
 
 struct PausedRecord {
@@ -484,30 +501,40 @@ impl LocalConnectorEngine {
         self.paused_onboards.insert(self, load, error);
     }
 
-    fn resolve_paused_load(&self, record: PausedRecord) {
+    fn resolve_paused_load(self: &Arc<Self>, record: PausedRecord) {
+        let mut load = record.load;
+        let resource = load.resource.take();
+        *load.pause.lock().expect("pause mutex poisoned") = None;
         let (status, result) = match record.unresolved.into_outcome() {
-            TransferDrainOutcome::Completed => (ActionStatus::Complete, "completed"),
+            TransferDrainOutcome::Completed => {
+                if let Some(resource) = resource
+                    && resource.remaining.len() != 0
+                {
+                    tracing::info!(
+                        request_id = %load.request,
+                        action_id = ?load.action,
+                        pause_seconds = record.since.elapsed().as_secs_f64(),
+                        "onboard pause cleared, resuming remaining resources",
+                    );
+                    self.spawn_resource_onboard(load, resource.remaining);
+                    return;
+                }
+                (ActionStatus::Complete, "completed")
+            }
             TransferDrainOutcome::DrainedWithError(error) => {
-                tracing::debug!(request_id = %record.load.request, %error, "paused onboard proved drained with error");
+                tracing::debug!(request_id = %load.request, %error, "paused onboard proved drained with error");
                 (
-                    ActionStatus::Failed(ActionFailure::AllBlocks),
+                    ActionStatus::Failed(
+                        resource.map_or(ActionFailure::AllBlocks, |resource| resource.failure),
+                    ),
                     "drained_with_error",
                 )
             }
             TransferDrainOutcome::Unproven(_) => unreachable!("unresolved onboard cannot settle"),
         };
-        let PausedLoad {
-            action,
-            request,
-            destinations,
-            physical_drain,
-            pause,
-            holds,
-        } = record.load;
-        drop(holds);
-        *pause.lock().expect("pause mutex poisoned") = None;
-        self.finish_load_action(action, &request, status, destinations);
-        self.finish_physical_load_action(action, &physical_drain);
+        let action = load.action;
+        let request = load.request.clone();
+        load.finish(self, status);
         tracing::info!(
             request_id = %request,
             action_id = ?action,
