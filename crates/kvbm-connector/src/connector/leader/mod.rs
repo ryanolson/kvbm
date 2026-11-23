@@ -925,6 +925,9 @@ impl ConnectorLeaderApi for Arc<Leader> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "testing")]
+    mod request_finish;
+
     use super::{Error, Leader};
     use crate::common::{CachedRequestData, NewRequestData, RequestMetadata, SchedulerOutput};
     use crate::common::{FinishedStatus, Request};
@@ -2319,7 +2322,7 @@ mod tests {
         assert_eq!(minted.len(), 1, "the fresh poll minted exactly one pin");
 
         // Stage an in-flight (Pending) onboard reading the pinned source.
-        let (onboard, cell) = engine.arm_onboard();
+        let (onboard, cell) = engine.arm_onboard("r1");
         leader.state.lock().get_mut("r1").unwrap().onboard = Some(onboard);
 
         // Evict: proposal + onboard MOVE into the drain-holder; the visible
@@ -2758,6 +2761,55 @@ mod tests {
 
     // --- finish / reap ---------------------------------------------------
 
+    #[rstest::rstest]
+    #[case(false, false, false, FinishedStatus::Pending)]
+    #[case(true, false, false, FinishedStatus::Pending)]
+    #[case(false, true, false, FinishedStatus::Finished)]
+    #[case(false, true, true, FinishedStatus::Pending)]
+    fn request_finished_with_terminal_load_waits_for_physical_proof(
+        #[case] preempted: bool,
+        #[case] drained: bool,
+        #[case] receive_claimed: bool,
+        #[case] expected: FinishedStatus,
+    ) {
+        use kvbm_protocols::connector::ActionFailure;
+
+        let engine = recording_engine(Refresh::Lost);
+        let leader = Leader::with_engine(engine.dyn_clone(), BS);
+        leader
+            .create_slot(make_request("abort", (0..12u32).collect()))
+            .unwrap();
+        leader.get_num_new_matched_tokens("abort", 0).unwrap();
+        let physical = Arc::new(AtomicBool::new(drained));
+        // A Claimed receive still belongs to the engine even with a complete fence.
+        let release_ready = if receive_claimed {
+            Arc::new(AtomicBool::new(false))
+        } else {
+            physical.clone()
+        };
+        engine.track_finish_work("abort", FinishWork::AwaitingProof(release_ready));
+        let onboard = OnboardHandle::new_with_physical_drain(
+            ActionId::new(),
+            engine.weak(),
+            Arc::new(Mutex::new(ActionStatus::Failed(ActionFailure::Partial {
+                block_ids: vec![10],
+            }))),
+            vec![10],
+            FenceHandle::new(physical),
+        );
+        leader.state.lock().get_mut("abort").unwrap().onboard = Some(onboard);
+        if preempted {
+            *engine.mint_fence_handles.lock().unwrap() = true;
+            leader.on_evicted("abort").unwrap();
+        }
+
+        assert_eq!(leader.request_finished("abort"), expected);
+        assert_eq!(
+            leader.has_slot("abort"),
+            expected == FinishedStatus::Pending
+        );
+    }
+
     /// No in-flight offload, so `request_finished` reaps the slot inline — no
     /// poll, no `update_connector_output` needed.
     #[test]
@@ -2808,9 +2860,7 @@ mod tests {
         );
     }
 
-    /// The deferred (handle-gated) sweep reap drops the parked handle too: a
-    /// finish with the load still in flight keeps the slot until the terminal,
-    /// then releases the lifecycle.
+    /// The engine's release signal reaps the slot and its parked lifecycle.
     #[test]
     fn finishing_sweep_reap_drops_proposal() {
         let engine = recording_engine(Refresh::Lost);
@@ -2832,31 +2882,22 @@ mod tests {
         leader
             .update_connector_output(HashSet::new(), HashSet::new())
             .unwrap();
+        assert!(leader.has_slot("r1"));
+        leader
+            .update_connector_output(HashSet::from(["r1".to_owned()]), HashSet::new())
+            .unwrap();
         assert!(!leader.has_slot("r1"));
         assert_eq!(*engine.releases.lock().unwrap(), minted);
     }
 
-    /// Offload-in-flight finish (REFACTOR.md §4 active-offloading case, D
-    /// semantics): the slot holds a non-terminal `offload`, so
-    /// `request_finished` returns `Pending`, keeps the slot, and hands the
-    /// engine the coordination IN-CALL — `take_offload_drain` + `commit`
-    /// (commit arms the engine's emit-on-last-terminal; the connector never
-    /// re-polls to decide when to emit). The deferred sweep in
-    /// `update_connector_output` then reaps the slot once its handles are
-    /// terminal — gated on the HANDLES, not on the vLLM sets (which are only
-    /// the wake-up cadence).
     #[test]
-    fn offload_in_flight_finish_commits_drain_in_call_and_reaps_on_terminal() {
+    fn request_finished_with_pending_offload_waits_for_engine_signal() {
         let engine = recording_engine(Refresh::Lost);
         let leader = Leader::with_engine(engine.dyn_clone(), BS);
-
         leader
             .create_slot(make_request("r1", (0..16u32).collect()))
             .unwrap();
-        leader.get_num_new_matched_tokens("r1", 0).unwrap();
-
-        // Stage an in-flight (Pending) offload on the slot.
-        let (handle, cell) = engine.arm_offload(&"r1".to_string());
+        let (handle, cell) = engine.arm_offload(&"r1".to_owned());
         leader
             .state
             .lock()
@@ -2865,64 +2906,34 @@ mod tests {
             .offloads
             .push(handle);
 
-        // A non-terminal offload defers the finish: slot kept, status Pending,
-        // and the drain is committed IN-CALL (D: the engine owns the terminal
-        // coordination from here; commit = arm, not emit).
         assert_eq!(leader.request_finished("r1"), FinishedStatus::Pending);
-        assert!(leader.has_slot("r1"));
-        assert_eq!(
-            engine.commits.lock().unwrap().as_slice(),
-            ["r1".to_string()],
-            "request_finished(Pending) must commit the drain in-call"
-        );
+        assert_eq!(leader.request_finished("r1"), FinishedStatus::Pending);
+        assert_eq!(engine.pending_finishes.lock().unwrap().as_slice(), ["r1"]);
+        assert!(!engine.drains_armed.lock().unwrap().contains("r1"));
 
-        // The sweep does NOT reap while the offload is still pending — even if
-        // vLLM's sets name the request (handles are the gate).
-        leader
-            .update_connector_output(HashSet::from(["r1".to_string()]), HashSet::new())
-            .unwrap();
-        assert!(leader.has_slot("r1"), "non-terminal handles block the reap");
-
-        // Worker save terminal: flip the offload cell; the next sweep reaps —
-        // with EMPTY vLLM sets (the sets are cadence, not the gate).
         *cell.lock().unwrap() = ActionStatus::Complete;
         leader
             .update_connector_output(HashSet::new(), HashSet::new())
             .unwrap();
-        assert!(!leader.has_slot("r1"), "the Pending slot is reaped");
-
-        // The drain committed exactly once (consume-once); later sweeps are
-        // no-ops.
-        leader
-            .update_connector_output(HashSet::from(["r1".to_string()]), HashSet::new())
-            .unwrap();
-        assert_eq!(
-            engine.commits.lock().unwrap().len(),
-            1,
-            "take_offload_drain is consume-once: exactly one commit total"
+        assert!(
+            leader.has_slot("r1"),
+            "the handle's terminal cannot reap the slot"
         );
+        leader
+            .update_connector_output(HashSet::from(["r1".to_owned()]), HashSet::new())
+            .unwrap();
+        assert!(!leader.has_slot("r1"));
     }
 
-    /// The mixed {onboard=Pending, offload=Pending} cell: a single slot carries
-    /// BOTH a visible in-flight onboard AND a visible in-flight offload at finish
-    /// time. The reap gate is an AND over onboard-terminal && all-offloads-terminal;
-    /// flipping ONE handle terminal must NOT reap while the other is still pending.
-    /// The drain is committed once, in-call, and consumed once across the mixed
-    /// terminal ordering (onboard terminal first, offload last).
     #[test]
-    fn both_onboard_and_offload_in_flight_finish_commits_drain_once_and_reaps_only_when_both_terminal()
-     {
+    fn request_finished_with_onboard_and_offload_waits_for_engine_signal() {
         let engine = recording_engine(Refresh::Lost);
         let leader = Leader::with_engine(engine.dyn_clone(), BS);
-
         leader
             .create_slot(make_request("r1", (0..16u32).collect()))
             .unwrap();
-        leader.get_num_new_matched_tokens("r1", 0).unwrap();
-
-        // Stage BOTH an in-flight onboard and an in-flight offload on the slot.
-        let (onboard, onboard_cell) = engine.arm_onboard();
-        let (offload, offload_cell) = engine.arm_offload(&"r1".to_string());
+        let (onboard, onboard_cell) = engine.arm_onboard("r1");
+        let (offload, offload_cell) = engine.arm_offload(&"r1".to_owned());
         {
             let mut state = leader.state.lock();
             let slot = state.get_mut("r1").unwrap();
@@ -2930,106 +2941,50 @@ mod tests {
             slot.offloads.push(offload);
         }
 
-        // A non-terminal handle defers the finish: slot kept, status Pending,
-        // drain committed IN-CALL exactly once.
         assert_eq!(leader.request_finished("r1"), FinishedStatus::Pending);
-        assert_eq!(
-            engine.commits.lock().unwrap().as_slice(),
-            ["r1".to_string()],
-            "request_finished(Pending) must commit the drain in-call"
-        );
-        assert!(leader.has_slot("r1"));
-
-        // Both handles pending: the sweep keeps the slot.
-        leader
-            .update_connector_output(HashSet::new(), HashSet::new())
-            .unwrap();
-        assert!(
-            leader.has_slot("r1"),
-            "both handles pending blocks the reap"
-        );
-
-        // Flip ONLY the onboard terminal: the offload is still pending, so the
-        // AND clause holds the slot.
+        assert_eq!(engine.pending_finishes.lock().unwrap().as_slice(), ["r1"]);
         *onboard_cell.lock().unwrap() = ActionStatus::Complete;
         leader
             .update_connector_output(HashSet::new(), HashSet::new())
             .unwrap();
-        assert!(
-            leader.has_slot("r1"),
-            "onboard terminal but offload pending must NOT reap"
-        );
-
-        // Flip the offload terminal too: now both handles are terminal and the
-        // sweep reaps.
+        assert!(leader.has_slot("r1"));
         *offload_cell.lock().unwrap() = ActionStatus::Complete;
         leader
             .update_connector_output(HashSet::new(), HashSet::new())
             .unwrap();
         assert!(
-            !leader.has_slot("r1"),
-            "reap once BOTH handles are terminal"
+            leader.has_slot("r1"),
+            "two logical terminals still require the engine signal"
         );
-
-        // The drain committed exactly once across the mixed terminal ordering.
         leader
-            .update_connector_output(HashSet::from(["r1".to_string()]), HashSet::new())
+            .update_connector_output(HashSet::from(["r1".to_owned()]), HashSet::new())
             .unwrap();
-        assert_eq!(
-            engine.commits.lock().unwrap().len(),
-            1,
-            "take_offload_drain is consume-once: exactly one commit total"
-        );
-        assert!(
-            engine.take_offload_drain(&"r1".to_string()).is_none(),
-            "the drain was already consumed by the finish path"
-        );
+        assert!(!leader.has_slot("r1"));
     }
 
-    /// Codex finding (the finish-during-drain A×E twin): finishing an EVICTED
-    /// request whose drain-holder still holds a non-terminal onboard must NOT
-    /// reap inline — the visible handles are empty (`pending == false`), but
-    /// dropping the slot drops the holder, releasing the lifecycle pin the old
-    /// onboard is still READING. The directive answer is still `Finished`
-    /// (nothing pending for vLLM); the reap defers to the handle-gated sweep.
     #[test]
-    fn finish_after_evict_keeps_slot_until_drain_holder_drains() {
+    fn request_finished_after_evict_keeps_slot_until_engine_release() {
         let engine = recording_engine(Refresh::Lost);
         let leader = Leader::with_engine(engine.dyn_clone(), BS);
-
         leader
             .create_slot(make_request("r1", (0..16u32).collect()))
             .unwrap();
         leader.get_num_new_matched_tokens("r1", 0).unwrap();
         let minted = engine.minted.lock().unwrap().clone();
-        let (onboard, cell) = engine.arm_onboard();
+        let (onboard, cell) = engine.arm_onboard("r1");
         leader.state.lock().get_mut("r1").unwrap().onboard = Some(onboard);
-
-        // Evict: proposal + in-flight onboard move into the drain-holder.
         leader.on_evicted("r1").unwrap();
 
-        // Finish while the evicted onboard still drains.
-        assert_eq!(leader.request_finished("r1"), FinishedStatus::Finished);
-        assert!(
-            leader.has_slot("r1"),
-            "slot must survive while the drain-holder's onboard drains"
-        );
-        assert!(
-            engine.releases.lock().unwrap().is_empty(),
-            "the held lifecycle must not release while the old onboard reads it"
-        );
-
-        // Sweep with the onboard still pending: no reap, no release.
+        assert_eq!(leader.request_finished("r1"), FinishedStatus::Pending);
         leader
             .update_connector_output(HashSet::new(), HashSet::new())
             .unwrap();
         assert!(leader.has_slot("r1"));
         assert!(engine.releases.lock().unwrap().is_empty());
 
-        // The old onboard drains: the sweep reaps and the pin releases.
         *cell.lock().unwrap() = ActionStatus::Complete;
         leader
-            .update_connector_output(HashSet::new(), HashSet::new())
+            .update_connector_output(HashSet::from(["r1".to_owned()]), HashSet::new())
             .unwrap();
         assert!(!leader.has_slot("r1"));
         assert_eq!(*engine.releases.lock().unwrap(), minted);
@@ -3049,8 +3004,9 @@ mod tests {
             .unwrap();
         leader.get_num_new_matched_tokens("r1", 0).unwrap();
         let old_pin = engine.minted.lock().unwrap()[0];
-        let (onboard, onboard_cell) = engine.arm_onboard();
+        let (onboard, onboard_cell) = engine.arm_onboard("r1");
         leader.state.lock().get_mut("r1").unwrap().onboard = Some(onboard);
+        *engine.mint_fence_handles.lock().unwrap() = true;
         leader.on_evicted("r1").unwrap();
 
         // Restore (fresh GNMT mint), then finish with a pending offload.
@@ -3065,12 +3021,11 @@ mod tests {
             .push(offload);
         assert_eq!(leader.request_finished("r1"), FinishedStatus::Pending);
 
-        // New-generation offload drains; the OLD onboard has not. The sweep
-        // must keep the slot — reaping would drop the holder and release the
-        // old pin mid-drain.
+        // An engine release from the restored lifecycle does not remove
+        // the connector's hold on the independently fenced old generation.
         *offload_cell.lock().unwrap() = ActionStatus::Complete;
         leader
-            .update_connector_output(HashSet::new(), HashSet::new())
+            .update_connector_output(HashSet::new(), HashSet::from(["r1".to_owned()]))
             .unwrap();
         assert!(
             leader.has_slot("r1"),
@@ -3081,8 +3036,9 @@ mod tests {
             "the old pin must not release while its onboard drains"
         );
 
-        // Old onboard drains too: now the sweep reaps and both pins release.
+        // Reaping consumes the latched signal after the old fence drains.
         *onboard_cell.lock().unwrap() = ActionStatus::Complete;
+        engine.fence_cells.lock().unwrap()[0].store(true, Ordering::Release);
         leader
             .update_connector_output(HashSet::new(), HashSet::new())
             .unwrap();
@@ -3106,14 +3062,14 @@ mod tests {
             .unwrap();
         leader.get_num_new_matched_tokens("r1", 0).unwrap();
         let gen1_pin = engine.minted.lock().unwrap()[0];
-        let (onboard1, cell1) = engine.arm_onboard();
+        let (onboard1, cell1) = engine.arm_onboard("r1");
         leader.state.lock().get_mut("r1").unwrap().onboard = Some(onboard1);
         leader.on_evicted("r1").unwrap();
 
         // Restore (gen 2 mints a new pin) + another in-flight onboard.
         leader.get_num_new_matched_tokens("r1", 0).unwrap();
         let gen2_pin = engine.minted.lock().unwrap()[1];
-        let (onboard2, cell2) = engine.arm_onboard();
+        let (onboard2, cell2) = engine.arm_onboard("r1");
         leader.state.lock().get_mut("r1").unwrap().onboard = Some(onboard2);
 
         // Second eviction while gen 1's onboard still drains.
@@ -3145,10 +3101,7 @@ mod tests {
         assert!(engine.releases.lock().unwrap().contains(&gen1_pin));
     }
 
-    /// A `Finished` answer scrubs an unconsumed drain registration WITHOUT
-    /// committing it: vLLM frees the blocks on `Finished` immediately, so a
-    /// later `finished_sending` for that request would assert in the
-    /// scheduler; and never taking it would leak the registration.
+    /// The engine scrubs its offload registration when it answers Finished.
     #[test]
     fn request_finished_finished_scrubs_unconsumed_drain() {
         let engine = recording_engine(Refresh::Lost);
@@ -3172,7 +3125,7 @@ mod tests {
         assert_eq!(leader.request_finished("r1"), FinishedStatus::Finished);
         assert!(!leader.has_slot("r1"));
         assert!(
-            engine.commits.lock().unwrap().is_empty(),
+            engine.pending_finishes.lock().unwrap().is_empty(),
             "Finished must not commit (vLLM already freed the blocks)"
         );
         assert!(
@@ -3181,45 +3134,27 @@ mod tests {
         );
     }
 
-    /// Onboard-only-pending finish (no offloads ever registered): `Pending`
-    /// with NO drain to commit — the engine's load terminal will surface the
-    /// request via `finished_recving` (vLLM frees a finished request's blocks
-    /// on that path too). The connector's job is only the handle-gated reap:
-    /// the sweep must reap the slot once the onboard is terminal, with empty
-    /// vLLM sets.
     #[test]
-    fn onboard_in_flight_finish_reaps_on_terminal_without_drain() {
+    fn request_finished_with_only_onboard_waits_for_engine_signal() {
         let engine = recording_engine(Refresh::Lost);
         let leader = Leader::with_engine(engine.dyn_clone(), BS);
-
         leader
             .create_slot(make_request("r1", (0..16u32).collect()))
             .unwrap();
-        leader.get_num_new_matched_tokens("r1", 0).unwrap();
-
-        // Stage an in-flight (Pending) onboard on the slot.
-        let (onboard, cell) = engine.arm_onboard();
+        let (onboard, cell) = engine.arm_onboard("r1");
         leader.state.lock().get_mut("r1").unwrap().onboard = Some(onboard);
 
         assert_eq!(leader.request_finished("r1"), FinishedStatus::Pending);
-        assert!(leader.has_slot("r1"));
-        assert!(
-            engine.commits.lock().unwrap().is_empty(),
-            "no offloads were registered, so there is no drain to commit"
-        );
-
-        // Still loading: the sweep must not reap.
-        leader
-            .update_connector_output(HashSet::new(), HashSet::new())
-            .unwrap();
-        assert!(leader.has_slot("r1"));
-
-        // Load terminal: the handle-gated sweep reaps with empty vLLM sets.
+        assert_eq!(engine.pending_finishes.lock().unwrap().as_slice(), ["r1"]);
         *cell.lock().unwrap() = ActionStatus::Complete;
         leader
             .update_connector_output(HashSet::new(), HashSet::new())
             .unwrap();
-        assert!(!leader.has_slot("r1"), "reap once the onboard is terminal");
+        assert!(leader.has_slot("r1"));
+        leader
+            .update_connector_output(HashSet::from(["r1".to_owned()]), HashSet::new())
+            .unwrap();
+        assert!(!leader.has_slot("r1"));
     }
 
     // ---- build_connector_meta / offload walk --------------------------------
@@ -3594,8 +3529,7 @@ mod tests {
         );
     }
 
-    /// End-to-end D machinery: a walk-produced offload handle drives the
-    /// existing drain-commit / request_finished / update_connector_output flow.
+    /// A walk-produced offload defers finish until the engine's signal.
     #[test]
     fn walk_offload_lifecycle_reaches_request_finished() {
         let engine = recording_engine(Refresh::Lost);
@@ -3610,13 +3544,13 @@ mod tests {
         leader.build_connector_meta(out).unwrap();
         assert_eq!(leader.state.lock().get("r1").unwrap().offloads.len(), 1);
 
-        // request_finished with in-flight offload → Pending, drain committed.
+        // The engine owns the release of the in-flight offload.
         assert_eq!(leader.request_finished("r1"), FinishedStatus::Pending);
         assert!(leader.has_slot("r1"));
         assert_eq!(
-            engine.commits.lock().unwrap().as_slice(),
+            engine.pending_finishes.lock().unwrap().as_slice(),
             ["r1".to_string()],
-            "drain committed in-call"
+            "engine armed the release in-call"
         );
 
         // Flip offload_cells[0] to terminal.
@@ -3624,7 +3558,7 @@ mod tests {
 
         // Sweep reaps.
         leader
-            .update_connector_output(HashSet::new(), HashSet::new())
+            .update_connector_output(HashSet::from(["r1".to_owned()]), HashSet::new())
             .unwrap();
         assert!(!leader.has_slot("r1"), "slot reaped after offload terminal");
     }
@@ -3820,6 +3754,20 @@ mod tests {
         Pending,
     }
 
+    enum FinishWork {
+        Logical(Arc<Mutex<ActionStatus>>),
+        AwaitingProof(Arc<AtomicBool>),
+    }
+
+    impl FinishWork {
+        fn pending(&self) -> bool {
+            match self {
+                Self::Logical(cell) => *cell.lock().unwrap() == ActionStatus::Pending,
+                Self::AwaitingProof(complete) => !complete.load(Ordering::Acquire),
+            }
+        }
+    }
+
     /// connector [`LeaderEngine`] double for the unified seam. `find_blocks` records
     /// the FULL request (chain + counts + remote-prefill params) plus whether
     /// a live handle was passed; a fresh call mints a lifecycle (recording the
@@ -3873,12 +3821,10 @@ mod tests {
         bundle_offload_calls: Mutex<Vec<(RequestId, BundleOffloadPlan)>>,
         /// Status cell of each minted offload handle, in `offload_calls` order.
         offload_cells: Mutex<Vec<Arc<Mutex<ActionStatus>>>>,
-        /// Requests whose offload drain is armed; consumed (removed) by
-        /// `take_offload_drain` so a second take returns `None` (consume-once).
+        /// Test-side registrations and actions the engine's finish decision owns.
         drains_armed: Mutex<HashSet<RequestId>>,
-        /// One push per `RequestOffloadDrain::commit` — the once-per-request
-        /// `finished_sending` emission the leader's deferred sweep drives.
-        commits: Arc<Mutex<Vec<RequestId>>>,
+        finish_work: Mutex<HashMap<RequestId, Vec<FinishWork>>>,
+        pending_finishes: Mutex<Vec<RequestId>>,
         /// Ordered log of `evict` / `release_action` calls. The order is
         /// load-bearing: a handle dropped BEFORE `evict` prunes its action
         /// record from the engine, so the fence capture never sees it.
@@ -3898,6 +3844,15 @@ mod tests {
                 .expect("self_weak set")
         }
 
+        fn track_finish_work(&self, req: &str, work: FinishWork) {
+            self.finish_work
+                .lock()
+                .unwrap()
+                .entry(req.to_owned())
+                .or_default()
+                .push(work);
+        }
+
         /// Mint a `Pending` [`OffloadHandle`] and arm `req`'s offload drain. The
         /// caller pushes the handle into `slot.offloads`; flipping the returned
         /// status cell to `Complete` simulates the worker save terminal.
@@ -3905,6 +3860,7 @@ mod tests {
             let cell = Arc::new(Mutex::new(ActionStatus::Pending));
             let handle = OffloadHandle::new(ActionId::new(), self.weak(), Arc::clone(&cell));
             self.drains_armed.lock().unwrap().insert(req.clone());
+            self.track_finish_work(req, FinishWork::Logical(cell.clone()));
             (handle, cell)
         }
 
@@ -3914,8 +3870,9 @@ mod tests {
         /// its lifecycle pin. The handle's RAII drop fires `release_action` (a
         /// no-op here), so the only release recorded on holder-drop is the
         /// lifecycle handle's `release_search`.
-        fn arm_onboard(&self) -> (OnboardHandle, Arc<Mutex<ActionStatus>>) {
+        fn arm_onboard(&self, req: &str) -> (OnboardHandle, Arc<Mutex<ActionStatus>>) {
             let cell = Arc::new(Mutex::new(ActionStatus::Pending));
+            self.track_finish_work(req, FinishWork::Logical(cell.clone()));
             let handle =
                 OnboardHandle::new(ActionId::new(), self.weak(), Arc::clone(&cell), Vec::new());
             (handle, cell)
@@ -3953,7 +3910,8 @@ mod tests {
             bundle_offload_calls: Mutex::new(Vec::new()),
             offload_cells: Mutex::new(Vec::new()),
             drains_armed: Mutex::new(HashSet::new()),
-            commits: Arc::new(Mutex::new(Vec::new())),
+            finish_work: Mutex::new(HashMap::new()),
+            pending_finishes: Mutex::new(Vec::new()),
             event_order: Mutex::new(Vec::new()),
         });
         *engine.self_weak.lock().unwrap() = Some(Arc::downgrade(
@@ -4032,6 +3990,7 @@ mod tests {
                 .unwrap()
                 .push((generation, dest.to_vec(), num_external_tokens));
             let cell = Arc::new(Mutex::new(ActionStatus::Pending));
+            self.track_finish_work(handle.request_id(), FinishWork::Logical(cell.clone()));
             self.onboard_cells.lock().unwrap().push(Arc::clone(&cell));
             Ok(OnboardHandle::new(
                 ActionId::new(),
@@ -4060,6 +4019,7 @@ mod tests {
                 num_external_tokens,
             ));
             let cell = Arc::new(Mutex::new(ActionStatus::Pending));
+            self.track_finish_work(handle.request_id(), FinishWork::Logical(cell.clone()));
             self.onboard_cells.lock().unwrap().push(Arc::clone(&cell));
             Ok(OnboardHandle::new(
                 ActionId::new(),
@@ -4078,10 +4038,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((req.clone(), pairs.clone()));
-            let cell = Arc::new(Mutex::new(ActionStatus::Pending));
-            self.offload_cells.lock().unwrap().push(Arc::clone(&cell));
-            self.drains_armed.lock().unwrap().insert(req.clone());
-            Ok(OffloadHandle::new(ActionId::new(), self.weak(), cell))
+            let (handle, cell) = self.arm_offload(req);
+            self.offload_cells.lock().unwrap().push(cell);
+            Ok(handle)
         }
 
         fn offload_bundle(
@@ -4124,18 +4083,22 @@ mod tests {
             }
         }
 
-        fn take_offload_drain(&self, req: &RequestId) -> Option<RequestOffloadDrain> {
-            // Consume-once: an armed req yields its drain exactly once; a second
-            // take (or an unarmed req) returns `None`.
-            if self.drains_armed.lock().unwrap().remove(req) {
-                let commits = Arc::clone(&self.commits);
-                let req = req.clone();
-                Some(RequestOffloadDrain::new(move || {
-                    commits.lock().unwrap().push(req);
-                }))
-            } else {
-                None
+        fn take_offload_drain(&self, _req: &RequestId) -> Option<RequestOffloadDrain> {
+            None
+        }
+
+        fn begin_request_finish(&self, req: &RequestId) -> bool {
+            self.drains_armed.lock().unwrap().remove(req);
+            let pending = self
+                .finish_work
+                .lock()
+                .unwrap()
+                .get(req)
+                .is_some_and(|actions| actions.iter().any(FinishWork::pending));
+            if pending {
+                self.pending_finishes.lock().unwrap().push(req.clone());
             }
+            pending
         }
 
         fn poll_action(&self, _id: &ActionId) -> ActionStatus {

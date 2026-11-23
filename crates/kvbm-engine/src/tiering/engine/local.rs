@@ -1033,6 +1033,10 @@ impl LeaderEngine for LocalConnectorEngine {
         self.arm_request_finish(req)
     }
 
+    fn acknowledge_load_receive(&self, action: &ActionId) {
+        self.record_load_receive_consumed(action);
+    }
+
     fn poll_action(&self, id: &ActionId) -> ActionStatus {
         // Sync map read — NO await on this path (the driver is async; this is a
         // plain lookup + cell read). A live cell (handle still alive) carries the

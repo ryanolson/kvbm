@@ -11,14 +11,14 @@
 //! `TransactionState`/`SlotState`, and no match bookkeeping — the engine owns
 //! window derivation, fresh-vs-refresh, and hit state.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use dynamo_tokens::{TokenBlockError, TokenBlockSequence};
 use kvbm_common::{BlockId, LogicalResourceId, SequenceHash};
 use kvbm_logical::KvbmSequenceHashProvider as _;
 use kvbm_protocols::connector::{
-    CacheScope, FenceHandle, FindBlocksHandle, OffloadHandle, OnboardHandle,
+    ActionId, CacheScope, FenceHandle, FindBlocksHandle, OffloadHandle, OnboardHandle, OnboardPause,
 };
 use kvbm_protocols::disagg::{RemotePrefillParams, TransferParams};
 
@@ -70,6 +70,9 @@ pub struct RequestSlot {
     /// Swept (completed entries dropped) by the same `update_connector_output`
     /// pass that polls the drain-holders.
     pub fence_holders: Vec<FenceHandle>,
+    /// Keep observing a holderless onboard until its eviction fence drains.
+    pub(crate) evicted_onboards: Vec<(OnboardHandle, FenceHandle)>,
+    observed_pauses: HashMap<ActionId, OnboardPause>,
     /// Disagg transfer params parsed from the request's `kv_transfer_params`
     /// JSON at slot creation. A `remote_prefill` marker carries the
     /// decode-minted params that ride `FindBlocksRequest.remote_prefill` —
@@ -139,6 +142,8 @@ impl RequestSlot {
             offloads: Vec::new(),
             drain_holders: Vec::new(),
             fence_holders: Vec::new(),
+            evicted_onboards: Vec::new(),
+            observed_pauses: HashMap::new(),
             transfer_params,
             block_ids: Vec::new(),
             resource_block_ids: BTreeMap::new(),
@@ -251,6 +256,56 @@ impl RequestSlot {
     /// use-after-release). Holders whose drain completed are safe to drop.
     pub fn drain_holder_draining(&self) -> bool {
         self.drain_holders.iter().any(holder_draining)
+    }
+
+    pub(crate) fn eviction_draining(&self) -> bool {
+        self.drain_holder_draining()
+            || self.fence_holders.iter().any(|fence| !fence.is_complete())
+            || self
+                .evicted_onboards
+                .iter()
+                .any(|(_, fence)| !fence.is_complete())
+    }
+
+    /// Observe pauses without using them to decide request finish.
+    pub(crate) fn observe_onboard_pauses(&mut self) {
+        let resolved = |pause: &OnboardPause| {
+            tracing::info!(request_id = %self.request_id, worker = %pause.worker(),
+                pause_state = "resolved", "connector onboard pause resolved");
+        };
+        let onboards = self
+            .onboard
+            .iter()
+            .chain(
+                self.drain_holders
+                    .iter()
+                    .filter_map(|(_, onboard, _)| onboard.as_ref()),
+            )
+            .chain(self.evicted_onboards.iter().map(|(onboard, _)| onboard));
+        for onboard in onboards.clone() {
+            let id = *onboard.id();
+            if let Some(pause) = onboard.paused() {
+                let changed = self.observed_pauses.get(&id).is_none_or(|old| {
+                    old.since() != pause.since() || old.worker() != pause.worker()
+                });
+                if changed {
+                    tracing::warn!(request_id = %self.request_id, worker = %pause.worker(),
+                        pause_state = "unproven", "connector onboard paused");
+                    self.observed_pauses.insert(id, pause);
+                }
+            } else if let Some(pause) = self.observed_pauses.remove(&id) {
+                resolved(&pause);
+            }
+        }
+        // An eviction sweep can drop a drained holder between observations.
+        self.observed_pauses.retain(|id, pause| {
+            if onboards.clone().any(|onboard| onboard.id() == id) {
+                true
+            } else {
+                resolved(pause);
+                false
+            }
+        });
     }
 }
 

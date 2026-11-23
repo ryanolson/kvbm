@@ -70,6 +70,19 @@ Test by pausing after the receive claim and again after fence publication.
 Check both finished sets before delivery and verify one entry after it.
 [Request release tests](../crates/kvbm-engine/src/tiering/engine/local/tests/request_release.rs)
 
+When the engine says a finish is pending, keep the connector slot until the
+worker's release reaches the scheduler. A logical terminal can precede
+physical drain, and even a proven drain can have a worker reply in transit.
+Test by presenting an empty scheduler output after proof, then delivering the
+finished-set entry. [Connector finish tests](../crates/kvbm-connector/src/connector/leader/tests/request_finish.rs)
+
+The scheduler can also consume a receive before the Velo sink returns.
+Acknowledge that receive by action ID before dropping the onboard handle.
+Test by holding the sink after it queues the receive, consuming the result,
+then finishing with and without an in-flight save. Without the acknowledgment,
+finish joins an entry the scheduler already consumed.
+[Consumed receive test](../crates/kvbm-connector/src/connector/leader/tests/request_finish.rs)
+
 ## Keep paused onboard blocks through connector teardown
 
 Keep the engine's pause registry alive while a worker can still touch its

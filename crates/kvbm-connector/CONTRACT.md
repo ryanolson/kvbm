@@ -104,6 +104,39 @@ schedule() tick T_k:
 ... continues as Trace 1 or 2 ...
 ```
 
+### Finish while a copy is still active
+
+For a tracked request, the leader asks the engine once through
+`begin_request_finish`. A ready answer allows vLLM to free G1 immediately.
+A pending answer keeps the request's slot until the engine's single
+finished-set entry arrives in `update_connector_output`. A logical terminal
+can precede physical drain, for example when a bundle watchdog fails the
+logical handle. Evicted copies are still tracked by the engine.
+
+The engine waits for drain proof. It sends `finished_recving` together with
+the failed G1 destination IDs if an armed load failed, or
+`finished_sending` otherwise. An already-started load delivery can serve
+as that single release. The connector observes paused onboards on its
+scheduler callbacks and logs the request ID, worker, and pause transition.
+
+The Velo sink queues the wire message on another task. The scheduler may
+consume it before the sink returns, or it may still be in transit when the
+sink returns. vLLM's `_update_from_kv_xfer_finished` first calls
+`update_connector_output`, then records the receive. Only a subsequent
+`schedule` can take the request out of `WAITING_FOR_REMOTE_KVS`.
+[vLLM output handling](https://github.com/vllm-project/vllm/blob/43cddb6c3765c67318ff5c9e4e7c00be2b347764/vllm/v1/core/sched/scheduler.py#L1988-L1999)
+[vLLM scheduling gate](https://github.com/vllm-project/vllm/blob/43cddb6c3765c67318ff5c9e4e7c00be2b347764/vllm/v1/core/sched/scheduler.py#L544-L559)
+
+The connector acknowledges a consumed receive by its visible onboard action
+ID before dropping the handle. A later finish can then arm any remaining
+save or finish immediately if there is no work. An abort before consumption
+can still join a receive whose sink callback is in progress.
+
+When there is no scheduler acknowledgment, the finish decision uses the
+engine's worker sink callback boundary. The late-join contract covers the
+current receive and its drain. Older physical work for a preempted request ID
+must have its own eviction fence to gate the worker's next forward pass.
+
 ### Per-request ordering invariants vLLM guarantees
 
 For any request_id, on the engine-core thread:
@@ -112,7 +145,7 @@ For any request_id, on the engine-core thread:
 2. `update_state_after_alloc` is called **at most twice** per request — once when blocks are allocated, and possibly a second time when async-load blocks land (per `base.py:491-495` docstring).
 3. `request_finished` is called **exactly once** per request, after model output is processed, before blocks are freed.
 4. `request_finished` is **always preceded by either** (a) at least one GNMT call **or** (b) an abort that never reached GNMT (cleanup-on-abort path). Abort-without-prior-GNMT means the request was aborted before scheduling — the connector has no state for it; the call is a no-op idempotent against UntrackedRequest.
-5. After `request_finished`, no further scheduler-side method is called for that `request_id`. (`build_connector_meta` may still reference the rid in a metadata slot if it was scheduled in the same tick; this is the scheduler's responsibility to settle.)
+5. After `request_finished`, the scheduler stops scheduling the request. A pending finish still consumes its engine release in `update_connector_output`. `build_connector_meta` may reference a request in metadata scheduled in the same tick.
 
 ## GNMT Idempotence
 

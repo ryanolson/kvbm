@@ -90,38 +90,57 @@ impl Drop for FenceBarrier {
     }
 }
 
-/// A reference-counted finished-request drain, armed by
-/// [`LocalConnectorEngine::arm_drain_emission`] when the connector commits a
-/// `RequestOffloadDrain` for a *finishing* request (D semantics: commit =
-/// "engine, emit when drained", never "emit now").
+/// A reference-counted barrier for the engine-owned release of a finishing request.
 ///
 /// Every action still pending at commit time holds one `Arc` clone (plus the
-/// arming loop's guard clone), so the RAII `Drop` fires the request's single
-/// `mark_save_finished` — the worker-side `finished_sending` — **exactly once,
-/// when the last pending-at-commit action drains**. If nothing was pending,
-/// the guard clone's drop at the end of the arming loop IS the emission
-/// ("might already be done — doesn't matter"). vLLM frees the request's G1
-/// blocks on `finished_sending`, so the emission must wait on pending LOADS
-/// too (an in-flight onboard writes into those blocks), not just saves.
+/// arming loop's guard clone). On the last drop, send a failed-load receive
+/// with the accumulated destination IDs, or a finished send otherwise.
 pub(super) struct DrainBarrier {
     request_id: RequestId,
     sink: Arc<dyn EngineWorkerSink>,
+    /// The legacy offload commit emits only a send.
+    failed_load_ids: Option<Mutex<Vec<usize>>>,
 }
 
 impl DrainBarrier {
-    pub(super) fn new(request_id: RequestId, sink: Arc<dyn EngineWorkerSink>) -> Self {
-        Self { request_id, sink }
+    fn new(
+        request_id: RequestId,
+        sink: Arc<dyn EngineWorkerSink>,
+        report_load_errors: bool,
+    ) -> Self {
+        Self {
+            request_id,
+            sink,
+            failed_load_ids: report_load_errors.then(|| Mutex::new(Vec::new())),
+        }
+    }
+
+    fn record_load(&self, outcome: LoadOutcome) {
+        if let (Some(failed), LoadOutcome::FailedPartial { block_ids }) =
+            (&self.failed_load_ids, outcome)
+        {
+            failed
+                .lock()
+                .expect("drain failure mutex poisoned")
+                .extend(block_ids);
+        }
     }
 }
 
 impl Drop for DrainBarrier {
     fn drop(&mut self) {
-        // Same no-lock-held discipline as `FenceBarrier::drop` (all drop sites
-        // release the per-action guard first). Failures collapse to `Done` —
-        // there is no failed-offload wire path; per-action failures are logged
-        // at their terminals.
-        self.sink
-            .mark_save_finished(&self.request_id, SaveOutcome::Done);
+        // The final owner delivers the release outside the engine guards.
+        let failed = self
+            .failed_load_ids
+            .take()
+            .map(|ids| ids.into_inner().expect("drain failure mutex poisoned"));
+        if let Some(block_ids) = failed.filter(|ids| !ids.is_empty()) {
+            self.sink
+                .mark_load_finished(&self.request_id, LoadOutcome::FailedPartial { block_ids });
+        } else {
+            self.sink
+                .mark_save_finished(&self.request_id, SaveOutcome::Done);
+        }
     }
 }
 
@@ -144,11 +163,10 @@ pub(super) struct ActionRecord {
     /// logical terminal status is still written to the cell promptly, so the
     /// by-id path stays correct.
     pub(super) fence: Option<Arc<FenceBarrier>>,
-    /// A clone of the shared [`DrainBarrier`], set by
-    /// [`LocalConnectorEngine::arm_drain_emission`] when the connector committed
-    /// the finishing request's drain while this action was still pending.
+    /// A clone of the shared [`DrainBarrier`] for the engine's finish decision
+    /// or the legacy offload drain commit.
     /// The action's drain terminal *takes* and drops it; the last armed action's
-    /// drop fires the request's single `finished_sending`.
+    /// drop fires the request's single release signal.
     /// Independent of `fence` — an action can be both (evicted, then the
     /// restored request finishes while the old drain is still in flight).
     pub(super) drain: Option<Arc<DrainBarrier>>,
@@ -306,7 +324,7 @@ enum LoadTerminalState {
     Deferred(LoadOutcome),
     /// Physical proof is available. Request finish can still take ownership.
     Claimed(LoadOutcome),
-    /// The receive belongs to the sink call, which runs without engine locks.
+    /// The sink call is in progress and the scheduler has not acknowledged it.
     Delivering,
     /// Worker notification was emitted or deliberately suppressed by an
     /// eviction/request-drain barrier.
@@ -424,21 +442,16 @@ impl LocalConnectorEngine {
                             on_logical_load_terminal = record.on_logical_load_terminal.take();
                         }
                     }
-                    let suppress_terminal = record.fence.is_some() || record.drain.is_some();
+                    let terminal = load_outcome_of(&outcome);
                     if record.physical_pending {
-                        let terminal = if suppress_terminal {
-                            LoadTerminalState::Settled
-                        } else {
-                            LoadTerminalState::Deferred(load_outcome_of(&outcome))
-                        };
-                        record.kind = ActionKind::Load(terminal);
+                        record.kind = ActionKind::Load(LoadTerminalState::Deferred(terminal));
                         (None, None, None, false)
                     } else {
                         record.kind = ActionKind::Load(LoadTerminalState::Settled);
                         (
                             record.fence.take(),
                             record.drain.take(),
-                            (!suppress_terminal).then(|| load_outcome_of(&outcome)),
+                            Some(terminal),
                             record.dropped_by_handle,
                         )
                     }
@@ -454,16 +467,15 @@ impl LocalConnectorEngine {
             observe();
         }
 
-        // Notify with NO engine lock held. A fenced (cancel-for-emission) action
-        // fires no `mark_load_finished`; dropping its fence clone below completes
-        // the shared barrier iff this is the last armed action to drain. A
-        // DRAIN-armed load is suppressed too: its request is finishing, and
-        // vLLM's `_free_blocks` deletes the request on the first finished-set
-        // hit — surfacing `finished_recving` alongside the request's eventual
-        // `finished_sending` would assert in the scheduler. The load's
-        // completion folds into the drain emission instead.
-        if let Some(worker_terminal) = worker_terminal {
-            self.sink.mark_load_finished(request_id, worker_terminal);
+        // Notify outside the engine locks. A finishing request folds this
+        // load into its single drain release. An eviction fence alone
+        // suppresses the load's own notification.
+        if let Some(outcome) = worker_terminal {
+            if let Some(drain) = &drain {
+                drain.record_load(outcome);
+            } else if fence.is_none() {
+                self.sink.mark_load_finished(request_id, outcome);
+            }
         }
         drop(fence);
         drop(drain);
@@ -509,7 +521,7 @@ impl LocalConnectorEngine {
         let request_guard = request_id
             .as_ref()
             .and_then(|req| self.by_request.get_mut(req));
-        let (claimed, fence, drain, remove_now) = {
+        let (claimed, fence, drain, drained_load, remove_now) = {
             let mut guard = self.actions.get_mut(&action_id);
             match guard.as_deref_mut() {
                 Some(record) => {
@@ -523,19 +535,23 @@ impl LocalConnectorEngine {
                         debug_assert!(false, "physical load terminal requires a load action");
                         return;
                     };
-                    match std::mem::replace(terminal, LoadTerminalState::Settled) {
+                    let drained_load = match std::mem::replace(terminal, LoadTerminalState::Settled)
+                    {
                         LoadTerminalState::Deferred(outcome) if !suppress_terminal => {
                             *terminal = LoadTerminalState::Claimed(outcome);
+                            None
                         }
+                        LoadTerminalState::Deferred(outcome) => Some(outcome),
                         LoadTerminalState::Pending => {
                             tracing::error!(
                                 ?action_id,
                                 "physical load settled before its logical terminal"
                             );
                             *terminal = LoadTerminalState::Pending;
+                            None
                         }
-                        _ => {}
-                    }
+                        _ => None,
+                    };
                     #[cfg(test)]
                     {
                         on_physical_load_claimed = record.on_physical_load_claimed.take();
@@ -545,10 +561,11 @@ impl LocalConnectorEngine {
                         matches!(terminal, LoadTerminalState::Claimed(_)),
                         record.fence.take(),
                         record.drain.take(),
+                        drained_load,
                         record.dropped_by_handle,
                     )
                 }
-                None => (false, None, None, false),
+                None => (false, None, None, None, false),
             }
         };
 
@@ -561,6 +578,9 @@ impl LocalConnectorEngine {
         // Worker notifications and barrier drops run outside both guards.
         physical_drain.store(true, Ordering::Release);
         drop(request_guard);
+        if let (Some(drain), Some(outcome)) = (&drain, drained_load) {
+            drain.record_load(outcome);
+        }
         drop(fence);
         drop(drain);
         #[cfg(test)]
@@ -593,17 +613,18 @@ impl LocalConnectorEngine {
                 unreachable!();
             };
             // Finish may have armed the request drain after local proof was
-            // published. Otherwise keep the receive pending through the sink
-            // call so a concurrent finish joins it without a second signal.
+            // published. Otherwise finish can join the receive until the sink
+            // returns or the scheduler acknowledges it.
             if let Some(drain) = record.drain.take() {
                 record.kind = ActionKind::Load(LoadTerminalState::Settled);
-                (None, Some(drain), record.dropped_by_handle)
+                (outcome, Some(drain), record.dropped_by_handle)
             } else {
-                (Some(outcome), None, false)
+                (outcome, None, false)
             }
         };
-        drop(drain);
-        if let Some(outcome) = outcome {
+        if let Some(drain) = drain {
+            drain.record_load(outcome);
+        } else {
             self.sink.mark_load_finished(request_id, outcome);
             remove_now = self.actions.get_mut(&action_id).is_some_and(|mut record| {
                 record.kind = ActionKind::Load(LoadTerminalState::Settled);
@@ -612,6 +633,20 @@ impl LocalConnectorEngine {
         }
         if remove_now {
             self.remove_action_record(&action_id);
+        }
+    }
+
+    pub(super) fn record_load_receive_consumed(&self, id: &ActionId) {
+        let Some(request) = self.actions.get(id).map(|record| record.request_id.clone()) else {
+            return;
+        };
+        // The lookup above releases its action guard before taking the request
+        // guard used by finish. IDs are unique even when a request ID is reused.
+        if let Some(_request_guard) = self.by_request.get_mut(&request)
+            && let Some(mut record) = self.actions.get_mut(id)
+            && matches!(record.kind, ActionKind::Load(LoadTerminalState::Delivering))
+        {
+            record.kind = ActionKind::Load(LoadTerminalState::Settled);
         }
     }
 
@@ -691,7 +726,7 @@ impl LocalConnectorEngine {
     /// per-action guard that serializes terminal updates. The local guard clone
     /// drops at return. That drop emits immediately when no action was armed.
     pub(super) fn arm_drain_emission(&self, req: &RequestId) {
-        let emission = Arc::new(DrainBarrier::new(req.clone(), self.sink.clone()));
+        let emission = Arc::new(DrainBarrier::new(req.clone(), self.sink.clone(), false));
         let action_ids: Vec<ActionId> = self
             .by_request
             .get(req)
@@ -733,7 +768,7 @@ impl LocalConnectorEngine {
                     || matches!(record.kind, ActionKind::Load(LoadTerminalState::Claimed(_))))
             {
                 let barrier = emission.get_or_insert_with(|| {
-                    Arc::new(DrainBarrier::new(req.clone(), self.sink.clone()))
+                    Arc::new(DrainBarrier::new(req.clone(), self.sink.clone(), true))
                 });
                 record.drain = Some(barrier.clone());
             }
