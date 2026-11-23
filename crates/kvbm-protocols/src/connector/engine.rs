@@ -31,9 +31,12 @@ use super::protocol::{BlockId, RequestId, SequenceHash};
 /// vs dispatched remote prefill, fresh vs refresh, window derivation, the
 /// inflight-onboard deferral guard, and the selected resource pipeline).
 /// The `poll_action` / `release_*` tail is **engine-internal** — completion and
-/// RAII sources that the handles call on the connector's behalf, not part of
-/// the connector's used surface (the connector only ever reads
-/// [`FindBlocksOutcome`] and `handle.is_complete()` / `handle.outcome()`).
+/// RAII sources for the engine's own bookkeeping, not part of the connector's
+/// used surface (the connector only ever reads [`FindBlocksOutcome`] and
+/// `handle.is_complete()` / `handle.outcome()`). The handles read their own
+/// status cells; only the RAII release calls (`release_search`,
+/// `release_action`, `release_prefill_session`) call back into the engine when
+/// a handle drops.
 pub trait LeaderEngine: Send + Sync + 'static {
     /// OFFLOAD. Request-scoped (a cold no-match request still caches its novel
     /// blocks). The returned handle's per-action terminal flips **only** that
@@ -218,11 +221,12 @@ pub trait LeaderEngine: Send + Sync + 'static {
     /// cross-process impl would read a leader-side completion cache fed by an
     /// engine→leader stream (batched per tick) — never a per-request RPC.
     ///
-    /// An unknown id — never tracked, released on handle drop, or whose live
-    /// completion cell is gone — returns `Failed(AllBlocks)`: polling cannot
-    /// prove that a dead cell has no physical work, so it fails closed rather
-    /// than reporting success. No handle reads this today; each
-    /// `OnboardHandle`/`OffloadHandle` reads its own shared status cell. The
+    /// kvbm-engine's `LocalConnectorEngine` returns `Failed(AllBlocks)` for an
+    /// unknown id — never tracked, released on handle drop, or whose live
+    /// completion cell is gone — because polling cannot prove that a dead cell
+    /// has no physical work. Stand-in engines may report `Complete` for any id
+    /// (`NoopBlockEngine` does). No handle reads this today; each
+    /// `OnboardHandle`/`OffloadHandle` reads its own shared status cell, and the
     /// connector does not call it either.
     fn poll_action(&self, id: &ActionId) -> ActionStatus;
 

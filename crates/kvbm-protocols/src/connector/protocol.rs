@@ -266,8 +266,9 @@ pub enum FindBlocksOutcome {
 // Action completion
 // ---------------------------------------------------------------------------
 
-/// Result of [`super::engine::LeaderEngine::poll_action`] — the engine-internal
-/// completion source read by onboard/offload handles.
+/// Engine-internal [`ActionStatus`] returned by
+/// [`super::engine::LeaderEngine::poll_action`]. Onboard and offload handles do
+/// not read it; each reads its own shared status cell.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionStatus {
     /// Still in flight.
