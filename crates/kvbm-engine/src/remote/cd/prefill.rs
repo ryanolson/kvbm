@@ -132,6 +132,9 @@ pub(crate) struct PrefillKick {
     pub(crate) action_id: ActionId,
     /// The external G1 suffix vLLM allocated (`block_ids[len - external ..]`).
     pub(crate) external_g1: Vec<BlockId>,
+    /// The handle's fence travels with the kick through the latch.
+    pub(crate) physical_drain: Arc<AtomicBool>,
+    pub(crate) pause: Arc<std::sync::Mutex<Option<(std::time::Instant, String)>>>,
 }
 
 /// See [`PrefillRequestState::gate`].
@@ -582,6 +585,8 @@ mod tests {
         PrefillKick {
             action_id: ActionId::new(),
             external_g1: vec![50, 51],
+            physical_drain: Arc::default(),
+            pause: Arc::default(),
         }
     }
 

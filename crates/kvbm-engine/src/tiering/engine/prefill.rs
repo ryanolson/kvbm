@@ -48,7 +48,7 @@
 //! deadline-bounded by the production resolver/factory implementations.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow, bail};
@@ -57,7 +57,8 @@ use futures::StreamExt;
 use kvbm_common::LogicalLayoutHandle;
 use kvbm_physical::TransferOptions;
 use kvbm_protocols::connector::{
-    AcceptId, ActionFailure, ActionId, ActionStatus, LeaderEngine, LeaderEngineError, OnboardHandle,
+    AcceptId, ActionFailure, ActionId, ActionStatus, FenceHandle, LeaderEngine, LeaderEngineError,
+    OnboardHandle,
 };
 use kvbm_protocols::connector::{BlockId, RequestId, SequenceHash};
 use kvbm_protocols::disagg::{RemotePrefillParams, digest_provided_hashes};
@@ -65,7 +66,8 @@ use kvbm_protocols::disagg::{RemotePrefillParams, digest_provided_hashes};
 use super::driver::ActionRecord;
 use super::inflight::InflightKey;
 use super::local::LocalConnectorEngine;
-use super::onboard;
+use super::onboard::{self, OnboardDrain};
+use super::paused::{LoadContinuation, PauseCell, PausedLoad};
 use crate::p2p::session::{AvailabilityDelta, CommitDelta};
 use crate::remote::cd::prefill::{ParkOutcome, PrefillKick, PrefillRequestState};
 
@@ -306,7 +308,7 @@ impl LocalConnectorEngine {
                 ),
             });
         }
-        let external_g1: Vec<BlockId> = block_ids[block_ids.len() - external_blocks..].to_vec();
+        let external_g1 = &block_ids[block_ids.len() - external_blocks..];
 
         if !state.claim_usaa() {
             return Err(LeaderEngineError::OnboardAlreadyInFlight);
@@ -319,9 +321,12 @@ impl LocalConnectorEngine {
         // so eviction fences and drain emissions gate this load.
         let action_id = ActionId::new();
         let cell = Arc::new(Mutex::new(ActionStatus::Pending));
+        let physical_drain = Arc::new(AtomicBool::new(false));
+        let pause = PauseCell::default();
         self.actions.insert(
             action_id,
-            ActionRecord::new(request_id.clone(), Arc::downgrade(&cell)),
+            ActionRecord::new(request_id.clone(), Arc::downgrade(&cell))
+                .with_physical_drain(tokio_util::sync::CancellationToken::new()),
         );
         self.by_request
             .entry(request_id.clone())
@@ -344,9 +349,21 @@ impl LocalConnectorEngine {
             .expect("inflight-guard mutex poisoned")
             .record(InflightKey::Prefill(accept_id), guard_window);
 
+        let me: Arc<dyn LeaderEngine> = self.clone();
+        let handle = OnboardHandle::new_with_physical_drain(
+            action_id,
+            Arc::downgrade(&me),
+            cell,
+            external_g1.to_vec(),
+            FenceHandle::new(physical_drain.clone()),
+        )
+        .with_pause_cell(pause.clone());
+
         let latch = state.latch_kick(PrefillKick {
             action_id,
-            external_g1: external_g1.clone(),
+            external_g1: external_g1.to_vec(),
+            physical_drain: physical_drain.clone(),
+            pause,
         });
 
         if let Err(reason) = latch {
@@ -358,11 +375,10 @@ impl LocalConnectorEngine {
             self.finish_load_action(
                 action_id,
                 &request_id,
-                ActionStatus::Failed(ActionFailure::Partial {
-                    block_ids: external_g1.clone(),
-                }),
-                external_g1.clone(),
+                ActionStatus::Failed(ActionFailure::AllBlocks),
+                external_g1.to_vec(),
             );
+            self.finish_physical_load_action(action_id, &physical_drain);
             if let Some(session) = state.take_session() {
                 session.close(Some(reason));
             }
@@ -373,13 +389,7 @@ impl LocalConnectorEngine {
             }
             cd.output.untrack(&request_id, state.accept_id());
             cd.prefill.release_if_matches(&request_id, &state);
-            let me: Arc<dyn LeaderEngine> = self;
-            return Ok(OnboardHandle::new(
-                action_id,
-                Arc::downgrade(&me),
-                cell,
-                external_g1,
-            ));
+            return Ok(handle);
         }
 
         // Two-phase handshake, USAA side: the kick is latched; if the pipeline
@@ -398,13 +408,7 @@ impl LocalConnectorEngine {
             });
         }
 
-        let me: Arc<dyn LeaderEngine> = self;
-        Ok(OnboardHandle::new(
-            action_id,
-            Arc::downgrade(&me),
-            cell,
-            external_g1,
-        ))
+        Ok(handle)
     }
 
     /// The connector's RAII release (`release_prefill_session`). A request
@@ -578,11 +582,10 @@ impl LocalConnectorEngine {
                     self.finish_load_action(
                         kick.action_id,
                         &request_id,
-                        ActionStatus::Failed(ActionFailure::Partial {
-                            block_ids: kick.external_g1.clone(),
-                        }),
+                        ActionStatus::Failed(ActionFailure::AllBlocks),
                         kick.external_g1,
                     );
+                    self.finish_physical_load_action(kick.action_id, &kick.physical_drain);
                 }
                 return Ok(());
             }
@@ -740,23 +743,11 @@ impl LocalConnectorEngine {
                 self.finish_load_action(
                     kick.action_id,
                     request_id,
-                    ActionStatus::Failed(ActionFailure::Partial {
-                        block_ids: kick.external_g1.clone(),
-                    }),
+                    ActionStatus::Failed(ActionFailure::AllBlocks),
                     kick.external_g1,
                 );
-                if state.claim_cleanup()
-                    && let Some(session) = state.take_session()
-                {
-                    session.close(Some(reason));
-                }
-                if let Some(sid) = state.take_local_search() {
-                    self.release_search(&sid);
-                }
-                if let Some(cd) = self.cd.as_ref() {
-                    cd.output.untrack(request_id, state.accept_id());
-                    cd.prefill.release_if_matches(request_id, state);
-                }
+                self.finish_physical_load_action(kick.action_id, &kick.physical_drain);
+                self.cleanup_failed_prefill(request_id, state, reason);
             }
             None => {
                 // Pre-USAA: `fail_pipeline` stashed the reason. The cleanup
@@ -783,28 +774,30 @@ impl LocalConnectorEngine {
         state: Arc<PrefillRequestState>,
         kick: PrefillKick,
     ) {
+        // USAA rejects a second onboard before minting an action. The USAA
+        // and pipeline owners take the only kick from the same gate, leaving
+        // one caller to win this claim for the generation.
         if !state.claim_kick() {
             return;
         }
         let PrefillKick {
             action_id,
             external_g1,
+            physical_drain,
+            pause,
         } = kick;
         let external_blocks = external_g1.len();
         if external_blocks == 0 {
             // Nothing external to move (zero-external CD) — immediately
             // terminal, no transfer.
             self.finish_load_action(action_id, &request_id, ActionStatus::Complete, external_g1);
+            self.finish_physical_load_action(action_id, &physical_drain);
             return;
         }
 
         let outcome = match state.registered_suffix(external_blocks) {
             Some(suffix) => {
                 let g2_block_ids: Vec<BlockId> = suffix.iter().map(|b| b.block_id()).collect();
-                // The cloned pins stay alive across the copy (their twins are
-                // also parked on the state, but the copy must not depend on
-                // that parking outliving it).
-                let _hold = suffix;
                 match self.leader.execute_local_transfer(
                     LogicalLayoutHandle::G2,
                     LogicalLayoutHandle::G1,
@@ -812,13 +805,30 @@ impl LocalConnectorEngine {
                     external_g1.clone(),
                     TransferOptions::default(),
                 ) {
-                    Ok(notification) => match notification.await {
-                        Ok(()) => ActionStatus::Complete,
-                        Err(e) => {
-                            tracing::error!(error = %e, %request_id, "prefill kick: G2->G1 transfer failed");
-                            ActionStatus::Failed(ActionFailure::AllBlocks)
+                    Ok(notification) => {
+                        match onboard::await_onboard_drain(notification, suffix).await {
+                            OnboardDrain::Proven(Ok(())) => ActionStatus::Complete,
+                            OnboardDrain::Proven(Err(error)) => {
+                                tracing::error!(%error, %request_id, "prefill kick: G2->G1 transfer failed");
+                                ActionStatus::Failed(ActionFailure::AllBlocks)
+                            }
+                            OnboardDrain::Unproven { error, holds } => {
+                                self.pause_load_action(
+                                    PausedLoad {
+                                        action: action_id,
+                                        request: request_id,
+                                        destinations: external_g1,
+                                        physical_drain,
+                                        pause,
+                                        holds: Box::new(holds),
+                                        continuation: Some(LoadContinuation::CdPrefill(state)),
+                                    },
+                                    error,
+                                );
+                                return;
+                            }
                         }
-                    },
+                    }
                     Err(e) => {
                         tracing::error!(error = %e, %request_id, "prefill kick: G2->G1 dispatch failed");
                         ActionStatus::Failed(ActionFailure::AllBlocks)
@@ -835,36 +845,61 @@ impl LocalConnectorEngine {
             }
         };
 
+        self.finish_prefill_kick_after_drain(
+            action_id,
+            &request_id,
+            &state,
+            outcome,
+            external_g1,
+            &physical_drain,
+        );
+    }
+
+    pub(super) fn finish_prefill_kick_after_drain(
+        &self,
+        action_id: ActionId,
+        request_id: &RequestId,
+        state: &Arc<PrefillRequestState>,
+        outcome: ActionStatus,
+        external_g1: Vec<BlockId>,
+        physical_drain: &Arc<AtomicBool>,
+    ) {
         let failed = !matches!(outcome, ActionStatus::Complete);
+        let reason = "prefill onboard kick failed";
+        // Stash a failure before the logical terminal, then settle physical
+        // drain before cleanup. A connector release can read the stash as
+        // soon as the handle, worker sink or eviction fence wakes up.
         if failed {
-            // The stash must land BEFORE the terminal becomes observable: the
-            // terminal is what lets the connector reap the slot and drop the
-            // session handle, and that RAII release decides finalize-vs-close
-            // by reading the stash — stashing after the terminal admits a
-            // window where the failed lifecycle is finalized (a clean
-            // cooperative seal) to the decode peer.
-            state.stash_failure("prefill onboard kick failed".to_string());
+            state.stash_failure(reason.to_owned());
         }
-        // `finish_load_action` resolves a total failure to these concrete
-        // external dest ids before the cell write and sink notify.
-        self.finish_load_action(action_id, &request_id, outcome, external_g1);
+        self.finish_load_action(action_id, request_id, outcome, external_g1);
+        self.finish_physical_load_action(action_id, physical_drain);
 
         if failed {
-            if state.claim_cleanup()
-                && let Some(session) = state.take_session()
-            {
-                session.close(Some("prefill onboard kick failed".to_string()));
-            }
-            if let Some(sid) = state.take_local_search() {
-                self.release_search(&sid);
-            }
-            if let Some(cd) = self.cd.as_ref() {
-                cd.output.untrack(&request_id, state.accept_id());
-                cd.prefill.release_if_matches(&request_id, &state);
-            }
+            self.cleanup_failed_prefill(request_id, state, reason.to_owned());
         }
         // On Complete: the session stays parked and the state latched — the
         // computed-suffix output direction publishes over this same session
         // later; the RAII release owns the finalize.
+    }
+
+    fn cleanup_failed_prefill(
+        &self,
+        request_id: &RequestId,
+        state: &Arc<PrefillRequestState>,
+        reason: String,
+    ) {
+        if state.claim_cleanup()
+            && let Some(session) = state.take_session()
+        {
+            session.close(Some(reason));
+        }
+        if let Some(sid) = state.take_local_search() {
+            self.release_search(&sid);
+        }
+        if let Some(cd) = self.cd.as_ref() {
+            cd.output.untrack(request_id, state.accept_id());
+            cd.prefill.release_if_matches(request_id, state);
+        }
     }
 }

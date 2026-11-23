@@ -171,6 +171,8 @@ pub(super) struct ActionRecord {
     /// Cancelling never aborts submitted DMA; it only lets the action leave
     /// `Pending` while the physical task and its fence keep G1 quarantined.
     pub(super) cancel: Option<tokio_util::sync::CancellationToken>,
+    #[cfg(test)]
+    pub(super) on_logical_load_terminal: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 impl ActionRecord {
@@ -186,6 +188,8 @@ impl ActionRecord {
             physical_pending: false,
             kind: ActionKind::Load(LoadTerminalState::Pending),
             cancel: None,
+            #[cfg(test)]
+            on_logical_load_terminal: None,
         }
     }
 
@@ -201,6 +205,8 @@ impl ActionRecord {
             physical_pending: false,
             kind: ActionKind::Save(SaveTerminalState::Pending),
             cancel: None,
+            #[cfg(test)]
+            on_logical_load_terminal: None,
         }
     }
 
@@ -377,6 +383,8 @@ impl LocalConnectorEngine {
         // TAKE any armed fence/drain clones, and learn whether the handle already
         // dropped (so this terminal must remove the record). Release the guard
         // before any sink call or barrier-clone drop.
+        #[cfg(test)]
+        let mut on_logical_load_terminal = None;
         let (fence, drain, worker_terminal, remove_now) = {
             let mut guard = self.actions.get_mut(&action_id);
             match guard.as_deref_mut() {
@@ -391,6 +399,10 @@ impl LocalConnectorEngine {
                     }
                     if let Some(cell) = record.cell.upgrade() {
                         *cell.lock().expect("action-status mutex poisoned") = outcome.clone();
+                        #[cfg(test)]
+                        {
+                            on_logical_load_terminal = record.on_logical_load_terminal.take();
+                        }
                     }
                     let suppress_terminal = record.fence.is_some() || record.drain.is_some();
                     if record.physical_pending {
@@ -414,6 +426,13 @@ impl LocalConnectorEngine {
                 None => (None, None, Some(load_outcome_of(&outcome)), false),
             }
         };
+
+        // Tests can act as a caller that sees the cell before physical
+        // settlement. Run the observer outside the action and cell locks.
+        #[cfg(test)]
+        if let Some(observe) = on_logical_load_terminal {
+            observe();
+        }
 
         // Notify with NO engine lock held. A fenced (cancel-for-emission) action
         // fires no `mark_load_finished`; dropping its fence clone below completes
