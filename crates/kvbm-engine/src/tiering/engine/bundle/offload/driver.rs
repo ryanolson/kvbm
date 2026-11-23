@@ -55,16 +55,14 @@ impl LocalConnectorEngine {
             lineages,
         ));
 
+        let mut admitted = self.admit_action(req, None, true)?;
         let action_id = ActionId::new();
         let cell = Arc::new(Mutex::new(ActionStatus::Pending));
         self.actions.insert(
             action_id,
             ActionRecord::new_save(req.clone(), Arc::downgrade(&cell)),
         );
-        self.by_request
-            .entry(req.clone())
-            .or_default()
-            .push(action_id);
+        admitted.ids.push(action_id);
         self.offload_drains.insert(req.clone(), ());
 
         let iteration = self
@@ -82,6 +80,7 @@ impl LocalConnectorEngine {
                 iteration,
                 completion: BufferedOffloadCompletion::Bundle(Arc::clone(&runtime)),
             }));
+        drop(admitted);
 
         let engine: Arc<dyn LeaderEngine> = self;
         Ok(OffloadHandle::new(action_id, Arc::downgrade(&engine), cell))

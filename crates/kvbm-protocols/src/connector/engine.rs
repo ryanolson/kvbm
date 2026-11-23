@@ -44,6 +44,8 @@ pub trait LeaderEngine: Send + Sync + 'static {
     /// `finished_sending` is emitted by the request drain. The caller can
     /// arm it via [`Self::begin_request_finish`] or commit the legacy
     /// [`RequestOffloadDrain`] from [`Self::take_offload_drain`].
+    /// After a load, callers sharing the scheduler's worker notification
+    /// stream must observe its receive before submitting a save.
     fn offload(
         self: Arc<Self>,
         req: &RequestId,
@@ -92,8 +94,9 @@ pub trait LeaderEngine: Send + Sync + 'static {
     /// connector embeds the returned [`super::protocol::EvictionFence`] in
     /// metadata; the paired observational [`super::handles::FenceHandle`]
     /// (`Some` iff something was armed) lets the leader gate its own
-    /// bookkeeping on the same drain. Not a `Finished` decision — that stays
-    /// connector-local.
+    /// bookkeeping on the same drain. The engine defers another allocation
+    /// for this request until the captured work drains. Eviction does not
+    /// finish the request.
     fn evict(&self, req: &RequestId) -> EvictionOutcome;
 
     /// FIND BLOCKS — the unified, source-agnostic match-poll verb (the connector's
@@ -107,6 +110,8 @@ pub trait LeaderEngine: Send + Sync + 'static {
     /// Errors are loud (prefill misconfig / digest divergence /
     /// [`LeaderEngineError::FindBlocksDesync`]); local search failures collapse to
     /// a zero `Resolved` as today.
+    /// `Deferred` also covers work the prior allocation still owns after
+    /// eviction. Retry the match before allocating destination blocks.
     fn find_blocks(
         self: Arc<Self>,
         req: &FindBlocksRequest,
@@ -210,10 +215,11 @@ pub trait LeaderEngine: Send + Sync + 'static {
     /// worker sink. The sink may queue its transport notification before
     /// returning. The default reports no engine-owned release.
     ///
-    /// When joining an in-progress receive, the signal covers that load and its
-    /// drain. Other pending physical work must be independently fenced. A
-    /// direct caller issuing a same-id save during a held onboard has no
-    /// scheduler gate and falls outside that contract.
+    /// After preemption, finish owns either the old allocation's drain while
+    /// matching is deferred or the restored allocation's work. Admission never
+    /// allows both to submit a release. Callers that bypass match must handle
+    /// [`LeaderEngineError::PriorGenerationDraining`] at submission. A save
+    /// during a physically pending onboard is refused before submission.
     fn begin_request_finish(&self, _req: &RequestId) -> bool {
         false
     }

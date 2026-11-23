@@ -137,6 +137,18 @@ engine's worker sink callback boundary. The late-join contract covers the
 current receive and its drain. Older physical work for a preempted request ID
 must have its own eviction fence to gate the worker's next forward pass.
 
+The engine defers same-request restore until work captured by preemption has
+proved drain. vLLM retries the match before allocating restored G1 blocks.
+An abort while deferred can release through the old drain. A restore admitted
+after proof can release through its own receive. An eviction fence token
+completes only the worker fence. The one terminal is consumed when EngineCore
+next runs. An isolated request can remain held until another event wakes it.
+
+Direct Rust submitters can receive `LeaderEngineError::PriorGenerationDraining`.
+The engine has submitted no copy, and the caller can retry admission after
+proof. The new variant is a Rust compatibility change for downstream
+exhaustive matches on `LeaderEngineError`.
+
 ### Per-request ordering invariants vLLM guarantees
 
 For any request_id, on the engine-core thread:

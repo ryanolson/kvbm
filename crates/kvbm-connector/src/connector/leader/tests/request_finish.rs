@@ -34,6 +34,8 @@ use crate::connector::worker::{FinishedRequests, WorkerCompletionState};
 
 use super::{BS, Leader, make_request, sched_new};
 
+mod restore;
+
 const REQUEST: &str = "abort-onboard";
 const DESTINATIONS: [usize; 2] = [10, 11];
 const WAIT: Duration = Duration::from_secs(3);
@@ -188,66 +190,8 @@ impl HeldOnboard {
             releases: releases.clone(),
             hold_load_delivery: Mutex::new(hold_load_delivery),
         });
-        let client = VeloWorkerClient::new(pair.messenger_a.clone(), worker_id)
-            .with_local_transfer_check(LocalTransferCheckTiming {
-                wait: Duration::ZERO,
-                deadline: WAIT,
-            });
-        let workers = Arc::new(SpmdParallelWorkers::new(
-            vec![Arc::new(client)],
-            Arc::new(velo::EventManager::local()),
-            pair.messenger_a.runtime().clone(),
-        ));
-        let manager = Arc::new(
-            TestManagerBuilder::<G2>::new()
-                .block_count(if enable_offload { 5 } else { 2 })
-                .block_size(BS)
-                .build(),
-        );
-        let instance = Arc::new(
-            InstanceLeader::builder()
-                .messenger(pair.messenger_a)
-                .registry(BlockRegistry::new())
-                .g2_manager(manager.clone())
-                .parallel_worker(workers)
-                .build()?,
-        );
-        let offload = if enable_offload {
-            let pipeline = PipelineBuilder::new().batch_size(3).min_batch_size(3);
-            Some(Arc::new(
-                OffloadEngine::builder(instance.clone())
-                    .with_g1_to_g2_pipeline(pipeline.build())
-                    .build()?,
-            ))
-        } else {
-            None
-        };
-        let (engine, driver) = build_local_connector_engine(
-            instance,
-            sink,
-            ConnectorEngineConfig {
-                block_size: BS,
-                remote: Default::default(),
-                resource_policies: Default::default(),
-                resource_component_bytes: Default::default(),
-            },
-            offload,
-        );
-        let leader = Leader::with_engine(engine, BS);
-        leader.create_slot(make_request(REQUEST, (0..12).collect()))?;
-        let hashes = leader
-            .state
-            .lock()
-            .get_mut(REQUEST)
-            .unwrap()
-            .all_sequence_hashes();
-        let sources = manager.allocate_blocks(DESTINATIONS.len()).unwrap();
-        let completed = sources
-            .into_iter()
-            .zip(hashes)
-            .map(|(source, hash)| source.stage(hash, BS))
-            .collect::<Result<Vec<_>, _>>()?;
-        let _sources = manager.register_blocks(completed);
+        let (leader, driver) =
+            build_test_leader(pair.messenger_a, worker_id, sink, enable_offload)?;
         let external = BS * DESTINATIONS.len();
         assert_eq!(
             leader.get_num_new_matched_tokens(REQUEST, 0)?,
@@ -269,6 +213,76 @@ impl HeldOnboard {
             _server: pair.messenger_b,
         })
     }
+}
+
+fn build_test_leader(
+    messenger: Arc<Messenger>,
+    worker_id: velo::InstanceId,
+    sink: Arc<dyn EngineWorkerSink>,
+    enable_offload: bool,
+) -> Result<(Leader, Arc<dyn WorkerEngineDriver>)> {
+    let client = VeloWorkerClient::new(messenger.clone(), worker_id).with_local_transfer_check(
+        LocalTransferCheckTiming {
+            wait: Duration::ZERO,
+            deadline: WAIT,
+        },
+    );
+    let workers = Arc::new(SpmdParallelWorkers::new(
+        vec![Arc::new(client)],
+        Arc::new(velo::EventManager::local()),
+        messenger.runtime().clone(),
+    ));
+    let manager = Arc::new(
+        TestManagerBuilder::<G2>::new()
+            .block_count(if enable_offload { 5 } else { 2 })
+            .block_size(BS)
+            .build(),
+    );
+    let instance = Arc::new(
+        InstanceLeader::builder()
+            .messenger(messenger)
+            .registry(BlockRegistry::new())
+            .g2_manager(manager.clone())
+            .parallel_worker(workers)
+            .build()?,
+    );
+    let offload = if enable_offload {
+        let pipeline = PipelineBuilder::new().batch_size(3).min_batch_size(3);
+        Some(Arc::new(
+            OffloadEngine::builder(instance.clone())
+                .with_g1_to_g2_pipeline(pipeline.build())
+                .build()?,
+        ))
+    } else {
+        None
+    };
+    let (engine, driver) = build_local_connector_engine(
+        instance,
+        sink,
+        ConnectorEngineConfig {
+            block_size: BS,
+            remote: Default::default(),
+            resource_policies: Default::default(),
+            resource_component_bytes: Default::default(),
+        },
+        offload,
+    );
+    let leader = Leader::with_engine(engine, BS);
+    leader.create_slot(make_request(REQUEST, (0..12).collect()))?;
+    let hashes = leader
+        .state
+        .lock()
+        .get_mut(REQUEST)
+        .unwrap()
+        .all_sequence_hashes();
+    let sources = manager.allocate_blocks(DESTINATIONS.len()).unwrap();
+    let completed = sources
+        .into_iter()
+        .zip(hashes)
+        .map(|(source, hash)| source.stage(hash, BS))
+        .collect::<Result<Vec<_>, _>>()?;
+    manager.register_blocks(completed);
+    Ok((leader, driver))
 }
 
 async fn eventually(mut predicate: impl FnMut() -> bool) -> Result<()> {

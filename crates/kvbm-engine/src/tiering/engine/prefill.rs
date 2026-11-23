@@ -306,13 +306,20 @@ impl LocalConnectorEngine {
         }
         let external_g1 = &block_ids[block_ids.len() - external_blocks..];
 
+        let admitted = self.admit_action(
+            &request_id,
+            Some(super::admission::AdmissionOffer::Prefill(accept_id)),
+            false,
+        )?;
         if !state.claim_usaa() {
+            drop(admitted);
+            self.prune_request_actions(&request_id);
             return Err(LeaderEngineError::OnboardAlreadyInFlight);
         }
 
         // The gate can replay a pre-USAA failure against this same action.
         let (handle, load) = self.mint_onboard(
-            request_id.clone(),
+            admitted,
             external_g1.to_vec(),
             Some(tokio_util::sync::CancellationToken::new()),
             None,

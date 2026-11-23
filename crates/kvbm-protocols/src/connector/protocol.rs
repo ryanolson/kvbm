@@ -248,7 +248,7 @@ pub struct BundleOnboardPlan {
 /// the connector needs without exposing handle internals.
 #[derive(Debug)]
 pub enum FindBlocksOutcome {
-    /// The poll's window overlaps another lifecycle's in-flight onboard.
+    /// Wait for the prior allocation's drain or an overlapping onboard.
     Deferred,
     /// Still resolving — re-poll next step.
     Searching { minted: Option<FindBlocksHandle> },
@@ -361,6 +361,10 @@ pub enum LeaderEngineError {
     /// in flight.
     #[error("onboard already in flight for this request's latched lifecycle")]
     OnboardAlreadyInFlight,
+    /// A prior allocation still owns physical work. This refusal minted no
+    /// action and submitted no copy. Retry admission after drain proof.
+    #[error("prior request generation is still draining")]
+    PriorGenerationDraining,
     /// The engine has shut down.
     #[error("engine has shut down")]
     Shutdown,

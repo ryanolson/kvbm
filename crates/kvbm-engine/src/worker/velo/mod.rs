@@ -108,6 +108,30 @@ mod lost_reply_tests;
 mod service;
 mod unresolved;
 
+/// Register production transfer handlers over a test-controlled copy.
+#[cfg(feature = "testing")]
+#[doc(hidden)]
+pub fn serve_test_local_transfers(
+    messenger: &::velo::Messenger,
+    dispatch: impl Fn(
+        LogicalLayoutHandle,
+        Vec<BlockId>,
+        Vec<BlockId>,
+    ) -> Result<TransferCompleteNotification>
+    + Send
+    + Sync
+    + 'static,
+) -> Result<()> {
+    service::register_local_transfer_handlers(
+        messenger,
+        None,
+        check::LocalTransferRecords::new(),
+        Arc::new(move |message| {
+            dispatch(message.src, message.src_block_ids, message.dst_block_ids)
+        }),
+    )
+}
+
 /// Test-only controls for the local-transfer handlers installed by
 /// [`serve_held_local_transfers`].
 #[cfg(any(test, feature = "testing"))]

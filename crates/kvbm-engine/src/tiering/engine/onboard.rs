@@ -191,11 +191,12 @@ impl LocalConnectorEngine {
     /// fence the whole onboard, including staging and any parked prefill kick.
     pub(super) fn mint_onboard(
         self: &Arc<Self>,
-        request: RequestId,
+        mut admitted: super::admission::AdmissionGuard<'_>,
         destinations: Vec<BlockId>,
         cancel: Option<CancellationToken>,
         inflight_hashes: Option<Vec<SequenceHash>>,
     ) -> (OnboardHandle, PausedLoad) {
+        let request = admitted.key().clone();
         let action = ActionId::new();
         let cell = Arc::new(Mutex::new(ActionStatus::Pending));
         let physical_drain = Arc::new(AtomicBool::new(false));
@@ -216,10 +217,9 @@ impl LocalConnectorEngine {
                 .expect("inflight-guard mutex poisoned")
                 .record(key, hashes);
         }
-        self.by_request
-            .entry(request.clone())
-            .or_default()
-            .push(action);
+        admitted.ids.push(action);
+        admitted.physical_loads += usize::from(fenced);
+        drop(admitted);
 
         let owner: Arc<dyn LeaderEngine> = self.clone();
         let handle = if fenced {
@@ -249,11 +249,11 @@ impl LocalConnectorEngine {
 
     pub(super) fn reject_cd_onboard(
         self: &Arc<Self>,
-        request: RequestId,
+        admitted: super::admission::AdmissionGuard<'_>,
         destinations: Vec<BlockId>,
         state: Arc<CdRequestState>,
     ) -> OnboardHandle {
-        let (handle, load) = self.mint_onboard(request, destinations, None, None);
+        let (handle, load) = self.mint_onboard(admitted, destinations, None, None);
         let status = ActionStatus::Failed(ActionFailure::Partial {
             block_ids: load.destinations.clone(),
         });
