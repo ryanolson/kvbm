@@ -13,11 +13,12 @@
 
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use crate::{
     layout::LayoutConfig,
     transfer::{
-        PhysicalLayout, TransferManager,
+        PhysicalLayout, TransferCompleteNotification, TransferDrainOutcome, TransferManager,
         executor::{TransferOptionsInternal, execute_transfer},
     },
 };
@@ -49,7 +50,8 @@ use kvbm_memory::nixl::NixlAgent;
 /// // Enable GDS for high-performance disk I/O
 /// let caps = TransferCapabilities::default().with_gds(true);
 /// ```
-static GDS_SUPPORTED: OnceLock<bool> = OnceLock::new();
+static GDS_SUPPORTED: OnceLock<()> = OnceLock::new();
+const GDS_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct TransferCapabilities {
@@ -141,8 +143,26 @@ impl TransferCapabilities {
         self
     }
 
-    fn test_gds_transfer(&self) -> anyhow::Result<()> {
-        let agent = NixlAgent::with_backends("agent", &["GDS_MT"])?;
+    fn test_gds_transfer() -> anyhow::Result<()> {
+        // The probe uses its own runtime so it can also run from a Tokio caller.
+        let (send, result) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("kvbm-gds-probe".to_owned())
+            .spawn(move || {
+                let _ = send.send(Self::run_gds_probe());
+            })?;
+        match result.recv_timeout(GDS_PROBE_TIMEOUT) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                anyhow::bail!("GDS probe timed out after {GDS_PROBE_TIMEOUT:?}")
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn run_gds_probe() -> anyhow::Result<()> {
+        let name = format!("gds-probe-{}", uuid::Uuid::new_v4());
+        let agent = NixlAgent::with_backends(&name, &["GDS_MT"])?;
 
         // Try a little test transfer and see if it works.
         let config = LayoutConfig::builder()
@@ -168,11 +188,12 @@ impl TransferCapabilities {
         let dst_blocks = vec![0];
 
         let ctx = TransferManager::builder()
+            .capabilities(Self::default().with_gds(true))
             .nixl_agent(agent)
             .cuda_device_id(0)
             .build()?;
 
-        execute_transfer(
+        let receipt = execute_transfer(
             &src,
             &dst,
             &src_blocks,
@@ -181,12 +202,23 @@ impl TransferCapabilities {
             ctx.context(),
         )?;
 
-        Ok(())
+        let outcome = ctx
+            .context()
+            .tokio()
+            .block_on(wait_for_gds_probe(receipt, GDS_PROBE_TIMEOUT));
+        match outcome {
+            TransferDrainOutcome::Completed => Ok(()),
+            TransferDrainOutcome::DrainedWithError(error) => Err(error),
+            TransferDrainOutcome::Unproven(error) => {
+                std::mem::forget((src, dst, ctx));
+                Err(error)
+            }
+        }
     }
 
+    /// Enable GDS after a direct device-to-disk probe completes.
     pub fn with_gds_if_supported(mut self) -> Self {
-        self.allow_gds = *GDS_SUPPORTED.get_or_init(|| self.test_gds_transfer().is_ok());
-
+        self.allow_gds = probe_support(&GDS_SUPPORTED, Self::test_gds_transfer);
         self
     }
 
@@ -281,5 +313,97 @@ mod tests {
         let caps = TransferCapabilities::new().with_gpu_rdma(true);
         assert!(!caps.allows_device_disk_direct());
         assert!(caps.allows_device_remote_direct());
+    }
+}
+
+fn probe_support(supported: &OnceLock<()>, probe: impl FnOnce() -> anyhow::Result<()>) -> bool {
+    if supported.get().is_some() {
+        return true;
+    }
+
+    match probe() {
+        Ok(()) => {
+            let _ = supported.set(());
+            true
+        }
+        Err(error) => {
+            tracing::warn!(%error, "GDS probe reported unsupported");
+            false
+        }
+    }
+}
+
+async fn wait_for_gds_probe(
+    receipt: TransferCompleteNotification,
+    timeout: Duration,
+) -> TransferDrainOutcome {
+    let mut drain = Box::pin(receipt.await_drain());
+    match tokio::time::timeout(timeout, drain.as_mut()).await {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            // A timed-out receipt still owns its holds.
+            std::mem::forget(drain);
+            TransferDrainOutcome::Unproven(anyhow::anyhow!("GDS probe drain timed out"))
+        }
+    }
+}
+
+#[cfg(test)]
+mod probe_receipt_tests {
+    use super::{probe_support, wait_for_gds_probe};
+    use crate::transfer::{TransferCompleteNotification, TransferDrainOutcome};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn gds_probe_retries_after_failure() {
+        let cached = std::sync::OnceLock::new();
+        assert!(!probe_support(&cached, || anyhow::bail!("probe failed")));
+        assert!(cached.get().is_none());
+        assert!(probe_support(&cached, || Ok(())));
+        assert!(probe_support(&cached, || panic!(
+            "successful probe is cached"
+        )));
+    }
+
+    #[tokio::test]
+    async fn gds_support_requires_a_completed_receipt() {
+        for (outcome, supported) in [
+            (TransferDrainOutcome::Completed, true),
+            (
+                TransferDrainOutcome::DrainedWithError(anyhow::anyhow!("copy failed")),
+                false,
+            ),
+            (
+                TransferDrainOutcome::Unproven(anyhow::anyhow!("drain unproven")),
+                false,
+            ),
+        ] {
+            let receipt =
+                TransferCompleteNotification::from_drain_future(std::future::ready(outcome));
+            assert_eq!(
+                matches!(
+                    wait_for_gds_probe(receipt, Duration::from_secs(1)).await,
+                    TransferDrainOutcome::Completed
+                ),
+                supported,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn gds_probe_timeout_preserves_the_receipts_hold() {
+        let kept = Arc::new(());
+        let hold = kept.clone();
+        let receipt = TransferCompleteNotification::from_drain_future(async move {
+            let _hold = hold;
+            std::future::pending().await
+        });
+        let outcome = wait_for_gds_probe(receipt, Duration::from_millis(15)).await;
+        let TransferDrainOutcome::Unproven(error) = outcome else {
+            panic!("a timed-out probe cannot confirm GDS support");
+        };
+        assert!(error.to_string().contains("timed out"));
+        assert_eq!(Arc::strong_count(&kept), 2);
     }
 }

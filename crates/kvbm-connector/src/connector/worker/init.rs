@@ -228,9 +228,8 @@ impl PendingWorkerState {
         // set, DYN_KVBM_CPU_CACHE_GB unset), enable GDS so the strategy layer
         // selects direct G1↔G3 transfers instead of trying to stage through a
         // G2 tier that doesn't exist. `with_gds_if_supported()` probes the
-        // host once and falls back to allow_gds=false if the probe fails — in
-        // that case the first G1↔G3 transfer will error loudly, which is the
-        // correct signal that bypass mode isn't viable on this host.
+        // direct route and caches success. If the probe fails, the first
+        // G1↔G3 transfer reports the missing host staging tier.
         let bypass_host = runtime.config().cache.bypass_host_cache();
         let capabilities = if bypass_host {
             TransferCapabilities::default().with_gds_if_supported()
