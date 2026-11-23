@@ -9,8 +9,83 @@
 use std::collections::HashMap;
 use std::fs;
 
+use super::NumaNode;
+
 /// Global cached topology
 static TOPOLOGY: std::sync::OnceLock<Result<NumaTopology, String>> = std::sync::OnceLock::new();
+
+/// Per-node memory counters in bytes.
+#[derive(Clone, Copy)]
+pub(crate) struct NodeMemorySnapshot {
+    pub(crate) total: u64,
+    pub(crate) free: u64,
+    pub(crate) inactive_file: u64,
+    pub(crate) active_file: u64,
+    pub(crate) reclaimable_slab: u64,
+    pub(crate) shmem: u64,
+}
+
+/// Read the node's current memory counters from sysfs.
+pub(crate) fn read_node_meminfo(node: NumaNode) -> Result<NodeMemorySnapshot, String> {
+    let path = format!("/sys/devices/system/node/node{}/meminfo", node.0);
+    let contents = fs::read_to_string(&path).map_err(|error| format!("read {path}: {error}"))?;
+    NodeMemorySnapshot::parse_meminfo(node, &contents)
+}
+
+impl NodeMemorySnapshot {
+    pub(crate) fn parse_meminfo(node: NumaNode, contents: &str) -> Result<Self, String> {
+        let prefix = format!("Node {} ", node.0);
+        let mut counters = HashMap::new();
+        for (label, value) in contents.lines().filter_map(|line| line.split_once(':')) {
+            let Some(field) = label.strip_prefix(prefix.as_str()) else {
+                continue;
+            };
+            if !matches!(
+                field,
+                "MemTotal"
+                    | "MemFree"
+                    | "Inactive(file)"
+                    | "Active(file)"
+                    | "SReclaimable"
+                    | "Shmem"
+            ) {
+                continue;
+            }
+
+            let invalid = || format!("invalid {field} value in node meminfo: {value:?}");
+            let mut parts = value.split_whitespace();
+            let kib: u64 = parts
+                .next()
+                .ok_or_else(invalid)?
+                .parse()
+                .map_err(|_| invalid())?;
+            if parts.next() != Some("kB") || parts.next().is_some() {
+                return Err(invalid());
+            }
+            let bytes = kib
+                .checked_mul(1024)
+                .ok_or_else(|| format!("{field} overflows bytes"))?;
+            if counters.insert(field, bytes).is_some() {
+                return Err(format!("duplicate {field} in node meminfo"));
+            }
+        }
+
+        let required = |field| {
+            counters
+                .get(field)
+                .copied()
+                .ok_or_else(|| format!("missing {field} in node meminfo"))
+        };
+        Ok(Self {
+            total: required("MemTotal")?,
+            free: required("MemFree")?,
+            inactive_file: required("Inactive(file)")?,
+            active_file: required("Active(file)")?,
+            reclaimable_slab: required("SReclaimable")?,
+            shmem: required("Shmem")?,
+        })
+    }
+}
 
 /// Represents the CPU topology for NUMA nodes.
 ///
