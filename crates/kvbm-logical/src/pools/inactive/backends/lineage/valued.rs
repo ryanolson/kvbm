@@ -120,6 +120,23 @@ pub(crate) struct ValuedPolicy {
 }
 
 impl ValuedPolicy {
+    pub(super) fn reserve(&mut self, capacity: usize) {
+        self.slots
+            .reserve_exact(capacity.saturating_sub(self.slots.len()));
+        self.leaf_dense
+            .reserve_exact(capacity.saturating_sub(self.leaf_dense.len()));
+        self.poison_dense
+            .reserve_exact(capacity.saturating_sub(self.poison_dense.len()));
+    }
+
+    #[cfg(test)]
+    pub(super) fn capacity(&self) -> usize {
+        self.slots
+            .capacity()
+            .min(self.leaf_dense.capacity())
+            .min(self.poison_dense.capacity())
+    }
+
     pub(crate) fn new(
         capacity: usize,
         sketch: Option<Arc<dyn FrequencyTracker<u128>>>,

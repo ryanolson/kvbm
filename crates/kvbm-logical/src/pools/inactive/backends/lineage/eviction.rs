@@ -90,6 +90,18 @@ impl LeafPolicy {
         Self::Valued(ValuedPolicy::new(capacity, sketch, oracle, params))
     }
 
+    pub(super) fn reserve(&mut self, capacity: usize) {
+        match self {
+            Self::Fifo(p) => p
+                .links
+                .reserve_exact(capacity.saturating_sub(p.links.len())),
+            Self::Tick(p) => p
+                .ticks
+                .reserve_exact(capacity.saturating_sub(p.ticks.len())),
+            Self::Valued(p) => p.reserve(capacity),
+        }
+    }
+
     /// A slot just became a `Real` node (fresh insert or ghost promotion). `seq_hash` is
     /// only consumed by [`Valued`](Self::Valued) (frequency/oracle lookup keys).
     pub(crate) fn on_node_inserted(&mut self, idx: u32, seq_hash: SequenceHash) {
@@ -195,6 +207,15 @@ impl LeafPolicy {
             Self::Fifo(p) => p.len(),
             Self::Tick(p) => p.queue.len(),
             Self::Valued(p) => p.len(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn capacity(&self) -> usize {
+        match self {
+            Self::Fifo(p) => p.links.capacity(),
+            Self::Tick(p) => p.ticks.capacity(),
+            Self::Valued(p) => p.capacity(),
         }
     }
 
