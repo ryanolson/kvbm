@@ -173,6 +173,10 @@ pub(super) struct ActionRecord {
     pub(super) cancel: Option<tokio_util::sync::CancellationToken>,
     #[cfg(test)]
     pub(super) on_logical_load_terminal: Option<Box<dyn FnOnce() + Send + Sync>>,
+    #[cfg(test)]
+    pub(super) on_physical_load_claimed: Option<Box<dyn FnOnce() + Send + Sync>>,
+    #[cfg(test)]
+    pub(super) on_physical_load_published: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 impl ActionRecord {
@@ -190,6 +194,10 @@ impl ActionRecord {
             cancel: None,
             #[cfg(test)]
             on_logical_load_terminal: None,
+            #[cfg(test)]
+            on_physical_load_claimed: None,
+            #[cfg(test)]
+            on_physical_load_published: None,
         }
     }
 
@@ -207,6 +215,10 @@ impl ActionRecord {
             cancel: None,
             #[cfg(test)]
             on_logical_load_terminal: None,
+            #[cfg(test)]
+            on_physical_load_claimed: None,
+            #[cfg(test)]
+            on_physical_load_published: None,
         }
     }
 
@@ -248,6 +260,10 @@ impl ActionRecord {
         self.fence.is_some()
             || self.drain.is_some()
             || self.has_pending_physical_work()
+            || matches!(
+                self.kind,
+                ActionKind::Load(LoadTerminalState::Claimed(_) | LoadTerminalState::Delivering)
+            )
             || (self.inflight.is_some() && self.has_pending_work())
     }
 
@@ -288,6 +304,10 @@ enum LoadTerminalState {
     /// The handle is terminal, but the worker must not reuse the named G1
     /// destinations until the physical phase drains.
     Deferred(LoadOutcome),
+    /// Physical proof is available. Request finish can still take ownership.
+    Claimed(LoadOutcome),
+    /// The receive belongs to the sink call, which runs without engine locks.
+    Delivering,
     /// Worker notification was emitted or deliberately suppressed by an
     /// eviction/request-drain barrier.
     Settled,
@@ -476,56 +496,120 @@ impl LocalConnectorEngine {
         action_id: ActionId,
         physical_drain: &Arc<AtomicBool>,
     ) {
-        let (request_id, worker_terminal, fence, drain, remove_now) = {
+        #[cfg(test)]
+        let mut on_physical_load_claimed = None;
+        #[cfg(test)]
+        let mut on_physical_load_published = None;
+        // Discover the request before taking the request guard. All nested
+        // acquisitions take the request index first, then its action record.
+        let request_id = self
+            .actions
+            .get(&action_id)
+            .map(|record| record.request_id.clone());
+        let request_guard = request_id
+            .as_ref()
+            .and_then(|req| self.by_request.get_mut(req));
+        let (claimed, fence, drain, remove_now) = {
             let mut guard = self.actions.get_mut(&action_id);
             match guard.as_deref_mut() {
                 Some(record) => {
+                    if !record.physical_pending {
+                        return;
+                    }
                     record.physical_pending = false;
                     record.cancel = None;
                     let suppress_terminal = record.fence.is_some() || record.drain.is_some();
-                    let prior_terminal = match &mut record.kind {
-                        ActionKind::Load(terminal) => {
-                            std::mem::replace(terminal, LoadTerminalState::Settled)
-                        }
-                        ActionKind::Save(_) => {
-                            debug_assert!(false, "physical load terminal requires a load action");
-                            return;
-                        }
+                    let ActionKind::Load(terminal) = &mut record.kind else {
+                        debug_assert!(false, "physical load terminal requires a load action");
+                        return;
                     };
-                    let worker_terminal = match prior_terminal {
-                        LoadTerminalState::Deferred(outcome) if !suppress_terminal => Some(outcome),
+                    match std::mem::replace(terminal, LoadTerminalState::Settled) {
+                        LoadTerminalState::Deferred(outcome) if !suppress_terminal => {
+                            *terminal = LoadTerminalState::Claimed(outcome);
+                        }
                         LoadTerminalState::Pending => {
                             tracing::error!(
                                 ?action_id,
                                 "physical load settled before its logical terminal"
                             );
-                            record.kind = ActionKind::Load(LoadTerminalState::Pending);
-                            None
+                            *terminal = LoadTerminalState::Pending;
                         }
-                        LoadTerminalState::Deferred(_) | LoadTerminalState::Settled => None,
-                    };
+                        _ => {}
+                    }
+                    #[cfg(test)]
+                    {
+                        on_physical_load_claimed = record.on_physical_load_claimed.take();
+                        on_physical_load_published = record.on_physical_load_published.take();
+                    }
                     (
-                        Some(record.request_id.clone()),
-                        worker_terminal,
+                        matches!(terminal, LoadTerminalState::Claimed(_)),
                         record.fence.take(),
                         record.drain.take(),
                         record.dropped_by_handle,
                     )
                 }
-                None => (None, None, None, None, false),
+                None => (false, None, None, false),
             }
         };
 
-        // Worker-side barriers first; once the leader-side physical fence is
-        // observed complete, every other release signal for this drain has
-        // already been emitted.
-        drop(fence);
-        drop(drain);
-        physical_drain.store(true, Ordering::Release);
-        if let (Some(request_id), Some(worker_terminal)) = (request_id, worker_terminal) {
-            self.sink.mark_load_finished(&request_id, worker_terminal);
+        #[cfg(test)]
+        if let Some(observe) = on_physical_load_claimed {
+            observe();
         }
 
+        // Publish the local proof under the same guard as the receive claim.
+        // Worker notifications and barrier drops run outside both guards.
+        physical_drain.store(true, Ordering::Release);
+        drop(request_guard);
+        drop(fence);
+        drop(drain);
+        #[cfg(test)]
+        if let Some(observe) = on_physical_load_published {
+            observe();
+        }
+        if claimed {
+            self.deliver_claimed_receive(
+                action_id,
+                &request_id.expect("tracked load has a request"),
+            );
+        } else if remove_now {
+            self.remove_action_record(&action_id);
+        }
+    }
+
+    fn deliver_claimed_receive(&self, action_id: ActionId, request_id: &RequestId) {
+        let (outcome, drain, mut remove_now) = {
+            let _request_guard = self.by_request.get_mut(request_id);
+            let Some(mut record) = self.actions.get_mut(&action_id) else {
+                return;
+            };
+            let ActionKind::Load(terminal @ LoadTerminalState::Claimed(_)) = &mut record.kind
+            else {
+                return;
+            };
+            let LoadTerminalState::Claimed(outcome) =
+                std::mem::replace(terminal, LoadTerminalState::Delivering)
+            else {
+                unreachable!();
+            };
+            // Finish may have armed the request drain after local proof was
+            // published. Otherwise keep the receive pending through the sink
+            // call so a concurrent finish joins it without a second signal.
+            if let Some(drain) = record.drain.take() {
+                record.kind = ActionKind::Load(LoadTerminalState::Settled);
+                (None, Some(drain), record.dropped_by_handle)
+            } else {
+                (Some(outcome), None, false)
+            }
+        };
+        drop(drain);
+        if let Some(outcome) = outcome {
+            self.sink.mark_load_finished(request_id, outcome);
+            remove_now = self.actions.get_mut(&action_id).is_some_and(|mut record| {
+                record.kind = ActionKind::Load(LoadTerminalState::Settled);
+                record.dropped_by_handle
+            });
+        }
         if remove_now {
             self.remove_action_record(&action_id);
         }
@@ -624,6 +708,38 @@ impl LocalConnectorEngine {
             }
         }
         // `emission` (the arming-guard clone) drops here with no lock held.
+    }
+
+    /// Atomically take ownership of a request's remaining release.
+    pub(super) fn arm_request_finish(&self, req: &RequestId) -> bool {
+        let actions = self.by_request.get_mut(req);
+        self.offload_drains.remove(req);
+        let Some(actions) = actions else {
+            return false;
+        };
+        if actions.iter().any(|id| {
+            self.actions.get(id).is_some_and(|record| {
+                record.drain.is_some()
+                    || matches!(record.kind, ActionKind::Load(LoadTerminalState::Delivering))
+            })
+        }) {
+            return true;
+        }
+
+        let mut emission = None;
+        for id in actions.iter() {
+            if let Some(mut record) = self.actions.get_mut(id)
+                && (record.has_pending_work()
+                    || matches!(record.kind, ActionKind::Load(LoadTerminalState::Claimed(_))))
+            {
+                let barrier = emission.get_or_insert_with(|| {
+                    Arc::new(DrainBarrier::new(req.clone(), self.sink.clone()))
+                });
+                record.drain = Some(barrier.clone());
+            }
+        }
+        drop(actions);
+        emission.is_some()
     }
 
     /// Sever a finished action's `request_id → action_ids` link, dropping the

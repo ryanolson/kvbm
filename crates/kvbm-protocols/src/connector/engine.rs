@@ -38,8 +38,9 @@ pub trait LeaderEngine: Send + Sync + 'static {
     /// OFFLOAD. Request-scoped (a cold no-match request still caches its novel
     /// blocks). The returned handle's per-action terminal flips **only** that
     /// handle — it does **not** push `mark_save_finished`. The one-per-request
-    /// `finished_sending` is emitted by consuming the [`RequestOffloadDrain`]
-    /// from [`Self::take_offload_drain`].
+    /// `finished_sending` is emitted by the request drain. The caller can
+    /// arm it via [`Self::begin_request_finish`] or commit the legacy
+    /// [`RequestOffloadDrain`] from [`Self::take_offload_drain`].
     fn offload(
         self: Arc<Self>,
         req: &RequestId,
@@ -193,6 +194,24 @@ pub trait LeaderEngine: Send + Sync + 'static {
     /// drains (immediately, if none are pending). Returns `None` when there is
     /// nothing to commit.
     fn take_offload_drain(&self, req: &RequestId) -> Option<RequestOffloadDrain>;
+
+    /// Decide request release and arm its drain as one operation.
+    ///
+    /// Call once when beginning request finish. `true` means the engine owns
+    /// the release and the caller must wait for a finished-set entry. A receive
+    /// claimed but still waiting for delivery joins the request drain and emits
+    /// `finished_sending`. If delivery to the worker sink has already started,
+    /// the caller waits for that `finished_recving` as the single release.
+    /// `false` means this finish decision has no release left to deliver to the
+    /// worker sink. The default reports no engine-owned release.
+    ///
+    /// When joining an in-progress receive, the signal covers that load and its
+    /// drain. Other pending physical work must be independently fenced. A
+    /// direct caller issuing a same-id save during a held onboard has no
+    /// scheduler gate and falls outside that contract.
+    fn begin_request_finish(&self, _req: &RequestId) -> bool {
+        false
+    }
 
     /// ENGINE-INTERNAL completion source for `OnboardHandle`/`OffloadHandle`.
     /// In-process this is an in-process map read (DashMap-style); a future M3
