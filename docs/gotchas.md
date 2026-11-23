@@ -123,6 +123,17 @@ return a receipt. Fail the stream synchronization to check that the receipt
 reports an unproven drain and the registration stays live.
 [Drain and registration test](../crates/kvbm-physical/src/transfer/executor/registration.rs)
 
+## Keep registered storage when NIXL refuses deregistration
+
+Explicitly deregister owned handles before releasing their storage. On error,
+keep both until process exit and log the failure once. Dropping the handle
+would retry deregistration. An explicit extraction panics after retaining the
+region. Ordinary teardown logs the error and continues.
+
+Test a counted failure after a real DRAM registration. Verify that the
+handle and storage never drop, including when extraction unwinds.
+[Deregistration tests](../crates/kvbm-memory/src/nixl.rs)
+
 ## Check the receipt before recording a layer event
 
 A transfer can return a receipt after dispatch fails. Check the receipt
