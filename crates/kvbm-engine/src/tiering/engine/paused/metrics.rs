@@ -95,7 +95,7 @@ impl PauseMetrics {
             stuck: IntCounterVec::new(
                 opts(
                     "kvbm_onboard_probe_stuck_total",
-                    "Onboard probe loops that missed two intervals",
+                    "Onboard probe loops that missed their next attempt budget",
                 ),
                 &["worker"],
             )?,

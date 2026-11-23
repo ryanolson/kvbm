@@ -101,6 +101,7 @@ impl fmt::Display for LocalTransferRecheck {
 pub(crate) struct CheckEvidence {
     pub(crate) attempted: Option<ClockInstant>,
     pub(crate) answered: Option<ClockInstant>,
+    pub(crate) deadline: Option<Duration>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -135,6 +136,7 @@ impl LocalTransferRecheck {
         let mut evidence = CheckEvidence {
             attempted: Some(ClockInstant::now()),
             answered: None,
+            deadline: Some(deadline),
         };
         // The outer timeout also bounds any handshake velo runs first, which
         // the request's own timeout may not cover.

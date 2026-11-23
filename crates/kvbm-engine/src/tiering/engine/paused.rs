@@ -28,6 +28,7 @@ use super::local::LocalConnectorEngine;
 use metrics::PauseMetrics;
 
 pub(super) const PROBE_INTERVAL: Duration = Duration::from_secs(10);
+const PROBE_SCHEDULING_MARGIN: Duration = Duration::from_secs(1);
 pub(super) type PauseCell = Arc<Mutex<Option<(std::time::Instant, String)>>>;
 
 /// Everything the driver must retain until all copies have stopped. A pause
@@ -115,6 +116,7 @@ impl PauseState {
 struct Participant {
     worker: Worker,
     recheck: Option<LocalTransferRecheck>,
+    deadline: Duration,
     state: PauseState,
     last_attempt: Option<Instant>,
     last_answer: Option<Instant>,
@@ -132,6 +134,9 @@ impl Participant {
         Self {
             worker,
             recheck,
+            deadline: evidence
+                .deadline
+                .unwrap_or(DEFAULT_LOCAL_TRANSFER_CHECK_DEADLINE),
             state,
             last_attempt: evidence.attempted,
             last_answer: evidence.answered,
@@ -152,12 +157,32 @@ impl WorkerSummary {
     }
 }
 
-#[derive(Default)]
 struct Probe {
     last_attempt: Option<Instant>,
+    deadline: Duration,
     stuck: bool,
     #[cfg(test)]
     task: Option<tokio::task::AbortHandle>,
+}
+
+impl Probe {
+    fn new(deadline: Duration) -> Self {
+        Self {
+            last_attempt: None,
+            deadline,
+            stuck: false,
+            #[cfg(test)]
+            task: None,
+        }
+    }
+
+    fn stuck_after(&self) -> Duration {
+        // A silent check can use its entire deadline before the loop sleeps.
+        PROBE_INTERVAL
+            .saturating_add(self.deadline)
+            .max(PROBE_INTERVAL * 2)
+            .saturating_add(PROBE_SCHEDULING_MARGIN)
+    }
 }
 
 #[derive(Default)]
@@ -301,7 +326,7 @@ impl PausedOnboards {
             if participant.recheck.is_some()
                 && let std::collections::hash_map::Entry::Vacant(entry) = inner.probes.entry(worker)
             {
-                entry.insert(Probe::default());
+                entry.insert(Probe::new(participant.deadline));
                 start.push(worker);
             }
         }
@@ -346,23 +371,30 @@ impl PausedOnboards {
         targets
     }
 
-    fn start_check(&self, worker: Worker, action: ActionId, check: &LocalTransferRecheck) {
+    fn start_check(
+        &self,
+        worker: Worker,
+        action: ActionId,
+        check: &LocalTransferRecheck,
+    ) -> Option<Duration> {
         let mut inner = self.inner.lock();
         let now = Instant::now();
+        let participant = inner
+            .records
+            .get_mut(&action)?
+            .participants
+            .iter_mut()
+            .find(|part| part.recheck.as_ref() == Some(check))?;
+        participant.last_attempt = Some(now);
+        let deadline = participant.deadline;
         let probe = inner.probes.get_mut(&worker).expect("registered probe");
         probe.last_attempt = Some(now);
+        probe.deadline = deadline;
         probe.stuck = false;
-        if let Some(record) = inner.records.get_mut(&action)
-            && let Some(participant) = record
-                .participants
-                .iter_mut()
-                .find(|part| part.recheck.as_ref() == Some(check))
-        {
-            participant.last_attempt = Some(now);
-        }
         if let Some(metrics) = &self.metrics {
             metrics.attempt(&worker.to_string(), now);
         }
+        Some(deadline)
     }
 
     fn apply_check(
@@ -501,16 +533,17 @@ async fn probe_worker(engine: Weak<LocalConnectorEngine>, worker: Worker, mut ne
         targets.rotate_left(shift);
         round = round.wrapping_add(1);
         for (action, check) in targets {
-            let messenger = {
+            let (messenger, deadline) = {
                 let Some(engine) = engine.upgrade() else {
                     return;
                 };
-                engine.paused_onboards.start_check(worker, action, &check);
-                engine.leader.messenger().clone()
+                let Some(deadline) = engine.paused_onboards.start_check(worker, action, &check)
+                else {
+                    continue;
+                };
+                (engine.leader.messenger().clone(), deadline)
             };
-            let outcome = check
-                .check(&messenger, DEFAULT_LOCAL_TRANSFER_CHECK_DEADLINE)
-                .await;
+            let outcome = check.check(&messenger, deadline).await;
             let Some(engine) = engine.upgrade() else {
                 return;
             };
@@ -555,7 +588,7 @@ async fn watch_pauses(engine: Weak<LocalConnectorEngine>, mut next: Instant) {
                     continue;
                 };
                 let reference = probe.last_attempt.map_or(oldest, |last| last.max(oldest));
-                if !probe.stuck && now - reference >= PROBE_INTERVAL * 2 {
+                if !probe.stuck && now - reference >= probe.stuck_after() {
                     probe.stuck = true;
                     if let Some(metrics) = &paused.metrics {
                         metrics.stuck(&worker.to_string());

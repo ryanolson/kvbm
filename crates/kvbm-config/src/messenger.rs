@@ -68,8 +68,8 @@ pub struct LocalTransferCheckConfig {
     #[serde(default = "default_local_transfer_check_wait_ms")]
     pub wait_ms: u64,
 
-    /// Deadline of the check RPC, and of the request that learns the worker's
-    /// incarnation, in milliseconds. Default: 5000.
+    /// Deadline in milliseconds for the check, its recovery probes, and the
+    /// request that learns the worker's incarnation. Default: 5000.
     #[serde(default = "default_local_transfer_check_deadline_ms")]
     #[validate(range(min = 1))]
     pub deadline_ms: u64,
