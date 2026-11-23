@@ -18,7 +18,7 @@ use kvbm_physical::manager::{ResourceLayoutHandles, TierLayoutHandles};
 
 use crate::KvbmRuntime;
 
-use super::{PendingLayoutMode, PendingWorkerState, select_g2_block_layout};
+use super::{PendingLayoutMode, PendingWorkerState, pinned_allocator, select_g2_block_layout};
 
 /// Deferred registrations for every manifest logical resource.
 pub(in crate::connector::worker) struct PendingWorkerResources {
@@ -174,11 +174,20 @@ impl PendingWorkerState {
         } else {
             let mut config = self.layout_config.clone();
             config.num_blocks = tier.host_block_count;
+            let allocator = runtime.config().cache.host.allocator;
+            tracing::info!(
+                ?resource,
+                ?allocator,
+                "Allocating pinned host memory for G2 layout"
+            );
             let layout = PhysicalLayoutBuilder::new(nixl_agent.clone())
                 .with_config(config)
                 .fully_contiguous()
                 .with_block_layout(lower_layout)
-                .allocate_pinned(Some(self.cuda_device_id as u32))
+                .allocate_pinned_with(
+                    Some(self.cuda_device_id as u32),
+                    pinned_allocator(allocator),
+                )
                 .build()?;
             created.push(LogicalLayoutHandle::G2);
             Some(manager.register_layout(layout)?)

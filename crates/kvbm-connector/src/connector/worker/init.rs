@@ -58,13 +58,23 @@ use kvbm_engine::worker::{DirectWorker, LeaderLayoutConfig, WorkerLayoutResponse
 
 use crate::KvbmRuntime;
 use kvbm_common::{BlockLayoutMode, KvBlockLayout, LogicalLayoutHandle};
+use kvbm_config::HostAllocator;
 use kvbm_physical::TransferManager;
-use kvbm_physical::layout::{BlockDimension, LayoutConfig, PhysicalLayoutBuilder};
+use kvbm_physical::layout::{BlockDimension, LayoutConfig, PhysicalLayoutBuilder, PinnedAllocator};
 use kvbm_physical::transfer::TransferCapabilities;
 
+#[cfg(all(test, feature = "testing-nixl"))]
+mod allocator_tests;
 mod resources;
 
 pub(super) use resources::PendingWorkerResources;
+
+fn pinned_allocator(allocator: HostAllocator) -> PinnedAllocator {
+    match allocator {
+        HostAllocator::CuMemHostAlloc => PinnedAllocator::CuMemHostAlloc,
+        HostAllocator::RegisteredMmap => PinnedAllocator::RegisteredMmap,
+    }
+}
 
 /// Whether the registered tensors describe a per-layer set of allocations
 /// (vLLM's default `register_kv_caches` path) or a single cross-layer
@@ -363,8 +373,10 @@ impl PendingWorkerState {
                 let mut host_layout = self.layout_config.clone();
                 host_layout.num_blocks = config.host_block_count;
 
+                let allocator = runtime.config().cache.host.allocator;
                 let total_bytes = host_layout.required_bytes() as u64;
                 tracing::info!(
+                    ?allocator,
                     host_block_count = config.host_block_count,
                     bytes_per_block = host_layout.bytes_per_block(),
                     total_gb = total_bytes / (1024 * 1024 * 1024),
@@ -375,7 +387,10 @@ impl PendingWorkerState {
                     .with_config(host_layout)
                     .fully_contiguous()
                     .with_block_layout(g2_block_layout)
-                    .allocate_pinned(Some(self.cuda_device_id as u32))
+                    .allocate_pinned_with(
+                        Some(self.cuda_device_id as u32),
+                        pinned_allocator(allocator),
+                    )
                     .build()
                     .map_err(|e| {
                         tracing::error!(

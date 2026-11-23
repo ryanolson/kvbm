@@ -97,6 +97,10 @@ Supported backends: `UCX`, `POSIX`, `GDS`, `GDS_MT`
 |---|---|---|---|---|
 | `cache.host.cache_size_gb` | `Option<f64>` | None | `KVBM_CACHE_HOST_CACHE_SIZE_GB` | Cache size in GB. Converted to blocks |
 | `cache.host.num_blocks` | `Option<usize>` | None | `KVBM_CACHE_HOST_NUM_BLOCKS` | Explicit block count (overrides cache_size_gb) |
+| `cache.host.allocator` | `HostAllocator` | `cu_mem_host_alloc` | `KVBM_CACHE_HOST_ALLOCATOR` | Pinned memory allocator. `registered_mmap` maps host memory and pins it with CUDA. |
+
+Workers read this setting from their own configuration. To select registered mmap in vLLM's
+`kv_connector_extra_config`, set `{"worker": {"cache": {"host": {"allocator": "registered_mmap"}}}}`.
 
 #### Disk Cache (G3 - Persistent Storage)
 

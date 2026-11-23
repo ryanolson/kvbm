@@ -43,6 +43,17 @@ pub enum ParallelismMode {
     ReplicatedData,
 }
 
+/// Allocator for pinned G2 memory.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HostAllocator {
+    /// Allocate pinned memory with CUDA's `cuMemHostAlloc`.
+    #[default]
+    CuMemHostAlloc,
+    /// Map host memory and pin it with CUDA's `cuMemHostRegister`.
+    RegisteredMmap,
+}
+
 /// Host cache configuration (G2 tier - pinned CPU memory).
 ///
 /// The host cache provides a staging area for KV blocks between GPU and disk.
@@ -56,6 +67,10 @@ pub struct HostCacheConfig {
     /// Explicit number of blocks for the host cache.
     /// Takes priority over cache_size_gb if set.
     pub num_blocks: Option<usize>,
+
+    /// Allocator workers use for pinned G2 memory. Defaults to `cu_mem_host_alloc`.
+    #[serde(default)]
+    pub allocator: HostAllocator,
 }
 
 impl HostCacheConfig {
@@ -250,10 +265,16 @@ mod tests {
     }
 
     #[test]
+    fn test_host_cache_deserializes_without_allocator() {
+        let config: HostCacheConfig = serde_json::from_str(r#"{"num_blocks": 4}"#).unwrap();
+        assert_eq!(config.allocator, HostAllocator::CuMemHostAlloc);
+    }
+
+    #[test]
     fn test_host_cache_only_num_blocks() {
         let config = HostCacheConfig {
             num_blocks: Some(1000),
-            cache_size_gb: None,
+            ..Default::default()
         };
         let bytes_per_block = 1_000_000;
         assert_eq!(config.compute_num_blocks(bytes_per_block), Some(1000));
@@ -263,8 +284,8 @@ mod tests {
     #[test]
     fn test_host_cache_only_size_gb() {
         let config = HostCacheConfig {
-            num_blocks: None,
             cache_size_gb: Some(10.0),
+            ..Default::default()
         };
         // 10GB / 1MB = 10_000 blocks
         let bytes_per_block = 1_000_000;
@@ -278,6 +299,7 @@ mod tests {
         let config = HostCacheConfig {
             num_blocks: Some(20_000),
             cache_size_gb: Some(10.0),
+            ..Default::default()
         };
         let bytes_per_block = 1_000_000;
         assert_eq!(config.compute_num_blocks(bytes_per_block), Some(20_000));
@@ -289,6 +311,7 @@ mod tests {
         let config = HostCacheConfig {
             num_blocks: Some(500),
             cache_size_gb: Some(10.0),
+            ..Default::default()
         };
         let bytes_per_block = 1_000_000;
         assert_eq!(config.compute_num_blocks(bytes_per_block), Some(10_000));
@@ -306,6 +329,7 @@ mod tests {
         let config = HostCacheConfig {
             num_blocks: Some(100),
             cache_size_gb: Some(1.0),
+            ..Default::default()
         };
         assert_eq!(config.compute_num_blocks(0), None);
     }
@@ -475,6 +499,7 @@ mod tests {
             host: HostCacheConfig {
                 cache_size_gb: Some(0.0),
                 num_blocks: Some(0),
+                ..Default::default()
             },
             disk: Some(DiskCacheConfig {
                 cache_size_gb: Some(30.0),
