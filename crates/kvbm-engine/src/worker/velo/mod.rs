@@ -108,18 +108,23 @@ mod lost_reply_tests;
 mod service;
 mod unresolved;
 
-#[cfg(test)]
-pub(crate) struct HeldLocalTransfers(Arc<check::LocalTransferRecords>);
+/// Test-only controls for the local-transfer handlers installed by
+/// [`serve_held_local_transfers`].
+#[cfg(any(test, feature = "testing"))]
+pub struct HeldLocalTransfers(Arc<check::LocalTransferRecords>);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 impl HeldLocalTransfers {
-    pub(crate) fn lose_next_reply(&self) {
+    /// Fail the next RPC and dispatch its copy in a separate task.
+    pub fn lose_next_reply(&self) {
         let (open, gate) = tokio::sync::oneshot::channel();
         open.send(()).expect("deferred copy gate");
         assert!(self.0.hooks.defer_next.lock().replace(gate).is_none());
     }
 
-    pub(crate) fn gate_reply_loss(&self) -> tokio::sync::oneshot::Sender<()> {
+    /// Fail the next RPC when the returned gate opens. Await dispatch before
+    /// opening the gate to lose the reply while the copy is held.
+    pub fn gate_reply_loss(&self) -> tokio::sync::oneshot::Sender<()> {
         let (open, gate) = tokio::sync::oneshot::channel();
         assert!(
             self.0
@@ -132,13 +137,17 @@ impl HeldLocalTransfers {
         open
     }
 
-    pub(crate) fn active(&self) -> bool {
+    /// Whether a copy still has an active worker record.
+    pub fn active(&self) -> bool {
         !self.0.active_ids().is_empty()
     }
 }
 
-#[cfg(test)]
-pub(crate) fn serve_held_local_transfers(
+/// Register the production local-transfer, check and incarnation handlers for
+/// one worker in a test. The callback supplies a drain receipt for each copy.
+/// Pass `false` for `lose_first_reply` to gate reply loss on the first RPC.
+#[cfg(any(test, feature = "testing"))]
+pub fn serve_held_local_transfers(
     messenger: &::velo::Messenger,
     worker_id: u64,
     lose_first_reply: bool,
