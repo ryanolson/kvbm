@@ -42,7 +42,7 @@ mod remote_search;
 mod tokio;
 mod v1_compat;
 
-pub use cache::{CacheConfig, DiskCacheConfig, HostCacheConfig, ParallelismMode};
+pub use cache::{CacheConfig, DiskCacheConfig, HostAllocator, HostCacheConfig, ParallelismMode};
 pub use control::ControlConfig;
 pub use debug::DebugConfig;
 pub use disagg::{DisaggConfig, DisaggregationRole};
@@ -259,7 +259,7 @@ impl KvbmConfig {
                 Env::prefixed("KVBM_NIXL_")
                     .map(|k| format!("nixl.{}", k.as_str().to_lowercase()).into()),
             )
-            // Cache host config: KVBM_CACHE_HOST_SIZE_GB, KVBM_CACHE_HOST_NUM_BLOCKS
+            // Host cache config: KVBM_CACHE_HOST_<FIELD>
             .merge(
                 Env::prefixed("KVBM_CACHE_HOST_")
                     .map(|k| format!("cache.host.{}", k.as_str().to_lowercase()).into()),
@@ -957,6 +957,57 @@ mod tests {
         });
     }
 
+    fn assert_host_allocator(config: &KvbmConfig, expected: &str) {
+        let host = serde_json::to_value(&config.cache.host).unwrap();
+        assert_eq!(
+            host.get("allocator").and_then(serde_json::Value::as_str),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn worker_profile_selects_registered_mmap() {
+        temp_env::with_vars_unset(["KVBM_CONFIG_PATH", "KVBM_CACHE_HOST_ALLOCATOR"], || {
+            let json = r#"{"worker": {"cache": {"host": {"allocator": "registered_mmap"}}}}"#;
+            let worker = KvbmConfig::from_figment_with_json_for_worker(json).unwrap();
+            assert_host_allocator(&worker, "registered_mmap");
+        });
+    }
+
+    #[test]
+    fn leader_profile_does_not_change_the_worker_allocator() {
+        temp_env::with_vars_unset(["KVBM_CONFIG_PATH", "KVBM_CACHE_HOST_ALLOCATOR"], || {
+            let json = r#"{"leader": {"cache": {"host": {"allocator": "registered_mmap"}}}}"#;
+            let worker = KvbmConfig::from_figment_with_json_for_worker(json).unwrap();
+            assert_host_allocator(&worker, "cu_mem_host_alloc");
+
+            let leader = KvbmConfig::from_figment_with_json_for_leader(json).unwrap();
+            assert_host_allocator(&leader, "registered_mmap");
+        });
+    }
+
+    #[test]
+    fn env_selects_registered_mmap() {
+        temp_env::with_vars(
+            [
+                ("KVBM_CONFIG_PATH", None),
+                ("KVBM_CACHE_HOST_ALLOCATOR", Some("registered_mmap")),
+            ],
+            || {
+                let worker = KvbmConfig::from_env_for_worker().unwrap();
+                assert_host_allocator(&worker, "registered_mmap");
+            },
+        );
+    }
+
+    #[test]
+    fn omitted_allocator_is_cu_mem_host_alloc() {
+        temp_env::with_vars_unset(["KVBM_CONFIG_PATH", "KVBM_CACHE_HOST_ALLOCATOR"], || {
+            let worker = KvbmConfig::from_env_for_worker().unwrap();
+            assert_host_allocator(&worker, "cu_mem_host_alloc");
+        });
+    }
+
     #[test]
     fn test_flat_json_applies_to_both_roles() {
         // Top-level keys that are real KvbmConfig fields (not "leader" /
@@ -1065,7 +1116,7 @@ mod tests {
             cache: CacheConfig {
                 host: HostCacheConfig {
                     cache_size_gb: host_gb,
-                    num_blocks: None,
+                    ..Default::default()
                 },
                 disk: disk_gb.map(|gb| DiskCacheConfig {
                     cache_size_gb: Some(gb),
@@ -1129,7 +1180,7 @@ mod tests {
             cache: CacheConfig {
                 host: HostCacheConfig {
                     cache_size_gb: Some(4.0),
-                    num_blocks: None,
+                    ..Default::default()
                 },
                 disk: Some(DiskCacheConfig {
                     cache_size_gb: Some(10.0),
