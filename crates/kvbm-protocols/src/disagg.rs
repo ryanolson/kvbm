@@ -44,8 +44,11 @@ pub fn digest_provided_hashes(hashes: &[SequenceHash]) -> u64 {
     compute_hash_v2(&buf, CD_DIGEST_SEED)
 }
 
-/// Current disaggregation protocol version.
+/// Disaggregation protocol version for ordinary remote prefill.
 pub const DISAGG_PROTOCOL_VERSION: u16 = 1;
+
+/// Request version for opt-in frontier prefill state transfer (FPST).
+pub const FPST_PROTOCOL_VERSION: u16 = 2;
 
 /// Unique identifier for a disaggregation session.
 pub type SessionId = uuid::Uuid;
@@ -336,7 +339,7 @@ impl RemotePrefillParams {
         }
     }
 
-    /// Validate request-independent wire metadata against the prompt window.
+    /// Validate version-1 wire metadata against the prompt window.
     ///
     /// Model-specific manifest, resource, alignment, and hash-chain checks
     /// remain the receiving worker's responsibility. This gate rejects wire
@@ -345,10 +348,35 @@ impl RemotePrefillParams {
         &self,
         prompt_len: usize,
     ) -> Result<(), RemotePrefillValidationError> {
-        if self.protocol_version != DISAGG_PROTOCOL_VERSION {
+        self.validate_version_and_prompt_len(DISAGG_PROTOCOL_VERSION, prompt_len)
+    }
+
+    /// Validate wire metadata for frontier prefill state transfer (FPST).
+    ///
+    /// Use this only on an opted-in hub or FPST-capable prefill worker. It
+    /// requires [`FPST_PROTOCOL_VERSION`] and checks the request ID and
+    /// prompt window before scheduling or attaching. The prefill worker
+    /// still owns model-specific validation.
+    pub fn validate_for_fpst(
+        &self,
+        request_id: &str,
+        prompt_len: usize,
+    ) -> Result<(), RemotePrefillValidationError> {
+        if request_id.trim().is_empty() {
+            return Err(RemotePrefillValidationError::EmptyRequestId);
+        }
+        self.validate_version_and_prompt_len(FPST_PROTOCOL_VERSION, prompt_len)
+    }
+
+    fn validate_version_and_prompt_len(
+        &self,
+        expected: u16,
+        prompt_len: usize,
+    ) -> Result<(), RemotePrefillValidationError> {
+        if self.protocol_version != expected {
             return Err(RemotePrefillValidationError::UnsupportedProtocolVersion {
                 actual: self.protocol_version,
-                expected: DISAGG_PROTOCOL_VERSION,
+                expected,
             });
         }
         if prompt_len == 0 {
@@ -386,7 +414,7 @@ impl RemotePrefillParams {
         Ok(())
     }
 
-    /// Validate the complete side-effect-free worker contract.
+    /// Validate the complete side-effect-free version-1 worker contract.
     ///
     /// Callers must run this before creating a search, prefill lifecycle, or
     /// destination allocation. It binds wire metadata to the receiving cache
@@ -933,9 +961,76 @@ mod tests {
     }
 
     #[test]
+    fn fpst_stays_unsupported_by_both_strict_validators() {
+        let request = valid_remote_prefill_request();
+        let mut params = request.remote_prefill_params();
+        params.protocol_version = 2;
+        params.decode_endpoint = Some(unitary_endpoint());
+        let length = request.token_ids.len();
+        let unsupported = RemotePrefillValidationError::UnsupportedProtocolVersion {
+            actual: 2,
+            expected: DISAGG_PROTOCOL_VERSION,
+        };
+
+        assert_eq!(
+            params.validate_for_prompt_len(length),
+            Err(unsupported.clone())
+        );
+        assert_eq!(
+            params.validate_for_worker(
+                &request.request_id,
+                &CacheScope::LegacyPrimary,
+                &[fake_plh(1, 0)],
+                length,
+                4,
+            ),
+            Err(unsupported)
+        );
+    }
+
+    #[test]
+    fn fpst_validator_requires_version_two_and_checks_the_prompt() {
+        let request = valid_remote_prefill_request();
+        let mut params = request.remote_prefill_params();
+        let length = request.token_ids.len();
+        params.protocol_version = 2;
+        assert_eq!(
+            params.validate_for_fpst(&request.request_id, length),
+            Ok(())
+        );
+
+        assert_eq!(
+            params.validate_for_fpst(" ", length),
+            Err(RemotePrefillValidationError::EmptyRequestId)
+        );
+        assert_eq!(
+            params.validate_for_fpst(&request.request_id, 0),
+            Err(RemotePrefillValidationError::EmptyPrompt)
+        );
+        assert_eq!(
+            params.validate_for_fpst(&request.request_id, 1),
+            Err(RemotePrefillValidationError::ProvidedWindowOutOfBounds {
+                provided_tokens: 4,
+                prompt_tokens: 1,
+            })
+        );
+
+        for actual in [DISAGG_PROTOCOL_VERSION, u16::MAX] {
+            params.protocol_version = actual;
+            assert_eq!(
+                params.validate_for_fpst(&request.request_id, length),
+                Err(RemotePrefillValidationError::UnsupportedProtocolVersion {
+                    actual,
+                    expected: 2,
+                })
+            );
+        }
+    }
+
+    #[test]
     fn remote_prefill_wire_validation_rejects_unknown_protocol_version() {
         let mut request = valid_remote_prefill_request();
-        request.protocol_version = DISAGG_PROTOCOL_VERSION + 1;
+        request.protocol_version = u16::MAX;
 
         assert!(matches!(
             request.validate(),

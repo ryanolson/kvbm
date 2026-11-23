@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
 use anyhow::Result;
+use kvbm_protocols::disagg::FPST_PROTOCOL_VERSION;
 use parking_lot::Mutex;
 use velo::{Context, Handler, Messenger};
 use velo_ext::{InstanceId, WorkerId};
@@ -33,6 +34,7 @@ const MAX_ATTEMPTS: usize = 2;
 
 pub struct PrefillRouter {
     selector: Arc<Selector>,
+    allow_fpst: bool,
     /// The charges of the requests that a velo worker took and has not
     /// finished, by request id.
     running: Mutex<HashMap<String, PickedSlot>>,
@@ -48,10 +50,15 @@ impl std::fmt::Debug for PrefillRouter {
 }
 
 impl PrefillRouter {
-    /// Build a router on top of `selector`.
+    /// Build a router for ordinary remote prefill.
     pub fn new(selector: Arc<Selector>) -> Arc<Self> {
+        Self::with_fpst(selector, false)
+    }
+
+    pub(super) fn with_fpst(selector: Arc<Selector>, allow_fpst: bool) -> Arc<Self> {
         Arc::new(Self {
             selector,
+            allow_fpst,
             running: Mutex::new(HashMap::new()),
         })
     }
@@ -65,7 +72,14 @@ impl PrefillRouter {
     /// Send `request` to the free worker with the least load. If that worker
     /// does not take it, try one other free worker.
     pub async fn submit(&self, request: PrefillRequest) -> DispatchOutcome {
-        if let Err(error) = request.validate() {
+        let validation = if self.allow_fpst && request.protocol_version == FPST_PROTOCOL_VERSION {
+            request
+                .remote_prefill_params()
+                .validate_for_fpst(&request.request_id, request.token_ids.len())
+        } else {
+            request.validate()
+        };
+        if let Err(error) = validation {
             return DispatchOutcome::Rejected {
                 reason: format!("invalid remote prefill request: {error:?}"),
             };

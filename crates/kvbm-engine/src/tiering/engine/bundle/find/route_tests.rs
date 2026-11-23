@@ -359,7 +359,7 @@ async fn remote_prefill_rejects_unknown_protocol_before_lifecycle_routing() -> R
     let identity = manifest("bad-protocol", &RESOURCES).identity();
     let mut request = find_request("bad-protocol", identity, rig.hashes.clone());
     let mut params = RemotePrefillParams::new(uuid::Uuid::new_v4(), InstanceId::new_v4());
-    params.protocol_version += 1;
+    params.protocol_version = u16::MAX;
     request.transfer_params = Some(TransferParams::remote_prefill(params));
 
     assert!(matches!(
