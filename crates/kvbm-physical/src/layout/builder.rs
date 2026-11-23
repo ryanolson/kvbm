@@ -138,13 +138,16 @@ impl MemoryEntry {
             self.registration = self.descriptor.clone();
         }
 
-        if matches!(policy, RegistrationPolicy::Required) && self.descriptor.is_none() {
-            bail!(
+        match (policy, self.descriptor.is_some()) {
+            (RegistrationPolicy::Required, false) => bail!(
                 "memory region {} is not registered with NIXL",
                 self.region.addr()
-            );
+            ),
+            (RegistrationPolicy::LocalOnly, true) => {
+                bail!("local-only layout cannot use a NIXL-registered memory region")
+            }
+            _ => Ok(self),
         }
-        Ok(self)
     }
 }
 
@@ -1084,18 +1087,111 @@ mod tests {
             TransferPlan::Direct(TransferStrategy::Memcpy)
         );
 
-        let peer = PhysicalLayout::builder(NixlAgent::with_backends(
-            "registration-policy-peer",
-            &["UCX"],
-        )?)
-        .with_config(cfg)
-        .fully_contiguous()
-        .allocate_system()
-        .build()?;
+        let peer_region = create_buffer(TestRegisteredRegion::new(
+            fully_contiguous_size(&cfg),
+            StorageKind::System,
+            MemType::Dram,
+            0,
+        ));
+        let peer = PhysicalLayout::builder(NixlAgent::new("registration-policy-peer")?)
+            .with_config(cfg)
+            .fully_contiguous()
+            .with_registered_regions(vec![peer_region])?
+            .build()?;
         for (src, dst) in [(&local, &peer), (&peer, &local)] {
             assert_eq!(
                 select_strategy(src, dst, &agent.name(), &caps)
                     .unwrap_err()
+                    .to_string(),
+                "local-only layout has no NIXL registration"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn registration_policy_local_only_rejects_registered_regions() -> Result<()> {
+        let agent = NixlAgent::new("registration-policy-local-registered")?;
+        let cfg = make_layout_config();
+        let registered_region = || {
+            TestRegisteredRegion::new(
+                fully_contiguous_size(&cfg),
+                StorageKind::System,
+                MemType::Dram,
+                0,
+            )
+        };
+        let builder = || {
+            PhysicalLayout::builder(agent.clone())
+                .local_only()
+                .with_config(cfg.clone())
+                .fully_contiguous()
+        };
+
+        let supplied = builder()
+            .with_registered_regions(vec![create_buffer(registered_region())])
+            .and_then(PhysicalLayoutBuilder::build);
+        let compatible = builder()
+            .with_memory_regions(vec![registered_region()])
+            .and_then(PhysicalLayoutBuilder::build);
+        for result in [supplied, compatible] {
+            assert_eq!(
+                result
+                    .expect_err("local-only layouts must not expose registered regions")
+                    .to_string(),
+                "local-only layout cannot use a NIXL-registered memory region"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn registration_policy_local_only_rejects_same_agent_disk_routes() -> Result<()> {
+        use crate::transfer::TransferCapabilities;
+        use crate::transfer::strategy::{TransferPlan, TransferStrategy, select_strategy};
+
+        let agent = NixlAgent::new("registration-policy-local-disk")?;
+        let cfg = make_layout_config();
+        let region = create_buffer(TestRegisteredRegion::new(
+            fully_contiguous_size(&cfg),
+            StorageKind::Disk(0),
+            MemType::File,
+            0,
+        ));
+        let disk = PhysicalLayout::builder(agent.clone())
+            .with_config(cfg.clone())
+            .fully_contiguous()
+            .with_registered_regions(vec![region])?
+            .build()?;
+        let local_host = PhysicalLayout::builder(agent.clone())
+            .local_only()
+            .with_config(cfg.clone())
+            .fully_contiguous()
+            .allocate_system()
+            .build()?;
+        let local_disk = PhysicalLayout::builder(agent.clone())
+            .local_only()
+            .with_config(cfg)
+            .fully_contiguous()
+            .allocate_disk(None)
+            .build()?;
+
+        let caps = TransferCapabilities::default();
+        assert!(matches!(
+            select_strategy(&disk, &disk, &agent.name(), &caps)?,
+            TransferPlan::TwoHop {
+                first: TransferStrategy::NixlReadFlipped,
+                ..
+            }
+        ));
+        for (src, dst) in [
+            (&local_host, &disk),
+            (&disk, &local_host),
+            (&disk, &local_disk),
+        ] {
+            assert_eq!(
+                select_strategy(src, dst, &agent.name(), &caps)
+                    .expect_err("local-only layouts must not select NIXL")
                     .to_string(),
                 "local-only layout has no NIXL registration"
             );

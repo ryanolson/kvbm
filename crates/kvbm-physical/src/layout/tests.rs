@@ -106,8 +106,7 @@ fn make_test_config() -> LayoutConfig {
 
 #[test]
 fn test_fully_contiguous_layout_serialization_roundtrip() {
-    let agent =
-        NixlAgent::with_backends("test-fc-serialize", &["UCX"]).expect("failed to create agent");
+    let agent = NixlAgent::new("test-fc-serialize").expect("failed to create agent");
     let config = make_test_config();
 
     // Calculate required size
@@ -175,8 +174,7 @@ fn test_fully_contiguous_layout_serialization_roundtrip() {
 
 #[test]
 fn test_layer_separate_layout_serialization_roundtrip() {
-    let agent =
-        NixlAgent::with_backends("test-ls-serialize", &["UCX"]).expect("failed to create agent");
+    let agent = NixlAgent::new("test-ls-serialize").expect("failed to create agent");
     let config = make_test_config();
 
     // Calculate per-layer size
@@ -253,8 +251,7 @@ fn test_layer_separate_layout_serialization_roundtrip() {
 
 #[test]
 fn ragged_layout_preserves_segment_sizes_and_addresses() {
-    let agent = NixlAgent::with_backends("test-ragged-serialize", &["UCX"])
-        .expect("failed to create agent");
+    let agent = NixlAgent::new("test-ragged-serialize").expect("failed to create agent");
     let config = LayoutConfig::builder()
         .num_blocks(3)
         .num_layers(3)
@@ -312,8 +309,7 @@ fn ragged_layout_preserves_segment_sizes_and_addresses() {
 
 #[test]
 fn test_memory_region_calculation_after_deserialization() {
-    let agent =
-        NixlAgent::with_backends("test-memory-calc", &["UCX"]).expect("failed to create agent");
+    let agent = NixlAgent::new("test-memory-calc").expect("failed to create agent");
     let config = LayoutConfig::builder()
         .num_blocks(2)
         .num_layers(2)

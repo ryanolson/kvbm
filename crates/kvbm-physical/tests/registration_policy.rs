@@ -40,7 +40,14 @@ fn default_builder_requires_native_registration() -> Result<()> {
 
 #[test]
 fn default_builder_preserves_a_native_pre_registered_region() -> Result<()> {
-    let agent = NixlAgent::with_backends("registration-policy-registered", &["UCX"])?;
+    let mut agent = NixlAgent::new("registration-policy-registered")?;
+    let plugins = agent.get_available_plugins()?;
+    let plugins = plugins.iter().collect::<Result<Vec<_>, _>>()?;
+    if !plugins.contains(&"UCX") {
+        eprintln!("Skipping native pre-registration test because the UCX plugin is unavailable");
+        return Ok(());
+    }
+    agent.add_backend("UCX")?;
     let config = layout_config()?;
     let storage = SystemStorage::new(config.required_bytes())?;
     let registered = register_with_nixl(storage, &agent, None)?;

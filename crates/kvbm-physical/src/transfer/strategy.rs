@@ -90,24 +90,23 @@ pub(crate) fn select_strategy(
         ));
     }
 
+    let src_kind = src.location();
+    let dst_kind = dst.location();
+    if !is_src_local || !is_dst_local || src_kind.is_disk() || dst_kind.is_disk() {
+        src.nixl_metadata()?;
+        dst.nixl_metadata()?;
+    }
+
     if is_src_local && is_dst_local {
         return Ok(select_direct_strategy(
-            src.location(),
-            dst.location(),
+            src_kind,
+            dst_kind,
             false,
             capabilities,
         ));
     }
 
-    src.nixl_metadata()?;
-    dst.nixl_metadata()?;
-    select_remote_strategy_nixl(
-        src.location(),
-        is_src_local,
-        dst.location(),
-        is_dst_local,
-        capabilities,
-    )
+    select_remote_strategy_nixl(src_kind, is_src_local, dst_kind, is_dst_local, capabilities)
 }
 
 /// Select the appropriate transfer plan based on source and destination locations.
