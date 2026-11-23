@@ -6,14 +6,17 @@
 //! This module provides a compile-time safe builder for NIXL transfers that ensures
 //! all required parameters are set before execution.
 
+use super::registration::RegistrationGuards;
 use super::{PhysicalLayout, TransferContext, TransferStrategy};
 use crate::BlockId;
-use crate::transfer::context::TransferCompleteNotification;
+use crate::transfer::context::{TransferCompleteNotification, TransferDrainOutcome};
 use crate::transfer::{can_use_whole_block_transfer, validate_layout_compatibility};
 use anyhow::{Result, anyhow};
-use kvbm_memory::nixl::{XferDescList, XferOp};
+use kvbm_memory::nixl::{NixlAgent, XferDescList, XferOp, XferRequest};
+use kvbm_observability::KvbmObservability;
 use std::marker::PhantomData;
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Marker type for unset builder fields.
 pub struct Unset;
@@ -195,8 +198,8 @@ impl<'a, TSrc, TDst, TSrcBlocks, TDstBlocks, TStrategy>
 impl<'a> NixlTransferBuilder<'a, Set, Set, Set, Set, Set> {
     /// Executes the NIXL transfer with the configured parameters.
     ///
-    /// This method is only available when all required fields have been set,
-    /// enforced at compile time by the typestate pattern.
+    /// A dispatch error precedes posting. Post failures return a receipt
+    /// because NIXL may have already submitted some descriptors.
     pub(crate) fn execute(self, ctx: &TransferContext) -> Result<TransferCompleteNotification> {
         // Unwrap all required fields (safe because typestate guarantees they're set)
         let src = self.src.unwrap();
@@ -381,21 +384,75 @@ impl<'a> NixlTransferBuilder<'a, Set, Set, Set, Set, Set> {
             None, // opt_args
         )?;
 
-        // Post transfer request
-        // Note: Notification handling via OptArgs can be added later if needed
-        // NOTE: this legacy NixlTransferBuilder path is NOT the live remote-search
-        // pull route (the connector always uses the planner's direct path via
-        // execute_planner_nixl_transfer). Per-worker RDMA telemetry lives there.
-        let still_pending = nixl_agent
-            .post_xfer_req(&xfer_req, None)
-            .inspect_err(|_| std::mem::forget(std::mem::take(&mut guards)))?;
-
-        if still_pending {
-            // Register for async completion via status polling
-            Ok(ctx.register_nixl_status(xfer_req, None, registration, guards))
-        } else {
-            // Transfer completed synchronously
-            Ok(TransferCompleteNotification::completed())
+        let observability = ctx.observability().map(|obs| obs.as_ref());
+        match post_transfer(nixl_agent, xfer_req, guards, observability) {
+            PostResult::Pending(request, guards) => {
+                Ok(ctx.register_nixl_status(request, None, registration, guards))
+            }
+            PostResult::Completed => Ok(TransferCompleteNotification::completed()),
+            PostResult::Unproven(receipt) => Ok(receipt),
         }
+    }
+}
+
+pub(super) enum PostResult {
+    Pending(XferRequest, RegistrationGuards),
+    Completed,
+    Unproven(TransferCompleteNotification),
+}
+
+pub(super) fn post_transfer(
+    agent: &NixlAgent,
+    request: XferRequest,
+    guards: RegistrationGuards,
+    observability: Option<&KvbmObservability>,
+) -> PostResult {
+    let posted = agent
+        .post_xfer_req(&request, None)
+        .map_err(anyhow::Error::from);
+    #[cfg(all(test, feature = "testing-kvbm"))]
+    let posted =
+        posted.and_then(|pending| super::dispatch_fault::after_nixl_post(agent, &request, pending));
+    match posted {
+        Ok(true) => PostResult::Pending(request, guards),
+        Ok(false) => PostResult::Completed,
+        Err(error) => {
+            // A backend can fail after posting some descriptors.
+            std::mem::forget((request, guards));
+            if let Some(metrics) = observability {
+                metrics
+                    .transfer_metrics()
+                    .transfer_failures_total
+                    .with_label_values(&["nixl", "post", "retained_request"])
+                    .inc();
+            }
+            static RETAINED_REQUESTS: AtomicU64 = AtomicU64::new(0);
+            if let Some(count) = count_retained_request(&RETAINED_REQUESTS) {
+                tracing::error!(retained_requests = count, %error, "Retained NIXL request after post failure");
+            }
+            PostResult::Unproven(TransferCompleteNotification::from_drain_future(
+                std::future::ready(TransferDrainOutcome::Unproven(error)),
+            ))
+        }
+    }
+}
+
+fn count_retained_request(counter: &AtomicU64) -> Option<u64> {
+    let count = counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    count.is_power_of_two().then_some(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retained_nixl_requests_log_at_doubling_counts() {
+        let counter = AtomicU64::new(0);
+        let logged: Vec<_> = (0..10)
+            .filter_map(|_| count_retained_request(&counter))
+            .collect();
+        assert_eq!(counter.load(Ordering::Relaxed), 10);
+        assert_eq!(logged, [1, 2, 4, 8]);
     }
 }

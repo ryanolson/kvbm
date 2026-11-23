@@ -42,8 +42,11 @@ use super::gate::nixl_serial;
 use super::local_transfers::{LayoutType, is_nixl_backend_available};
 use super::*;
 use crate::layout::KvBlockLayout;
+use crate::transfer::executor::dispatch_fault::{Point, inject};
 use crate::transfer::executor::{TransferOptionsInternal, execute_transfer};
 use crate::transfer::strategy::{TransferPlan, TransferStrategy, select_strategy};
+use crate::transfer::{BounceBufferInternal, TransferCompleteNotification, TransferDrainOutcome};
+use kvbm_observability::{KvbmObservability, SharedKvbmObservability};
 
 /// Direction of the NIXL transfer under test.
 ///
@@ -883,6 +886,96 @@ async fn use_planner_nixl_transform_without_bounce_errors() -> Result<()> {
     assert!(
         msg.contains("bounce_buffer") || msg.contains("Bounce") || msg.contains("bounce"),
         "expected bounce_buffer-related error, got: {msg}"
+    );
+    Ok(())
+}
+
+fn dispatch_nixl_fault(
+    point: Point,
+    use_planner: bool,
+    metrics: SharedKvbmObservability,
+) -> Result<Result<TransferCompleteNotification>> {
+    assert!(!kvbm_kernels::is_using_stubs(), "CUDA kernels required");
+    let (source_name, destination_name) = agent_pair_names("dispatch-failure");
+    let source = build_ucx_agent(&source_name)?.expect("UCX backend required");
+    let destination = build_ucx_agent(&destination_name)?.expect("UCX backend required");
+    let src_kv = if point == Point::CompletionEvent {
+        KvBlockLayout::Universal
+    } else {
+        KvBlockLayout::OperationalNHD
+    };
+    let dst_kv = if point == Point::NixlStatusEvent {
+        KvBlockLayout::Universal
+    } else {
+        KvBlockLayout::OperationalNHD
+    };
+    let src = build_fc_with_block_layout_on_agent(source.clone(), src_kv, 1)?;
+    let dst = build_fc_with_block_layout_on_agent(destination.clone(), dst_kv, 1)?;
+    fill_blocks(&src, &[0], FillPattern::Sequential)?;
+    let (local, remote) = if point == Point::NixlStatusEvent {
+        (destination, source)
+    } else {
+        (source, destination)
+    };
+    let mut options = TransferOptionsInternal::builder().use_planner(use_planner);
+    let bounce = if src_kv != dst_kv {
+        let layout =
+            build_fc_with_block_layout_on_agent(local.clone(), KvBlockLayout::OperationalNHD, 1)?;
+        options = options.bounce_buffer(BounceBufferInternal::from_layout(layout.clone(), vec![0]));
+        Some(layout)
+    } else {
+        None
+    };
+    local.load_remote_md(&remote.get_local_md()?)?;
+    let manager = crate::manager::TransferManager::builder()
+        .capabilities(TransferCapabilities::default().with_gpu_rdma(true))
+        .observability(metrics)
+        .cuda_device_id(0)
+        .nixl_agent(local)
+        .build()?;
+    let result = inject(point, 1, || {
+        execute_transfer(
+            &src,
+            &dst,
+            &[0],
+            &[0],
+            options.build().unwrap(),
+            manager.context(),
+        )
+    });
+    // The injected NIXL fault waits for the fixture copy. The staged CUDA
+    // fault has no NIXL leg, so drain the device before releasing its buffers.
+    if point == Point::CompletionEvent {
+        cudarc::driver::CudaContext::new(0)?.synchronize()?;
+    }
+    drop(bounce);
+    Ok(result)
+}
+
+#[rstest::rstest]
+#[case(false)]
+#[case(true)]
+#[tokio::test]
+async fn nixl_dispatch_failure_after_post_returns_unproven(
+    #[case] use_planner: bool,
+) -> Result<()> {
+    nixl_serial!();
+    let metrics = std::sync::Arc::new(KvbmObservability::new()?);
+    let receipt = dispatch_nixl_fault(Point::NixlPost, use_planner, metrics.clone())?
+        .expect("the request posted before dispatch reported failure");
+    let drain =
+        tokio::time::timeout(std::time::Duration::from_secs(5), receipt.await_drain()).await?;
+    let TransferDrainOutcome::Unproven(error) = drain else {
+        panic!("a NIXL post error cannot prove drain");
+    };
+    assert!(error.to_string().contains("injected NIXL post failure"));
+    assert_eq!(
+        metrics
+            .transfer_metrics()
+            .transfer_failures_total
+            .with_label_values(&["nixl", "post", "retained_request"])
+            .get(),
+        1
     );
     Ok(())
 }

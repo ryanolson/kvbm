@@ -43,6 +43,7 @@ use kvbm_kernels::MemcpyBatchMode;
 use kvbm_memory::nixl::{XferDescList, XferOp};
 
 use super::TransferContext;
+use super::nixl::{PostResult, post_transfer};
 use super::registration::{CudaSubmissionGuard, record_completion_event};
 use super::{PhysicalLayout, TransferStrategy};
 use crate::BlockId;
@@ -267,6 +268,8 @@ pub(crate) fn execute_planner_cuda_transfer(
 
 /// Dispatch a NIXL transfer through the stride-aware planner.
 ///
+/// Direct NIXL post failures resolve through the receipt.
+///
 /// Behaves like [`execute_planner_cuda_transfer`] for the validation,
 /// planning, and lowering stages, then maps the lowered
 /// [`Vec<CopyOp>`] onto a NIXL `XferDescList` pair instead of
@@ -467,9 +470,16 @@ pub(crate) fn execute_planner_nixl_transfer(
     let xfer_req = nixl_agent.create_xfer_req(xfer_op, &src_dl, &dst_dl, remote_agent, None)?;
     let tel_ctrl_us = t_ctrl0.elapsed().as_micros() as u64;
     let t_post0 = std::time::Instant::now();
-    let still_pending = nixl_agent
-        .post_xfer_req(&xfer_req, None)
-        .inspect_err(|_| std::mem::forget(std::mem::take(&mut guards)))?;
+    let (xfer_req, guards) = match post_transfer(
+        nixl_agent,
+        xfer_req,
+        guards,
+        ctx.observability().map(|obs| obs.as_ref()),
+    ) {
+        PostResult::Pending(request, guards) => (Some(request), guards),
+        PostResult::Completed => (None, Vec::new()),
+        PostResult::Unproven(receipt) => return Ok(receipt),
+    };
     let tel_post_us = t_post0.elapsed().as_micros() as u64;
     let tel_submitted_at = std::time::Instant::now();
 
@@ -514,7 +524,7 @@ pub(crate) fn execute_planner_nixl_transfer(
         submitted_at: tel_submitted_at,
     };
 
-    if still_pending {
+    if let Some(xfer_req) = xfer_req {
         Ok(ctx.register_nixl_status(xfer_req, Some(telemetry), registration, guards))
     } else {
         // Synchronous completion never enters the poller — emit inline.
