@@ -115,14 +115,41 @@ impl HeldLoad {
             "request finish must produce one finished_sending and no finished_recving"
         );
     }
+
+    fn prove(&self, failed: bool) -> Result<()> {
+        if failed {
+            self.worker.fail_drained(self.worker.take_running_copy()?)
+        } else {
+            self.worker.release()
+        }
+    }
+
+    fn failed_receive(&self) -> Vec<(RequestId, LoadOutcome)> {
+        vec![(
+            self.request.clone(),
+            LoadOutcome::FailedPartial {
+                block_ids: vec![DESTINATION],
+            },
+        )]
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn request_release_accounts_for_the_published_fence_before_receive_delivery() -> Result<()> {
+    finish_after_fence_publish(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_release_accounts_for_the_published_fence_before_receive_delivery_with_failed_load()
+-> Result<()> {
+    finish_after_fence_publish(true).await
+}
+
+async fn finish_after_fence_publish(failed: bool) -> Result<()> {
     let load = HeldLoad::start(false).await?;
     let (published, resume) = load.gate_after_fence_publish();
     load.assert_before_proof();
-    load.worker.release()?;
+    load.prove(failed)?;
     tokio::time::timeout(TEST_WAIT, published).await??;
     assert!(load.fence.is_complete());
 
@@ -137,7 +164,12 @@ async fn request_release_accounts_for_the_published_fence_before_receive_deliver
         needs_drain,
         "finish reported no unsettled work before the receive was delivered: {after_delivery:?}"
     );
-    load.assert_single_send();
+    if failed {
+        assert_eq!(load.sink.loads(), load.failed_receive());
+        assert!(load.sink.saves().is_empty());
+    } else {
+        load.assert_single_send();
+    }
     Ok(())
 }
 
@@ -218,7 +250,60 @@ async fn request_release_folds_receive_into_finish_before_proof() -> Result<()> 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn request_release_sends_once_for_an_evicted_load_without_offloads() -> Result<()> {
+async fn request_release_collects_failed_load_ids_until_the_last_action_drains() -> Result<()> {
+    finish_with_pending_load_and_save(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_release_collects_failed_load_ids_until_the_last_action_drains_load_first()
+-> Result<()> {
+    finish_with_pending_load_and_save(true).await
+}
+
+async fn finish_with_pending_load_and_save(load_first: bool) -> Result<()> {
+    let sink = RecordingSink::new();
+    let (load, save) = HeldLoad::start_with_sink(false, sink.clone(), sink, |engine, request| {
+        let save = ActionId::new();
+        engine
+            .actions
+            .insert(save, ActionRecord::new_save(request.clone(), Weak::new()));
+        engine.by_request.insert(request.clone(), vec![save]);
+        save
+    })
+    .await?;
+    assert!(load.engine.begin_request_finish(&load.request));
+
+    if load_first {
+        load.prove(true)?;
+        wait_onboard_driver_finished(*load.onboard.id()).await;
+        assert!(load.sink.loads().is_empty());
+        assert!(load.sink.saves().is_empty());
+        load.engine
+            .finish_save_action(save, &load.request, ActionStatus::Complete);
+    } else {
+        load.engine
+            .finish_save_action(save, &load.request, ActionStatus::Complete);
+        load.assert_before_proof();
+        load.prove(true)?;
+        wait_onboard_driver_finished(*load.onboard.id()).await;
+    }
+    assert_eq!(load.sink.loads(), load.failed_receive());
+    assert!(load.sink.saves().is_empty());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_release_signals_once_for_an_evicted_load_without_offloads() -> Result<()> {
+    finish_evicted_load(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_release_signals_once_for_an_evicted_load_without_offloads_with_failed_load()
+-> Result<()> {
+    finish_evicted_load(true).await
+}
+
+async fn finish_evicted_load(failed: bool) -> Result<()> {
     let load = HeldLoad::start(false).await?;
     let eviction = load.engine.evict(&load.request);
     let eviction_fence = eviction.handle.expect("eviction arms its own fence");
@@ -226,12 +311,39 @@ async fn request_release_sends_once_for_an_evicted_load_without_offloads() -> Re
     let needs_drain = load.engine.begin_request_finish(&load.request);
     load.assert_before_proof();
     assert!(load.sink.fences().is_empty());
-    load.worker.release()?;
+    load.prove(failed)?;
     wait_onboard_driver_finished(*load.onboard.id()).await;
     assert!(eviction_fence.is_complete());
     assert_eq!(load.sink.fences(), eviction.fence.per_worker);
-    load.assert_single_send();
+    if failed {
+        assert_eq!(load.sink.loads(), load.failed_receive());
+        assert!(load.sink.saves().is_empty());
+    } else {
+        load.assert_single_send();
+    }
     assert!(needs_drain, "a load alone requires the request drain");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_release_keeps_a_failed_evicted_loads_already_written_result() -> Result<()> {
+    let load = HeldLoad::start(false).await?;
+    let eviction = load.engine.evict(&load.request);
+    let fence = eviction.handle.expect("eviction armed the load");
+    let (logical, resume) = load.gate_settlement(|record| &mut record.on_logical_load_terminal);
+    load.prove(true)?;
+    tokio::time::timeout(TEST_WAIT, logical).await??;
+    assert!(load.onboard.is_complete());
+    assert!(!fence.is_complete());
+    assert!(load.sink.loads().is_empty());
+    assert!(load.sink.saves().is_empty());
+    assert!(load.engine.begin_request_finish(&load.request));
+
+    resume.send(())?;
+    wait_onboard_driver_finished(*load.onboard.id()).await;
+    assert!(fence.is_complete());
+    assert_eq!(load.sink.loads(), load.failed_receive());
+    assert!(load.sink.saves().is_empty());
     Ok(())
 }
 
@@ -272,6 +384,16 @@ impl EngineWorkerSink for HeldReceiveSink {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn request_release_joins_an_in_progress_receive_and_keeps_the_old_eviction_fence()
 -> Result<()> {
+    finish_during_receive(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_release_joins_an_in_progress_receive_and_keeps_the_old_eviction_fence_with_failed_load()
+-> Result<()> {
+    finish_during_receive(true).await
+}
+
+async fn finish_during_receive(failed: bool) -> Result<()> {
     let sink = RecordingSink::new();
     let (enter, entered) = oneshot::channel();
     let (resume, blocked) = std::sync::mpsc::channel();
@@ -296,12 +418,17 @@ async fn request_release_joins_an_in_progress_receive_and_keeps_the_old_eviction
         .await?;
     let old_fence = eviction.handle.expect("the old save has a fence");
     load.assert_before_proof();
-    load.worker.release()?;
+    load.prove(failed)?;
     tokio::time::timeout(TEST_WAIT, entered).await??;
     assert!(load.fence.is_complete());
     let join = load.engine.begin_request_finish(&load.request);
     let before = (load.sink.loads(), load.sink.saves());
     let action = *load.onboard.id();
+    let expected = if failed {
+        load.failed_receive()
+    } else {
+        vec![(load.request.clone(), LoadOutcome::Done)]
+    };
     drop(load.onboard);
     let retained = load.engine.actions.contains_key(&action);
     resume.send(())?;
@@ -310,10 +437,7 @@ async fn request_release_joins_an_in_progress_receive_and_keeps_the_old_eviction
     assert!(retained, "an active delivery must outlive the handle");
     assert!(!load.engine.actions.contains_key(&action));
     assert_eq!(before, (vec![], vec![]));
-    assert_eq!(
-        load.sink.loads(),
-        vec![(load.request.clone(), LoadOutcome::Done)]
-    );
+    assert_eq!(load.sink.loads(), expected);
     assert!(load.sink.saves().is_empty());
     assert!(!old_fence.is_complete());
     assert!(load.sink.fences().is_empty());
@@ -328,12 +452,25 @@ async fn request_release_joins_an_in_progress_receive_and_keeps_the_old_eviction
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn request_release_reports_ready_after_receive_delivery() -> Result<()> {
+    finish_after_receive(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_release_reports_ready_after_receive_delivery_with_failed_load() -> Result<()> {
+    finish_after_receive(true).await
+}
+
+async fn finish_after_receive(failed: bool) -> Result<()> {
     let load = HeldLoad::start(true).await?;
     load.assert_before_proof();
-    load.worker.release()?;
+    load.prove(failed)?;
     wait_onboard_driver_finished(*load.onboard.id()).await;
     assert!(load.fence.is_complete());
-    let received = vec![(load.request.clone(), LoadOutcome::Done)];
+    let received = if failed {
+        load.failed_receive()
+    } else {
+        vec![(load.request.clone(), LoadOutcome::Done)]
+    };
     assert_eq!(load.sink.loads(), received);
 
     assert!(!load.engine.begin_request_finish(&load.request));

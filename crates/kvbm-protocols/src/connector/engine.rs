@@ -186,24 +186,25 @@ pub trait LeaderEngine: Send + Sync + 'static {
         })
     }
 
-    /// Hand the leader the consume-once [`RequestOffloadDrain`] for a
-    /// *finishing* request whose offloads have started. The leader commits it
-    /// **once**, at `request_finished(Pending)` time; `commit` arms the
+    /// Legacy consume-once [`RequestOffloadDrain`] for a finishing request
+    /// whose offloads have started. Its `commit` arms the
     /// engine's emit-on-last-terminal, which fires the single
     /// `finished_sending` when the request's last pending-at-commit action
     /// drains (immediately, if none are pending). Returns `None` when there is
-    /// nothing to commit.
+    /// nothing to commit. The connector uses [`Self::begin_request_finish`].
     fn take_offload_drain(&self, req: &RequestId) -> Option<RequestOffloadDrain>;
 
     /// Decide request release and arm its drain as one operation.
     ///
     /// Call once when beginning request finish. `true` means the engine owns
     /// the release and the caller must wait for a finished-set entry. A receive
-    /// claimed but still waiting for delivery joins the request drain and emits
-    /// `finished_sending`. If delivery to the worker sink has already started,
-    /// the caller waits for that `finished_recving` as the single release.
+    /// claimed but still waiting for delivery joins the request drain. The
+    /// drain emits `finished_recving` with failed load IDs if there are any,
+    /// or `finished_sending` otherwise. If delivery to the worker sink has
+    /// already started, the caller waits for that receive as the single release.
     /// `false` means this finish decision has no release left to deliver to the
-    /// worker sink. The default reports no engine-owned release.
+    /// worker sink. The sink may queue its transport notification before
+    /// returning. The default reports no engine-owned release.
     ///
     /// When joining an in-progress receive, the signal covers that load and its
     /// drain. Other pending physical work must be independently fenced. A
