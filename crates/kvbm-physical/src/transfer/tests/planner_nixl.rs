@@ -42,8 +42,13 @@ use super::gate::nixl_serial;
 use super::local_transfers::{LayoutType, is_nixl_backend_available};
 use super::*;
 use crate::layout::KvBlockLayout;
+use crate::transfer::executor::dispatch_fault::{
+    NIXL_POSTS, NIXL_REQUEST_PROBE, Point, inject, inject_async,
+};
 use crate::transfer::executor::{TransferOptionsInternal, execute_transfer};
 use crate::transfer::strategy::{TransferPlan, TransferStrategy, select_strategy};
+use crate::transfer::{BounceBufferInternal, TransferDrainOutcome};
+use kvbm_observability::{KvbmObservability, SharedKvbmObservability};
 
 /// Direction of the NIXL transfer under test.
 ///
@@ -883,6 +888,299 @@ async fn use_planner_nixl_transform_without_bounce_errors() -> Result<()> {
     assert!(
         msg.contains("bounce_buffer") || msg.contains("Bounce") || msg.contains("bounce"),
         "expected bounce_buffer-related error, got: {msg}"
+    );
+    Ok(())
+}
+
+#[derive(Debug)]
+struct TestRegistration(std::sync::Arc<()>);
+
+impl kvbm_memory::nixl::MappedRegistrationProvider for TestRegistration {
+    fn acquire(
+        &self,
+        address: usize,
+        size: usize,
+    ) -> Result<kvbm_memory::nixl::MappedRegistrationLease> {
+        Ok(kvbm_memory::nixl::MappedRegistrationLease {
+            ranges: std::iter::once(address..address + size).collect(),
+            guard: self.0.clone(),
+        })
+    }
+}
+
+async fn dispatch_nixl_fault(
+    point: Point,
+    use_planner: bool,
+    metrics: SharedKvbmObservability,
+) -> Result<Result<TransferDrainOutcome>> {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    assert!(!kvbm_kernels::is_using_stubs(), "CUDA kernels required");
+    let (source_name, destination_name) = agent_pair_names("dispatch-failure");
+    let source = build_ucx_agent(&source_name)?.expect("UCX backend required");
+    let destination = build_ucx_agent(&destination_name)?.expect("UCX backend required");
+    let staged_read = matches!(
+        point,
+        Point::NixlStatusEvent | Point::BeforeTransformUpload | Point::StagedNixlQueueClosed
+    );
+    let must_retain = matches!(
+        point,
+        Point::NixlPost
+            | Point::NixlQueueClosed
+            | Point::StagedNixlQueueClosed
+            | Point::NixlEventShutdown
+            | Point::NixlDroppedReceipt
+    );
+    let src_kv = if point == Point::CompletionEvent {
+        KvBlockLayout::Universal
+    } else {
+        KvBlockLayout::OperationalNHD
+    };
+    let dst_kv = if staged_read {
+        KvBlockLayout::Universal
+    } else {
+        KvBlockLayout::OperationalNHD
+    };
+    let guard = Arc::new(());
+    let mut src = build_fc_with_block_layout_on_agent(source.clone(), src_kv, 1)?;
+    if must_retain {
+        src = src.with_registration_provider(Arc::new(TestRegistration(guard.clone())));
+    }
+    let count_before = Arc::strong_count(&guard);
+    let dst = build_fc_with_block_layout_on_agent(destination.clone(), dst_kv, 1)?;
+    fill_blocks(&src, &[0], FillPattern::Sequential)?;
+    let (local, remote) = if staged_read {
+        (destination, source)
+    } else {
+        (source, destination)
+    };
+    let mut options = TransferOptionsInternal::builder().use_planner(use_planner);
+    let bounce = if src_kv != dst_kv {
+        let layout =
+            build_fc_with_block_layout_on_agent(local.clone(), KvBlockLayout::OperationalNHD, 1)?;
+        options = options.bounce_buffer(BounceBufferInternal::from_layout(layout.clone(), vec![0]));
+        Some(layout)
+    } else {
+        None
+    };
+    local.load_remote_md(&remote.get_local_md()?)?;
+    let manager = crate::manager::TransferManager::builder()
+        .capabilities(TransferCapabilities::default().with_gpu_rdma(true))
+        .observability(metrics.clone())
+        .cuda_device_id(0)
+        .nixl_agent(local)
+        .build()?;
+    let options = options.build()?;
+    let request_probe = Arc::new(());
+    if must_retain {
+        // Keep the test buffers available even under the mutation that drops the request.
+        std::mem::forget((src.clone(), dst.clone(), bounce.clone()));
+    }
+    let completes = matches!(
+        point,
+        Point::NixlSuccessfulReceipt | Point::NixlSynchronousPost
+    );
+    if must_retain || completes {
+        NIXL_REQUEST_PROBE.set(Some(request_probe.clone()));
+    }
+    if point == Point::NixlEventShutdown {
+        manager
+            .context()
+            .event_system()
+            .force_shutdown("injected event shutdown");
+    }
+    let dispatch = || execute_transfer(&src, &dst, &[0], &[0], options, manager.context());
+    let outcome = if point == Point::BeforeTransformUpload {
+        inject_async(point, async {
+            tokio::time::timeout(Duration::from_secs(5), dispatch()?.await_drain())
+                .await
+                .map_err(anyhow::Error::from)
+        })
+        .await
+    } else {
+        match inject(point, 1, dispatch) {
+            Ok(receipt) if point == Point::NixlDroppedReceipt => {
+                drop(receipt);
+                assert_eq!(
+                    Arc::strong_count(&request_probe),
+                    2,
+                    "dropping the receipt dropped the request"
+                );
+                manager
+                    .context()
+                    .event_system()
+                    .force_shutdown("injected event shutdown");
+                let counter = metrics
+                    .transfer_metrics()
+                    .transfer_failures_total
+                    .with_label_values(&["nixl", "post", "retained_request"]);
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while counter.get() == 0 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await?;
+                Ok(TransferDrainOutcome::Unproven(anyhow::anyhow!(
+                    "test dropped the receipt"
+                )))
+            }
+            Ok(receipt) => {
+                Ok(tokio::time::timeout(Duration::from_secs(5), receipt.await_drain()).await?)
+            }
+            Err(error) => Err(error),
+        }
+    };
+
+    if must_retain {
+        assert!(
+            NIXL_REQUEST_PROBE.take().is_none(),
+            "request probe was never attached"
+        );
+        assert_eq!(
+            Arc::strong_count(&request_probe),
+            2,
+            "dropped the live NIXL request"
+        );
+        assert!(
+            Arc::strong_count(&guard) > count_before,
+            "dropped the live registration guard"
+        );
+    }
+    if completes {
+        assert!(
+            NIXL_REQUEST_PROBE.take().is_none(),
+            "request probe was never attached"
+        );
+        assert_eq!(
+            Arc::strong_count(&request_probe),
+            1,
+            "a completed request was retained"
+        );
+    }
+    drop(bounce);
+    Ok(outcome)
+}
+
+#[rstest::rstest]
+#[case(false)]
+#[case(true)]
+#[tokio::test]
+async fn nixl_dispatch_failure_after_post_returns_unproven(
+    #[case] use_planner: bool,
+) -> Result<()> {
+    nixl_serial!();
+    let metrics = std::sync::Arc::new(KvbmObservability::new()?);
+    let drain = dispatch_nixl_fault(Point::NixlPost, use_planner, metrics.clone())
+        .await?
+        .expect("the request posted before dispatch reported failure");
+    let TransferDrainOutcome::Unproven(error) = drain else {
+        panic!("a NIXL post error cannot prove drain");
+    };
+    assert!(error.to_string().contains("injected NIXL post failure"));
+    assert_eq!(
+        metrics
+            .transfer_metrics()
+            .transfer_failures_total
+            .with_label_values(&["nixl", "post", "retained_request"])
+            .get(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn nixl_dispatch_failure_reserves_staged_status_before_post() -> Result<()> {
+    nixl_serial!();
+    let before = NIXL_POSTS.get();
+    let result = dispatch_nixl_fault(
+        Point::NixlStatusEvent,
+        true,
+        std::sync::Arc::new(KvbmObservability::new()?),
+    )
+    .await?;
+    let error = result
+        .err()
+        .expect("stage must fail to reserve its status event");
+    assert!(
+        error
+            .to_string()
+            .contains("injected NIXL status event failure")
+    );
+    assert_eq!(
+        NIXL_POSTS.get(),
+        before,
+        "NIXL must wait for status event admission"
+    );
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case(Point::CompletionEvent)]
+#[case(Point::BeforeTransformUpload)]
+#[tokio::test]
+async fn nixl_dispatch_failure_in_staged_cuda_leg(#[case] point: Point) -> Result<()> {
+    nixl_serial!();
+    let before = NIXL_POSTS.get();
+    let outcome = dispatch_nixl_fault(point, true, std::sync::Arc::new(KvbmObservability::new()?))
+        .await?
+        .expect("staged dispatch must report errors through its receipt after work started");
+    let TransferDrainOutcome::DrainedWithError(error) = outcome else {
+        panic!("the staged CUDA failure must report a proven drain");
+    };
+    assert!(error.to_string().contains("injected CUDA dispatch failure"));
+    // A staged read completes its initial NIXL post before its CUDA leg.
+    assert_eq!(
+        NIXL_POSTS.get() - before,
+        usize::from(point == Point::BeforeTransformUpload)
+    );
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case(Point::NixlQueueClosed, false)]
+#[case(Point::NixlQueueClosed, true)]
+#[case(Point::StagedNixlQueueClosed, true)]
+#[case(Point::NixlEventShutdown, true)]
+#[case(Point::NixlDroppedReceipt, true)]
+#[tokio::test]
+async fn nixl_dispatch_failure_retains_request_when_completion_is_lost(
+    #[case] point: Point,
+    #[case] use_planner: bool,
+) -> Result<()> {
+    nixl_serial!();
+    let metrics = std::sync::Arc::new(KvbmObservability::new()?);
+    let outcome = dispatch_nixl_fault(point, use_planner, metrics.clone())
+        .await?
+        .expect("completion loss followed a pending post");
+    assert!(matches!(outcome, TransferDrainOutcome::Unproven(_)));
+    assert_eq!(
+        metrics
+            .transfer_metrics()
+            .transfer_failures_total
+            .with_label_values(&["nixl", "post", "retained_request"])
+            .get(),
+        1
+    );
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case(Point::NixlSuccessfulReceipt)]
+#[case(Point::NixlSynchronousPost)]
+#[tokio::test]
+async fn nixl_successful_receipt_releases_its_request(#[case] point: Point) -> Result<()> {
+    nixl_serial!();
+    let metrics = std::sync::Arc::new(KvbmObservability::new()?);
+    let outcome = dispatch_nixl_fault(point, true, metrics.clone()).await??;
+    assert!(matches!(outcome, TransferDrainOutcome::Completed));
+    assert_eq!(
+        metrics
+            .transfer_metrics()
+            .transfer_failures_total
+            .with_label_values(&["nixl", "post", "retained_request"])
+            .get(),
+        0
     );
     Ok(())
 }

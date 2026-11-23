@@ -6,12 +6,15 @@
 //! This module provides a compile-time safe builder for NIXL transfers that ensures
 //! all required parameters are set before execution.
 
+use super::registration::RegistrationGuards;
 use super::{PhysicalLayout, TransferContext, TransferStrategy};
 use crate::BlockId;
-use crate::transfer::context::TransferCompleteNotification;
+use crate::transfer::context::{TransferCompleteNotification, TransferDrainOutcome};
+use crate::transfer::notifications::NixlRequestHold;
 use crate::transfer::{can_use_whole_block_transfer, validate_layout_compatibility};
 use anyhow::{Result, anyhow};
-use kvbm_memory::nixl::{XferDescList, XferOp};
+use kvbm_memory::nixl::{NixlAgent, XferDescList, XferOp, XferRequest};
+use kvbm_observability::SharedKvbmObservability;
 use std::marker::PhantomData;
 use std::ops::Range;
 
@@ -195,8 +198,8 @@ impl<'a, TSrc, TDst, TSrcBlocks, TDstBlocks, TStrategy>
 impl<'a> NixlTransferBuilder<'a, Set, Set, Set, Set, Set> {
     /// Executes the NIXL transfer with the configured parameters.
     ///
-    /// This method is only available when all required fields have been set,
-    /// enforced at compile time by the typestate pattern.
+    /// A dispatch error precedes posting. Post failures return a receipt
+    /// because NIXL may have already submitted some descriptors.
     pub(crate) fn execute(self, ctx: &TransferContext) -> Result<TransferCompleteNotification> {
         // Unwrap all required fields (safe because typestate guarantees they're set)
         let src = self.src.unwrap();
@@ -381,21 +384,44 @@ impl<'a> NixlTransferBuilder<'a, Set, Set, Set, Set, Set> {
             None, // opt_args
         )?;
 
-        // Post transfer request
-        // Note: Notification handling via OptArgs can be added later if needed
-        // NOTE: this legacy NixlTransferBuilder path is NOT the live remote-search
-        // pull route (the connector always uses the planner's direct path via
-        // execute_planner_nixl_transfer). Per-worker RDMA telemetry lives there.
-        let still_pending = nixl_agent
-            .post_xfer_req(&xfer_req, None)
-            .inspect_err(|_| std::mem::forget(std::mem::take(&mut guards)))?;
+        match post_transfer(nixl_agent, xfer_req, guards, ctx.observability()) {
+            PostResult::Pending(hold) => Ok(ctx.register_nixl_status(hold, None, registration)),
+            PostResult::Completed => Ok(TransferCompleteNotification::completed()),
+            PostResult::Unproven(receipt) => Ok(receipt),
+        }
+    }
+}
 
-        if still_pending {
-            // Register for async completion via status polling
-            Ok(ctx.register_nixl_status(xfer_req, None, registration, guards))
-        } else {
-            // Transfer completed synchronously
-            Ok(TransferCompleteNotification::completed())
+pub(super) enum PostResult {
+    Pending(NixlRequestHold),
+    Completed,
+    Unproven(TransferCompleteNotification),
+}
+
+pub(super) fn post_transfer(
+    agent: &NixlAgent,
+    request: XferRequest,
+    guards: RegistrationGuards,
+    observability: Option<&SharedKvbmObservability>,
+) -> PostResult {
+    let hold = NixlRequestHold::new(request, guards, observability.cloned());
+    let posted = agent
+        .post_xfer_req(hold.request(), None)
+        .map_err(anyhow::Error::from);
+    #[cfg(all(test, feature = "testing-kvbm"))]
+    let posted = posted
+        .and_then(|pending| super::dispatch_fault::after_nixl_post(agent, hold.request(), pending));
+    match posted {
+        Ok(true) => PostResult::Pending(hold),
+        Ok(false) => {
+            hold.confirm_drain();
+            PostResult::Completed
+        }
+        Err(error) => {
+            // The hold retains the request even if the backend posted only some descriptors.
+            PostResult::Unproven(TransferCompleteNotification::from_drain_future(
+                std::future::ready(TransferDrainOutcome::Unproven(error)),
+            ))
         }
     }
 }

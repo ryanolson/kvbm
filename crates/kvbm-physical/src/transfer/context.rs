@@ -273,7 +273,20 @@ impl<C: notifications::CompletionChecker> PollingRegistrationQueue<C> {
     }
 
     pub(crate) fn send(&self, notification: RegisterPollingNotification<C>) -> Result<()> {
-        self.tx
+        let sender = &self.tx;
+        #[cfg(all(test, feature = "testing-kvbm"))]
+        let closed = {
+            use crate::transfer::executor::dispatch_fault::{Point, check};
+            (check(Point::NixlQueueClosed).is_err() || check(Point::StagedNixlQueueClosed).is_err())
+                .then(|| {
+                    let (tx, rx) = mpsc::channel(1);
+                    drop(rx);
+                    tx
+                })
+        };
+        #[cfg(all(test, feature = "testing-kvbm"))]
+        let sender = closed.as_ref().unwrap_or(sender);
+        sender
             .try_send(notification)
             .map_err(|error| anyhow::anyhow!("completion registration queue unavailable: {error}"))
     }
@@ -654,25 +667,24 @@ impl TransferContext {
     /// can be awaited for completion.
     pub(crate) fn register_nixl_status(
         &self,
-        xfer_req: XferRequest,
+        hold: notifications::NixlRequestHold,
         telemetry: Option<notifications::XferTelemetry>,
         admission: OwnedSemaphorePermit,
-        registrations: crate::transfer::executor::registration::RegistrationGuards,
     ) -> TransferCompleteNotification {
-        let checker = notifications::NixlStatusChecker::new(
-            self.nixl_agent.raw_agent().clone(),
-            xfer_req,
-            registrations,
-        );
-        let event = self
-            .event_system
-            .new_event()
-            .expect("Failed to allocate event");
-        let handle = event.into_handle();
-        let awaiter = self
-            .event_system
-            .awaiter(handle)
-            .expect("Failed to get awaiter");
+        let checker =
+            notifications::NixlStatusChecker::new(self.nixl_agent.raw_agent().clone(), hold);
+        let registration = self.event_system.new_event().and_then(|event| {
+            let awaiter = event.awaiter()?;
+            Ok((event.into_handle(), awaiter))
+        });
+        let (handle, awaiter) = match registration {
+            Ok(pair) => pair,
+            Err(error) => {
+                return TransferCompleteNotification::from_drain_future(std::future::ready(
+                    TransferDrainOutcome::Unproven(error),
+                ));
+            }
+        };
 
         let notification = notifications::RegisterPollingNotification {
             uuid: Uuid::new_v4(),

@@ -182,7 +182,7 @@ impl TransferMetrics {
             transfer_failures_total: IntCounterVec::new(
                 Opts::new(
                     "kvbm_transfer_failures_total",
-                    "Transfer failures by operation, route, and reason",
+                    "Transfer failures by operation, route, and reason. Retained NIXL requests use the fixed labels operation=nixl, route=post, reason=retained_request.",
                 ),
                 &["operation", "route", "reason"],
             )

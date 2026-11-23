@@ -138,3 +138,39 @@ async fn cuda_dispatch_failure_after_first_ragged_region() -> Result<()> {
     super::planner_path::assert_dispatch_failure_drained(result).await;
     Ok(())
 }
+
+#[tokio::test]
+async fn host_dispatch_failure_after_first_region_returns_drain_proof() -> Result<()> {
+    use crate::transfer::TransferDrainOutcome;
+    use crate::transfer::executor::dispatch_fault::{Point, inject};
+
+    let agent = build_agent_for_kinds(&[StorageKind::System])?;
+    let src = build_many_region_layout(agent.clone(), StorageKind::System, 1);
+    let dst = build_many_region_layout(agent.clone(), StorageKind::System, 1);
+    fill_layers(&src, &[0], 0..1, FillPattern::Sequential)?;
+    let source = compute_layer_checksums(&src, &[0], 0..1)?;
+    let manager = create_transfer_context(agent, None)?;
+
+    let run = |call| {
+        inject(Point::HostCopy, call, || {
+            execute_transfer(
+                &src,
+                &dst,
+                &[0],
+                &[0],
+                TransferOptionsInternal::default(),
+                manager.context(),
+            )
+        })
+    };
+    assert!(run(1).is_err());
+    let receipt = run(2).expect("the first host region copied before dispatch failed");
+    let drain =
+        tokio::time::timeout(std::time::Duration::from_secs(5), receipt.await_drain()).await?;
+    let TransferDrainOutcome::DrainedWithError(error) = drain else {
+        panic!("completed host copies prove drain");
+    };
+    assert!(error.to_string().contains("injected host dispatch failure"));
+    assert_eq!(compute_layer_checksums(&dst, &[0], 0..1)?, source);
+    Ok(())
+}

@@ -42,3 +42,12 @@ and successful.
 Test with a failed receipt on a caller-owned stream and a receipt that never
 resolves. A timeout must keep the receipt's holds.
 [Layer receipt tests](../crates/kvbm-engine/src/worker/layer_transfer.rs)
+
+## Reserve completion before starting a staged transfer
+
+Reserve the status event before posting a NIXL request. A late reservation
+can fail after the backend starts accessing the bounce buffer.
+
+Test by failing the status reservation on a staged read. Check that
+dispatch returns the reservation error before NIXL posts a request.
+[Staged status test](../crates/kvbm-physical/src/transfer/tests/planner_nixl.rs)
