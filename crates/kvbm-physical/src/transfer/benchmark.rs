@@ -471,6 +471,7 @@ fn dispatch_benchmark_candidate(
                 None, // benchmark dispatches full-extent transfers
                 stream,
                 &prepared,
+                &mut false,
             )?;
             stream.synchronize()?;
             Ok(("TransformKernel", t0.elapsed().as_micros() as u64))

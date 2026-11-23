@@ -747,3 +747,135 @@ async fn auto_promote_g1_nhd_to_g2_univ_with_layer_range() -> Result<()> {
     forward.await?;
     Ok(())
 }
+
+pub(super) async fn assert_dispatch_failure_drained(
+    result: Result<crate::transfer::context::TransferCompleteNotification>,
+) {
+    let receipt = result.expect("CUDA work was submitted, so dispatch must return a receipt");
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), receipt.await_drain())
+        .await
+        .expect("dispatch failure receipt did not resolve");
+    match outcome {
+        crate::transfer::TransferDrainOutcome::DrainedWithError(error) => {
+            assert!(error.to_string().contains("injected CUDA dispatch failure"));
+        }
+        crate::transfer::TransferDrainOutcome::Unproven(error) => {
+            panic!("expected a successful stream drain, got {error:#}");
+        }
+        crate::transfer::TransferDrainOutcome::Completed => {
+            panic!("dispatch must report the error")
+        }
+    }
+}
+
+async fn cuda_copy_with_dispatch_fault(
+    copy_engine: crate::transfer::CopyEngine,
+    point: crate::transfer::executor::dispatch_fault::Point,
+) -> Result<()> {
+    use crate::transfer::executor::dispatch_fault::inject;
+
+    gpu_serial!();
+    assert!(!kvbm_kernels::is_using_stubs(), "CUDA kernels required");
+    let agent = build_agent_for_kinds(&[StorageKind::Device(0)])?;
+    let src = build_layout_for_planner(agent.clone(), LayoutType::FC, StorageKind::Device(0), 1);
+    let dst = build_layout_for_planner(agent.clone(), LayoutType::FC, StorageKind::Device(0), 1);
+    let checksums = fill_and_checksum(&src, &[0], FillPattern::Sequential)?;
+    let ctx = create_transfer_context(agent, None)?;
+    let options = TransferOptionsInternal::builder()
+        .copy_engine(copy_engine)
+        .build()?;
+    let result = inject(point, 1, || {
+        execute_transfer(&src, &dst, &[0], &[0], options, ctx.context())
+    });
+    assert_dispatch_failure_drained(result).await;
+    verify_checksums_by_position(&checksums, &[0], &dst, &[0])
+}
+
+#[tokio::test]
+async fn cuda_dispatch_failure_recording_completion_event() -> Result<()> {
+    cuda_copy_with_dispatch_fault(
+        crate::transfer::CopyEngine::MemcpyBatch,
+        crate::transfer::executor::dispatch_fault::Point::CompletionEvent,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn cuda_dispatch_failure_freeing_vectorized_pointer_table() -> Result<()> {
+    cuda_copy_with_dispatch_fault(
+        crate::transfer::CopyEngine::VectorizedKernel,
+        crate::transfer::executor::dispatch_fault::Point::VectorizedFree,
+    )
+    .await
+}
+
+async fn transform_with_dispatch_fault(
+    point: crate::transfer::executor::dispatch_fault::Point,
+) -> Result<()> {
+    use crate::transfer::executor::dispatch_fault::{Point, inject};
+
+    gpu_serial!();
+    assert!(!kvbm_kernels::is_using_stubs(), "CUDA kernels required");
+    let agent = build_agent_for_kinds(&[StorageKind::Device(0)])?;
+    let seed = build_fc_dtype_none(agent.clone(), KvBlockLayout::OperationalNHD, 1);
+    let universal = build_fc_dtype_none(agent.clone(), KvBlockLayout::Universal, 2);
+    let dst = build_fc_dtype_none(agent.clone(), KvBlockLayout::OperationalNHD, 1);
+    let checksums = fill_and_checksum(&seed, &[0], FillPattern::Sequential)?;
+    let ctx = create_transfer_context(agent, None)?;
+
+    let transfer = |src, dst| {
+        execute_transfer(
+            src,
+            dst,
+            &[0],
+            &[0],
+            TransferOptionsInternal::default(),
+            ctx.context(),
+        )
+    };
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        transfer(&seed, &universal)?,
+    )
+    .await??;
+    let result = inject(point, 1, || transfer(&universal, &dst));
+    assert_dispatch_failure_drained(result).await;
+    if point == Point::CompletionEvent {
+        verify_checksums_by_position(&checksums, &[0], &dst, &[0])?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn cuda_dispatch_failure_recording_transform_completion_event() -> Result<()> {
+    transform_with_dispatch_fault(crate::transfer::executor::dispatch_fault::Point::CompletionEvent)
+        .await
+}
+
+#[tokio::test]
+async fn cuda_dispatch_failure_uploading_second_transform_pointer_table() -> Result<()> {
+    transform_with_dispatch_fault(crate::transfer::executor::dispatch_fault::Point::TransformUpload)
+        .await
+}
+
+#[tokio::test]
+async fn cuda_dispatch_failure_before_enqueue_returns_error() -> Result<()> {
+    gpu_serial!();
+    assert!(!kvbm_kernels::is_using_stubs(), "CUDA kernels required");
+    let agent = build_agent_for_kinds(&[StorageKind::Device(0)])?;
+    let src = build_fc_dtype_none(agent.clone(), KvBlockLayout::OperationalNHD, 1);
+    let dst = build_fc_dtype_none(agent.clone(), KvBlockLayout::OperationalNHD, 1);
+    let ctx = create_transfer_context(agent, None)?;
+    assert!(
+        execute_transfer(
+            &src,
+            &dst,
+            &[1],
+            &[0],
+            TransferOptionsInternal::default(),
+            ctx.context(),
+        )
+        .is_err()
+    );
+    Ok(())
+}

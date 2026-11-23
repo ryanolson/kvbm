@@ -4,6 +4,7 @@
 //! CUDA executor for GPU memory transfers.
 
 use super::TransferContext;
+use super::registration::{CudaSubmissionGuard, record_completion_event};
 use super::{PhysicalLayout, TransferStrategy};
 use crate::BlockId;
 use crate::transfer::context::TransferCompleteNotification;
@@ -22,8 +23,8 @@ use std::sync::Arc;
 
 /// Execute a CUDA transfer between host and device memory.
 ///
-/// This executor handles transfers involving GPU memory using CUDA APIs.
-/// Supports async and blocking transfers depending on the strategy.
+/// Returns `Err` only before any work can reach the stream. A later error
+/// returns a receipt that proves the drain only if the stream synchronizes.
 ///
 /// # Arguments
 /// * `src` - Source physical layout
@@ -32,8 +33,8 @@ use std::sync::Arc;
 /// * `dst_block_ids` - Destination block IDs to transfer
 /// * `layer_range` - Optional range of layers to transfer (None = all layers)
 /// * `strategy` - CUDA transfer strategy (H2D, D2H, D2D, async or blocking)
-/// * `cuda_stream` - Optional caller-provided stream. If provided, use this stream
-///   and skip event recording (caller manages sync). Returns completed() immediately.
+/// * `cuda_stream` - Optional caller-provided stream. When no registration
+///   guards are needed, the caller synchronizes after successful dispatch.
 /// * `copy_engine` - CUDA copy primitive selection (see [`CopyEngine`])
 /// * `ctx` - Transfer context with CUDA stream
 #[allow(clippy::too_many_arguments)]
@@ -149,9 +150,10 @@ pub fn execute_cuda_transfer(
     let completion_admission = (!caller_manages_sync)
         .then(|| ctx.reserve_cuda_event())
         .transpose()?;
-    let mut submission = super::registration::CudaSubmissionGuard::new(stream.clone(), guards);
+    let mut submission = CudaSubmissionGuard::new(stream.clone(), guards);
+    let mut submitted = false;
 
-    match strategy {
+    let result = match strategy {
         TransferStrategy::CudaAsyncH2D
         | TransferStrategy::CudaAsyncD2H
         | TransferStrategy::CudaAsyncD2D => {
@@ -172,7 +174,8 @@ pub fn execute_cuda_transfer(
                             src_block_ids,
                             dst_block_ids,
                             stream.as_ref(),
-                        )?;
+                            &mut submitted,
+                        )
                     } else {
                         match uniform_chunk_bytes {
                             Some(chunk_size) => {
@@ -191,7 +194,8 @@ pub fn execute_cuda_transfer(
                                     chunk_size,
                                     stream.as_ref(),
                                     ctx.cuda_pool(),
-                                )?;
+                                    &mut submitted,
+                                )
                             }
                             None => {
                                 tracing::debug!(
@@ -207,7 +211,8 @@ pub fn execute_cuda_transfer(
                                     dst_block_ids,
                                     layers.clone(),
                                     stream.as_ref(),
-                                )?;
+                                    &mut submitted,
+                                )
                             }
                         }
                     }
@@ -220,7 +225,8 @@ pub fn execute_cuda_transfer(
                             src_block_ids,
                             dst_block_ids,
                             stream.as_ref(),
-                        )?;
+                            &mut submitted,
+                        )
                     } else {
                         match uniform_chunk_bytes {
                             Some(chunk_size) => {
@@ -238,18 +244,18 @@ pub fn execute_cuda_transfer(
                                     layers.clone(),
                                     chunk_size,
                                     stream.as_ref(),
-                                )?;
+                                    &mut submitted,
+                                )
                             }
-                            None => {
-                                execute_ragged_layer_wise_cuda(
-                                    src,
-                                    dst,
-                                    src_block_ids,
-                                    dst_block_ids,
-                                    layers.clone(),
-                                    stream.as_ref(),
-                                )?;
-                            }
+                            None => execute_ragged_layer_wise_cuda(
+                                src,
+                                dst,
+                                src_block_ids,
+                                dst_block_ids,
+                                layers.clone(),
+                                stream.as_ref(),
+                                &mut submitted,
+                            ),
                         }
                     }
                 }
@@ -262,21 +268,21 @@ pub fn execute_cuda_transfer(
                             dst_block_ids,
                             stream.as_ref(),
                             ctx.cuda_pool(),
-                        )?;
+                            &mut submitted,
+                        )
                     } else {
                         match uniform_chunk_bytes {
-                            Some(chunk_size) => {
-                                execute_fc_lw_vectorized(
-                                    src,
-                                    dst,
-                                    src_block_ids,
-                                    dst_block_ids,
-                                    layers.clone(),
-                                    chunk_size,
-                                    stream.as_ref(),
-                                    ctx.cuda_pool(),
-                                )?;
-                            }
+                            Some(chunk_size) => execute_fc_lw_vectorized(
+                                src,
+                                dst,
+                                src_block_ids,
+                                dst_block_ids,
+                                layers.clone(),
+                                chunk_size,
+                                stream.as_ref(),
+                                ctx.cuda_pool(),
+                                &mut submitted,
+                            ),
                             None => {
                                 return Err(anyhow!(
                                     "CopyEngine::VectorizedKernel requires a uniform chunk size; \
@@ -291,6 +297,9 @@ pub fn execute_cuda_transfer(
         _ => {
             return Err(anyhow!("Invalid CUDA transfer strategy: {:?}", strategy));
         }
+    };
+    if let Err(error) = result {
+        return submission.dispatch_error(submitted, error);
     }
 
     // If caller provided the stream, they manage synchronization - return completed immediately
@@ -298,22 +307,13 @@ pub fn execute_cuda_transfer(
         return Ok(TransferCompleteNotification::completed());
     }
 
-    // For async transfers, record an event and register it for completion tracking
-    if matches!(
-        strategy,
-        TransferStrategy::CudaAsyncH2D
-            | TransferStrategy::CudaAsyncD2H
-            | TransferStrategy::CudaAsyncD2D
-    ) {
-        let event = stream.record_event(None)?;
-        Ok(ctx.register_cuda_event(
+    match record_completion_event(&stream) {
+        Ok(event) => Ok(ctx.register_cuda_event(
             event,
             completion_admission.expect("async CUDA transfer reserved completion admission"),
             submission.take(),
-        ))
-    } else {
-        // Blocking transfers are already synchronized
-        Ok(TransferCompleteNotification::completed())
+        )),
+        Err(error) => submission.dispatch_error(submitted, error),
     }
 }
 
@@ -334,6 +334,7 @@ fn execute_whole_block_cuda(
     src_block_ids: &[BlockId],
     dst_block_ids: &[BlockId],
     stream: &cudarc::driver::CudaStream,
+    submitted: &mut bool,
 ) -> Result<()> {
     let bytes_per_block = src.layout().bytes_per_block();
     let num_blocks = src_block_ids.len();
@@ -353,7 +354,8 @@ fn execute_whole_block_cuda(
         dst_ptrs.push(dst_region.addr() as *mut std::ffi::c_void);
     }
 
-    // Use batched memcpy - handles CUDA 12.9+ batch API with automatic fallback
+    // The batch fallback may enqueue copies before reporting an error.
+    *submitted = true;
     let status = unsafe {
         kvbm_kernels::memcpy_batch(
             src_ptrs.as_ptr(),
@@ -389,6 +391,7 @@ fn execute_whole_block_vectorized(
     dst_block_ids: &[BlockId],
     stream: &CudaStream,
     pool: &CudaMemPool,
+    submitted: &mut bool,
 ) -> Result<()> {
     // Bind CUDA context to current thread before any CUDA operations.
     stream.context().bind_to_thread()?;
@@ -410,7 +413,7 @@ fn execute_whole_block_vectorized(
         dst_ptrs.push(dst_region.addr());
     }
 
-    launch_vectorized_copy(&src_ptrs, &dst_ptrs, bytes_per_block, stream, pool)
+    launch_vectorized_copy(src_ptrs, dst_ptrs, bytes_per_block, stream, pool, submitted)
 }
 
 // ============================================================================
@@ -427,6 +430,7 @@ fn execute_whole_block_vectorized(
 /// - Faster: 16-byte (int4) loads when aligned (vs 8-byte in operational_copy_vectorized)
 /// - All offset math on host: Kernel just copies bytes
 /// - Handles any alignment: Falls back gracefully to 8/4/1-byte copies
+#[allow(clippy::too_many_arguments)]
 fn execute_fc_lw_vectorized(
     src: &PhysicalLayout,
     dst: &PhysicalLayout,
@@ -436,6 +440,7 @@ fn execute_fc_lw_vectorized(
     chunk_size: usize,
     stream: &CudaStream,
     pool: &CudaMemPool,
+    submitted: &mut bool,
 ) -> Result<()> {
     // Bind CUDA context to current thread before any CUDA operations.
     stream.context().bind_to_thread()?;
@@ -465,62 +470,77 @@ fn execute_fc_lw_vectorized(
         }
     }
 
-    launch_vectorized_copy(&src_ptrs, &dst_ptrs, chunk_size, stream, pool)
+    launch_vectorized_copy(src_ptrs, dst_ptrs, chunk_size, stream, pool, submitted)
 }
 
 /// Upload (src, dst) pointer pairs to the device pool and launch the
 /// `vectorized_copy` kernel over them. Waits for the pointer upload
 /// before returning so the host arrays may drop.
 fn launch_vectorized_copy(
-    src_ptrs: &[usize],
-    dst_ptrs: &[usize],
+    src_ptrs: Vec<usize>,
+    dst_ptrs: Vec<usize>,
     chunk_size: usize,
     stream: &CudaStream,
     pool: &CudaMemPool,
+    submitted: &mut bool,
 ) -> Result<()> {
     let total_chunks = src_ptrs.len();
 
-    // Allocate device memory for pointer arrays
-    let src_ptrs_device = pool.alloc_async(std::mem::size_of_val(src_ptrs), stream)?;
-    let dst_ptrs_device = pool.alloc_async(std::mem::size_of_val(dst_ptrs), stream)?;
-
-    // Upload pointer arrays to device
-    unsafe {
-        cuda_result::memcpy_htod_async(
-            src_ptrs_device,
-            std::slice::from_raw_parts(
-                src_ptrs.as_ptr() as *const u8,
-                std::mem::size_of_val(src_ptrs),
-            ),
-            stream.cu_stream(),
-        )?;
-        cuda_result::memcpy_htod_async(
-            dst_ptrs_device,
-            std::slice::from_raw_parts(
-                dst_ptrs.as_ptr() as *const u8,
-                std::mem::size_of_val(dst_ptrs),
-            ),
-            stream.cu_stream(),
-        )?;
-    }
-
-    let pointers_transfered_event = stream.record_event(None)?;
-
-    // Call vectorized_copy kernel
-    let status = unsafe {
-        kvbm_kernels::vectorized_copy(
-            src_ptrs_device as *mut *mut c_void,
-            dst_ptrs_device as *mut *mut c_void,
-            chunk_size,
-            total_chunks as i32,
-            stream.cu_stream() as cudaStream_t,
-        )
+    let src_ptrs_device = pool.alloc_async(std::mem::size_of_val(src_ptrs.as_slice()), stream)?;
+    *submitted = true;
+    let dst_ptrs_device = match pool.alloc_async(std::mem::size_of_val(dst_ptrs.as_slice()), stream)
+    {
+        Ok(ptr) => ptr,
+        Err(error) => {
+            let _ = pool.free_async(src_ptrs_device, stream);
+            return Err(error);
+        }
     };
 
-    // Free device allocations back to the pool
-    pool.free_async(src_ptrs_device, stream)?;
-    pool.free_async(dst_ptrs_device, stream)?;
+    let uploaded = (|| -> Result<_> {
+        for (device, host) in [(src_ptrs_device, &src_ptrs), (dst_ptrs_device, &dst_ptrs)] {
+            unsafe {
+                cuda_result::memcpy_htod_async(
+                    device,
+                    std::slice::from_raw_parts(
+                        host.as_ptr().cast::<u8>(),
+                        std::mem::size_of_val(host.as_slice()),
+                    ),
+                    stream.cu_stream(),
+                )?;
+            }
+        }
+        Ok(stream.record_event(None)?)
+    })();
 
+    let launched = uploaded.map(|event| {
+        let status = unsafe {
+            kvbm_kernels::vectorized_copy(
+                src_ptrs_device as *mut *mut c_void,
+                dst_ptrs_device as *mut *mut c_void,
+                chunk_size,
+                total_chunks as i32,
+                stream.cu_stream() as cudaStream_t,
+            )
+        };
+        (status, event)
+    });
+    let src_free = pool.free_async(src_ptrs_device, stream);
+    let dst_free = pool.free_async(dst_ptrs_device, stream);
+    let pointer_drain = match &launched {
+        Ok((_, event)) => event.synchronize(),
+        Err(_) => stream.synchronize(),
+    };
+    if let Err(error) = pointer_drain {
+        // The pending uploads may still read the host tables.
+        std::mem::forget((src_ptrs, dst_ptrs));
+        return Err(error.into());
+    }
+    let (status, _) = launched?;
+    #[cfg(all(test, feature = "testing-kvbm"))]
+    super::dispatch_fault::check(super::dispatch_fault::Point::VectorizedFree)?;
+    src_free?;
+    dst_free?;
     if status != cudarc::runtime::sys::cudaError::cudaSuccess {
         return Err(anyhow!("vectorized_copy failed: {:?}", status));
     }
@@ -531,14 +551,13 @@ fn launch_vectorized_copy(
         "vectorized_copy transfer completed"
     );
 
-    pointers_transfered_event.synchronize()?;
-
     Ok(())
 }
 
 /// Uniform-chunk transfer through the hardware copy engine: the same
 /// (src, dst) chunk pairs as `execute_fc_lw_vectorized`, dispatched to
 /// `kvbm_kernels::memcpy_batch` on host pointer arrays.
+#[allow(clippy::too_many_arguments)]
 fn execute_fc_lw_memcpy_batch(
     src: &PhysicalLayout,
     dst: &PhysicalLayout,
@@ -547,6 +566,7 @@ fn execute_fc_lw_memcpy_batch(
     layers: Range<usize>,
     chunk_size: usize,
     stream: &CudaStream,
+    submitted: &mut bool,
 ) -> Result<()> {
     // Bind CUDA context to current thread before any CUDA operations.
     stream.context().bind_to_thread()?;
@@ -575,6 +595,8 @@ fn execute_fc_lw_memcpy_batch(
         }
     }
 
+    // The batch fallback may enqueue copies before reporting an error.
+    *submitted = true;
     let status = unsafe {
         kvbm_kernels::memcpy_batch(
             src_ptrs.as_ptr(),
@@ -607,6 +629,7 @@ fn execute_ragged_layer_wise_cuda(
     dst_block_ids: &[BlockId],
     layers: Range<usize>,
     stream: &CudaStream,
+    submitted: &mut bool,
 ) -> Result<()> {
     stream.context().bind_to_thread()?;
     let outer_dim = src.layout().outer_dim();
@@ -623,6 +646,9 @@ fn execute_ragged_layer_wise_cuda(
                         dst_region.size()
                     ));
                 }
+                #[cfg(all(test, feature = "testing-kvbm"))]
+                super::dispatch_fault::check(super::dispatch_fault::Point::RaggedCopy)?;
+                *submitted = true;
                 let status = unsafe {
                     cudarc::runtime::sys::cudaMemcpyAsync(
                         dst_region.addr() as *mut c_void,
