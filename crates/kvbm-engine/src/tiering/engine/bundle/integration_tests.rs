@@ -741,42 +741,103 @@ async fn bundle_onboard_join_error_after_logical_timeout_stays_fail_closed() -> 
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn bundle_onboard_unproven_transfer_failure_stays_fenced() -> Result<()> {
-    let (engine, hanging, sink, plan) = build_hanging_onboard(Duration::from_secs(5)).await?;
-    let request = "bundle-unproven-failure".to_owned();
-    let mut onboard = engine.clone().onboard_resources(&request, plan)?;
-    let action_id = *onboard.id();
-    let physical_drain = onboard
-        .take_physical_drain_fence()
-        .expect("bundle onboard must expose its physical drain fence");
-    hanging.wait_started().await;
+    use super::super::paused::PROBE_INTERVAL;
+    use super::super::test_support::{build_leader_with_resources, wait_onboard_driver_finished};
+    use crate::testing::messenger::create_messenger_pair_tcp;
+    use crate::worker::group::SpmdParallelWorkers;
+    use crate::worker::velo::{
+        LocalTransferCheckTiming, VeloWorkerClient, serve_held_local_transfers,
+    };
+    use kvbm_physical::transfer::{TransferCompleteNotification, TransferDrainOutcome};
+    use tokio::sync::{mpsc, oneshot};
 
-    // The receipt fails, but it does not prove that the worker copy drained.
-    // An RPC error after the worker accepted the request has this outcome.
-    hanging.fail_unproven()?;
-    wait_until(|| onboard.is_complete()).await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    for (proof, failed_ids) in [
+        (TransferDrainOutcome::Completed, vec![101, 102]),
+        (
+            TransferDrainOutcome::DrainedWithError(anyhow!("drained copy failed")),
+            vec![100],
+        ),
+    ] {
+        let pair = create_messenger_pair_tcp().await?;
+        let (started, mut copies) = mpsc::unbounded_channel();
+        let worker =
+            serve_held_local_transfers(&pair.messenger_b, 0, true, move |resource, _, _| {
+                let (prove, receipt) = oneshot::channel();
+                started.send((resource, prove))?;
+                Ok(TransferCompleteNotification::from_drain_future(
+                    async move {
+                        receipt
+                            .await
+                            .unwrap_or_else(|error| TransferDrainOutcome::Unproven(error.into()))
+                    },
+                ))
+            })?;
+        let client = VeloWorkerClient::new_for_worker(
+            pair.messenger_a.clone(),
+            pair.messenger_b.instance_id(),
+            0,
+        )
+        .with_local_transfer_check(LocalTransferCheckTiming {
+            wait: Duration::from_millis(10),
+            ..LocalTransferCheckTiming::default()
+        });
+        let workers = Arc::new(SpmdParallelWorkers::new(
+            vec![Arc::new(client)],
+            Arc::new(velo::EventManager::local()),
+            pair.messenger_a.runtime().clone(),
+        ));
+        let (leader, managers) =
+            build_leader_with_resources(pair.messenger_a, &RESOURCES, 4, BLOCK_SIZE, workers)?;
+        let managers = RESOURCES.into_iter().zip(managers).collect();
+        let sink = Arc::new(RecordingLoadSink::default());
+        let engine = LocalConnectorEngine::new(Arc::new(leader), sink.clone(), BLOCK_SIZE, false);
+        let plan = commit_one_block_bundle(&engine, &manifest()?.identity(), &managers)?;
+        let request = "bundle-lost-reply".to_owned();
+        let mut onboard = engine.clone().onboard_resources(&request, plan)?;
+        let action = *onboard.id();
+        let fence = onboard
+            .take_physical_drain_fence()
+            .expect("bundle drain fence");
+        let (resource, prove) = tokio::time::timeout(Duration::from_secs(2), copies.recv())
+            .await?
+            .expect("the worker accepted a bundle copy");
+        assert_eq!(resource, RESOURCES[0]);
+        wait_onboard_driver_finished(action).await;
 
-    assert!(matches!(
-        onboard.outcome(),
-        Some(LoadOutcome::FailedPartial { .. })
-    ));
-    assert!(
-        engine
-            .actions
-            .get(&action_id)
-            .is_some_and(|record| record.physical_pending),
-        "an unproven transfer failure must retain the destination quarantine"
-    );
-    assert!(
-        !physical_drain.is_complete(),
-        "an unproven transfer failure must not report the destination as drained"
-    );
-    assert!(
-        sink.loads().is_empty(),
-        "an unproven transfer failure must never expose failed ids for reuse"
-    );
+        assert!(worker.active(), "the first copy is still running");
+        assert!(onboard.paused().is_some());
+        assert!(onboard.outcome().is_none());
+        assert!(
+            engine
+                .actions
+                .get(&action)
+                .is_some_and(|record| record.physical_pending)
+        );
+        assert!(!fence.is_complete());
+        assert!(sink.loads().is_empty());
+        assert!(copies.try_recv().is_err());
+
+        assert!(prove.send(proof).is_ok());
+        wait_until(|| !worker.active()).await;
+        tokio::time::pause();
+        tokio::time::advance(PROBE_INTERVAL + Duration::from_millis(1)).await;
+        tokio::time::resume();
+        wait_until(|| !sink.loads().is_empty()).await;
+
+        let expected = LoadOutcome::FailedPartial {
+            block_ids: failed_ids,
+        };
+        assert_eq!(onboard.outcome(), Some(expected.clone()));
+        assert_eq!(sink.loads(), vec![(request, expected)]);
+        assert!(onboard.paused().is_none());
+        assert!(fence.is_complete());
+        assert!(
+            copies.try_recv().is_err(),
+            "proof must not dispatch the bundle tail"
+        );
+    }
     Ok(())
 }
 

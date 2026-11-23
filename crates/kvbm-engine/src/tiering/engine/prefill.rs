@@ -48,26 +48,22 @@
 //! deadline-bounded by the production resolver/factory implementations.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicUsize};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use anyhow::{Result, anyhow, bail};
 use futures::StreamExt;
 
-use kvbm_common::LogicalLayoutHandle;
-use kvbm_physical::TransferOptions;
 use kvbm_protocols::connector::{
-    AcceptId, ActionFailure, ActionId, ActionStatus, FenceHandle, LeaderEngine, LeaderEngineError,
-    OnboardHandle,
+    AcceptId, ActionFailure, ActionStatus, LeaderEngine, LeaderEngineError, OnboardHandle,
 };
 use kvbm_protocols::connector::{BlockId, RequestId, SequenceHash};
 use kvbm_protocols::disagg::{RemotePrefillParams, digest_provided_hashes};
 
-use super::driver::ActionRecord;
 use super::inflight::InflightKey;
 use super::local::LocalConnectorEngine;
-use super::onboard::{self, OnboardDrain};
-use super::paused::{LoadContinuation, PauseCell, PausedLoad};
+use super::onboard::{self, OnboardDrain, OnboardWork};
+use super::paused::LoadContinuation;
 use crate::p2p::session::{AvailabilityDelta, CommitDelta};
 use crate::remote::cd::prefill::{ParkOutcome, PrefillKick, PrefillRequestState};
 
@@ -314,24 +310,13 @@ impl LocalConnectorEngine {
             return Err(LeaderEngineError::OnboardAlreadyInFlight);
         }
 
-        // Mint the action BEFORE consulting the gate so the replay arm can
-        // resolve this same action (the gate keeps the failure-stash check and
-        // the kick latch atomic — a pipeline failure can never slip between
-        // them). Register in `actions`/`by_request` before the handle returns
-        // so eviction fences and drain emissions gate this load.
-        let action_id = ActionId::new();
-        let cell = Arc::new(Mutex::new(ActionStatus::Pending));
-        let physical_drain = Arc::new(AtomicBool::new(false));
-        let pause = PauseCell::default();
-        self.actions.insert(
-            action_id,
-            ActionRecord::new(request_id.clone(), Arc::downgrade(&cell))
-                .with_physical_drain(tokio_util::sync::CancellationToken::new()),
+        // The gate can replay a pre-USAA failure against this same action.
+        let (handle, load) = self.mint_onboard(
+            request_id.clone(),
+            external_g1.to_vec(),
+            Some(tokio_util::sync::CancellationToken::new()),
+            None,
         );
-        self.by_request
-            .entry(request_id.clone())
-            .or_default()
-            .push(action_id);
 
         // Record the in-flight onboard's hashes for the deferral guard — the
         // EXTERNAL suffix of the decode-provided window (`expected_hashes`),
@@ -349,21 +334,11 @@ impl LocalConnectorEngine {
             .expect("inflight-guard mutex poisoned")
             .record(InflightKey::Prefill(accept_id), guard_window);
 
-        let me: Arc<dyn LeaderEngine> = self.clone();
-        let handle = OnboardHandle::new_with_physical_drain(
-            action_id,
-            Arc::downgrade(&me),
-            cell,
-            external_g1.to_vec(),
-            FenceHandle::new(physical_drain.clone()),
-        )
-        .with_pause_cell(pause.clone());
-
         let latch = state.latch_kick(PrefillKick {
-            action_id,
-            external_g1: external_g1.to_vec(),
-            physical_drain: physical_drain.clone(),
-            pause,
+            action_id: load.action,
+            external_g1: load.destinations.clone(),
+            physical_drain: load.physical_drain.clone(),
+            pause: load.pause.clone(),
         });
 
         if let Err(reason) = latch {
@@ -372,13 +347,7 @@ impl LocalConnectorEngine {
             // this replay and is removed here (the failure path already
             // closed the session — the take below is a defensive no-op).
             tracing::warn!(%request_id, %reason, "prefill onboard: replaying pre-USAA failure stash");
-            self.finish_load_action(
-                action_id,
-                &request_id,
-                ActionStatus::Failed(ActionFailure::AllBlocks),
-                external_g1.to_vec(),
-            );
-            self.finish_physical_load_action(action_id, &physical_drain);
+            load.finish(&self, Some(ActionStatus::Failed(ActionFailure::AllBlocks)));
             if let Some(session) = state.take_session() {
                 session.close(Some(reason));
             }
@@ -579,13 +548,8 @@ impl LocalConnectorEngine {
                         %request_id,
                         "prefill release won the pre-attach race; failing the latched kick"
                     );
-                    self.finish_load_action(
-                        kick.action_id,
-                        &request_id,
-                        ActionStatus::Failed(ActionFailure::AllBlocks),
-                        kick.external_g1,
-                    );
-                    self.finish_physical_load_action(kick.action_id, &kick.physical_drain);
+                    kick.into_load(request_id.clone())
+                        .finish(&self, Some(ActionStatus::Failed(ActionFailure::AllBlocks)));
                 }
                 return Ok(());
             }
@@ -740,13 +704,8 @@ impl LocalConnectorEngine {
             Some(kick) => {
                 // The terminal always fires — the worker is waiting on this
                 // action regardless of who started the teardown.
-                self.finish_load_action(
-                    kick.action_id,
-                    request_id,
-                    ActionStatus::Failed(ActionFailure::AllBlocks),
-                    kick.external_g1,
-                );
-                self.finish_physical_load_action(kick.action_id, &kick.physical_drain);
+                kick.into_load(request_id.clone())
+                    .finish(self, Some(ActionStatus::Failed(ActionFailure::AllBlocks)));
                 self.cleanup_failed_prefill(request_id, state, reason);
             }
             None => {
@@ -780,110 +739,38 @@ impl LocalConnectorEngine {
         if !state.claim_kick() {
             return;
         }
-        let PrefillKick {
-            action_id,
-            external_g1,
-            physical_drain,
-            pause,
-        } = kick;
-        let external_blocks = external_g1.len();
-        if external_blocks == 0 {
-            // Nothing external to move (zero-external CD) — immediately
-            // terminal, no transfer.
-            self.finish_load_action(action_id, &request_id, ActionStatus::Complete, external_g1);
-            self.finish_physical_load_action(action_id, &physical_drain);
-            return;
-        }
-
-        let outcome = match state.registered_suffix(external_blocks) {
-            Some(suffix) => {
-                let g2_block_ids: Vec<BlockId> = suffix.iter().map(|b| b.block_id()).collect();
-                match self.leader.execute_local_transfer(
-                    LogicalLayoutHandle::G2,
-                    LogicalLayoutHandle::G1,
-                    g2_block_ids,
-                    external_g1.clone(),
-                    TransferOptions::default(),
-                ) {
-                    Ok(notification) => {
-                        match onboard::await_onboard_drain(notification, suffix).await {
-                            OnboardDrain::Proven(Ok(())) => ActionStatus::Complete,
-                            OnboardDrain::Proven(Err(error)) => {
-                                tracing::error!(%error, %request_id, "prefill kick: G2->G1 transfer failed");
-                                ActionStatus::Failed(ActionFailure::AllBlocks)
-                            }
-                            OnboardDrain::Unproven { error, holds } => {
-                                self.pause_load_action(
-                                    PausedLoad {
-                                        action: action_id,
-                                        request: request_id,
-                                        destinations: external_g1,
-                                        physical_drain,
-                                        pause,
-                                        holds: Box::new(holds),
-                                        continuation: Some(LoadContinuation::CdPrefill(state)),
-                                    },
-                                    error,
-                                );
-                                return;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, %request_id, "prefill kick: G2->G1 dispatch failed");
-                        ActionStatus::Failed(ActionFailure::AllBlocks)
-                    }
-                }
+        let mut load = kick.into_load(request_id.clone());
+        let destinations = load.destinations.clone();
+        let leader = self.leader.clone();
+        load.continuation = Some(LoadContinuation::CdPrefill(state.clone()));
+        self.drive_onboard(load, async move {
+            if destinations.is_empty() {
+                return OnboardWork::Proven(ActionStatus::Complete);
             }
-            None => {
+            let external_blocks = destinations.len();
+            let Some(suffix) = state.registered_suffix(external_blocks) else {
                 tracing::error!(
-                    %request_id,
-                    external_blocks,
+                    %request_id, external_blocks,
                     "prefill kick: fewer registered G2 blocks than the external slice"
                 );
-                ActionStatus::Failed(ActionFailure::AllBlocks)
+                return OnboardWork::Proven(ActionStatus::Failed(ActionFailure::AllBlocks));
+            };
+            match onboard::dispatch_pinned_onboard(&leader, suffix, destinations).await {
+                Ok(OnboardDrain::Proven(Ok(()))) => OnboardWork::Proven(ActionStatus::Complete),
+                Ok(OnboardDrain::Unproven { error, holds }) => OnboardWork::unproven(error, holds, None),
+                Ok(OnboardDrain::Proven(Err(error))) => {
+                    tracing::error!(%error, %request_id, "prefill kick: G2->G1 transfer failed");
+                    OnboardWork::Proven(ActionStatus::Failed(ActionFailure::AllBlocks))
+                }
+                Err(error) => {
+                    tracing::error!(%error, %request_id, "prefill kick: G2->G1 dispatch failed");
+                    OnboardWork::Proven(ActionStatus::Failed(ActionFailure::AllBlocks))
+                }
             }
-        };
-
-        self.finish_prefill_kick_after_drain(
-            action_id,
-            &request_id,
-            &state,
-            outcome,
-            external_g1,
-            &physical_drain,
-        );
+        }, None).await;
     }
 
-    pub(super) fn finish_prefill_kick_after_drain(
-        &self,
-        action_id: ActionId,
-        request_id: &RequestId,
-        state: &Arc<PrefillRequestState>,
-        outcome: ActionStatus,
-        external_g1: Vec<BlockId>,
-        physical_drain: &Arc<AtomicBool>,
-    ) {
-        let failed = !matches!(outcome, ActionStatus::Complete);
-        let reason = "prefill onboard kick failed";
-        // Stash a failure before the logical terminal, then settle physical
-        // drain before cleanup. A connector release can read the stash as
-        // soon as the handle, worker sink or eviction fence wakes up.
-        if failed {
-            state.stash_failure(reason.to_owned());
-        }
-        self.finish_load_action(action_id, request_id, outcome, external_g1);
-        self.finish_physical_load_action(action_id, physical_drain);
-
-        if failed {
-            self.cleanup_failed_prefill(request_id, state, reason.to_owned());
-        }
-        // On Complete: the session stays parked and the state latched — the
-        // computed-suffix output direction publishes over this same session
-        // later; the RAII release owns the finalize.
-    }
-
-    fn cleanup_failed_prefill(
+    pub(super) fn cleanup_failed_prefill(
         &self,
         request_id: &RequestId,
         state: &Arc<PrefillRequestState>,

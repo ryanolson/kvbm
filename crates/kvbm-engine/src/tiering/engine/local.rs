@@ -45,7 +45,7 @@
 // consumers; one module-level allow covers that gap.
 #![allow(dead_code)]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use anyhow::Result;
@@ -55,7 +55,7 @@ use kvbm_common::LogicalResourceId;
 use kvbm_protocols::cache_manifest::{BundleKey, CacheIdentity};
 use kvbm_protocols::connector::{
     AcceptId, ActionFailure, ActionId, ActionStatus, BundleOffloadPlan, BundleOnboardPlan,
-    EngineWorkerSink, EvictionFence, EvictionOutcome, FenceHandle, FenceToken, FindBlocksHandle,
+    EngineWorkerSink, EvictionFence, EvictionOutcome, FenceToken, FindBlocksHandle,
     FindBlocksOutcome, FindBlocksRequest, LeaderEngine, LeaderEngineError, OffloadHandle,
     OnboardHandle, RequestOffloadDrain, ResourceOnboard, SearchId, WorkerEngineDriver,
 };
@@ -74,8 +74,8 @@ use super::inflight::{InflightKey, InflightOnboards};
 use super::offload::{
     self, BufferedOffload, BufferedOffloadCompletion, DisabledOffloadSubmit, OffloadSubmit,
 };
-use super::onboard::{self, OnboardDrain};
-use super::paused::{CdDecodeContinuation, LoadContinuation, PauseCell, PausedLoad};
+use super::onboard::{self, OnboardDrain, OnboardWork};
+use super::paused::{CdDecodeContinuation, LoadContinuation};
 use super::reconcile::{
     MatchCheckOutcome, OnboardingState, compute_outcome, issue_shard, reconcile_state,
 };
@@ -1423,25 +1423,12 @@ impl LocalConnectorEngine {
             .map(|shard| shard.find_session.wait_for_completion())
             .collect();
 
-        let action_id = ActionId::new();
-        // The completion cell: the engine keeps a `Weak` in `actions` (the by-id
-        // `poll_action` path), the handle owns the strong — so the cell frees by
-        // RAII on handle drop, with no terminal-category-dependent prune. Insert
-        // the in-flight record BEFORE returning the handle so `evict` and the
-        // by-id path observe a live `Pending` action, not the missing-key default.
-        let cell = Arc::new(Mutex::new(ActionStatus::Pending));
-        let physical_drain = Arc::new(AtomicBool::new(false));
-        let pause = PauseCell::default();
-        self.actions.insert(
-            action_id,
-            // The local driver waits for the receipt even if this token is cancelled.
-            ActionRecord::new(request_id.clone(), Arc::downgrade(&cell))
-                .with_physical_drain(tokio_util::sync::CancellationToken::new()),
+        let (handle, load) = self.mint_onboard(
+            request_id,
+            g1_block_ids.clone(),
+            Some(tokio_util::sync::CancellationToken::new()),
+            None,
         );
-        self.by_request
-            .entry(request_id.clone())
-            .or_default()
-            .push(action_id);
 
         // Record the in-flight onboard's accepted window for the deferral guard,
         // keyed by the lifecycle generation so the clear lands at the
@@ -1458,59 +1445,30 @@ impl LocalConnectorEngine {
             .expect("inflight-guard mutex poisoned")
             .record(InflightKey::Search(search_id), window);
 
-        // The dest set travels twice: into the driver terminal (which resolves
-        // a total failure to these concrete ids — see `finish_load_action`) and
-        // into the handle (whose `outcome()` projection names them likewise).
-        let handle_dest_ids = g1_block_ids.clone();
-        let this = self.clone();
-        let drain_cell = physical_drain.clone();
-        let pause_cell = pause.clone();
-        self.leader.runtime().spawn(async move {
-            let dest_ids = g1_block_ids.clone();
-            let outcome = onboard::run_onboard(
-                &this.leader,
-                &mut onboarding,
-                g1_block_ids,
-                staging_futs,
-                block_size,
-                accepted_blocks as usize,
-            )
-            .await;
-            // Release every shard's server-side session (Ready pins are no-ops).
-            onboarding.release_all(&this.leader);
-            match outcome {
-                OnboardDrain::Proven(status) => {
-                    this.finish_load_action(action_id, &request_id, status, dest_ids);
-                    this.finish_physical_load_action(action_id, &drain_cell);
+        let leader = self.leader.clone();
+        self.spawn_onboard(
+            load,
+            async move {
+                let outcome = onboard::run_onboard(
+                    &leader,
+                    &mut onboarding,
+                    g1_block_ids,
+                    staging_futs,
+                    block_size,
+                    accepted_blocks as usize,
+                )
+                .await;
+                onboarding.release_all(&leader);
+                match outcome {
+                    OnboardDrain::Proven(status) => OnboardWork::Proven(status),
+                    OnboardDrain::Unproven { error, holds } => {
+                        OnboardWork::unproven(error, holds, None)
+                    }
                 }
-                OnboardDrain::Unproven { error, holds } => this.pause_load_action(
-                    PausedLoad {
-                        action: action_id,
-                        request: request_id,
-                        destinations: dest_ids,
-                        physical_drain: drain_cell,
-                        pause: pause_cell,
-                        holds: Box::new(holds),
-                        continuation: None,
-                    },
-                    error,
-                ),
-            }
-            #[cfg(test)]
-            super::test_support::note_onboard_driver_finished(action_id);
-        });
-
-        // The handle owns the strong cell and a `Weak` back-ref; its RAII drop
-        // fires `release_action`. The action record stays until its drain is proven.
-        let me: Arc<dyn LeaderEngine> = self;
-        Ok(OnboardHandle::new_with_physical_drain(
-            action_id,
-            Arc::downgrade(&me),
-            cell,
-            handle_dest_ids,
-            FenceHandle::new(physical_drain),
-        )
-        .with_pause_cell(pause))
+            },
+            None,
+        );
+        Ok(handle)
     }
 }
 
@@ -1860,7 +1818,7 @@ impl LocalConnectorEngine {
         //    dispatch resolved Err) surfaces here with the now-known dest ids.
         if state.pending_failure().is_some() {
             tracing::warn!(%request_id, "cd onboard: replaying pre-onboard failure stash");
-            return self.mint_failed_onboard(request_id, external_ids, &state);
+            return self.reject_cd_onboard(request_id, external_ids, state);
         }
 
         // b. Count / split guards (the legacy USAA-1 bails, never a panic).
@@ -1873,22 +1831,21 @@ impl LocalConnectorEngine {
                 window = window.len(),
                 "cd onboard: external/window split mismatch; failing the load"
             );
-            return self.mint_failed_onboard(request_id, external_ids, &state);
+            return self.reject_cd_onboard(request_id, external_ids, state);
         }
 
         let local_g1: Vec<BlockId> = external_ids[..local_hit].to_vec();
-        let remote_g1: Vec<BlockId> = external_ids[local_hit..unified].to_vec();
         let remote_pairs: Vec<(SequenceHash, BlockId)> = window[local_hit..unified]
             .iter()
             .copied()
-            .zip(remote_g1.iter().copied())
+            .zip(external_ids[local_hit..unified].iter().copied())
             .collect();
 
         // Clone the session Arc (the terminal hooks own teardown via
         // take_session — the driver must not consume it).
         let Some(session) = state.clone_session() else {
             tracing::error!(%request_id, "cd onboard: session already gone; failing the load");
-            return self.mint_failed_onboard(request_id, external_ids, &state);
+            return self.reject_cd_onboard(request_id, external_ids, state);
         };
 
         let staging_futs: Vec<_> = onboarding
@@ -1897,25 +1854,21 @@ impl LocalConnectorEngine {
             .map(|shard| shard.find_session.wait_for_completion())
             .collect();
 
-        let action_id = ActionId::new();
-        let cell = Arc::new(Mutex::new(ActionStatus::Pending));
-        let physical_drain = Arc::new(AtomicBool::new(false));
-        let pause = PauseCell::default();
-        self.actions.insert(
-            action_id,
-            ActionRecord::new(request_id.clone(), Arc::downgrade(&cell))
-                .with_physical_drain(tokio_util::sync::CancellationToken::new()),
+        let (handle, mut load) = self.mint_onboard(
+            request_id.clone(),
+            external_ids.clone(),
+            Some(tokio_util::sync::CancellationToken::new()),
+            None,
         );
-        self.by_request
-            .entry(request_id.clone())
-            .or_default()
-            .push(action_id);
+        load.continuation = Some(LoadContinuation::CdDecode(CdDecodeContinuation::new(
+            state.clone(),
+        )));
 
         // Record the in-flight onboard's UNIFIED window (the local+remote
         // committed span) for the deferral guard, keyed by the DRIVING search
         // generation so the clear lands at the connector's release
         // (`release_search` on the parked handle's id). The bail paths above
-        // route through `mint_failed_onboard`, which records nothing (born
+        // route through `reject_cd_onboard`, which records nothing (born
         // terminal) — only this live fan-out records. `window.len() >=
         // unified` was proven by the split guard above.
         self.inflight
@@ -1923,44 +1876,36 @@ impl LocalConnectorEngine {
             .expect("inflight-guard mutex poisoned")
             .record(InflightKey::Search(search_id), window[..unified].to_vec());
 
-        let handle_dest_ids = external_ids.clone();
-        let mut load = PausedLoad {
-            action: action_id,
-            request: request_id,
-            destinations: external_ids,
-            physical_drain: physical_drain.clone(),
-            pause: pause.clone(),
-            holds: Box::new(()),
-            continuation: None,
-        };
-        let this = self.clone();
-        self.leader.runtime().spawn(async move {
-            let leader = &this.leader;
-            let mut cd = CdDecodeContinuation {
-                state,
-                unfilled: Vec::new(),
-                pending_copy: Default::default(),
-            };
-
-            // LOCAL kick: the matched span sources `local_g1` only. An empty
-            // `local_g1` (zero local match) short-circuits to Complete in
-            // run_onboard without awaiting the staging futures.
+        let leader = self.leader.clone();
+        let work = async move {
             let local = onboard::run_onboard(
-                leader, &mut onboarding, local_g1, staging_futs, block_size, local_hit,
+                &leader,
+                &mut onboarding,
+                local_g1,
+                staging_futs,
+                block_size,
+                local_hit,
             )
             .await;
-            onboarding.release_all(leader);
+            onboarding.release_all(&leader);
 
-            let outcome = match local {
+            match local {
                 OnboardDrain::Unproven { error, holds } => {
-                    cd.pending_copy = load.destinations[..local_hit].iter().copied().collect();
-                    cd.unfilled = load.destinations.clone();
-                    return this.pause_cd_onboard(load, cd, holds, error);
+                    let cd = CdDecodeContinuation {
+                        state,
+                        pending_copy: external_ids[..local_hit].iter().copied().collect(),
+                        unfilled: external_ids,
+                    };
+                    OnboardWork::unproven(error, holds, Some(LoadContinuation::CdDecode(cd)))
                 }
                 OnboardDrain::Proven(ActionStatus::Complete) => {
                     let mut filled = std::collections::HashSet::new();
                     let remote = onboard::run_remote_onboard(
-                        leader, &session, &remote_pairs, block_size, &mut filled,
+                        &leader,
+                        &session,
+                        &remote_pairs,
+                        block_size,
+                        &mut filled,
                     )
                     .await;
                     let unfilled = || {
@@ -1971,90 +1916,36 @@ impl LocalConnectorEngine {
                             .collect()
                     };
                     match remote {
-                        Ok(OnboardDrain::Proven(())) => ActionStatus::Complete,
+                        Ok(OnboardDrain::Proven(())) => OnboardWork::Proven(ActionStatus::Complete),
                         Ok(OnboardDrain::Unproven { error, holds }) => {
-                            cd.pending_copy = holds.destinations.into_iter().collect();
-                            cd.unfilled = unfilled();
-                            return this.pause_cd_onboard(load, cd, holds.sources, error);
+                            let cd = CdDecodeContinuation {
+                                state,
+                                unfilled: unfilled(),
+                                pending_copy: holds.destinations.into_iter().collect(),
+                            };
+                            OnboardWork::unproven(
+                                error,
+                                holds.sources,
+                                Some(LoadContinuation::CdDecode(cd)),
+                            )
                         }
                         Err(error) => {
-                            tracing::error!(%error, request_id = %load.request, "cd remote onboard pipeline failed");
-                            ActionStatus::Failed(ActionFailure::Partial { block_ids: unfilled() })
+                            tracing::error!(%error, %request_id, "cd remote onboard pipeline failed");
+                            OnboardWork::Proven(ActionStatus::Failed(ActionFailure::Partial {
+                                block_ids: unfilled(),
+                            }))
                         }
                     }
                 }
-                OnboardDrain::Proven(_) => ActionStatus::Failed(ActionFailure::Partial {
-                    block_ids: load.destinations.clone(),
-                }),
-            };
-
-            load.continuation = Some(LoadContinuation::CdDecode(cd));
-            load.finish(&this, outcome);
-        });
-
-        let me: Arc<dyn LeaderEngine> = self;
-        OnboardHandle::new_with_physical_drain(
-            action_id,
-            Arc::downgrade(&me),
-            cell,
-            handle_dest_ids,
-            FenceHandle::new(physical_drain),
-        )
-        .with_pause_cell(pause)
-    }
-
-    fn pause_cd_onboard(
-        self: &Arc<Self>,
-        mut load: PausedLoad,
-        cd: CdDecodeContinuation,
-        holds: Vec<ImmutableBlock<G2>>,
-        error: anyhow::Error,
-    ) {
-        load.holds = Box::new(holds);
-        load.continuation = Some(LoadContinuation::CdDecode(cd));
-        self.pause_load_action(load, error);
-    }
-
-    /// Mint an in-flight action and resolve it IMMEDIATELY to
-    /// `Failed(Partial { external_ids })`. The shared `finish_load_action` writes
-    /// the cell and fires the worker sink with the failed dest ids; this then
-    /// runs the CD load-terminal hook (budget release + session close) against
-    /// the originating lifecycle's `state` Arc. Used by the onboard fan-out's
-    /// pre-pull bail paths (stash replay, count mismatch, missing session).
-    fn mint_failed_onboard(
-        self: Arc<Self>,
-        request_id: RequestId,
-        external_ids: Vec<BlockId>,
-        state: &Arc<CdRequestState>,
-    ) -> OnboardHandle {
-        let action_id = ActionId::new();
-        let cell = Arc::new(Mutex::new(ActionStatus::Pending));
-        self.actions.insert(
-            action_id,
-            ActionRecord::new(request_id.clone(), Arc::downgrade(&cell)),
-        );
-        self.by_request
-            .entry(request_id.clone())
-            .or_default()
-            .push(action_id);
-
-        let outcome = ActionStatus::Failed(ActionFailure::Partial {
-            block_ids: external_ids.clone(),
-        });
-        self.finish_load_action(
-            action_id,
-            &request_id,
-            outcome.clone(),
-            external_ids.clone(),
-        );
-        // CD load terminal against the originating lifecycle's Arc (lock-free,
-        // post-guard). See `CdRuntime::complete_load`.
-        if let Some(cd) = &self.cd {
-            cd.complete_load(&request_id, state, &outcome);
-        }
-
-        let me: Arc<dyn LeaderEngine> = self;
-        OnboardHandle::new(action_id, Arc::downgrade(&me), cell, external_ids)
+                OnboardDrain::Proven(_) => {
+                    OnboardWork::Proven(ActionStatus::Failed(ActionFailure::Partial {
+                        block_ids: external_ids,
+                    }))
+                }
+            }
+        };
+        self.spawn_onboard(load, work, None);
+        handle
     }
 }
 
@@ -2293,7 +2184,7 @@ mod tests {
     use crate::offload::{ExternalBlock, TransferStatus};
     use crate::{ConnectorEngineConfig, RemoteOps};
     use kvbm_protocols::connector::NoopWorkerSink;
-    use kvbm_protocols::connector::{LoadOutcome, SaveOutcome};
+    use kvbm_protocols::connector::{FenceHandle, LoadOutcome, SaveOutcome};
     use std::sync::Mutex as StdMutex;
     use tokio::sync::{Mutex as TokioMutex, watch};
     use uuid::Uuid;

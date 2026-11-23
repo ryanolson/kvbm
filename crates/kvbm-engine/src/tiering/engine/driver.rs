@@ -471,7 +471,7 @@ impl LocalConnectorEngine {
         // The conditional-disagg load terminal (budget release + session
         // finalize/close) is NOT fired here: it must run against the ORIGINATING
         // lifecycle's `Arc<CdRequestState>`, which only the CD producers (the
-        // onboard driver task, `mint_failed_onboard`) hold. They call
+        // onboard driver or its CD rejection path) hold. They call
         // `CdRuntime::complete_load(rid, &state, outcome)` AFTER this returns, so
         // a stale terminal racing an evict + re-latch of the same rid can never
         // tear down the fresh lifecycle. `finish_load_action` stays CD-free.

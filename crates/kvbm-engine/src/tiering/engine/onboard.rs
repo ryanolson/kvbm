@@ -3,15 +3,15 @@
 
 //! The local G1←G2 onboard driver.
 //!
-//! This is the async tail of [`super::local::LocalConnectorEngine::local_onboard`]:
-//! it runs **off** the forward-pass thread (spawned on the leader's tokio
-//! runtime), awaits every shard's staging future, folds the reconciled
-//! [`OnboardingState`] into a concrete G2 source list via the matched span,
-//! and issues the G2→G1 transfer through the leader's parallel worker. It
-//! returns a proven status or the source blocks and error for a paused copy.
+//! The driver owns the fenced action, local worker dispatch, source holds,
+//! and both terminals. Each entry point prepares its copies and projects the
+//! outcome for its own request lifecycle.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::future::Future;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use futures::StreamExt;
@@ -20,14 +20,23 @@ use kvbm_common::LogicalLayoutHandle;
 use kvbm_logical::blocks::ImmutableBlock;
 use kvbm_physical::TransferOptions;
 use kvbm_physical::transfer::{TransferCompleteNotification, TransferDrainOutcome};
-use kvbm_protocols::connector::{ActionFailure, ActionStatus};
-use kvbm_protocols::connector::{BlockId, SequenceHash};
+use kvbm_protocols::connector::{
+    ActionFailure, ActionId, ActionStatus, BlockId, FenceHandle, LeaderEngine, OnboardHandle,
+    RequestId, ResourceOnboard, SequenceHash,
+};
+use tokio_util::sync::CancellationToken;
 
+use super::driver::ActionRecord;
+use super::inflight::InflightKey;
+use super::local::LocalConnectorEngine;
+use super::paused::{CdDecodeContinuation, LoadContinuation, PauseCell, PausedLoad};
 use super::reconcile::OnboardingState;
 use crate::G2;
 use crate::g2_capacity::reserve_required_staging;
 use crate::leader::InstanceLeader;
 use crate::p2p::session::{AvailabilityDelta, CommitDelta, Session};
+use crate::remote::cd::prefill::PrefillKick;
+use crate::remote::cd::state::CdRequestState;
 
 /// The per-shard staging future type — exactly what
 /// [`crate::leader::FindMatchesResult::wait_for_completion`] yields. A `Ready`
@@ -112,7 +121,7 @@ pub(super) enum OnboardDrain<H, T = ActionStatus> {
 }
 
 /// Keep the source holds until the receipt proves drain or the caller takes ownership.
-pub(super) async fn await_onboard_drain<H>(
+async fn await_onboard_drain<H>(
     notification: TransferCompleteNotification,
     holds: H,
 ) -> OnboardDrain<H, Result<()>> {
@@ -121,6 +130,303 @@ pub(super) async fn await_onboard_drain<H>(
         TransferDrainOutcome::DrainedWithError(error) => OnboardDrain::Proven(Err(error)),
         TransferDrainOutcome::Unproven(error) => OnboardDrain::Unproven { error, holds },
     }
+}
+
+/// A copy whose sources and route-specific settlement must survive the driver task.
+pub(super) struct PendingOnboard {
+    holds: Box<dyn Send>,
+    continuation: Option<LoadContinuation>,
+}
+
+pub(super) type OnboardWork = OnboardDrain<PendingOnboard>;
+
+impl OnboardWork {
+    pub(super) fn unproven(
+        error: anyhow::Error,
+        holds: impl Send + 'static,
+        continuation: Option<LoadContinuation>,
+    ) -> Self {
+        Self::Unproven {
+            error,
+            holds: PendingOnboard {
+                holds: Box::new(holds),
+                continuation,
+            },
+        }
+    }
+}
+
+pub(super) struct OnboardWatchdog {
+    pub(super) cancel: CancellationToken,
+    pub(super) duration: Duration,
+}
+
+impl LocalConnectorEngine {
+    /// Register before the handle escapes so eviction and request finish can
+    /// fence the whole onboard, including staging and any parked prefill kick.
+    pub(super) fn mint_onboard(
+        self: &Arc<Self>,
+        request: RequestId,
+        destinations: Vec<BlockId>,
+        cancel: Option<CancellationToken>,
+        inflight_hashes: Option<Vec<SequenceHash>>,
+    ) -> (OnboardHandle, PausedLoad) {
+        let action = ActionId::new();
+        let cell = Arc::new(Mutex::new(ActionStatus::Pending));
+        let physical_drain = Arc::new(AtomicBool::new(false));
+        let pause = PauseCell::default();
+        let fenced = cancel.is_some();
+        let mut record = ActionRecord::new(request.clone(), Arc::downgrade(&cell));
+        if let Some(cancel) = cancel {
+            record = record.with_physical_drain(cancel);
+        }
+        let key = InflightKey::Action(action);
+        if inflight_hashes.is_some() {
+            record = record.with_inflight(key);
+        }
+        self.actions.insert(action, record);
+        if let Some(hashes) = inflight_hashes {
+            self.inflight
+                .lock()
+                .expect("inflight-guard mutex poisoned")
+                .record(key, hashes);
+        }
+        self.by_request
+            .entry(request.clone())
+            .or_default()
+            .push(action);
+
+        let owner: Arc<dyn LeaderEngine> = self.clone();
+        let handle = if fenced {
+            OnboardHandle::new_with_physical_drain(
+                action,
+                Arc::downgrade(&owner),
+                cell,
+                destinations.clone(),
+                FenceHandle::new(physical_drain.clone()),
+            )
+            .with_pause_cell(pause.clone())
+        } else {
+            // CD rejections before dispatch have always returned an unfenced handle.
+            OnboardHandle::new(action, Arc::downgrade(&owner), cell, destinations.clone())
+        };
+        let load = PausedLoad {
+            action,
+            request,
+            destinations,
+            physical_drain,
+            pause,
+            holds: Box::new(()),
+            continuation: None,
+        };
+        (handle, load)
+    }
+
+    pub(super) fn reject_cd_onboard(
+        self: &Arc<Self>,
+        request: RequestId,
+        destinations: Vec<BlockId>,
+        state: Arc<CdRequestState>,
+    ) -> OnboardHandle {
+        let (handle, load) = self.mint_onboard(request, destinations, None, None);
+        let status = ActionStatus::Failed(ActionFailure::Partial {
+            block_ids: load.destinations.clone(),
+        });
+        self.settle_onboard(
+            load.action,
+            &load.request,
+            Some((status, load.destinations)),
+            None,
+            Some(LoadContinuation::CdDecode(CdDecodeContinuation::new(state))),
+        );
+        handle
+    }
+
+    pub(super) fn spawn_onboard(
+        self: &Arc<Self>,
+        load: PausedLoad,
+        work: impl Future<Output = OnboardWork> + Send + 'static,
+        watchdog: Option<OnboardWatchdog>,
+    ) {
+        let driver = self.clone();
+        self.leader.runtime().spawn(async move {
+            driver.drive_onboard(load, work, watchdog).await;
+        });
+    }
+
+    /// Run route-specific preparation and copies under a single terminal owner.
+    /// The bundle watchdog or cancel can settle the logical result early. The
+    /// copy task continues to proof or a pause in either case. A bundle pause
+    /// never dispatches its tail: a Completed proof preserves landed blocks
+    /// and fails the unfilled ids; a drained error keeps the resource failure.
+    pub(super) async fn drive_onboard(
+        self: &Arc<Self>,
+        mut load: PausedLoad,
+        work: impl Future<Output = OnboardWork> + Send + 'static,
+        watchdog: Option<OnboardWatchdog>,
+    ) {
+        #[cfg(test)]
+        let action = load.action;
+        let mut logical_done = false;
+        let outcome = if let Some(OnboardWatchdog { cancel, duration }) = watchdog {
+            let mut physical = self.leader.runtime().spawn(work);
+            let ready = tokio::select! {
+                biased;
+                result = &mut physical => Some(result),
+                () = cancel.cancelled() => None,
+                () = tokio::time::sleep(duration) => {
+                    tracing::warn!(request_id = %load.request, watchdog = ?duration,
+                        "bundle onboard exceeded its logical watchdog");
+                    None
+                }
+            };
+            let result = match ready {
+                Some(result) => result,
+                None => {
+                    self.fail_onboard_logically(&mut load);
+                    logical_done = true;
+                    physical.await
+                }
+            };
+            match result {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    tracing::error!(%error, request_id = %load.request,
+                        "bundle onboard physical task failed; destination quarantine remains fail-closed");
+                    if !logical_done {
+                        self.fail_onboard_logically(&mut load);
+                    }
+                    return;
+                }
+            }
+        } else {
+            work.await
+        };
+
+        match outcome {
+            OnboardDrain::Proven(status) => load.finish(self, (!logical_done).then_some(status)),
+            OnboardDrain::Unproven { error, holds } => {
+                load.holds = holds.holds;
+                if let Some(mut continuation) = holds.continuation {
+                    if let LoadContinuation::Bundle(bundle) = &mut continuation {
+                        bundle.logical_done = logical_done;
+                    }
+                    load.continuation = Some(continuation);
+                }
+                self.pause_load_action(load, error);
+            }
+        }
+        #[cfg(test)]
+        super::test_support::note_onboard_driver_finished(action);
+    }
+
+    fn fail_onboard_logically(&self, load: &mut PausedLoad) {
+        self.settle_onboard(
+            load.action,
+            &load.request,
+            Some((
+                ActionStatus::Failed(ActionFailure::AllBlocks),
+                std::mem::take(&mut load.destinations),
+            )),
+            None,
+            None,
+        );
+    }
+
+    fn settle_onboard(
+        &self,
+        action: ActionId,
+        request: &RequestId,
+        logical: Option<(ActionStatus, Vec<BlockId>)>,
+        physical: Option<&Arc<AtomicBool>>,
+        continuation: Option<LoadContinuation>,
+    ) {
+        // Stash a failed prefill kick before the logical terminal. Cleanup
+        // follows physical settlement so release can see the stash at either.
+        let prefill_reason = "prefill onboard kick failed";
+        let failed_prefill = match (&continuation, &logical) {
+            (Some(LoadContinuation::CdPrefill(state)), Some((ActionStatus::Failed(_), _))) => {
+                state.stash_failure(prefill_reason.to_owned());
+                Some(state)
+            }
+            _ => None,
+        };
+
+        if let Some((status, destinations)) = logical {
+            let cd_status = matches!(&continuation, Some(LoadContinuation::CdDecode(_)))
+                .then(|| status.clone());
+            self.finish_load_action(action, request, status, destinations);
+            if let (Some(LoadContinuation::CdDecode(cd)), Some(status), Some(runtime)) =
+                (&continuation, cd_status, &self.cd)
+            {
+                runtime.complete_load(request, &cd.state, &status);
+            }
+        }
+        if let Some(fence) = physical {
+            self.finish_physical_load_action(action, fence);
+        }
+        if let Some(state) = failed_prefill {
+            self.cleanup_failed_prefill(request, state, prefill_reason.to_owned());
+        }
+    }
+}
+
+impl PausedLoad {
+    pub(super) fn finish(self, engine: &LocalConnectorEngine, status: Option<ActionStatus>) {
+        drop(self.holds);
+        engine.settle_onboard(
+            self.action,
+            &self.request,
+            status.map(|status| (status, self.destinations)),
+            Some(&self.physical_drain),
+            self.continuation,
+        );
+    }
+}
+
+impl PrefillKick {
+    pub(super) fn into_load(self, request: RequestId) -> PausedLoad {
+        PausedLoad {
+            action: self.action_id,
+            request,
+            destinations: self.external_g1,
+            physical_drain: self.physical_drain,
+            pause: self.pause,
+            holds: Box::new(()),
+            continuation: None,
+        }
+    }
+}
+
+/// The only G2 to G1 dispatch site. A dispatch error means no copy launched.
+/// Once a receipt exists, its typed drain outcome controls the source hold.
+pub(super) async fn dispatch_onboard<H>(
+    leader: &InstanceLeader,
+    transfer: ResourceOnboard,
+    holds: H,
+) -> Result<OnboardDrain<H, Result<()>>> {
+    let notification = leader.execute_local_transfer_for_resource(
+        transfer.resource,
+        LogicalLayoutHandle::G2,
+        LogicalLayoutHandle::G1,
+        transfer.source_block_ids,
+        transfer.destination_block_ids,
+        TransferOptions::default(),
+    )?;
+    Ok(await_onboard_drain(notification, holds).await)
+}
+
+pub(super) async fn dispatch_pinned_onboard(
+    leader: &InstanceLeader,
+    sources: Vec<ImmutableBlock<G2>>,
+    destinations: Vec<BlockId>,
+) -> Result<OnboardDrain<Vec<ImmutableBlock<G2>>, Result<()>>> {
+    let transfer = ResourceOnboard {
+        resource: leader.primary_g2_resource(),
+        source_block_ids: sources.iter().map(|block| block.block_id()).collect(),
+        destination_block_ids: destinations,
+    };
+    dispatch_onboard(leader, transfer, sources).await
 }
 
 /// Wait for staging and drive the G2 to G1 copy on the leader's runtime.
@@ -162,24 +468,8 @@ pub(super) async fn run_onboard(
             return OnboardDrain::Proven(ActionStatus::Failed(ActionFailure::AllBlocks));
         }
     };
-    let src_block_ids: Vec<BlockId> = g2_blocks.iter().map(|b| b.block_id()).collect();
-    if src_block_ids.len() != g1_block_ids.len() {
-        tracing::error!(
-            src = src_block_ids.len(),
-            dst = g1_block_ids.len(),
-            "onboard G2/G1 block count mismatch"
-        );
-        return OnboardDrain::Proven(ActionStatus::Failed(ActionFailure::AllBlocks));
-    }
-
-    match leader.execute_local_transfer(
-        LogicalLayoutHandle::G2,
-        LogicalLayoutHandle::G1,
-        src_block_ids,
-        g1_block_ids,
-        TransferOptions::default(),
-    ) {
-        Ok(notification) => match await_onboard_drain(notification, g2_blocks).await {
+    match dispatch_pinned_onboard(leader, g2_blocks, g1_block_ids).await {
+        Ok(drain) => match drain {
             OnboardDrain::Proven(Ok(())) => OnboardDrain::Proven(ActionStatus::Complete),
             OnboardDrain::Proven(Err(error)) => {
                 tracing::error!(%error, "onboard transfer drained with an error");
@@ -463,16 +753,7 @@ async fn pull_register_onboard_run(
     let g1_block_ids: Vec<BlockId> = run.iter().map(|(slot, _)| remote_pairs[*slot].1).collect();
 
     let registered = pull_run_into_g2(leader, session, ordered_hashes, block_size).await?;
-    let g2_block_ids: Vec<BlockId> = registered.iter().map(|b| b.block_id()).collect();
-
-    let notification = leader.execute_local_transfer(
-        LogicalLayoutHandle::G2,
-        LogicalLayoutHandle::G1,
-        g2_block_ids,
-        g1_block_ids,
-        TransferOptions::default(),
-    )?;
-    Ok(await_onboard_drain(notification, registered).await)
+    dispatch_pinned_onboard(leader, registered, g1_block_ids).await
 }
 
 #[cfg(test)]

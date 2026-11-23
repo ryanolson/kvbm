@@ -49,6 +49,7 @@ pub(super) struct PausedLoad {
 
 pub(super) enum LoadContinuation {
     Resource(ResourceContinuation),
+    Bundle(BundleContinuation),
     CdDecode(CdDecodeContinuation),
     CdPrefill(Arc<PrefillRequestState>),
 }
@@ -59,6 +60,30 @@ pub(super) struct ResourceContinuation {
     pub(super) remaining: std::vec::IntoIter<ResourceOnboard>,
 }
 
+/// Preserve the old bundle failure and the destinations no copy ever reached.
+pub(super) struct BundleContinuation {
+    pub(super) failure: ActionFailure,
+    pub(super) unfilled: Vec<usize>,
+    pub(super) logical_done: bool,
+}
+
+impl BundleContinuation {
+    fn outcome(self, completed: bool) -> Option<ActionStatus> {
+        if self.logical_done {
+            return None;
+        }
+        Some(if !completed {
+            ActionStatus::Failed(self.failure)
+        } else if self.unfilled.is_empty() {
+            ActionStatus::Complete
+        } else {
+            ActionStatus::Failed(ActionFailure::Partial {
+                block_ids: self.unfilled,
+            })
+        })
+    }
+}
+
 /// The originating CD lifecycle and the destinations still missing at pause.
 pub(super) struct CdDecodeContinuation {
     pub(super) state: Arc<CdRequestState>,
@@ -67,6 +92,14 @@ pub(super) struct CdDecodeContinuation {
 }
 
 impl CdDecodeContinuation {
+    pub(super) fn new(state: Arc<CdRequestState>) -> Self {
+        Self {
+            state,
+            unfilled: Vec::new(),
+            pending_copy: HashSet::new(),
+        }
+    }
+
     fn outcome(&self, completed: bool) -> ActionStatus {
         // A pause ends CD dispatch. Proof of completion preserves the copied
         // ids. A drained error leaves them in the set vLLM will recompute.
@@ -81,34 +114,6 @@ impl CdDecodeContinuation {
         } else {
             ActionStatus::Failed(ActionFailure::Partial { block_ids })
         }
-    }
-}
-
-impl PausedLoad {
-    pub(super) fn finish(self, engine: &LocalConnectorEngine, status: ActionStatus) {
-        drop(self.holds);
-        let cd_terminal = match self.continuation {
-            Some(LoadContinuation::CdDecode(cd)) => Some((cd.state, status.clone())),
-            Some(LoadContinuation::CdPrefill(state)) => {
-                engine.finish_prefill_kick_after_drain(
-                    self.action,
-                    &self.request,
-                    &state,
-                    status,
-                    self.destinations,
-                    &self.physical_drain,
-                );
-                return;
-            }
-            _ => None,
-        };
-        engine.finish_load_action(self.action, &self.request, status, self.destinations);
-        if let Some((state, status)) = cd_terminal
-            && let Some(cd) = &engine.cd
-        {
-            cd.complete_load(&self.request, &state, &status);
-        }
-        engine.finish_physical_load_action(self.action, &self.physical_drain);
     }
 }
 
@@ -564,30 +569,35 @@ impl LocalConnectorEngine {
             }
             TransferDrainOutcome::Unproven(_) => unreachable!("unresolved onboard cannot settle"),
         };
-        let status = if let Some(LoadContinuation::CdDecode(cd)) = &load.continuation {
-            cd.outcome(completed)
-        } else {
-            let resource = match load.continuation.take() {
-                Some(LoadContinuation::Resource(resource)) => Some(resource),
-                continuation => {
-                    load.continuation = continuation;
-                    None
-                }
-            };
-            match (completed, resource) {
-                (true, Some(resource)) if resource.remaining.len() != 0 => {
-                    tracing::info!(
-                        request_id = %load.request,
-                        action_id = ?load.action,
-                        pause_seconds = record.since.elapsed().as_secs_f64(),
-                        "onboard pause cleared, resuming remaining resources",
-                    );
-                    self.spawn_resource_onboard(load, resource.remaining);
-                    return;
-                }
-                (true, _) => ActionStatus::Complete,
-                (false, Some(resource)) => ActionStatus::Failed(resource.failure),
-                (false, _) => ActionStatus::Failed(ActionFailure::AllBlocks),
+        let status = match load.continuation.take() {
+            Some(LoadContinuation::Bundle(bundle)) => bundle.outcome(completed),
+            Some(LoadContinuation::CdDecode(cd)) => {
+                let status = cd.outcome(completed);
+                load.continuation = Some(LoadContinuation::CdDecode(cd));
+                Some(status)
+            }
+            Some(LoadContinuation::Resource(resource))
+                if completed && resource.remaining.len() != 0 =>
+            {
+                tracing::info!(
+                    request_id = %load.request,
+                    action_id = ?load.action,
+                    pause_seconds = record.since.elapsed().as_secs_f64(),
+                    "onboard pause cleared, resuming remaining resources",
+                );
+                self.spawn_resource_onboard(load, resource.remaining);
+                return;
+            }
+            Some(LoadContinuation::Resource(resource)) if !completed => {
+                Some(ActionStatus::Failed(resource.failure))
+            }
+            continuation => {
+                load.continuation = continuation;
+                Some(if completed {
+                    ActionStatus::Complete
+                } else {
+                    ActionStatus::Failed(ActionFailure::AllBlocks)
+                })
             }
         };
         let action = load.action;

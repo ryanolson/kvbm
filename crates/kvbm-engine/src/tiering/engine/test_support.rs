@@ -370,14 +370,6 @@ impl HangingParallelWorkers {
         self.reply(TransferDrainOutcome::Completed)
     }
 
-    /// Fail the hanging transfer without proof that its physical work drained.
-    /// The copy keeps running.
-    pub(super) fn fail_unproven(&self) -> Result<()> {
-        self.reply(TransferDrainOutcome::Unproven(anyhow!(
-            "injected transfer failure without drain proof"
-        )))
-    }
-
     /// Lose the worker's reply while `copy` is still running. The receipt
     /// resolves `Unproven`, as it does when the RPC to a worker fails after
     /// the worker accepted the request.
