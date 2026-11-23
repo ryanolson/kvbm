@@ -203,7 +203,7 @@ impl Fixture {
             physical_drain: action.physical.clone(),
             pause: action.pause.clone(),
             holds: Box::new(self.g2.allocate_blocks(1).expect("one G2 block")),
-            resource: None,
+            continuation: None,
         }
     }
 

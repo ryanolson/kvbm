@@ -75,7 +75,7 @@ use super::offload::{
     self, BufferedOffload, BufferedOffloadCompletion, DisabledOffloadSubmit, OffloadSubmit,
 };
 use super::onboard::{self, OnboardDrain};
-use super::paused::{PauseCell, PausedLoad};
+use super::paused::{CdDecodeContinuation, LoadContinuation, PauseCell, PausedLoad};
 use super::reconcile::{
     MatchCheckOutcome, OnboardingState, compute_outcome, issue_shard, reconcile_state,
 };
@@ -1487,7 +1487,7 @@ impl LocalConnectorEngine {
                         physical_drain: drain_cell,
                         pause: pause_cell,
                         holds: Box::new(holds),
-                        resource: None,
+                        continuation: None,
                     },
                     error,
                 ),
@@ -1835,9 +1835,9 @@ impl LocalConnectorEngine {
     /// `external_ids` at `local_hit_blocks`, builds the remote pairs from
     /// `window_hashes[local_hit..unified]`, and spawns the driver: the local kick
     /// (`run_onboard` over `local_g1` only — the matched span counts now agree)
-    /// then the remote pull pipeline. The single load terminal carries the merged
-    /// outcome; `finish_load_action`'s CD hook releases the budget + tears the
-    /// session down.
+    /// then the remote pull pipeline. An unproven copy stops dispatch and parks
+    /// its pins until drain is proven. The terminal settles the load, closes or
+    /// finalizes the originating CD lifecycle, then releases the physical fence.
     fn cd_onboard(
         self: Arc<Self>,
         state: Arc<CdRequestState>,
@@ -1895,9 +1895,12 @@ impl LocalConnectorEngine {
 
         let action_id = ActionId::new();
         let cell = Arc::new(Mutex::new(ActionStatus::Pending));
+        let physical_drain = Arc::new(AtomicBool::new(false));
+        let pause = PauseCell::default();
         self.actions.insert(
             action_id,
-            ActionRecord::new(request_id.clone(), Arc::downgrade(&cell)),
+            ActionRecord::new(request_id.clone(), Arc::downgrade(&cell))
+                .with_physical_drain(tokio_util::sync::CancellationToken::new()),
         );
         self.by_request
             .entry(request_id.clone())
@@ -1917,73 +1920,95 @@ impl LocalConnectorEngine {
             .record(InflightKey::Search(search_id), window[..unified].to_vec());
 
         let handle_dest_ids = external_ids.clone();
-        // The originating lifecycle's Arc, carried into the terminal so the CD
-        // load-terminal hook tears down THIS lifecycle (never a stale map
-        // re-fetch). See `CdRuntime::complete_load`.
-        let terminal_state = Arc::clone(&state);
+        let mut load = PausedLoad {
+            action: action_id,
+            request: request_id,
+            destinations: external_ids,
+            physical_drain: physical_drain.clone(),
+            pause: pause.clone(),
+            holds: Box::new(()),
+            continuation: None,
+        };
         let this = self.clone();
         self.leader.runtime().spawn(async move {
-            let leader = this.leader.clone();
+            let leader = &this.leader;
+            let mut cd = CdDecodeContinuation {
+                state,
+                unfilled: Vec::new(),
+                pending_copy: Default::default(),
+            };
 
             // LOCAL kick: the matched span sources `local_g1` only. An empty
             // `local_g1` (zero local match) short-circuits to Complete in
             // run_onboard without awaiting the staging futures.
-            let local_status = match onboard::run_onboard(
-                &leader, &mut onboarding, local_g1, staging_futs, block_size, local_hit,
+            let local = onboard::run_onboard(
+                leader, &mut onboarding, local_g1, staging_futs, block_size, local_hit,
             )
-            .await
-            {
-                OnboardDrain::Proven(status) => status,
-                OnboardDrain::Unproven { error, .. } => {
-                    tracing::error!(%error, "onboard G2->G1 transfer failed");
-                    ActionStatus::Failed(ActionFailure::AllBlocks)
-                }
-            };
-            onboarding.release_all(&leader);
+            .await;
+            onboarding.release_all(leader);
 
-            let outcome = if !matches!(local_status, ActionStatus::Complete) {
-                // Local failed before any remote pull landed → nothing onboarded,
-                // report the whole external slice failed.
-                ActionStatus::Failed(ActionFailure::Partial {
-                    block_ids: external_ids.clone(),
-                })
-            } else {
-                // REMOTE pull pipeline over the parked CD session.
-                let mut filled = std::collections::HashSet::new();
-                match onboard::run_remote_onboard(
-                    &leader,
-                    &session,
-                    &remote_pairs,
-                    block_size,
-                    &mut filled,
-                )
-                .await
-                {
-                    Ok(()) => ActionStatus::Complete,
-                    Err(e) => {
-                        tracing::error!(error = %e, %request_id, "cd remote onboard pipeline failed");
-                        // The local span landed; only the remote dest ids whose
-                        // hash never filled are reported failed.
-                        let unfilled: Vec<BlockId> = remote_pairs
+            let outcome = match local {
+                OnboardDrain::Unproven { error, holds } => {
+                    cd.pending_copy = load.destinations[..local_hit].iter().copied().collect();
+                    cd.unfilled = load.destinations.clone();
+                    return this.pause_cd_onboard(load, cd, holds, error);
+                }
+                OnboardDrain::Proven(ActionStatus::Complete) => {
+                    let mut filled = std::collections::HashSet::new();
+                    let remote = onboard::run_remote_onboard(
+                        leader, &session, &remote_pairs, block_size, &mut filled,
+                    )
+                    .await;
+                    let unfilled = || {
+                        remote_pairs
                             .iter()
                             .filter(|(hash, _)| !filled.contains(hash))
                             .map(|(_, g1)| *g1)
-                            .collect();
-                        ActionStatus::Failed(ActionFailure::Partial { block_ids: unfilled })
+                            .collect()
+                    };
+                    match remote {
+                        Ok(OnboardDrain::Proven(())) => ActionStatus::Complete,
+                        Ok(OnboardDrain::Unproven { error, holds }) => {
+                            cd.pending_copy = holds.destinations.into_iter().collect();
+                            cd.unfilled = unfilled();
+                            return this.pause_cd_onboard(load, cd, holds.sources, error);
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, request_id = %load.request, "cd remote onboard pipeline failed");
+                            ActionStatus::Failed(ActionFailure::Partial { block_ids: unfilled() })
+                        }
                     }
                 }
+                OnboardDrain::Proven(_) => ActionStatus::Failed(ActionFailure::Partial {
+                    block_ids: load.destinations.clone(),
+                }),
             };
 
-            this.finish_load_action(action_id, &request_id, outcome.clone(), external_ids);
-            // CD load terminal, fired AFTER finish_load_action returns (lock-free)
-            // against the originating lifecycle's Arc.
-            if let Some(cd) = &this.cd {
-                cd.complete_load(&request_id, &terminal_state, &outcome);
-            }
+            load.continuation = Some(LoadContinuation::CdDecode(cd));
+            load.finish(&this, outcome);
         });
 
         let me: Arc<dyn LeaderEngine> = self;
-        OnboardHandle::new(action_id, Arc::downgrade(&me), cell, handle_dest_ids)
+        OnboardHandle::new_with_physical_drain(
+            action_id,
+            Arc::downgrade(&me),
+            cell,
+            handle_dest_ids,
+            FenceHandle::new(physical_drain),
+        )
+        .with_pause_cell(pause)
+    }
+
+    fn pause_cd_onboard(
+        self: &Arc<Self>,
+        mut load: PausedLoad,
+        cd: CdDecodeContinuation,
+        holds: Vec<ImmutableBlock<G2>>,
+        error: anyhow::Error,
+    ) {
+        load.holds = Box::new(holds);
+        load.continuation = Some(LoadContinuation::CdDecode(cd));
+        self.pause_load_action(load, error);
     }
 
     /// Mint an in-flight action and resolve it IMMEDIATELY to
@@ -4146,6 +4171,8 @@ mod tests {
     mod cd_tests {
         #[path = "accepted_transfer.rs"]
         mod accepted_transfer;
+        #[path = "drain_proof.rs"]
+        mod drain_proof;
         use super::*;
 
         use futures::FutureExt;

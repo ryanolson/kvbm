@@ -129,7 +129,11 @@ pub(crate) fn serve_held_local_transfers(
     messenger: &::velo::Messenger,
     worker_id: u64,
     lose_first_reply: bool,
-    dispatch: impl Fn(kvbm_common::LogicalResourceId) -> Result<TransferCompleteNotification>
+    dispatch: impl Fn(
+        kvbm_common::LogicalResourceId,
+        Vec<BlockId>,
+        Vec<BlockId>,
+    ) -> Result<TransferCompleteNotification>
     + Send
     + Sync
     + 'static,
@@ -143,7 +147,13 @@ pub(crate) fn serve_held_local_transfers(
         messenger,
         Some(worker_id),
         records.clone(),
-        Arc::new(move |message| dispatch(message.resource.expect("resource transfer"))),
+        Arc::new(move |message| {
+            dispatch(
+                message.resource.expect("resource transfer"),
+                message.src_block_ids,
+                message.dst_block_ids,
+            )
+        }),
     )?;
     Ok(transfers)
 }

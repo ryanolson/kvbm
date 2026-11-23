@@ -222,8 +222,8 @@ pub(super) async fn run_onboard(
 ///
 /// `remote_pairs` is the expected remote slice in absolute-position order:
 /// `(expected_hash, g1_dst_block_id)`. `filled` accumulates the hashes whose
-/// blocks have landed in G1; on `Err` the caller reads it to report only the
-/// still-unfilled remote dest ids.
+/// blocks have landed in G1. The caller uses it to project failures. An
+/// unproven run returns its pins and destinations and stops the pipeline.
 ///
 /// Superset tolerance: the peer may legitimately publish MORE than this
 /// onboard's slice — a conditional-disagg prefill commits its whole computed
@@ -241,10 +241,10 @@ pub(super) async fn run_remote_onboard(
     remote_pairs: &[(SequenceHash, BlockId)],
     block_size: usize,
     filled: &mut HashSet<SequenceHash>,
-) -> Result<()> {
+) -> Result<OnboardDrain<PendingRemoteCopy, ()>> {
     let expected_count = remote_pairs.len();
     if expected_count == 0 {
-        return Ok(());
+        return Ok(OnboardDrain::Proven(()));
     }
 
     // Gate the pull pipeline on attach completion: the peer's worker metadata
@@ -348,7 +348,22 @@ pub(super) async fn run_remote_onboard(
         indexed.dedup_by_key(|(slot, _)| *slot);
 
         for run in group_contiguous_runs(indexed) {
-            pull_register_onboard_run(leader, session, remote_pairs, &run, block_size).await?;
+            match pull_register_onboard_run(leader, session, remote_pairs, &run, block_size).await?
+            {
+                OnboardDrain::Proven(result) => result?,
+                OnboardDrain::Unproven { error, holds } => {
+                    return Ok(OnboardDrain::Unproven {
+                        error,
+                        holds: PendingRemoteCopy {
+                            sources: holds,
+                            destinations: run
+                                .iter()
+                                .map(|(slot, _)| remote_pairs[*slot].1)
+                                .collect(),
+                        },
+                    });
+                }
+            }
             for (_, hash) in &run {
                 filled.insert(*hash);
             }
@@ -366,7 +381,12 @@ pub(super) async fn run_remote_onboard(
             expected_count
         );
     }
-    Ok(())
+    Ok(OnboardDrain::Proven(()))
+}
+
+pub(super) struct PendingRemoteCopy {
+    pub(super) sources: Vec<ImmutableBlock<G2>>,
+    pub(super) destinations: Vec<BlockId>,
 }
 
 /// Split position-indexed entries (pre-sorted ascending) into maximal
@@ -438,26 +458,21 @@ async fn pull_register_onboard_run(
     remote_pairs: &[(SequenceHash, BlockId)],
     run: &[(usize, SequenceHash)],
     block_size: usize,
-) -> Result<()> {
+) -> Result<OnboardDrain<Vec<ImmutableBlock<G2>>, Result<()>>> {
     let ordered_hashes: Vec<SequenceHash> = run.iter().map(|(_, hash)| *hash).collect();
     let g1_block_ids: Vec<BlockId> = run.iter().map(|(slot, _)| remote_pairs[*slot].1).collect();
 
     let registered = pull_run_into_g2(leader, session, ordered_hashes, block_size).await?;
     let g2_block_ids: Vec<BlockId> = registered.iter().map(|b| b.block_id()).collect();
 
-    // Hold the registered pins for the lifetime of the G2→G1 copy (the
-    // ImmutableBlock Drop would return them to the pool otherwise).
-    let _hold = registered;
-    leader
-        .execute_local_transfer(
-            LogicalLayoutHandle::G2,
-            LogicalLayoutHandle::G1,
-            g2_block_ids,
-            g1_block_ids,
-            TransferOptions::default(),
-        )?
-        .await?;
-    Ok(())
+    let notification = leader.execute_local_transfer(
+        LogicalLayoutHandle::G2,
+        LogicalLayoutHandle::G1,
+        g2_block_ids,
+        g1_block_ids,
+        TransferOptions::default(),
+    )?;
+    Ok(await_onboard_drain(notification, registered).await)
 }
 
 #[cfg(test)]

@@ -19,6 +19,7 @@ use parking_lot::Mutex as RegistryMutex;
 use tokio::time::{Instant, sleep_until};
 use velo::InstanceId;
 
+use crate::remote::cd::state::CdRequestState;
 use crate::worker::velo::{
     CheckEvidence, DEFAULT_LOCAL_TRANSFER_CHECK_DEADLINE, LocalTransferWorker,
 };
@@ -43,7 +44,12 @@ pub(super) struct PausedLoad {
     pub(super) physical_drain: Arc<AtomicBool>,
     pub(super) pause: PauseCell,
     pub(super) holds: Box<dyn Send>,
-    pub(super) resource: Option<ResourceContinuation>,
+    pub(super) continuation: Option<LoadContinuation>,
+}
+
+pub(super) enum LoadContinuation {
+    Resource(ResourceContinuation),
+    CdDecode(CdDecodeContinuation),
 }
 
 /// The current resource and the work that has yet to reach admission.
@@ -52,10 +58,44 @@ pub(super) struct ResourceContinuation {
     pub(super) remaining: std::vec::IntoIter<ResourceOnboard>,
 }
 
+/// The originating CD lifecycle and the destinations still missing at pause.
+pub(super) struct CdDecodeContinuation {
+    pub(super) state: Arc<CdRequestState>,
+    pub(super) unfilled: Vec<usize>,
+    pub(super) pending_copy: HashSet<usize>,
+}
+
+impl CdDecodeContinuation {
+    fn outcome(&self, completed: bool) -> ActionStatus {
+        // A pause ends CD dispatch. Proof of completion preserves the copied
+        // ids. A drained error leaves them in the set vLLM will recompute.
+        let block_ids: Vec<_> = self
+            .unfilled
+            .iter()
+            .copied()
+            .filter(|id| !completed || !self.pending_copy.contains(id))
+            .collect();
+        if block_ids.is_empty() {
+            ActionStatus::Complete
+        } else {
+            ActionStatus::Failed(ActionFailure::Partial { block_ids })
+        }
+    }
+}
+
 impl PausedLoad {
     pub(super) fn finish(self, engine: &LocalConnectorEngine, status: ActionStatus) {
         drop(self.holds);
+        let cd_terminal = match self.continuation {
+            Some(LoadContinuation::CdDecode(cd)) => Some((cd.state, status.clone())),
+            _ => None,
+        };
         engine.finish_load_action(self.action, &self.request, status, self.destinations);
+        if let Some((state, status)) = cd_terminal
+            && let Some(cd) = &engine.cd
+        {
+            cd.complete_load(&self.request, &state, &status);
+        }
         engine.finish_physical_load_action(self.action, &self.physical_drain);
     }
 }
@@ -503,12 +543,21 @@ impl LocalConnectorEngine {
 
     fn resolve_paused_load(self: &Arc<Self>, record: PausedRecord) {
         let mut load = record.load;
-        let resource = load.resource.take();
         *load.pause.lock().expect("pause mutex poisoned") = None;
-        let (status, result) = match record.unresolved.into_outcome() {
-            TransferDrainOutcome::Completed => {
-                if let Some(resource) = resource
-                    && resource.remaining.len() != 0
+        let (completed, result) = match record.unresolved.into_outcome() {
+            TransferDrainOutcome::Completed => (true, "completed"),
+            TransferDrainOutcome::DrainedWithError(error) => {
+                tracing::debug!(request_id = %load.request, %error, "paused onboard proved drained with error");
+                (false, "drained_with_error")
+            }
+            TransferDrainOutcome::Unproven(_) => unreachable!("unresolved onboard cannot settle"),
+        };
+        let status = if let Some(LoadContinuation::CdDecode(cd)) = &load.continuation {
+            cd.outcome(completed)
+        } else {
+            match (completed, load.continuation.take()) {
+                (true, Some(LoadContinuation::Resource(resource)))
+                    if resource.remaining.len() != 0 =>
                 {
                     tracing::info!(
                         request_id = %load.request,
@@ -519,18 +568,12 @@ impl LocalConnectorEngine {
                     self.spawn_resource_onboard(load, resource.remaining);
                     return;
                 }
-                (ActionStatus::Complete, "completed")
+                (true, _) => ActionStatus::Complete,
+                (false, Some(LoadContinuation::Resource(resource))) => {
+                    ActionStatus::Failed(resource.failure)
+                }
+                (false, _) => ActionStatus::Failed(ActionFailure::AllBlocks),
             }
-            TransferDrainOutcome::DrainedWithError(error) => {
-                tracing::debug!(request_id = %load.request, %error, "paused onboard proved drained with error");
-                (
-                    ActionStatus::Failed(
-                        resource.map_or(ActionFailure::AllBlocks, |resource| resource.failure),
-                    ),
-                    "drained_with_error",
-                )
-            }
-            TransferDrainOutcome::Unproven(_) => unreachable!("unresolved onboard cannot settle"),
         };
         let action = load.action;
         let request = load.request.clone();

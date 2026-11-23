@@ -22,7 +22,9 @@ use crate::tiering::engine::driver::ActionRecord;
 use crate::tiering::engine::inflight::InflightKey;
 use crate::tiering::engine::local::LocalConnectorEngine;
 use crate::tiering::engine::onboard::{OnboardDrain, await_onboard_drain};
-use crate::tiering::engine::paused::{PauseCell, PausedLoad, ResourceContinuation};
+use crate::tiering::engine::paused::{
+    LoadContinuation, PauseCell, PausedLoad, ResourceContinuation,
+};
 
 type ResourcePins = Vec<ImmutableBlock<G2>>;
 type SourceLeases = BTreeMap<LogicalResourceId, ResourcePins>;
@@ -141,7 +143,7 @@ impl LocalConnectorEngine {
                 pause: pause.clone(),
                 // This path takes block IDs. The caller keeps the G2 pins.
                 holds: Box::new(()),
-                resource: None,
+                continuation: None,
             },
             resources.into_iter(),
         );
@@ -177,13 +179,13 @@ impl LocalConnectorEngine {
                     destination_block_ids,
                     error,
                 } => {
-                    load.resource = Some(ResourceContinuation {
+                    load.continuation = Some(LoadContinuation::Resource(ResourceContinuation {
                         failure: ActionFailure::Resource {
                             resource,
                             block_ids: Some(destination_block_ids),
                         },
                         remaining: resources,
-                    });
+                    }));
                     driver.pause_load_action(load, error);
                 }
             }
