@@ -40,6 +40,7 @@ use crate::transfer::executor::{TransferOptionsInternal, execute_transfer};
 fn device_fc(agent: NixlAgent, num_blocks: usize) -> PhysicalLayout {
     let config = standard_config(num_blocks);
     PhysicalLayout::builder(agent)
+        .local_only()
         .with_config(config)
         .with_block_layout(KvBlockLayout::OperationalNHD)
         .fully_contiguous()

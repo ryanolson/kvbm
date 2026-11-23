@@ -331,7 +331,7 @@ pub(crate) fn execute_transfer(
     }
 
     // Select transfer plan based on locations and capabilities
-    let plan = select_strategy(src, dst, ctx)?;
+    let plan = select_strategy(src, dst, &ctx.nixl_agent().name(), ctx.capabilities())?;
 
     // Dispatch based on plan type
     match plan {

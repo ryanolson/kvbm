@@ -14,7 +14,7 @@ use std::collections::HashMap;
 
 use crate::BlockId;
 use crate::{
-    layout::{BlockDimension, LayoutConfig, PhysicalLayout},
+    layout::{BlockDimension, LayoutConfig, PhysicalLayout, builder::PhysicalLayoutBuilderDefault},
     manager::{LayoutHandle, TransferManager},
     transfer::{
         BlockChecksum, FillPattern, NixlAgent, StorageKind, TransferCapabilities,
@@ -387,9 +387,15 @@ pub fn create_fc_layout_with_config(
     storage_kind: StorageKind,
     config: LayoutConfig,
 ) -> PhysicalLayout {
-    let builder = PhysicalLayout::builder(agent)
-        .with_config(config)
-        .fully_contiguous();
+    build_fc_layout(PhysicalLayout::builder(agent), storage_kind, config)
+}
+
+fn build_fc_layout(
+    builder: PhysicalLayoutBuilderDefault,
+    storage_kind: StorageKind,
+    config: LayoutConfig,
+) -> PhysicalLayout {
+    let builder = builder.with_config(config).fully_contiguous();
 
     match storage_kind {
         StorageKind::System => builder.allocate_system().build().unwrap(),
@@ -414,7 +420,15 @@ pub fn create_lw_layout_with_config(
     storage_kind: StorageKind,
     config: LayoutConfig,
 ) -> PhysicalLayout {
-    let builder = PhysicalLayout::builder(agent)
+    build_lw_layout(PhysicalLayout::builder(agent), storage_kind, config)
+}
+
+fn build_lw_layout(
+    builder: PhysicalLayoutBuilderDefault,
+    storage_kind: StorageKind,
+    config: LayoutConfig,
+) -> PhysicalLayout {
+    let builder = builder
         .with_config(config)
         .layer_separate(BlockDimension::BlockIsFirstDim);
 
@@ -672,24 +686,37 @@ pub fn fill_and_checksum_manager(
 mod tests {
     use super::*;
 
+    fn local_builder(name: &str) -> PhysicalLayoutBuilderDefault {
+        PhysicalLayout::builder(create_test_agent(name)).local_only()
+    }
+
     #[test]
     fn test_create_fc_layout_system() {
-        let agent = create_test_agent("test_fc_system");
-        let layout = create_fc_layout(agent, StorageKind::System, 4);
+        let layout = build_fc_layout(
+            local_builder("test_fc_system"),
+            StorageKind::System,
+            standard_config(4),
+        );
         assert!(layout.layout().as_ref().is_fully_contiguous());
     }
 
     #[test]
     fn test_create_lw_layout_system() {
-        let agent = create_test_agent("test_lw_system");
-        let layout = create_lw_layout(agent, StorageKind::System, 4);
+        let layout = build_lw_layout(
+            local_builder("test_lw_system"),
+            StorageKind::System,
+            standard_config(4),
+        );
         assert!(!layout.layout().as_ref().is_fully_contiguous());
     }
 
     #[test]
     fn test_fill_and_checksum() {
-        let agent = create_test_agent("test_fill_checksum");
-        let layout = create_fc_layout(agent, StorageKind::System, 4);
+        let layout = build_fc_layout(
+            local_builder("test_fill_checksum"),
+            StorageKind::System,
+            standard_config(4),
+        );
 
         let block_ids = vec![0, 1, 2];
         let checksums = fill_and_checksum(&layout, &block_ids, FillPattern::Sequential).unwrap();

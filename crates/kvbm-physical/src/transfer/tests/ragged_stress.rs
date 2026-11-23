@@ -44,6 +44,7 @@ fn build_many_region_layout(
         .build()
         .unwrap();
     let builder = PhysicalLayout::builder(agent)
+        .local_only()
         .with_config(config)
         .ragged_layer_separate(region_sizes);
     match storage_kind {

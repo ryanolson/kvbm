@@ -45,6 +45,7 @@ fn build_layout_for_planner(
 ) -> PhysicalLayout {
     let config = standard_config(num_blocks);
     let builder = PhysicalLayout::builder(agent)
+        .local_only()
         .with_config(config)
         .with_block_layout(KvBlockLayout::OperationalNHD);
     let typed = match layout_type {
@@ -197,6 +198,7 @@ fn build_fc_with_block_layout(
 ) -> PhysicalLayout {
     let config = standard_config(num_blocks);
     PhysicalLayout::builder(agent)
+        .local_only()
         .with_config(config)
         .with_block_layout(block_layout)
         .fully_contiguous()
@@ -364,6 +366,7 @@ async fn use_planner_small_inner_threshold_fallback_d2d() -> Result<()> {
     let config = standard_config_with_page_size(4, /*page_size=*/ 1);
     let build_layout = |bl: KvBlockLayout| {
         PhysicalLayout::builder(agent.clone())
+            .local_only()
             .with_config(config.clone())
             .with_block_layout(bl)
             .fully_contiguous()
@@ -435,6 +438,7 @@ fn build_fc_dtype_none(
     let mut config = standard_config(num_blocks);
     config.dtype = None;
     PhysicalLayout::builder(agent)
+        .local_only()
         .with_config(config)
         .with_block_layout(block_layout)
         .fully_contiguous()

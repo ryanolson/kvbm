@@ -89,6 +89,7 @@ mod tests {
             .unwrap();
 
         PhysicalLayout::builder(agent)
+            .local_only()
             .with_config(config)
             .fully_contiguous()
             .allocate_system()

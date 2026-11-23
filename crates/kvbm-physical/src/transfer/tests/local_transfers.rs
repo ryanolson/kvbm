@@ -28,16 +28,17 @@ pub(super) enum LayoutType {
     LW,
 }
 
-pub(super) fn build_layout(
-    agent: NixlAgent,
+fn build_layout(
+    builder: PhysicalLayoutBuilderDefault,
     layout_type: LayoutType,
     storage_kind: StorageKind,
     num_blocks: usize,
 ) -> PhysicalLayout {
-    match layout_type {
-        LayoutType::FC => create_fc_layout(agent, storage_kind, num_blocks),
-        LayoutType::LW => create_lw_layout(agent, storage_kind, num_blocks),
-    }
+    let kind = match layout_type {
+        LayoutType::FC => LayoutKind::FC,
+        LayoutType::LW => LayoutKind::LW,
+    };
+    create_layout_with_page_size(builder, LayoutSpec::new(kind, storage_kind), num_blocks, 16)
 }
 
 fn build_ragged_layout(
@@ -57,6 +58,7 @@ fn build_ragged_layout(
         .build()
         .unwrap();
     let builder = PhysicalLayout::builder(agent)
+        .local_only()
         .with_config(config)
         .ragged_layer_separate(bytes_per_layer_block);
     match storage_kind {
@@ -315,10 +317,18 @@ async fn test_p2p(
 
     let agent = build_agent_for_kinds(&[src_kind, dst_kind])?;
 
-    let src = build_layout(agent.clone(), src_layout, src_kind, 4);
-    let dst = build_layout(agent.clone(), dst_layout, dst_kind, 4);
+    let builder = || {
+        let builder = PhysicalLayout::builder(agent.clone());
+        if matches!(src_kind, StorageKind::Disk(_)) || matches!(dst_kind, StorageKind::Disk(_)) {
+            builder
+        } else {
+            builder.local_only()
+        }
+    };
+    let src = build_layout(builder(), src_layout, src_kind, 4);
+    let dst = build_layout(builder(), dst_layout, dst_kind, 4);
 
-    let bounce_layout = build_layout(agent.clone(), LayoutType::FC, StorageKind::Pinned, 4);
+    let bounce_layout = build_layout(builder(), LayoutType::FC, StorageKind::Pinned, 4);
 
     let bounce_buffer_spec = BounceBufferInternal::from_layout(bounce_layout, vec![0, 1]);
 
@@ -374,9 +384,24 @@ async fn test_roundtrip(
     let agent = build_agent_for_kinds(&[src_kind, inter_kind, dst_kind])?;
 
     // Create layouts: source pinned, device intermediate, destination pinned
-    let src = build_layout(agent.clone(), src_layout, src_kind, 4);
-    let device = build_layout(agent.clone(), inter_layout, inter_kind, 4);
-    let dst = build_layout(agent.clone(), dst_layout, dst_kind, 4);
+    let src = build_layout(
+        PhysicalLayout::builder(agent.clone()).local_only(),
+        src_layout,
+        src_kind,
+        4,
+    );
+    let device = build_layout(
+        PhysicalLayout::builder(agent.clone()).local_only(),
+        inter_layout,
+        inter_kind,
+        4,
+    );
+    let dst = build_layout(
+        PhysicalLayout::builder(agent.clone()).local_only(),
+        dst_layout,
+        dst_kind,
+        4,
+    );
 
     let src_blocks = vec![0, 1];
     let device_blocks = vec![0, 1];
@@ -436,8 +461,18 @@ async fn test_gds(
 
     let agent = build_agent_for_kinds(&[src_kind, dst_kind])?;
 
-    let src = build_layout(agent.clone(), src_layout, src_kind, 4);
-    let dst = build_layout(agent.clone(), dst_layout, dst_kind, 4);
+    let src = build_layout(
+        PhysicalLayout::builder(agent.clone()),
+        src_layout,
+        src_kind,
+        4,
+    );
+    let dst = build_layout(
+        PhysicalLayout::builder(agent.clone()),
+        dst_layout,
+        dst_kind,
+        4,
+    );
 
     let src_blocks = vec![0, 1];
     let dst_blocks = vec![2, 3];
@@ -541,13 +576,13 @@ async fn test_page_size_sweep(
     let agent = build_agent_for_kinds(&[src_kind, dst_kind])?;
 
     let src = create_layout_with_page_size(
-        agent.clone(),
+        PhysicalLayout::builder(agent.clone()).local_only(),
         LayoutSpec::new(src_layout, src_kind),
         num_blocks,
         page_size,
     );
     let dst = create_layout_with_page_size(
-        agent.clone(),
+        PhysicalLayout::builder(agent.clone()).local_only(),
         LayoutSpec::new(dst_layout, dst_kind),
         num_blocks,
         page_size,
@@ -619,13 +654,13 @@ async fn test_page_size_sweep_partial_layer(
     let agent = build_agent_for_kinds(&[src_kind, dst_kind])?;
 
     let src = create_layout_with_page_size(
-        agent.clone(),
+        PhysicalLayout::builder(agent.clone()).local_only(),
         LayoutSpec::new(src_layout, src_kind),
         num_blocks,
         page_size,
     );
     let dst = create_layout_with_page_size(
-        agent.clone(),
+        PhysicalLayout::builder(agent.clone()).local_only(),
         LayoutSpec::new(dst_layout, dst_kind),
         num_blocks,
         page_size,
@@ -703,13 +738,13 @@ async fn test_page_size_sweep_disk_posix(
     let agent = build_agent_for_kinds(&[src_kind, dst_kind])?;
 
     let src = create_layout_with_page_size(
-        agent.clone(),
+        PhysicalLayout::builder(agent.clone()),
         LayoutSpec::new(src_layout, src_kind),
         num_blocks,
         page_size,
     );
     let dst = create_layout_with_page_size(
-        agent.clone(),
+        PhysicalLayout::builder(agent.clone()),
         LayoutSpec::new(dst_layout, dst_kind),
         num_blocks,
         page_size,
@@ -1146,6 +1181,7 @@ fn test_validate_layout_compatibility_lw_to_fc_operational_nhd() {
     let config = standard_config(4);
 
     let src = PhysicalLayout::builder(agent.clone())
+        .local_only()
         .with_config(config.clone())
         .layer_separate(BlockDimension::BlockIsFirstDim)
         .with_block_layout(KvBlockLayout::OperationalNHD)
@@ -1153,6 +1189,7 @@ fn test_validate_layout_compatibility_lw_to_fc_operational_nhd() {
         .build()
         .unwrap();
     let dst = PhysicalLayout::builder(agent)
+        .local_only()
         .with_config(config)
         .fully_contiguous()
         .with_block_layout(KvBlockLayout::OperationalNHD)

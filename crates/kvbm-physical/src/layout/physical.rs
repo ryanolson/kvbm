@@ -35,8 +35,7 @@ pub struct PhysicalLayout {
     /// Physical storage location (System, Device, Pinned, Disk)
     location: StorageKind,
 
-    /// NIXL registration metadata
-    nixl_metadata: NixlMetadata,
+    registration: LayoutRegistration,
     registration_provider: Option<Arc<dyn kvbm_memory::nixl::MappedRegistrationProvider>>,
 
     /// The NIXL registrations that back this layout, in address order.
@@ -45,6 +44,12 @@ pub struct PhysicalLayout {
     /// regions, so these descriptors are not the same as the layout memory
     /// regions. A partial metadata export must name the registration.
     registrations: Vec<NixlDescriptor>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum LayoutRegistration {
+    Registered(NixlMetadata),
+    LocalOnly { agent_name: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,15 +120,15 @@ impl PhysicalLayout {
     /// # Arguments
     /// * `layout` - The abstract layout to wrap
     /// * `location` - Where the layout's memory resides
-    pub(crate) fn new_local(
+    pub(super) fn new_local(
         layout: Arc<dyn Layout>,
         location: StorageKind,
-        nixl_metadata: NixlMetadata,
+        registration: LayoutRegistration,
     ) -> Self {
         Self {
             layout,
             location,
-            nixl_metadata,
+            registration,
             registration_provider: None,
             registrations: Vec::new(),
         }
@@ -168,9 +173,21 @@ impl PhysicalLayout {
         self.location
     }
 
-    /// Get the NIXL metadata.
-    pub(crate) fn nixl_metadata(&self) -> &NixlMetadata {
-        &self.nixl_metadata
+    pub(crate) fn agent_name(&self) -> &str {
+        match &self.registration {
+            LayoutRegistration::Registered(metadata) => metadata.agent_name(),
+            LayoutRegistration::LocalOnly { agent_name } => agent_name,
+        }
+    }
+
+    /// Get the NIXL metadata required for serialization and NIXL transfers.
+    pub(crate) fn nixl_metadata(&self) -> Result<&NixlMetadata> {
+        match &self.registration {
+            LayoutRegistration::Registered(metadata) => Ok(metadata),
+            LayoutRegistration::LocalOnly { .. } => {
+                Err(anyhow!("local-only layout has no NIXL registration"))
+            }
+        }
     }
 
     /// Get a memory region with location information.
@@ -198,6 +215,7 @@ impl PhysicalLayout {
     /// # Returns
     /// A serializable representation of this layout
     pub(crate) fn to_descriptor(&self) -> Result<LayoutDescriptor> {
+        let nixl_metadata = self.nixl_metadata()?.clone();
         // Extract memory descriptors
         let memory_descriptors = self
             .layout
@@ -216,7 +234,7 @@ impl PhysicalLayout {
             version: LayoutDescriptor::CURRENT_VERSION,
             layout_config: self.layout.config().clone(),
             location: self.location,
-            nixl_metadata: self.nixl_metadata.clone(),
+            nixl_metadata,
             memory_descriptors,
             layout_type_details,
         })
@@ -312,7 +330,7 @@ impl PhysicalLayout {
         Ok(Self {
             layout,
             location: serialized.location,
-            nixl_metadata: serialized.nixl_metadata,
+            registration: LayoutRegistration::Registered(serialized.nixl_metadata),
             registration_provider: None,
             // A remote layout holds no local registration.
             registrations: Vec::new(),

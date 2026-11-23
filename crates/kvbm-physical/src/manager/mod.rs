@@ -1010,7 +1010,9 @@ mod tests {
         NixlAgent::new(name).expect("failed to create agent")
     }
 
-    fn make_test_layout(agent: &NixlAgent) -> PhysicalLayout {
+    fn make_test_layout(
+        builder: crate::layout::builder::PhysicalLayoutBuilderDefault,
+    ) -> PhysicalLayout {
         let config = LayoutConfig::builder()
             .num_blocks(2)
             .num_layers(2)
@@ -1021,7 +1023,7 @@ mod tests {
             .build()
             .unwrap();
 
-        PhysicalLayout::builder(agent.clone())
+        builder
             .with_config(config)
             .fully_contiguous()
             .allocate_system()
@@ -1044,7 +1046,7 @@ mod tests {
         let agent = make_test_agent("test-register");
         let mut manager = LayoutRegistry::new(agent.clone(), 100);
 
-        let layout = make_test_layout(&agent);
+        let layout = make_test_layout(PhysicalLayout::builder(agent.clone()).local_only());
         let handle = manager.register_local(layout).unwrap();
 
         assert_eq!(handle.worker_id(), 100);
@@ -1059,9 +1061,21 @@ mod tests {
         let agent = make_test_agent("test-multiple");
         let mut manager = LayoutRegistry::new(agent.clone(), 1);
 
-        let handle1 = manager.register_local(make_test_layout(&agent)).unwrap();
-        let handle2 = manager.register_local(make_test_layout(&agent)).unwrap();
-        let handle3 = manager.register_local(make_test_layout(&agent)).unwrap();
+        let handle1 = manager
+            .register_local(make_test_layout(
+                PhysicalLayout::builder(agent.clone()).local_only(),
+            ))
+            .unwrap();
+        let handle2 = manager
+            .register_local(make_test_layout(
+                PhysicalLayout::builder(agent.clone()).local_only(),
+            ))
+            .unwrap();
+        let handle3 = manager
+            .register_local(make_test_layout(
+                PhysicalLayout::builder(agent.clone()).local_only(),
+            ))
+            .unwrap();
 
         assert_eq!(handle1.layout_id(), 0);
         assert_eq!(handle2.layout_id(), 1);
@@ -1073,14 +1087,18 @@ mod tests {
     #[ignore] // Requires actual NIXL memory registration
     fn test_export_import_roundtrip() {
         // Create source manager and register layouts
-        let source_agent = make_test_agent("source");
+        let source_agent = NixlAgent::with_backends("source", &["UCX"]).unwrap();
         let mut source_manager = LayoutRegistry::new(source_agent.clone(), 1);
 
         let handle1 = source_manager
-            .register_local(make_test_layout(&source_agent))
+            .register_local(make_test_layout(PhysicalLayout::builder(
+                source_agent.clone(),
+            )))
             .unwrap();
         let handle2 = source_manager
-            .register_local(make_test_layout(&source_agent))
+            .register_local(make_test_layout(PhysicalLayout::builder(
+                source_agent.clone(),
+            )))
             .unwrap();
 
         // Export metadata
@@ -1088,7 +1106,7 @@ mod tests {
         assert!(!metadata.is_empty());
 
         // Create destination manager and import
-        let dest_agent = make_test_agent("dest");
+        let dest_agent = NixlAgent::with_backends("dest", &["UCX"]).unwrap();
         let mut dest_manager = LayoutRegistry::new(dest_agent, 2);
 
         let imported_handles = dest_manager.import_metadata(metadata).unwrap();
@@ -1120,7 +1138,9 @@ mod tests {
         source_agent.add_backend("UCX").expect("UCX backend");
         let mut source_manager = LayoutRegistry::new(source_agent.clone(), 42);
         let handle = source_manager
-            .register_local(make_test_layout(&source_agent))
+            .register_local(make_test_layout(PhysicalLayout::builder(
+                source_agent.clone(),
+            )))
             .unwrap();
 
         let hosts = source_manager.host_descriptors();
@@ -1159,16 +1179,18 @@ mod tests {
     #[test]
     #[ignore] // Requires actual NIXL memory registration
     fn test_import_duplicate_remote_is_idempotent() {
-        let source_agent = make_test_agent("source2");
+        let source_agent = NixlAgent::with_backends("source2", &["UCX"]).unwrap();
         let mut source_manager = LayoutRegistry::new(source_agent.clone(), 10);
 
         source_manager
-            .register_local(make_test_layout(&source_agent))
+            .register_local(make_test_layout(PhysicalLayout::builder(
+                source_agent.clone(),
+            )))
             .unwrap();
 
         let metadata = source_manager.export_metadata().unwrap();
 
-        let dest_agent = make_test_agent("dest2");
+        let dest_agent = NixlAgent::with_backends("dest2", &["UCX"]).unwrap();
         let mut dest_manager = LayoutRegistry::new(dest_agent, 20);
 
         // First import succeeds and returns the imported handles.
@@ -1186,8 +1208,16 @@ mod tests {
         let agent = make_test_agent("test-handles");
         let mut manager = LayoutRegistry::new(agent.clone(), 5);
 
-        let h1 = manager.register_local(make_test_layout(&agent)).unwrap();
-        let h2 = manager.register_local(make_test_layout(&agent)).unwrap();
+        let h1 = manager
+            .register_local(make_test_layout(
+                PhysicalLayout::builder(agent.clone()).local_only(),
+            ))
+            .unwrap();
+        let h2 = manager
+            .register_local(make_test_layout(
+                PhysicalLayout::builder(agent.clone()).local_only(),
+            ))
+            .unwrap();
 
         let handles = manager.local_handles();
         assert_eq!(handles.len(), 2);

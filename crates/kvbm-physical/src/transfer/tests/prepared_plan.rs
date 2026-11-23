@@ -36,6 +36,7 @@ fn build_fc_device(
 ) -> PhysicalLayout {
     let config = standard_config(num_blocks);
     PhysicalLayout::builder(agent)
+        .local_only()
         .with_config(config)
         .with_block_layout(block_layout)
         .fully_contiguous()
@@ -53,6 +54,7 @@ fn build_lw_device(
 ) -> PhysicalLayout {
     let config = standard_config(num_blocks);
     PhysicalLayout::builder(agent)
+        .local_only()
         .with_config(config)
         .with_block_layout(block_layout)
         .layer_separate(BlockDimension::BlockIsFirstDim)
@@ -66,6 +68,7 @@ fn build_lw_device(
 fn build_universal_pinned(agent: NixlAgent, num_blocks: usize) -> PhysicalLayout {
     let config = standard_config(num_blocks);
     PhysicalLayout::builder(agent)
+        .local_only()
         .with_config(config)
         .with_block_layout(KvBlockLayout::Universal)
         .fully_contiguous()
