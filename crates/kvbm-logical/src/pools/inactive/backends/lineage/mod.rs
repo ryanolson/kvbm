@@ -7,10 +7,9 @@
 //! # Structure
 //!
 //! Every node (real block or out-of-order ghost placeholder) lives in a
-//! single pre-sized `Vec<LineageSlot>` arena addressed by `u32` index, so
-//! insert / remove / find do **no heap allocation in steady state** — they
-//! pop and recycle slots through a free list. The graph edges are slab
-//! indices, not hash keys:
+//! single pre-sized `Vec<LineageSlot>` arena addressed by `u32` index.
+//! Inserts reuse freed slots through a free list. The slab and leaf policy
+//! can grow when out-of-order ghosts push the slot count past capacity.
 //!
 //! - `parent` / `first_child` / `next_sibling` — an intrusive parent→child
 //!   tree. A single-child chain (the common KV-prefix shape) is just
@@ -22,8 +21,9 @@
 //! fragment, never the parent's full hash). A node is keyed by
 //! `parent_fragment_for_child_position(position + 1)` — the fragment width
 //! its children compute as `parent_hash_fragment` — so child→parent
-//! lookups match exactly. The map is identity-mixed (see `PairHasher`) and
-//! pre-sized, so it does not rehash on the hot path.
+//! lookups match exactly. The map uses `PairHasher` and reserves room for
+//! churn at the current block capacity. Churn can still rebuild the map
+//! in place when tombstones use up the growth budget.
 //!
 //! # Leaf eviction ordering
 //!
@@ -53,7 +53,7 @@ use dynamo_tokens::PositionalLineageHash;
 use crate::BlockId;
 use crate::blocks::SequenceHash;
 use crate::pools::advice::{InactiveFeatures, evict_rank_for};
-use crate::pools::store::{ExactReclaimPlanError, InactiveIndex};
+use crate::pools::store::{ExactReclaimPlanError, InactiveIndex, room};
 
 // ---------------------------------------------------------------------------
 // `(position, fragment)` index hasher
@@ -145,6 +145,8 @@ pub(crate) struct LineageBackend {
     /// `(position, fragment)` → slot index, for parent resolution on
     /// insert and target resolution on remove.
     index: IndexMap,
+    /// Largest clean entry capacity observed so far.
+    index_full: usize,
     /// Pluggable leaf-eviction ordering. The backend feeds it the
     /// inserted / leaf-added / leaf-demoted / removed transitions and asks
     /// it for the next eviction victim.
@@ -178,18 +180,16 @@ impl LineageBackend {
         Self::with_policy(capacity, LeafPolicy::tick(capacity))
     }
 
-    /// Create pre-sized for `capacity` real blocks with an explicit leaf
-    /// eviction policy. The inactive pool is bounded by the store's
-    /// `total_blocks`, so sizing the slab, index, and policy to that bound
-    /// means the steady-state hot path never reallocates. (Out-of-order
-    /// ghosts can briefly push past `capacity`; that grows the slab once,
-    /// amortized — not a steady-state cost. The `Tick` policy's `BTreeMap`
-    /// is the one structure that always churns nodes.)
-    pub(crate) fn with_policy(capacity: usize, leaves: LeafPolicy) -> Self {
+    /// Reserve the slab and leaf policy from the initial block capacity.
+    pub(crate) fn with_policy(capacity: usize, mut leaves: LeafPolicy) -> Self {
+        let slots = Vec::with_capacity(capacity);
+        let index = IndexMap::with_capacity_and_hasher(room(capacity), PairBuildHasher);
+        leaves.reserve(slots.capacity());
         Self {
-            slots: Vec::with_capacity(capacity),
+            slots,
             free_head: None,
-            index: HashMap::with_capacity_and_hasher(capacity, PairBuildHasher),
+            index_full: index.capacity(),
+            index,
             leaves,
             count: 0,
             #[cfg(test)]
@@ -209,11 +209,15 @@ impl LineageBackend {
             }
             None => {
                 let idx = self.slots.len();
+                let capacity = self.slots.capacity();
                 debug_assert!(
                     idx <= u32::MAX as usize,
                     "lineage slab exceeded u32 index space"
                 );
                 self.slots.push(slot);
+                if idx == capacity {
+                    self.leaves.reserve(self.slots.capacity());
+                }
                 idx as u32
             }
         }
@@ -538,6 +542,32 @@ impl LineageBackend {
 }
 
 impl InactiveIndex for LineageBackend {
+    fn grow_capacity(&mut self, capacity: usize) {
+        // Tombstones can lower the reported capacity without freeing buckets.
+        self.index_full = self.index_full.max(self.index.capacity());
+        let wanted = room(capacity);
+        if wanted > self.index_full {
+            self.index.reserve(wanted.saturating_sub(self.index.len()));
+            self.index_full = self.index.capacity();
+        }
+
+        if capacity > self.slots.capacity() {
+            self.slots.reserve_exact(capacity - self.slots.len());
+            self.leaves.reserve(self.slots.capacity());
+        }
+    }
+
+    #[cfg(test)]
+    fn lineage_storage(&self) -> Option<(usize, usize, usize, usize, usize)> {
+        Some((
+            self.index.len(),
+            self.index.capacity(),
+            self.slots.len(),
+            self.slots.capacity(),
+            self.leaves.capacity(),
+        ))
+    }
+
     fn find_matches(
         &mut self,
         hashes: &[SequenceHash],
@@ -886,6 +916,63 @@ mod tests {
             .into_iter()
             .next()
             .unwrap()
+    }
+
+    #[test]
+    fn lineage_policy_grows_with_slab() {
+        const CAPACITY: usize = 4;
+        let cases = [
+            ("Tick", LeafPolicy::tick(CAPACITY)),
+            ("Fifo", LeafPolicy::fifo(CAPACITY)),
+            (
+                "Valued",
+                LeafPolicy::valued(CAPACITY, None, None, ScorerParams::default()),
+            ),
+        ];
+        let roots = [10, 11, 12].map(|token| create_block(token).1);
+        let chain = create_chain(2, 20);
+        let parent = chain[0].1;
+        let child = chain[1].1;
+
+        for (name, policy) in cases {
+            let mut backend = LineageBackend::with_policy(CAPACITY, policy);
+            let capacities =
+                |backend: &LineageBackend| (backend.slots.capacity(), backend.leaves.capacity());
+            let mut trace = vec![capacities(&backend)];
+            for (id, hash) in roots.into_iter().enumerate() {
+                backend.insert(hash, id);
+                trace.push(capacities(&backend));
+            }
+
+            // The child uses slot 3 and its ghost parent uses slot 4.
+            backend.insert(child, 3);
+            assert_eq!(backend.slots.len(), 5);
+            trace.push(capacities(&backend));
+            for hash in &roots[..2] {
+                assert!(backend.remove_by_hash(hash).is_some());
+                trace.push(capacities(&backend));
+            }
+
+            // Promoting the parent uses slot 4 with only three nodes left.
+            let before = backend.leaves.capacity();
+            backend.insert(parent, 0);
+            trace.push(capacities(&backend));
+            assert_eq!(backend.index.len(), 3);
+            assert_eq!(backend.len(), 3);
+            println!("{name} (slab, policy) capacity trace: {trace:?}");
+            assert_eq!(
+                backend.leaves.capacity(),
+                before,
+                "{name} grew on promotion"
+            );
+            for (slab, policy) in trace {
+                assert!(policy >= slab, "{name} reserve {policy} trails slab {slab}");
+            }
+
+            backend.grow_capacity(3 * CAPACITY);
+            assert!(backend.slots.capacity() >= 3 * CAPACITY);
+            assert!(backend.leaves.capacity() >= backend.slots.capacity());
+        }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Growth of the live-primary hash index under the store lock.
+//! Growth of the live-primary and inactive lineage indexes under the store lock.
 //!
 //! `BlockStore::active_by_hash` holds one entry per live primary. Allocating,
 //! matching, registering and releasing all run under the one store mutex, so
@@ -21,8 +21,8 @@
 use std::collections::VecDeque;
 
 use super::*;
-use crate::ImmutableBlock;
 use crate::testing::{create_iota_token_block, create_test_manager_with_backend};
+use crate::{ImmutableBlock, MutableBlock};
 
 /// Live primaries held at once by the churn test.
 ///
@@ -67,6 +67,117 @@ fn lineage_manager(block_count: usize, maximum: usize) -> BlockManager<TestBlock
     })
 }
 
+fn tick_lineage_manager(capacity: usize) -> BlockManager<TestBlockData> {
+    create_test_manager_with_backend(capacity, |builder| {
+        builder
+            .block_size(1)
+            .maximum_block_count(64 * capacity)
+            .with_lineage_backend()
+    })
+}
+
+#[test]
+fn lineage_grow_reserves() {
+    const INITIAL: usize = 1024;
+    const GROWN: usize = 4 * INITIAL;
+    let manager = tick_lineage_manager(INITIAL);
+    let store = manager.store_for_test();
+    let (_, built_index, _, built_slab, built_policy) = store.lineage_storage().unwrap();
+    let built = (built_index, built_slab, built_policy);
+    assert!(built_index < 8 * INITIAL);
+    assert_eq!(built_slab, INITIAL);
+    assert_eq!(built_policy, INITIAL);
+
+    manager.set_capacity(GROWN).expect("grow the manager");
+    let (_, index, _, slab, policy) = store.lineage_storage().unwrap();
+    let reserved = (index, slab, policy);
+    let mut held = VecDeque::new();
+    let mut next_token = 0;
+    hold_fresh(&manager, &mut held, &mut next_token, GROWN);
+    held.clear();
+
+    let (index_len, index, slab_len, slab, policy) = store.lineage_storage().unwrap();
+    let filled = (index, slab, policy);
+    println!(
+        "lineage (index, slab, policy): built {built:?}, reserved {reserved:?}, filled {filled:?}"
+    );
+    assert_eq!(manager.inactive_len(), GROWN);
+    assert_eq!(index_len, GROWN, "the roots create no ghosts");
+    assert_eq!(slab_len, GROWN, "one slab slot per root");
+    assert_eq!(
+        filled, reserved,
+        "the fill must use the set_capacity reserve"
+    );
+    assert!(built_index >= 2 * INITIAL);
+    assert!(reserved.0 >= 2 * GROWN);
+}
+
+#[test]
+fn lineage_inactive_churn() {
+    let manager = tick_lineage_manager(LIVE);
+    let store = manager.store_for_test();
+    let (_, built_capacity, ..) = store.lineage_storage().unwrap();
+    let mut peak_capacity = built_capacity;
+    let mut peak_live = 0;
+    let mut peak_real = 0;
+    let mut peak_ghosts = 0;
+    let mut evictions = 0;
+    let mut growths = 0;
+    let mut rehashes = 0;
+    let mut next_token = 0;
+
+    let fill_batches = LIVE / CHUNK;
+    for batch in 0..fill_batches + TURNOUTS {
+        let (mutables, evicted) = manager
+            .allocate_blocks_with_evictions(CHUNK)
+            .expect("reset blocks or inactive roots are available");
+        let expected = if batch < fill_batches { 0 } else { CHUNK };
+        assert_eq!(evicted.len(), expected);
+        evictions += evicted.len();
+
+        let held = register_fresh(&manager, mutables, &mut next_token);
+        peak_live = peak_live.max(store.active_by_hash_len());
+        let (_, mut before, ..) = store.lineage_storage().unwrap();
+        for guard in held {
+            drop(guard);
+            let (_, after, ..) = store.lineage_storage().unwrap();
+            if after > peak_capacity {
+                growths += 1;
+                peak_capacity = after;
+            } else if after.saturating_sub(before) > 1 {
+                // A single insert can reclaim at most one tombstone.
+                rehashes += 1;
+            }
+            before = after;
+        }
+
+        let real = manager.inactive_len();
+        let (nodes, _, slab_len, ..) = store.lineage_storage().unwrap();
+        assert_eq!(real, ((batch + 1) * CHUNK).min(LIVE));
+        assert_eq!(slab_len, real);
+        peak_real = peak_real.max(real);
+        peak_ghosts = peak_ghosts.max(nodes - real);
+    }
+
+    println!(
+        "inactive churn: peak real {peak_real}, ghosts {peak_ghosts}, live primaries {peak_live}, \
+         evictions {evictions}, index built {built_capacity}, peak {peak_capacity}, \
+         growths {growths}, in-place rebuilds {rehashes}",
+    );
+    assert_eq!(evictions, TURNOUTS * CHUNK);
+    assert_eq!(peak_ghosts, 0);
+    assert_eq!(growths, 0, "the churn must not grow the lineage index");
+    assert!(rehashes <= rehash_bound(), "in-place rebuilds: {rehashes}");
+
+    // The map already has room for this capacity even with tombstones.
+    let (_, after_churn, ..) = store.lineage_storage().unwrap();
+    manager
+        .set_capacity(built_capacity / 2)
+        .expect("grow within the map's allocation");
+    let (_, after_grow, ..) = store.lineage_storage().unwrap();
+    assert_eq!(after_grow, after_churn);
+}
+
 /// What the live-primary index did over one fill and churn.
 #[derive(Debug, Default)]
 struct ChurnStats {
@@ -109,20 +220,29 @@ fn hold_fresh(
         let mutables = manager
             .allocate_blocks(CHUNK)
             .expect("a quarter of the store is free or evictable");
-        let completes = mutables
-            .into_iter()
-            .map(|mutable| {
-                let token_block = create_iota_token_block(*next_token, 1);
-                *next_token += 1;
-                mutable
-                    .complete(&token_block)
-                    .expect("meta block matches the store block size")
-            })
-            .collect::<Vec<_>>();
-        let guards = manager.register_blocks(completes);
-        assert_eq!(guards.len(), CHUNK, "one guard per held block");
-        held.push_back(guards);
+        held.push_back(register_fresh(manager, mutables, next_token));
     }
+}
+
+fn register_fresh(
+    manager: &BlockManager<TestBlockData>,
+    mutables: Vec<MutableBlock<TestBlockData>>,
+    next_token: &mut u32,
+) -> Vec<ImmutableBlock<TestBlockData>> {
+    let count = mutables.len();
+    let completes = mutables
+        .into_iter()
+        .map(|mutable| {
+            let token_block = create_iota_token_block(*next_token, 1);
+            *next_token += 1;
+            mutable
+                .complete(&token_block)
+                .expect("meta block matches the store block size")
+        })
+        .collect();
+    let guards = manager.register_blocks(completes);
+    assert_eq!(guards.len(), count, "one guard per held block");
+    guards
 }
 
 /// Fill to `live` held primaries, then turn `step` of them over `turnouts`
