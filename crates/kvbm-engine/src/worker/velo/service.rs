@@ -116,9 +116,9 @@ pub(super) fn register_local_transfer_handlers(
                         ));
                     }
                 };
-                #[cfg(test)]
+                #[cfg(any(test, feature = "testing"))]
                 let deferred = records.hooks.defer_next.lock().take();
-                #[cfg(test)]
+                #[cfg(any(test, feature = "testing"))]
                 if let Some(gate) = deferred {
                     tokio::spawn(async move {
                         let _ = gate.await;
@@ -126,9 +126,9 @@ pub(super) fn register_local_transfer_handlers(
                     });
                     anyhow::bail!("injected lost reply before the transfer was recorded");
                 }
-                #[cfg(test)]
+                #[cfg(any(test, feature = "testing"))]
                 let lose_running_reply = records.hooks.lose_running_reply.lock().take();
-                #[cfg(test)]
+                #[cfg(any(test, feature = "testing"))]
                 if let Some(gate) = lose_running_reply {
                     tokio::spawn(async move {
                         let _ = run_local_transfer(&records, &dispatch, message).await;

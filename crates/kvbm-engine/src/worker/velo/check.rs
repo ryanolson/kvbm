@@ -396,7 +396,7 @@ pub(super) struct LocalTransferRecords {
     registry: Mutex<Registry>,
     capacity: usize,
     max_age: Duration,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub(super) hooks: TestHooks,
 }
 
@@ -411,7 +411,7 @@ impl LocalTransferRecords {
             registry: Mutex::new(Registry::default()),
             capacity: RECORD_CAPACITY,
             max_age: RECORD_MAX_AGE,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "testing"))]
             hooks: TestHooks::default(),
         })
     }
@@ -476,7 +476,7 @@ impl LocalTransferRecords {
     }
 
     /// The ids of the transfers recorded as active.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub(super) fn active_ids(&self) -> Vec<Uuid> {
         let registry = self.registry.lock();
         registry
@@ -513,11 +513,12 @@ impl LocalTransferRecords {
     }
 }
 
-/// Fault seams for the tests of this module and the client.
-#[cfg(test)]
+/// Fault seams for the held-transfer fixture and unit tests.
+#[cfg(any(test, feature = "testing"))]
 #[derive(Default)]
 pub(super) struct TestHooks {
     /// Drop the reply of the next transfer after its outcome is recorded.
+    #[cfg(test)]
     pub(super) lose_next_reply: std::sync::atomic::AtomicBool,
     /// Hold the next transfer, unrecorded, until this gate opens, and fail
     /// its reply at once.
@@ -525,10 +526,13 @@ pub(super) struct TestHooks {
     /// Run the next transfer and fail its reply when this gate opens.
     pub(super) lose_running_reply: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     /// Evict every record after the next transfer is recorded.
+    #[cfg(test)]
     pub(super) evict_after_next: std::sync::atomic::AtomicBool,
     /// Checks received.
+    #[cfg(test)]
     pub(super) checks: std::sync::atomic::AtomicUsize,
     /// Run once in the next `finish`, before it takes the registry lock.
+    #[cfg(test)]
     pub(super) before_finish_lock: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 

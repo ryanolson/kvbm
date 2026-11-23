@@ -27,6 +27,18 @@ process.
 let (messenger_a, messenger_b) = create_messenger_pair_tcp().await?;
 ```
 
+### Held local transfers
+
+With the `testing` feature, `worker::velo::serve_held_local_transfers`
+registers the real local-transfer and check handlers around a test copy.
+Register the fixture with `lose_first_reply = false` to lose a reply while
+the copy is running. Arm `HeldLocalTransfers::gate_reply_loss` before
+sending the transfer. Signal from the dispatch callback when it returns a
+held receipt, then open the reply gate. The first check sees an active worker
+record. Complete the receipt with success or a drained error and use the
+client's `LocalTransferRecheck` to read the outcome for the same transfer
+and worker incarnation. This fixture is for tests only.
+
 ### TestSession
 
 Helper for testing distributed session protocols. Sets up the full session
