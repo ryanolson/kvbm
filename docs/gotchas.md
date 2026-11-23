@@ -76,6 +76,13 @@ physical drain, and even a proven drain can have a worker reply in transit.
 Test by presenting an empty scheduler output after proof, then delivering the
 finished-set entry. [Connector finish tests](../crates/kvbm-connector/src/connector/leader/tests/request_finish.rs)
 
+The scheduler can also consume a receive before the Velo sink returns.
+Acknowledge that receive by action ID before dropping the onboard handle.
+Test by holding the sink after it queues the receive, consuming the result,
+then finishing with and without an in-flight save. Without the acknowledgment,
+finish joins an entry the scheduler already consumed.
+[Consumed receive test](../crates/kvbm-connector/src/connector/leader/tests/request_finish.rs)
+
 ## Keep paused onboard blocks through connector teardown
 
 Keep the engine's pause registry alive while a worker can still touch its

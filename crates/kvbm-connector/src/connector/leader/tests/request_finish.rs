@@ -9,7 +9,9 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 use bytes::Bytes;
+use kvbm_common::LogicalLayoutHandle;
 use kvbm_engine::leader::InstanceLeader;
+use kvbm_engine::offload::{OffloadEngine, PipelineBuilder};
 use kvbm_engine::testing::{TestManagerBuilder, create_messenger_pair_tcp};
 use kvbm_engine::worker::VeloWorkerClient;
 use kvbm_engine::worker::group::SpmdParallelWorkers;
@@ -17,7 +19,7 @@ use kvbm_engine::worker::velo::LocalTransferCheckTiming;
 use kvbm_engine::{ConnectorEngineConfig, G2, build_local_connector_engine};
 use kvbm_logical::BlockRegistry;
 use kvbm_protocols::connector::{
-    EngineWorkerSink, FenceToken, LoadOutcome, RequestId, SaveOutcome,
+    EngineWorkerSink, FenceToken, LoadOutcome, RequestId, SaveOutcome, WorkerEngineDriver,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -30,15 +32,32 @@ use crate::connector::leader::sink::VeloWorkerSink;
 use crate::connector::worker::velo::register_completion_handlers;
 use crate::connector::worker::{FinishedRequests, WorkerCompletionState};
 
-use super::{BS, Leader, make_request};
+use super::{BS, Leader, make_request, sched_new};
 
 const REQUEST: &str = "abort-onboard";
 const DESTINATIONS: [usize; 2] = [10, 11];
 const WAIT: Duration = Duration::from_secs(3);
+const SINK_WAIT: Duration = Duration::from_secs(15);
 
 #[derive(Deserialize)]
 struct TransferId {
     transfer_id: Uuid,
+}
+
+#[derive(Deserialize)]
+struct TransferRequest {
+    transfer_id: Uuid,
+    src: LogicalLayoutHandle,
+}
+
+struct HeldSave {
+    started: oneshot::Receiver<()>,
+    reply: oneshot::Sender<TransferReply>,
+}
+
+enum TransferReply {
+    Completed,
+    Lost,
 }
 
 /// The wire-side copy is active until the test publishes proof. Dropping the
@@ -47,20 +66,28 @@ struct HeldOnboard {
     leader: Leader,
     completions: Arc<WorkerCompletionState>,
     copy: Arc<Mutex<Option<(Uuid, Value)>>>,
-    lose_reply: oneshot::Sender<()>,
+    reply: oneshot::Sender<TransferReply>,
     releases: Arc<AtomicUsize>,
+    driver: Arc<dyn WorkerEngineDriver>,
+    save: HeldSave,
     _server: Arc<Messenger>,
 }
 
 struct CountingSink {
     sink: Arc<VeloWorkerSink>,
     releases: Arc<AtomicUsize>,
+    hold_load_delivery: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
 }
 
 impl EngineWorkerSink for CountingSink {
     fn mark_load_finished(&self, request: &RequestId, outcome: LoadOutcome) {
         self.releases.fetch_add(1, Ordering::Relaxed);
         self.sink.mark_load_finished(request, outcome);
+        let gate = self.hold_load_delivery.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.recv_timeout(SINK_WAIT)
+                .expect("test releases the load sink callback");
+        }
     }
 
     fn mark_save_finished(&self, request: &RequestId, outcome: SaveOutcome) {
@@ -75,27 +102,47 @@ impl EngineWorkerSink for CountingSink {
 
 impl HeldOnboard {
     async fn start() -> Result<Self> {
+        Self::start_with_load_delivery(None, false).await
+    }
+
+    async fn start_with_load_delivery(
+        hold_load_delivery: Option<std::sync::mpsc::Receiver<()>>,
+        enable_offload: bool,
+    ) -> Result<Self> {
         let pair = create_messenger_pair_tcp().await?;
         let worker_id = pair.messenger_b.instance_id();
         let incarnation = Uuid::new_v4();
         let copy = Arc::new(Mutex::new(None));
         let (started, accepted) = oneshot::channel();
-        let (lose_reply, lost) = oneshot::channel();
-        let transfer = Arc::new(Mutex::new(Some((started, lost))));
+        let (reply, reply_result) = oneshot::channel();
+        let transfer = Arc::new(Mutex::new(Some((started, reply_result))));
+        let (save_started, save_accepted) = oneshot::channel();
+        let (save_reply, save_result) = oneshot::channel();
+        let save = Arc::new(Mutex::new(Some((save_started, save_result))));
         let active = copy.clone();
         pair.messenger_b.register_handler(
             Handler::unary_handler_async("kvbm.worker.local_transfer", move |ctx| {
                 let active = active.clone();
-                let transfer = transfer.lock().unwrap().take();
+                let transfer = transfer.clone();
+                let save = save.clone();
                 async move {
-                    let request: TransferId = serde_json::from_slice(&ctx.payload)?;
-                    let Some((started, lost)) = transfer else {
-                        bail!("only one transfer should reach this worker");
+                    let request: TransferRequest = serde_json::from_slice(&ctx.payload)?;
+                    let gate = match request.src {
+                        LogicalLayoutHandle::G1 => save.lock().unwrap().take(),
+                        LogicalLayoutHandle::G2 => {
+                            *active.lock().unwrap() = Some((request.transfer_id, json!("Active")));
+                            transfer.lock().unwrap().take()
+                        }
+                        _ => bail!("unexpected transfer source {:?}", request.src),
                     };
-                    *active.lock().unwrap() = Some((request.transfer_id, json!("Active")));
+                    let Some((started, reply_result)) = gate else {
+                        bail!("only one transfer per direction should reach this worker");
+                    };
                     let _ = started.send(());
-                    lost.await?;
-                    bail!("worker lost the reply for the active copy")
+                    match reply_result.await? {
+                        TransferReply::Completed => Ok(Some(Bytes::from_static(b"\"Completed\""))),
+                        TransferReply::Lost => bail!("worker lost the reply for the active copy"),
+                    }
                 }
             })
             .build(),
@@ -139,6 +186,7 @@ impl HeldOnboard {
         let sink = Arc::new(CountingSink {
             sink,
             releases: releases.clone(),
+            hold_load_delivery: Mutex::new(hold_load_delivery),
         });
         let client = VeloWorkerClient::new(pair.messenger_a.clone(), worker_id)
             .with_local_transfer_check(LocalTransferCheckTiming {
@@ -152,18 +200,30 @@ impl HeldOnboard {
         ));
         let manager = Arc::new(
             TestManagerBuilder::<G2>::new()
-                .block_count(2)
+                .block_count(if enable_offload { 5 } else { 2 })
                 .block_size(BS)
                 .build(),
         );
-        let instance = InstanceLeader::builder()
-            .messenger(pair.messenger_a)
-            .registry(BlockRegistry::new())
-            .g2_manager(manager.clone())
-            .parallel_worker(workers)
-            .build()?;
-        let (engine, _) = build_local_connector_engine(
-            Arc::new(instance),
+        let instance = Arc::new(
+            InstanceLeader::builder()
+                .messenger(pair.messenger_a)
+                .registry(BlockRegistry::new())
+                .g2_manager(manager.clone())
+                .parallel_worker(workers)
+                .build()?,
+        );
+        let offload = if enable_offload {
+            let pipeline = PipelineBuilder::new().batch_size(3).min_batch_size(3);
+            Some(Arc::new(
+                OffloadEngine::builder(instance.clone())
+                    .with_g1_to_g2_pipeline(pipeline.build())
+                    .build()?,
+            ))
+        } else {
+            None
+        };
+        let (engine, driver) = build_local_connector_engine(
+            instance,
             sink,
             ConnectorEngineConfig {
                 block_size: BS,
@@ -171,7 +231,7 @@ impl HeldOnboard {
                 resource_policies: Default::default(),
                 resource_component_bytes: Default::default(),
             },
-            None,
+            offload,
         );
         let leader = Leader::with_engine(engine, BS);
         leader.create_slot(make_request(REQUEST, (0..12).collect()))?;
@@ -199,8 +259,13 @@ impl HeldOnboard {
             leader,
             completions,
             copy,
-            lose_reply,
+            reply,
             releases,
+            driver,
+            save: HeldSave {
+                started: save_accepted,
+                reply: save_reply,
+            },
             _server: pair.messenger_b,
         })
     }
@@ -237,6 +302,10 @@ async fn prove(
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(11)).await;
     tokio::time::resume();
+    wait_for_finished(completions).await
+}
+
+async fn wait_for_finished(completions: &WorkerCompletionState) -> Result<FinishedRequests> {
     let mut finished = None;
     eventually(|| {
         let observed = completions.drain_finished();
@@ -261,11 +330,12 @@ async fn request_finished_paused_load_releases_once_after_proof(
         leader,
         completions,
         copy,
-        lose_reply,
+        reply,
         releases,
         _server,
+        ..
     } = HeldOnboard::start().await?;
-    assert!(lose_reply.send(()).is_ok());
+    assert!(reply.send(TransferReply::Lost).is_ok());
     eventually(|| {
         leader
             .state
@@ -366,9 +436,10 @@ async fn request_finished_preempted_load_without_offloads_releases_once(
         leader,
         completions,
         copy,
-        lose_reply,
+        reply,
         releases,
         _server,
+        ..
     } = HeldOnboard::start().await?;
     if holderless {
         // A find may have released the consumed lifecycle before preemption.
@@ -380,7 +451,7 @@ async fn request_finished_preempted_load_without_offloads_releases_once(
     assert_eq!(releases.load(Ordering::Relaxed), 0);
     leader.update_connector_output(HashSet::new(), HashSet::new())?;
     assert!(leader.has_slot(REQUEST));
-    assert!(lose_reply.send(()).is_ok());
+    assert!(reply.send(TransferReply::Lost).is_ok());
     eventually(|| {
         let state = leader.state.lock();
         let slot = state.get(REQUEST).unwrap();
@@ -396,6 +467,92 @@ async fn request_finished_preempted_load_without_offloads_releases_once(
     assert!(finished.onboarding.is_empty());
     assert_eq!(finished.offloading, HashSet::from([REQUEST.to_owned()]));
     leader.update_connector_output(finished.offloading, finished.onboarding)?;
+    assert!(!leader.has_slot(REQUEST));
+    assert_no_finished(&completions);
+    assert_eq!(releases.load(Ordering::Relaxed), 1);
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case(false)]
+#[case(true)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_finished_after_consuming_the_receive(#[case] save_pending: bool) -> Result<()> {
+    let (resume, gate) = std::sync::mpsc::channel();
+    let HeldOnboard {
+        leader,
+        completions,
+        reply,
+        driver,
+        save,
+        releases,
+        _server,
+        ..
+    } = HeldOnboard::start_with_load_delivery(Some(gate), save_pending).await?;
+    assert!(reply.send(TransferReply::Completed).is_ok());
+    let received = wait_for_finished(&completions).await?;
+    let request = HashSet::from([REQUEST.to_owned()]);
+    assert_eq!(received.onboarding, request);
+    assert!(received.offloading.is_empty());
+    leader.update_connector_output(received.offloading, received.onboarding)?;
+
+    // vLLM can schedule this request after consuming the receive, even when
+    // the engine's sink callback is still returning on another thread.
+    if save_pending {
+        let mut blocks = DESTINATIONS.to_vec();
+        blocks.push(12);
+        leader.build_connector_meta(sched_new(1, REQUEST, blocks, 2 * BS, BS))?;
+        assert_eq!(leader.state.lock().get(REQUEST).unwrap().offloads.len(), 1);
+        driver.finish_forward_pass(1);
+        tokio::time::timeout(WAIT, save.started).await??;
+    }
+    let finish = leader.request_finished(REQUEST);
+    resume.send(())?;
+    if !save_pending {
+        assert_eq!(finish, FinishedStatus::Finished);
+        assert!(!leader.has_slot(REQUEST));
+        assert_no_finished(&completions);
+        return Ok(());
+    }
+    assert_eq!(finish, FinishedStatus::Pending);
+    assert_no_finished(&completions);
+    assert!(leader.has_slot(REQUEST));
+
+    assert!(save.reply.send(TransferReply::Completed).is_ok());
+    let released = wait_for_finished(&completions)
+        .await
+        .expect("finish must arm the in-flight save after the load receive was consumed");
+    assert_eq!(released.offloading, request);
+    assert!(released.onboarding.is_empty());
+    leader.update_connector_output(released.offloading, released.onboarding)?;
+    assert!(!leader.has_slot(REQUEST));
+    assert_no_finished(&completions);
+    assert_eq!(releases.load(Ordering::Relaxed), 2);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_finished_before_consuming_the_receive_joins_it() -> Result<()> {
+    let (resume, gate) = std::sync::mpsc::channel();
+    let HeldOnboard {
+        leader,
+        completions,
+        reply,
+        releases,
+        _server,
+        ..
+    } = HeldOnboard::start_with_load_delivery(Some(gate), false).await?;
+    assert!(reply.send(TransferReply::Completed).is_ok());
+    let received = wait_for_finished(&completions).await?;
+    assert_eq!(received.onboarding, HashSet::from([REQUEST.to_owned()]));
+    assert!(received.offloading.is_empty());
+
+    // The engine-core loop handles an abort before updating from this frame.
+    assert_eq!(leader.request_finished(REQUEST), FinishedStatus::Pending);
+    assert!(leader.has_slot(REQUEST));
+    assert_no_finished(&completions);
+    leader.update_connector_output(received.offloading, received.onboarding)?;
+    resume.send(())?;
     assert!(!leader.has_slot(REQUEST));
     assert_no_finished(&completions);
     assert_eq!(releases.load(Ordering::Relaxed), 1);

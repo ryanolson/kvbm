@@ -201,7 +201,8 @@ pub trait LeaderEngine: Send + Sync + 'static {
     /// claimed but still waiting for delivery joins the request drain. The
     /// drain emits `finished_recving` with failed load IDs if there are any,
     /// or `finished_sending` otherwise. If delivery to the worker sink has
-    /// already started, the caller waits for that receive as the single release.
+    /// already started and the scheduler has not acknowledged it, the caller
+    /// waits for that receive as the single release.
     /// `false` means this finish decision has no release left to deliver to the
     /// worker sink. The sink may queue its transport notification before
     /// returning. The default reports no engine-owned release.
@@ -213,6 +214,14 @@ pub trait LeaderEngine: Send + Sync + 'static {
     fn begin_request_finish(&self, _req: &RequestId) -> bool {
         false
     }
+
+    /// Record that the scheduler consumed the receive for this onboard action.
+    ///
+    /// Call before dropping the visible onboard handle in response to its
+    /// finished receive. The sink can publish the receive before its callback
+    /// returns. Once acknowledged, the receive cannot serve as the release for
+    /// a later request finish. Duplicate, late, and unknown IDs are no-ops.
+    fn acknowledge_load_receive(&self, _action: &ActionId) {}
 
     /// ENGINE-INTERNAL completion source for `OnboardHandle`/`OffloadHandle`.
     /// In-process this is an in-process map read (DashMap-style); a future M3

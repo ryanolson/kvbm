@@ -473,6 +473,9 @@ async fn finish_after_receive(failed: bool) -> Result<()> {
     };
     assert_eq!(load.sink.loads(), received);
 
+    load.engine.acknowledge_load_receive(load.onboard.id());
+    load.engine.acknowledge_load_receive(load.onboard.id());
+    load.engine.acknowledge_load_receive(&ActionId::new());
     assert!(!load.engine.begin_request_finish(&load.request));
     assert!(load.engine.take_offload_drain(&load.request).is_none());
     assert_eq!(load.sink.loads(), received);

@@ -324,7 +324,7 @@ enum LoadTerminalState {
     Deferred(LoadOutcome),
     /// Physical proof is available. Request finish can still take ownership.
     Claimed(LoadOutcome),
-    /// The receive belongs to the sink call, which runs without engine locks.
+    /// The sink call is in progress and the scheduler has not acknowledged it.
     Delivering,
     /// Worker notification was emitted or deliberately suppressed by an
     /// eviction/request-drain barrier.
@@ -613,8 +613,8 @@ impl LocalConnectorEngine {
                 unreachable!();
             };
             // Finish may have armed the request drain after local proof was
-            // published. Otherwise keep the receive pending through the sink
-            // call so a concurrent finish joins it without a second signal.
+            // published. Otherwise finish can join the receive until the sink
+            // returns or the scheduler acknowledges it.
             if let Some(drain) = record.drain.take() {
                 record.kind = ActionKind::Load(LoadTerminalState::Settled);
                 (outcome, Some(drain), record.dropped_by_handle)
@@ -633,6 +633,20 @@ impl LocalConnectorEngine {
         }
         if remove_now {
             self.remove_action_record(&action_id);
+        }
+    }
+
+    pub(super) fn record_load_receive_consumed(&self, id: &ActionId) {
+        let Some(request) = self.actions.get(id).map(|record| record.request_id.clone()) else {
+            return;
+        };
+        // The lookup above releases its action guard before taking the request
+        // guard used by finish. IDs are unique even when a request ID is reused.
+        if let Some(_request_guard) = self.by_request.get_mut(&request)
+            && let Some(mut record) = self.actions.get_mut(id)
+            && matches!(record.kind, ActionKind::Load(LoadTerminalState::Delivering))
+        {
+            record.kind = ActionKind::Load(LoadTerminalState::Settled);
         }
     }
 

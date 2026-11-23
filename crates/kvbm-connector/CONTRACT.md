@@ -119,12 +119,23 @@ the failed G1 destination IDs if an armed load failed, or
 as that single release. The connector observes paused onboards on its
 scheduler callbacks and logs the request ID, worker, and pause transition.
 
-Delivery is ordered to the engine's worker sink callback. The Velo sink
-queues the wire message, which can reach the worker after that callback
-returns. The finish decision uses this sink boundary even if the scheduler
-has yet to receive the message. The late-join contract covers the current
-receive and its drain. Older physical work for a preempted request ID must
-have its own eviction fence to gate the worker's next forward pass.
+The Velo sink queues the wire message on another task. The scheduler may
+consume it before the sink returns, or it may still be in transit when the
+sink returns. vLLM's `_update_from_kv_xfer_finished` first calls
+`update_connector_output`, then records the receive. Only a subsequent
+`schedule` can take the request out of `WAITING_FOR_REMOTE_KVS`.
+[vLLM output handling](https://github.com/vllm-project/vllm/blob/43cddb6c3765c67318ff5c9e4e7c00be2b347764/vllm/v1/core/sched/scheduler.py#L1988-L1999)
+[vLLM scheduling gate](https://github.com/vllm-project/vllm/blob/43cddb6c3765c67318ff5c9e4e7c00be2b347764/vllm/v1/core/sched/scheduler.py#L544-L559)
+
+The connector acknowledges a consumed receive by its visible onboard action
+ID before dropping the handle. A later finish can then arm any remaining
+save or finish immediately if there is no work. An abort before consumption
+can still join a receive whose sink callback is in progress.
+
+When there is no scheduler acknowledgment, the finish decision uses the
+engine's worker sink callback boundary. The late-join contract covers the
+current receive and its drain. Older physical work for a preempted request ID
+must have its own eviction fence to gate the worker's next forward pass.
 
 ### Per-request ordering invariants vLLM guarantees
 

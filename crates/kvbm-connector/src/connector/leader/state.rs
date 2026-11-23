@@ -753,11 +753,12 @@ impl LeaderState {
         for req in &finished_recving {
             if !self.finishing.contains_key(req)
                 && let Some(slot) = self.slots.get_mut(req)
-                && slot
-                    .onboard
-                    .as_ref()
-                    .is_some_and(OnboardHandle::is_complete)
+                && let Some(onboard) = &slot.onboard
+                && onboard.is_complete()
             {
+                // Velo may publish the receive before the engine's sink call
+                // returns. A later finish must exclude this consumed receive.
+                self.engine.acknowledge_load_receive(onboard.id());
                 slot.onboard = None;
                 slot.proposal = None;
             }
