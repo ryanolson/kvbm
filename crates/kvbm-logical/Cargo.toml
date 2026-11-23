@@ -82,3 +82,13 @@ required-features = ["testing"]
 name = "register_blocks"
 harness = false
 required-features = ["testing"]
+
+# Tail-latency benchmark for store growth: the slowest register, allocate and
+# release chunk on a large manager, for a live-primary workload and an
+# inactive-pool workload. It has its own `main` (no criterion: criterion
+# reports means, and the defect is the tail). It does nothing unless `--bench`
+# is in its arguments.
+[[bench]]
+name = "store_growth"
+harness = false
+required-features = ["testing"]
