@@ -27,7 +27,7 @@ pub(super) mod tests;
 // #[cfg(test)]
 // mod integration_tests;
 
-pub use builder::PhysicalLayoutBuilder;
+pub use builder::{PhysicalLayoutBuilder, PinnedAllocator};
 pub use config::{BlockDimension, LayoutConfig};
 // Re-export `TensorDataType` (consumed by `LayoutConfig.dtype`) so downstream
 // crates can populate it without taking a direct `kvbm-kernels` dep.
