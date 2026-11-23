@@ -62,7 +62,8 @@
 //! are pinned, so they stay there; [`crate::numa::page_placement`] shows the
 //! kernel's current view. The driver checks `get_mempolicy` when it
 //! starts. If that call works but `mbind` is denied, `cuMemHostRegister`
-//! fails with `CUDA_ERROR_NOT_PERMITTED`, and the entry returns that error.
+//! fails with `CUDA_ERROR_NOT_PERMITTED`. The entry reports that status
+//! together with the bind refusal.
 //! When both are denied (as Docker's default seccomp profile does), the
 //! driver skips its own call and registration succeeds.
 //!
@@ -151,13 +152,12 @@ pub enum PlacementFallback {
     /// The device's node has no CPUs (a memory-only node), so no thread can
     /// first-touch the pages there.
     NodeHasNoCpus(NumaNode),
-    /// `mbind(MPOL_BIND)` to the node was refused, for example by a cpuset
-    /// or a seccomp profile. The pages stay on the same mapping and are
-    /// touched from the same thread; the OS places them.
+    /// `mbind(MPOL_BIND)` to the node was refused or the policy readback
+    /// contradicted it. The OS places the pages on the same mapping.
     BindRefused {
         /// The node the bind asked for.
         node: NumaNode,
-        /// The error `mbind` returned.
+        /// The bind error or the policy that contradicted the bind.
         error: String,
     },
     /// The rounded mapping exceeds the node's estimated usable memory.
@@ -450,11 +450,11 @@ impl actions::Memset for MmappedPinnedStorage {
 /// [`MmappedPinnedStorage::allocate`] uses strict binding without a budget
 /// check, including when `kvbm-service` uses it for pool slabs.
 ///
-/// A refused `mbind` is not an error: the same mapping is touched from the
-/// same pinned thread and the OS places it, recorded as
-/// [`PlacementFallback::BindRefused`]. Any other failure (`mmap`, CUDA
-/// context, `cuMemHostRegister`) fails the call. Logs one `info` line with
-/// the placement.
+/// After a refused bind, the OS places the pages on the same mapping. A
+/// successful registration records [`PlacementFallback::BindRefused`]. If
+/// `cuMemHostRegister_v2` also fails, [`StorageError::AllocationFailed`]
+/// gives both causes, the device ID and the mapped bytes. Other `mmap`, CUDA
+/// context and registration errors propagate. Success logs the placement.
 pub fn allocate_pinned_host(size: usize, device_id: u32) -> Result<MmappedPinnedStorage> {
     if size == 0 {
         return Err(StorageError::AllocationFailed(
@@ -476,10 +476,10 @@ pub fn allocate_pinned_host(size: usize, device_id: u32) -> Result<MmappedPinned
         PlacementDecision::Bind(node) => crate::numa::worker_pool::run_on_node_thread(
             node,
             format!("pinned-host-node-{}", node.0),
-            move |pinned| place_pinned_host(size, ctx, requested, decision, pinned),
+            move |pinned| place_pinned_host(size, device_id, ctx, requested, decision, pinned),
         )?,
         PlacementDecision::OsDefault(_) => {
-            place_pinned_host(size, ctx, requested, decision, Ok(()))?
+            place_pinned_host(size, device_id, ctx, requested, decision, Ok(()))?
         }
     };
 
@@ -499,27 +499,27 @@ pub fn allocate_pinned_host(size: usize, device_id: u32) -> Result<MmappedPinned
 /// Run [`map_place_register`] with the real steps on the calling thread.
 fn place_pinned_host(
     size: usize,
+    device_id: u32,
     ctx: Arc<CudaContext>,
     requested: Option<NumaNode>,
     decision: PlacementDecision,
     pinned: std::result::Result<(), String>,
 ) -> Result<MmappedPinnedStorage> {
+    ctx.bind_to_thread().map_err(StorageError::Cuda)?;
     let Placed {
         registered,
         mmap,
         placement,
     } = map_place_register(
         size,
+        device_id,
         requested,
         decision,
         pinned,
         read_node_meminfo,
         mbind_to_node,
         crate::numa::placement::read_page,
-        |ptr, len| {
-            ctx.bind_to_thread().map_err(StorageError::Cuda)?;
-            HostRegisterGuard::new(ptr, len, ctx.clone())
-        },
+        |ptr, len| HostRegisterGuard::new(ptr, len, ctx.clone()),
     )?;
     Ok(MmappedPinnedStorage {
         register_guard: registered,
@@ -565,11 +565,13 @@ pub(crate) struct Placed<T> {
 /// [`PlacementFallback::BindRefused`]. Each query's answer is kept on
 /// its own. A failed query is logged; `observed` is the first page's node if
 /// that query answered, and with no policy answer the bind's own result
-/// stands. A `register` error fails the call as is. Tests can inject failures
-/// through the step parameters.
+/// stands. A `register` error after a refused bind includes both causes.
+/// Other registration errors propagate. Tests can inject failures through
+/// the step parameters.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn map_place_register<T, R: Into<PageReading>>(
     size: usize,
+    device_id: u32,
     requested: Option<NumaNode>,
     decision: PlacementDecision,
     pinned: std::result::Result<(), String>,
@@ -672,7 +674,24 @@ pub(crate) fn map_place_register<T, R: Into<PageReading>>(
         _ => readings[0].node.as_ref().ok().copied(),
     };
 
-    let registered = register(mmap.ptr, mmap.len)?;
+    let registered = register(mmap.ptr, mmap.len).map_err(|registration_error| {
+        let Some(PlacementFallback::BindRefused { node, error }) = &fallback else {
+            return registration_error;
+        };
+
+        // The raw status is available even when a CUDA error-string lookup fails.
+        let registration_detail = match registration_error {
+            StorageError::Cuda(cuda_error) => {
+                format!("cuMemHostRegister_v2 returned {:?}", cuda_error.0)
+            }
+            other => other.to_string(),
+        };
+        StorageError::AllocationFailed(format!(
+            "CUDA registration failed for {} bytes on device {device_id}. {registration_detail}. \
+             NUMA bind to node {} was refused with {error}",
+            mmap.len, node.0,
+        ))
+    })?;
     Ok(Placed {
         registered,
         mmap,
@@ -1104,6 +1123,7 @@ mod tests {
             let bound = Cell::new(false);
             map_place_register(
                 size,
+                0,
                 Some(node),
                 PlacementDecision::Bind(node),
                 Ok(()),
@@ -1277,6 +1297,7 @@ Node 0 HugePages_Total:        0
         let page = system_page_size();
         let placed = map_place_register(
             1,
+            0,
             Some(node),
             PlacementDecision::Bind(node),
             Ok(()),
@@ -1308,6 +1329,7 @@ Node 0 HugePages_Total:        0
         let node = absent_node();
         let placed = map_place_register(
             1 << 16,
+            0,
             Some(node),
             PlacementDecision::Bind(node),
             Ok(()),
@@ -1346,6 +1368,7 @@ Node 0 HugePages_Total:        0
             .expect("a node with CPUs");
         let placed = map_place_register(
             1 << 16,
+            0,
             Some(node),
             PlacementDecision::Bind(node),
             Ok(()),
@@ -1432,6 +1455,7 @@ Node 0 HugePages_Total:        0
     fn a_bind_the_kernel_does_not_show_is_not_recorded_as_bound() {
         let placed = map_place_register(
             1 << 16,
+            0,
             Some(NumaNode(0)),
             PlacementDecision::Bind(NumaNode(0)),
             Ok(()),
@@ -1458,6 +1482,7 @@ Node 0 HugePages_Total:        0
         let mut first_reading = None;
         let placed = map_place_register(
             4 * page,
+            0,
             Some(node),
             PlacementDecision::Bind(node),
             Ok(()),
@@ -1493,6 +1518,7 @@ Node 0 HugePages_Total:        0
     fn a_failed_node_query_does_not_hide_a_policy_answer() {
         let placed = map_place_register(
             1 << 16,
+            0,
             Some(NumaNode(0)),
             PlacementDecision::Bind(NumaNode(0)),
             Ok(()),
@@ -1520,6 +1546,7 @@ Node 0 HugePages_Total:        0
     fn a_bind_without_a_policy_reading_is_not_reported_as_confirmed() {
         let placed = map_place_register(
             1 << 16,
+            0,
             Some(NumaNode(0)),
             PlacementDecision::Bind(NumaNode(0)),
             Ok(()),
@@ -1547,6 +1574,7 @@ Node 0 HugePages_Total:        0
         let mut calls = 0;
         let placed = map_place_register(
             1 << 16,
+            0,
             Some(NumaNode(0)),
             PlacementDecision::Bind(NumaNode(0)),
             Ok(()),
@@ -1581,6 +1609,7 @@ Node 0 HugePages_Total:        0
     fn a_failed_policy_query_does_not_hide_the_page_node() {
         let placed = map_place_register(
             1 << 16,
+            0,
             None,
             PlacementDecision::OsDefault(PlacementFallback::NodeUnknown),
             Ok(()),
@@ -1603,6 +1632,7 @@ Node 0 HugePages_Total:        0
     fn a_refused_bind_on_an_unpinned_thread_names_both_failures() {
         let placed = map_place_register(
             1 << 16,
+            0,
             Some(NumaNode(0)),
             PlacementDecision::Bind(NumaNode(0)),
             Err("Failed to set CPU affinity: Operation not permitted".into()),
@@ -1630,44 +1660,265 @@ Node 0 HugePages_Total:        0
         }
     }
 
-    /// A registration error comes back as is. It is not relabeled as a
-    /// placement fallback, and nothing is retried.
+    const TEST_CUDA_REGISTRATION_STATUS: cudarc::driver::sys::CUresult =
+        cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_PERMITTED;
+    const TEST_BIND_REFUSAL: &str = "mbind: Operation not permitted (os error 1)";
+
+    fn failed_cuda_registration() -> StorageError {
+        StorageError::Cuda(cudarc::driver::DriverError(TEST_CUDA_REGISTRATION_STATUS))
+    }
+
+    fn assert_combined_registration_error<T>(
+        result: Result<T>,
+        device_id: u32,
+        node: NumaNode,
+        mapped_bytes: usize,
+        refusal: &str,
+        registration_detail: &str,
+    ) {
+        let message = match result {
+            Err(StorageError::AllocationFailed(message)) => message,
+            Err(StorageError::Cuda(error)) => {
+                panic!(
+                    "expected the combined allocation error, got CUDA status {:?}",
+                    error.0
+                )
+            }
+            Err(_) => panic!("expected the combined allocation error, got another error variant"),
+            Ok(_) => panic!("expected the combined allocation error, got a region"),
+        };
+        assert!(
+            message.contains(&format!(
+                "CUDA registration failed for {mapped_bytes} bytes on device {device_id}"
+            )),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("NUMA bind to node {}", node.0)),
+            "{message}"
+        );
+        assert!(message.contains(refusal), "{message}");
+        assert!(message.contains(registration_detail), "{message}");
+    }
+
     #[test]
-    fn a_registration_error_is_not_a_placement_fallback() {
-        let binds = std::cell::Cell::new(0);
-        let registers = std::cell::Cell::new(0);
+    fn registration_after_refused_bind_reports_both_causes() {
+        let node = NumaNode(3);
+        let device_id = 7;
+        let page = system_page_size();
+        let mut registrations = 0;
         let result = map_place_register(
-            1 << 16,
-            Some(NumaNode(0)),
-            PlacementDecision::Bind(NumaNode(0)),
+            page + 1,
+            device_id,
+            Some(node),
+            PlacementDecision::Bind(node),
             Ok(()),
             ample_node_memory,
-            |_, _, _| {
-                binds.set(binds.get() + 1);
-                Ok(())
+            |_, _, _| Err(TEST_BIND_REFUSAL.into()),
+            |_| PageReading {
+                policy: Ok((MemPolicyMode::Default, vec![])),
+                node: Ok(NumaNode(0)),
             },
-            crate::numa::page_placement,
             |_, _| -> Result<()> {
-                registers.set(registers.get() + 1);
-                Err(StorageError::RegistrationFailed("injected".into()))
+                registrations += 1;
+                Err(failed_cuda_registration())
             },
         );
-        match result {
-            Err(StorageError::RegistrationFailed(msg)) => assert_eq!(msg, "injected"),
-            Err(other) => panic!("expected the injected error, got {other:?}"),
-            Ok(_) => panic!("expected the injected error, got Ok"),
+        assert_eq!(registrations, 1);
+        assert_combined_registration_error(
+            result,
+            device_id,
+            node,
+            2 * page,
+            TEST_BIND_REFUSAL,
+            "cuMemHostRegister_v2 returned CUDA_ERROR_NOT_PERMITTED",
+        );
+    }
+
+    #[test]
+    fn registration_after_refused_bind_keeps_non_cuda_error_detail() {
+        let node = NumaNode(0);
+        let device_id = 7;
+        let page = system_page_size();
+        let result = map_place_register(
+            page,
+            device_id,
+            Some(node),
+            PlacementDecision::Bind(node),
+            Ok(()),
+            ample_node_memory,
+            |_, _, _| Err(TEST_BIND_REFUSAL.into()),
+            |_| PageReading {
+                policy: Ok((MemPolicyMode::Default, vec![])),
+                node: Ok(node),
+            },
+            |_, _| -> Result<()> {
+                Err(StorageError::RegistrationFailed("injected failure".into()))
+            },
+        );
+
+        assert_combined_registration_error(
+            result,
+            device_id,
+            node,
+            page,
+            TEST_BIND_REFUSAL,
+            "registration failed: injected failure",
+        );
+    }
+
+    #[test]
+    fn registration_after_refused_bind_reports_policy_readback() {
+        let node = NumaNode(2);
+        let device_id = 5;
+        let page = system_page_size();
+        let mut registrations = 0;
+        let result = map_place_register(
+            page,
+            device_id,
+            Some(node),
+            PlacementDecision::Bind(node),
+            Ok(()),
+            ample_node_memory,
+            |_, _, _| Ok(()),
+            |_| PageReading {
+                policy: Ok((MemPolicyMode::Default, vec![])),
+                node: Ok(NumaNode(0)),
+            },
+            |_, _| -> Result<()> {
+                registrations += 1;
+                Err(failed_cuda_registration())
+            },
+        );
+        assert_eq!(registrations, 1);
+        assert_combined_registration_error(
+            result,
+            device_id,
+            node,
+            page,
+            "kernel reports Default on nodes []",
+            "cuMemHostRegister_v2 returned CUDA_ERROR_NOT_PERMITTED",
+        );
+    }
+
+    #[test]
+    fn registration_after_refused_bind_releases_earlier_regions() {
+        use std::cell::Cell;
+
+        struct Registration<'a>(&'a Cell<usize>);
+
+        impl Drop for Registration<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
         }
-        assert_eq!(binds.get(), 1);
-        assert_eq!(registers.get(), 1);
+
+        let node = NumaNode(3);
+        let device_id = 8;
+        let page = system_page_size();
+        let mut allocations = 0;
+        let mut registrations = 0;
+        let drops = Cell::new(0);
+        let result = allocate_regions_in_order(&[page, page + 1, 3 * page], |size| {
+            allocations += 1;
+            map_place_register(
+                size,
+                device_id,
+                Some(node),
+                PlacementDecision::Bind(node),
+                Ok(()),
+                ample_node_memory,
+                |_, _, _| Err(TEST_BIND_REFUSAL.into()),
+                |_| PageReading {
+                    policy: Ok((MemPolicyMode::Default, vec![])),
+                    node: Ok(NumaNode(0)),
+                },
+                |_, _| {
+                    registrations += 1;
+                    if size == page {
+                        Ok(Registration(&drops))
+                    } else {
+                        Err(failed_cuda_registration())
+                    }
+                },
+            )
+        });
+
+        assert_eq!(allocations, 2);
+        assert_eq!(registrations, 2);
+        assert_eq!(drops.get(), 1);
+        assert_combined_registration_error(
+            result,
+            device_id,
+            node,
+            2 * page,
+            TEST_BIND_REFUSAL,
+            "cuMemHostRegister_v2 returned CUDA_ERROR_NOT_PERMITTED",
+        );
+    }
+
+    #[test]
+    fn registration_after_refused_bind_leaves_plain_cuda_errors_unchanged() {
+        let node = NumaNode(0);
+        let mut registrations = 0;
+        let result = map_place_register(
+            1 << 16,
+            0,
+            Some(node),
+            PlacementDecision::Bind(node),
+            Ok(()),
+            ample_node_memory,
+            |_, _, _| Ok(()),
+            |_| PageReading {
+                policy: Ok((MemPolicyMode::Bind, vec![node])),
+                node: Ok(node),
+            },
+            |_, _| -> Result<()> {
+                registrations += 1;
+                Err(failed_cuda_registration())
+            },
+        );
+        assert_eq!(registrations, 1);
+        match result {
+            Err(StorageError::Cuda(error)) => assert_eq!(error.0, TEST_CUDA_REGISTRATION_STATUS),
+            Err(_) => panic!("expected the CUDA error, got another error variant"),
+            Ok(_) => panic!("expected the CUDA error, got a region"),
+        }
+    }
+
+    #[test]
+    fn registration_after_unavailable_budget_keeps_plain_cuda_error() {
+        let node = NumaNode(0);
+        let result = map_place_register(
+            system_page_size(),
+            0,
+            Some(node),
+            PlacementDecision::Bind(node),
+            Ok(()),
+            |_| Err("read node meminfo: permission denied".into()),
+            |_, _, _| panic!("no bind without a memory budget"),
+            |_| PageReading {
+                policy: Ok((MemPolicyMode::Default, vec![])),
+                node: Ok(node),
+            },
+            |_, _| -> Result<()> { Err(failed_cuda_registration()) },
+        );
+
+        match result {
+            Err(StorageError::Cuda(error)) => assert_eq!(error.0, TEST_CUDA_REGISTRATION_STATUS),
+            Err(_) => panic!("expected the CUDA error, got another error variant"),
+            Ok(_) => panic!("expected the CUDA error, got a region"),
+        }
     }
 
     /// A denied bind and a denied `get_mempolicy` (as Docker's default
     /// seccomp profile can do) still register the mapping.
     #[test]
-    fn a_denied_bind_and_denied_query_still_register() {
+    fn registration_after_refused_bind_can_still_succeed() {
         let registered = std::cell::Cell::new(false);
         let placed = map_place_register(
             1 << 16,
+            0,
             Some(NumaNode(0)),
             PlacementDecision::Bind(NumaNode(0)),
             Ok(()),
@@ -1703,6 +1954,7 @@ Node 0 HugePages_Total:        0
     fn an_os_default_decision_skips_the_bind() {
         let placed = map_place_register(
             1 << 16,
+            0,
             None,
             PlacementDecision::OsDefault(PlacementFallback::NodeUnknown),
             Ok(()),
