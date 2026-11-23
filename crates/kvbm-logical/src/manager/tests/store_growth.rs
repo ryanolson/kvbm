@@ -125,6 +125,15 @@ fn lineage_inactive_churn() {
     let mut growths = 0;
     let mut rehashes = 0;
     let mut next_token = 0;
+    let mut observe = |before: usize, after: usize, inserts: usize| {
+        if after > peak_capacity {
+            growths += 1;
+            peak_capacity = after;
+        } else if after.saturating_sub(before) > inserts {
+            // Each insert may reclaim one tombstone. A larger jump is a rebuild.
+            rehashes += 1;
+        }
+    };
 
     let fill_batches = LIVE / CHUNK;
     for batch in 0..fill_batches + TURNOUTS {
@@ -135,19 +144,15 @@ fn lineage_inactive_churn() {
         assert_eq!(evicted.len(), expected);
         evictions += evicted.len();
 
+        let (_, before_registration, ..) = store.lineage_storage().unwrap();
         let held = register_fresh(&manager, mutables, &mut next_token);
         peak_live = peak_live.max(store.active_by_hash_len());
         let (_, mut before, ..) = store.lineage_storage().unwrap();
+        observe(before_registration, before, CHUNK);
         for guard in held {
             drop(guard);
             let (_, after, ..) = store.lineage_storage().unwrap();
-            if after > peak_capacity {
-                growths += 1;
-                peak_capacity = after;
-            } else if after.saturating_sub(before) > 1 {
-                // A single insert can reclaim at most one tombstone.
-                rehashes += 1;
-            }
+            observe(before, after, 1);
             before = after;
         }
 

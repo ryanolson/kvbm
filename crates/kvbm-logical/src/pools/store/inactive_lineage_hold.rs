@@ -178,6 +178,7 @@ impl<T: BlockMetadata> BlockStore<T> {
         inner.slots[victim_id].state = SlotState::Reset;
         inner.reset_on_release[victim_id] = self.default_reset_on_release;
         super::push_reset_id_locked(&mut inner, victim_id);
+        inner.forget_lineage_if_unowned(victim_hash);
 
         self.metrics
             .inc_inactive_pool_size_by(restored.restored_count as i64);
@@ -214,9 +215,7 @@ fn current_inactive_lineage<T: BlockMetadata>(
                 && slot.inactive_epoch == candidate.inactive_epoch => {}
         _ => return None,
     }
-    let source_blocks = inner
-        .inactive
-        .complete_lineage(candidate.seq_hash, candidate.block_id)?;
+    let source_blocks = inner.verified_lineage(candidate.seq_hash, candidate.block_id)?;
     if source_blocks
         .iter()
         .any(|(seq_hash, _)| inner.held_by_hash.contains_key(seq_hash))

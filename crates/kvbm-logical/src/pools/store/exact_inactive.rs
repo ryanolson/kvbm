@@ -43,8 +43,7 @@ impl<T: BlockMetadata> BlockStore<T> {
         }
 
         if inner
-            .inactive
-            .complete_lineage(candidate.seq_hash, candidate.block_id)
+            .verified_lineage(candidate.seq_hash, candidate.block_id)
             .is_none()
         {
             return Err(ExactReclaimNameError::NotCompleteInactiveEntry);

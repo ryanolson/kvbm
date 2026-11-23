@@ -70,9 +70,18 @@ impl<T: BlockMetadata + Sync> MutableBlock<T> {
     /// On size mismatch returns `Err(`[`BlockError::BlockSizeMismatch`]`)`
     /// containing this `MutableBlock` so the caller can recover it.
     pub fn stage(
+        self,
+        seq_hash: SequenceHash,
+        block_size: usize,
+    ) -> Result<CompleteBlock<T>, BlockError<MutableBlock<T>>> {
+        self.stage_with_parent(seq_hash, block_size, None)
+    }
+
+    pub(crate) fn stage_with_parent(
         mut self,
         seq_hash: SequenceHash,
         block_size: usize,
+        parent_hash: Option<u64>,
     ) -> Result<CompleteBlock<T>, BlockError<MutableBlock<T>>> {
         if block_size != self.block_size {
             return Err(BlockError::BlockSizeMismatch {
@@ -81,7 +90,8 @@ impl<T: BlockMetadata + Sync> MutableBlock<T> {
                 block: self,
             });
         }
-        self.store.transition_to_staged(self.block_id, seq_hash);
+        self.store
+            .transition_to_staged(self.block_id, seq_hash, parent_hash);
         let id = self.block_id;
         let bsize = self.block_size;
         let store = self.store.clone();
@@ -97,16 +107,19 @@ impl<T: BlockMetadata + Sync> MutableBlock<T> {
         self,
         token_block: &TokenBlock,
     ) -> Result<CompleteBlock<T>, BlockError<MutableBlock<T>>> {
-        let actual = token_block.block_size();
-        if actual != self.block_size {
+        let block_size = token_block.block_size();
+        if block_size != self.block_size {
             return Err(BlockError::BlockSizeMismatch {
                 expected: self.block_size,
-                actual,
+                actual: block_size,
                 block: self,
             });
         }
-        let seq_hash = token_block.kvbm_sequence_hash();
-        self.stage(seq_hash, actual)
+        self.stage_with_parent(
+            token_block.kvbm_sequence_hash(),
+            block_size,
+            token_block.parent_sequence_hash(),
+        )
     }
 }
 

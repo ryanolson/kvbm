@@ -28,6 +28,7 @@
 //! `BlockStore.inner` (Mutex). Never the reverse.
 
 use std::collections::{BTreeSet, HashSet};
+use std::num::NonZeroU64;
 use std::sync::{Arc, Weak};
 
 // Under `#[cfg(test)]` use `tracing-mutex`'s parking_lot wrapper, which
@@ -66,9 +67,49 @@ pub(crate) use exact_reclaim::ExactReclaimPlanError;
 pub(crate) use inactive_lineage_hold::StoreInactiveLineageHold;
 pub use rebind::{RebindOutcome, RebindPlan, RebindPrepareError};
 
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct LineageAudit {
+    pub(crate) nodes: usize,
+    pub(crate) ghosts: usize,
+    pub(crate) waiting_keys: usize,
+    pub(crate) list_steps: usize,
+    pub(crate) child_writes: usize,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct PresencePause(Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>);
+
+#[cfg(test)]
+impl PresencePause {
+    fn arm(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (arrived, arrival) = std::sync::mpsc::channel();
+        let (resume, resumed) = std::sync::mpsc::channel();
+        assert!(self.0.lock().replace((arrived, resumed)).is_none());
+        (arrival, resume)
+    }
+
+    fn wait_if_armed(&self) {
+        let pause = self.0.lock().take();
+        if let Some((arrived, resumed)) = pause {
+            arrived.send(()).unwrap();
+            resumed
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("test resumes the marker update");
+        }
+    }
+}
+
 /// Index trait for inactive-pool eviction backends. T-free: backends only
 /// need `(SequenceHash, BlockId)` pairs.
 pub(crate) trait InactiveIndex: Send + Sync {
+    /// A fresh primary owns this hash until it resets or enters the pool.
+    fn live_added(&mut self, _hash: SequenceHash) {}
+
+    /// The store no longer holds a primary or hold for this hash.
+    fn forget_live(&mut self, _hash: SequenceHash) {}
+
     /// Increase a bounded backend's limit before new blocks enter the pool.
     fn grow_capacity(&mut self, _capacity: usize) {}
 
@@ -76,6 +117,17 @@ pub(crate) trait InactiveIndex: Send + Sync {
     /// capacity, and minimum leaf policy capacity.
     #[cfg(test)]
     fn lineage_storage(&self) -> Option<(usize, usize, usize, usize, usize)> {
+        None
+    }
+
+    #[cfg(test)]
+    fn audit_lineage(
+        &self,
+        _live_keys: &HashSet<(u64, u64)>,
+        _inactive: &HashSet<(SequenceHash, BlockId)>,
+        _registered: usize,
+        _collisions: bool,
+    ) -> Option<LineageAudit> {
         None
     }
 
@@ -475,6 +527,56 @@ pub(crate) struct BlockStoreInner<T: BlockMetadata> {
     /// visibility comes from the mutex's release-acquire semantics —
     /// no atomic-ordering subtleties.
     reset_on_release: Vec<bool>,
+    /// Full parent hash from the token block, when available.
+    parent_hashes: Vec<Option<NonZeroU64>>,
+}
+
+impl<T: BlockMetadata> BlockStoreInner<T> {
+    fn forget_lineage_if_unowned(&mut self, hash: SequenceHash) {
+        if !self.active_by_hash.contains_key(&hash) && !self.held_by_hash.contains_key(&hash) {
+            self.inactive.forget_live(hash);
+        }
+    }
+
+    fn inherit_parent_hash(&mut self, incoming: BlockId, retained: BlockId) {
+        self.parent_hashes[retained] =
+            self.parent_hashes[retained].or(self.parent_hashes[incoming]);
+    }
+
+    fn verified_lineage(
+        &self,
+        hash: SequenceHash,
+        block_id: BlockId,
+    ) -> Option<Vec<(SequenceHash, BlockId)>> {
+        let blocks = self.inactive.complete_lineage(hash, block_id)?;
+        for pair in blocks.windows(2) {
+            let [(parent, _), (child, child_id)] = pair else {
+                unreachable!("a lineage edge has two blocks");
+            };
+            if !lineage_link_matches(*parent, *child, self.parent_hashes[*child_id]) {
+                return None;
+            }
+        }
+        Some(blocks)
+    }
+}
+
+fn lineage_link_matches(
+    parent: SequenceHash,
+    child: SequenceHash,
+    record: Option<NonZeroU64>,
+) -> bool {
+    if child.position() != parent.position() + 1 {
+        return false;
+    }
+    let fragment = child.parent_hash_fragment();
+    match record {
+        // A recorded 1 has fragment 1. Only a recorded zero uses
+        // the stored value 1 with fragment 0.
+        Some(record) if record.get() == 1 && fragment == 0 => parent.current_sequence_hash() == 0,
+        Some(record) => parent.current_sequence_hash() == record.get(),
+        None => parent.parent_fragment_for_child_position(child.position()) == fragment,
+    }
 }
 
 /// Single-mutex bookkeeping store for the reset, active, and inactive
@@ -524,6 +626,10 @@ pub(crate) struct BlockStore<T: BlockMetadata> {
     /// scheduler-dependent sleeps in deterministic race tests.
     #[cfg(test)]
     release_primary_arrivals: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    before_mark_present: PresencePause,
+    #[cfg(test)]
+    before_mark_absent: PresencePause,
 }
 
 /// Options for [`BlockStore::release_blocks`].
@@ -622,6 +728,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
             active_by_hash,
             held_by_hash: SeqHashMap::default(),
             reset_on_release,
+            parent_hashes: vec![None; total_blocks],
         };
         Arc::new(Self {
             id: crate::ManagerId::next(),
@@ -635,6 +742,10 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
             release_primary_gate: Mutex::new(()),
             #[cfg(test)]
             release_primary_arrivals: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            before_mark_present: PresencePause::default(),
+            #[cfg(test)]
+            before_mark_absent: PresencePause::default(),
         })
     }
 
@@ -705,6 +816,18 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    #[cfg(test)]
+    pub(crate) fn pause_presence_marker(
+        &self,
+        present: bool,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        if present {
+            self.before_mark_present.arm()
+        } else {
+            self.before_mark_absent.arm()
+        }
+    }
+
     pub(crate) fn block_size(&self) -> usize {
         self.block_size
     }
@@ -770,6 +893,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
             inner
                 .reset_on_release
                 .resize(capacity, self.default_reset_on_release);
+            inner.parent_hashes.resize(capacity, None);
             inner.inactive.grow_capacity(capacity);
         }
         inner.capacity = capacity;
@@ -850,6 +974,47 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
     #[cfg(test)]
     pub(crate) fn lineage_storage(&self) -> Option<(usize, usize, usize, usize, usize)> {
         self.inner.lock().inactive.lineage_storage()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_lineage_link(
+        &self,
+        parent: SequenceHash,
+        child: SequenceHash,
+        child_id: BlockId,
+    ) -> bool {
+        lineage_link_matches(parent, child, self.inner.lock().parent_hashes[child_id])
+    }
+
+    #[cfg(test)]
+    pub(crate) fn audit_lineage(&self, collisions: bool) -> LineageAudit {
+        let inner = self.inner.lock();
+        let mut live_keys = HashSet::new();
+        let mut inactive = HashSet::new();
+        let mut registered = 0;
+        for (id, slot) in inner.slots.iter().enumerate() {
+            // A duplicate keeps its primary alive, and that primary contributes the key.
+            match slot.state {
+                SlotState::Primary { seq_hash, .. } | SlotState::Held { seq_hash, .. } => {
+                    let position = seq_hash.position();
+                    live_keys.insert((
+                        position,
+                        seq_hash.parent_fragment_for_child_position(position + 1),
+                    ));
+                    registered += 1;
+                }
+                SlotState::Inactive { seq_hash, .. } => {
+                    inactive.insert((seq_hash, id));
+                    registered += 1;
+                }
+                _ => {}
+            }
+        }
+        assert!(registered <= inner.capacity);
+        inner
+            .inactive
+            .audit_lineage(&live_keys, &inactive, registered, collisions)
+            .expect("lineage backend")
     }
 
     /// Test-only: the live-primary index's reported capacity, in entries.
@@ -1391,6 +1556,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
                 block_id,
                 "register_completed_block: collision with same block_id {block_id}"
             );
+            inner.inherit_parent_hash(block_id, existing_primary.block_id());
             match policy {
                 BlockDuplicationPolicy::Allow => {
                     debug_assert!(matches!(
@@ -1435,6 +1601,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
                 inner: Arc::downgrade(&inner_arc),
             };
             inner.active_by_hash.insert(seq_hash, block_id);
+            inner.inactive.live_added(seq_hash);
             presence_added = true;
             inner_arc
         };
@@ -1446,6 +1613,8 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         // already been released. Skip on Reject — no new presence-bearing
         // slot was created.
         if presence_added {
+            #[cfg(test)]
+            self.before_mark_present.wait_if_armed();
             handle.mark_present::<T>(self.presence_lane());
         }
 
@@ -1538,6 +1707,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
                         block_id,
                         "register_blocks: collision with same block_id {block_id}"
                     );
+                    inner.inherit_parent_hash(block_id, existing_primary.block_id());
                     match policy {
                         BlockDuplicationPolicy::Allow => {
                             debug_assert!(matches!(
@@ -1583,6 +1753,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
                         inner: Arc::downgrade(&inner_arc),
                     };
                     inner.active_by_hash.insert(seq_hash, block_id);
+                    inner.inactive.live_added(seq_hash);
                     present_handles.push(handle.clone());
                     inner_arc
                 };
@@ -1774,10 +1945,17 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
     }
 
     /// `Mutable` → `Staged` (MutableBlock::stage / ::complete).
-    pub(crate) fn transition_to_staged(&self, block_id: BlockId, seq_hash: SequenceHash) {
+    pub(crate) fn transition_to_staged(
+        &self,
+        block_id: BlockId,
+        seq_hash: SequenceHash,
+        parent_hash: Option<u64>,
+    ) {
         let mut inner = self.inner.lock();
         debug_assert!(matches!(inner.slots[block_id].state, SlotState::Mutable));
         inner.slots[block_id].state = SlotState::Staged { seq_hash };
+        inner.parent_hashes[block_id] =
+            parent_hash.map(|hash| NonZeroU64::new(hash).unwrap_or(NonZeroU64::MIN));
         self.metrics.dec_inflight_mutable();
         self.metrics.inc_stagings();
     }
@@ -1864,6 +2042,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
                 // duplicates have a different `block_id` under the same
                 // hash and must never clear it.
                 inner.active_by_hash.remove(&seq_hash);
+                inner.forget_lineage_if_unowned(seq_hash);
                 tracing::trace!(?seq_hash, block_id, "Primary released to reset pool");
                 Some(handle)
             } else {
@@ -1881,6 +2060,8 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         // (attachments → store) is satisfied because the store lock has
         // already been released. Matches the `release_duplicate` pattern.
         if let Some(handle) = handle_to_mark_absent {
+            #[cfg(test)]
+            self.before_mark_absent.wait_if_armed();
             handle.mark_absent::<T>(self.presence_lane());
         }
     }
@@ -2163,6 +2344,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
                     self.reset_slot_locked(inner, block_id);
                     // Only the primary owns the `active_by_hash` mapping.
                     inner.active_by_hash.remove(&seq_hash);
+                    inner.forget_lineage_if_unowned(seq_hash);
                     pending_mark_absent.push(handle);
                     report.primary_reset += 1;
                 } else {

@@ -14,6 +14,7 @@ mod exact_inactive_allocation;
 mod exact_reclaim_allocation;
 mod exact_reclaim_by_hash;
 mod inactive_lineage_hold;
+mod lineage_ghosts;
 mod opaque_exact_reclaim;
 mod rebind;
 mod registered_presence;
