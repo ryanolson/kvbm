@@ -14,6 +14,7 @@ pub(crate) enum Point {
     PlannerBatch,
     BeforeGraphLaunch,
     VectorizedAlloc,
+    HostCopy,
 }
 
 thread_local! {
@@ -44,6 +45,9 @@ pub(super) fn check(point: Point) -> anyhow::Result<()> {
     {
         if count == 1 {
             FAULT.set(None);
+            if target == Point::HostCopy {
+                anyhow::bail!("injected host dispatch failure");
+            }
             anyhow::bail!("injected CUDA dispatch failure");
         }
         FAULT.set(Some((target, count - 1)));

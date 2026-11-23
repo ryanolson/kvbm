@@ -6,7 +6,7 @@
 use crate::BlockId;
 use crate::transfer::PhysicalLayout;
 use crate::transfer::TransferContext;
-use crate::transfer::context::TransferCompleteNotification;
+use crate::transfer::context::{TransferCompleteNotification, TransferDrainOutcome};
 use crate::transfer::{can_use_whole_block_transfer, validate_layout_compatibility};
 use anyhow::Result;
 use std::ops::Range;
@@ -15,6 +15,9 @@ use std::ops::Range;
 ///
 /// This executor handles transfers between System and Pinned memory using
 /// standard CPU memcpy operations. The transfer is synchronous and blocking.
+///
+/// A dispatch error means no bytes were copied. A later error returns a
+/// receipt with a proven drain because all completed copies ran synchronously.
 ///
 /// For FC→FC transfers with compatible layouts and full-block transfers,
 /// this uses an optimized whole-block copy path (single memcpy per block).
@@ -68,14 +71,14 @@ pub fn execute_memcpy_transfer(
 
     let layers = layer_range.clone().unwrap_or(0..src_layout.num_layers());
 
-    // Try whole-block path for FC→FC transfers with compatible layouts
-    if can_use_whole_block_transfer(src, dst, layer_range.as_ref()) {
+    let mut copied = false;
+    let result = if can_use_whole_block_transfer(src, dst, layer_range.as_ref()) {
         tracing::debug!(
             num_blocks = src_block_ids.len(),
             bytes_per_block = src_layout.bytes_per_block(),
             "Using whole-block memcpy path"
         );
-        execute_whole_block_memcpy(src, dst, src_block_ids, dst_block_ids)?;
+        execute_whole_block_memcpy(src, dst, src_block_ids, dst_block_ids, &mut copied)
     } else {
         tracing::debug!(
             num_blocks = src_block_ids.len(),
@@ -84,11 +87,16 @@ pub fn execute_memcpy_transfer(
             dst_fc = dst_layout.is_fully_contiguous(),
             "Using layer-wise memcpy path"
         );
-        execute_layer_wise_memcpy(src, dst, src_block_ids, dst_block_ids, layers)?;
-    }
+        execute_layer_wise_memcpy(src, dst, src_block_ids, dst_block_ids, layers, &mut copied)
+    };
 
-    // Memcpy is synchronous, so return already-completed notification
-    Ok(TransferCompleteNotification::completed())
+    match result {
+        Ok(()) => Ok(TransferCompleteNotification::completed()),
+        Err(error) if copied => Ok(TransferCompleteNotification::from_drain_future(
+            std::future::ready(TransferDrainOutcome::DrainedWithError(error)),
+        )),
+        Err(error) => Err(error),
+    }
 }
 
 /// Whole-block memcpy for FC→FC with compatible layouts.
@@ -100,6 +108,7 @@ fn execute_whole_block_memcpy(
     dst: &PhysicalLayout,
     src_block_ids: &[BlockId],
     dst_block_ids: &[BlockId],
+    copied: &mut bool,
 ) -> Result<()> {
     let bytes_per_block = src.layout().bytes_per_block();
 
@@ -115,6 +124,7 @@ fn execute_whole_block_memcpy(
                 bytes_per_block,
             );
         }
+        *copied |= bytes_per_block != 0;
     }
     Ok(())
 }
@@ -129,6 +139,7 @@ fn execute_layer_wise_memcpy(
     src_block_ids: &[BlockId],
     dst_block_ids: &[BlockId],
     layers: Range<usize>,
+    copied: &mut bool,
 ) -> Result<()> {
     let src_layout = src.layout();
 
@@ -153,11 +164,14 @@ fn execute_layer_wise_memcpy(
                 }
 
                 // Perform memcpy
+                #[cfg(all(test, feature = "testing-kvbm"))]
+                super::dispatch_fault::check(super::dispatch_fault::Point::HostCopy)?;
                 unsafe {
                     let src_ptr = src_region.addr() as *const u8;
                     let dst_ptr = dst_region.addr() as *mut u8;
                     std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, src_region.size());
                 }
+                *copied |= src_region.size() != 0;
             }
         }
     }
