@@ -44,6 +44,8 @@ CUDA is required (`KVBM_REQUIRE_CUDA=1`); the build links NIXL, so set an
 `LD_LIBRARY_PATH` that includes the NIXL install (`/opt/nvidia/nvda_nixl/lib/<arch>`)
 and `/usr/local/cuda/lib64` at runtime.
 
+See [Coding gotchas](docs/gotchas.md) for concurrency rules and the tests that check them.
+
 ## License
 
 Apache-2.0. See [`LICENSE`](LICENSE).

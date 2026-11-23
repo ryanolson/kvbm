@@ -67,6 +67,9 @@
 //!   the record was evicted), a different incarnation, or no bound
 //!   incarnation. A reconnect, a restart or a replacement worker proves
 //!   nothing, because kvbm has no signal that the original copy stopped.
+//!   After an ambiguous RPC error, a fresh handler list may show that the
+//!   worker answered but lacks the check handler. The list uses the same
+//!   deadline and cannot prove drain.
 //! - **The re-check capability.** An `Unproven` outcome from this path
 //!   carries a [`LocalTransferRecheck`] as error context: the instance, the
 //!   worker id, the bound incarnation and the transfer id.
@@ -105,6 +108,7 @@ mod lost_reply_tests;
 mod service;
 mod unresolved;
 
+pub(crate) use check::CheckEvidence;
 pub use check::{
     DEFAULT_LOCAL_TRANSFER_CHECK_DEADLINE, DEFAULT_LOCAL_TRANSFER_CHECK_WAIT,
     LocalTransferCheckTiming, LocalTransferRecheck,

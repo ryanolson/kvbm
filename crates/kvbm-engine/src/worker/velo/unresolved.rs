@@ -451,7 +451,13 @@ mod tests {
             vec![second.clone()]
         );
 
-        assert!(transfer.apply(&second, second.unproven("still unknown")));
+        assert!(transfer.apply(
+            &second,
+            second.unproven(
+                super::super::check::CheckEvidence::default(),
+                "still unknown"
+            )
+        ));
         assert_eq!(
             transfer.rechecks().cloned().collect::<Vec<_>>(),
             vec![second.clone()]
@@ -554,7 +560,13 @@ mod tests {
         let original = capability(1);
         let mut transfer = UnresolvedTransfer::from_unproven(unproven_on(&original));
 
-        assert!(transfer.apply(&original, original.unproven("still unknown")));
+        assert!(transfer.apply(
+            &original,
+            original.unproven(
+                super::super::check::CheckEvidence::default(),
+                "still unknown"
+            )
+        ));
 
         let text = format!("{:#}", transfer.participants()[0].error());
         assert_eq!(text, format!("{original}: still unknown"));

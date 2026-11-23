@@ -204,6 +204,7 @@ pub(crate) struct LocalConnectorEngine {
     pub(super) searches: DashMap<SearchId, SearchState>,
     pub(super) bundle_searches: DashMap<SearchId, BundleSearchState>,
     pub(super) actions: DashMap<ActionId, ActionRecord>,
+    pub(super) paused_onboards: super::paused::PausedOnboards,
     /// `request_id → in-flight onboard/offload action ids` (read by `evict`).
     pub(super) by_request: DashMap<RequestId, Vec<ActionId>>,
     /// The offload-submission seam (real: [`super::offload::OffloadEngineSubmit`];
@@ -505,6 +506,8 @@ impl LocalConnectorEngine {
         let inflight_gauge = leader
             .observability()
             .map(|o| o.compat_metrics().inflight_onboard_hashes.clone());
+        let paused_onboards =
+            super::paused::PausedOnboards::new(leader.observability().map(|o| o.registry()));
         Arc::new_cyclic(|weak| {
             let bundle_eviction_observers = leader
                 .g2_managers()
@@ -530,6 +533,7 @@ impl LocalConnectorEngine {
                 searches: DashMap::new(),
                 bundle_searches: DashMap::new(),
                 actions: DashMap::new(),
+                paused_onboards,
                 by_request: DashMap::new(),
                 offload_submit,
                 offload_buffer: Mutex::new(Vec::new()),
@@ -2242,6 +2246,9 @@ mod tests {
 
     #[path = "onboard_drain.rs"]
     mod onboard_drain;
+
+    #[path = "onboard_pause.rs"]
+    mod onboard_pause;
 
     fn connector_config(block_size: usize, remote: RemoteOps) -> ConnectorEngineConfig {
         ConnectorEngineConfig {
