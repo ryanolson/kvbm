@@ -265,6 +265,12 @@ mod tests {
     }
 
     #[test]
+    fn test_host_cache_deserializes_without_allocator() {
+        let config: HostCacheConfig = serde_json::from_str(r#"{"num_blocks": 4}"#).unwrap();
+        assert_eq!(config.allocator, HostAllocator::CuMemHostAlloc);
+    }
+
+    #[test]
     fn test_host_cache_only_num_blocks() {
         let config = HostCacheConfig {
             num_blocks: Some(1000),

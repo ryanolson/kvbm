@@ -142,6 +142,7 @@ fn check_g2_policy(
     // The live policy distinguishes the allocators. CUDA can rewrite it
     // during registration, so this cannot verify the earlier bind.
     if registered_mmap {
+        // Allow mbind and leave DYN_MEMORY_DISABLE_NUMA unset. A default policy fails by design.
         let node = get_device_numa_node(DEVICE_ID).context("test GPU has no known NUMA node")?;
         assert!(
             matches!(
