@@ -42,6 +42,8 @@ mod offload;
 mod onboard;
 mod prefill;
 mod prefill_validation;
+#[cfg(test)]
+mod test_support;
 mod worker;
 
 pub use config::{ConnectorEngineConfig, PulledBundleReadyObserver, RemoteOps};

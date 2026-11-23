@@ -1466,6 +1466,8 @@ impl LocalConnectorEngine {
             onboarding.release_all(&this.leader);
             // Write terminal into the cell + notify with no engine lock held.
             this.finish_load_action(action_id, &request_id, outcome, dest_ids);
+            #[cfg(test)]
+            super::test_support::note_onboard_driver_finished(action_id);
         });
 
         // The handle owns the strong cell and a `Weak` back-ref; its RAII drop
@@ -2237,6 +2239,9 @@ mod tests {
 
     #[path = "accepted_onboard.rs"]
     mod accepted_onboard;
+
+    #[path = "onboard_drain.rs"]
+    mod onboard_drain;
 
     fn connector_config(block_size: usize, remote: RemoteOps) -> ConnectorEngineConfig {
         ConnectorEngineConfig {
