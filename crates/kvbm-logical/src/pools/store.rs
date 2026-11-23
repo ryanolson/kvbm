@@ -72,6 +72,13 @@ pub(crate) trait InactiveIndex: Send + Sync {
     /// Increase a bounded backend's limit before new blocks enter the pool.
     fn grow_capacity(&mut self, _capacity: usize) {}
 
+    /// Test-only lineage storage: index length and capacity, slab length and
+    /// capacity, and minimum leaf policy capacity.
+    #[cfg(test)]
+    fn lineage_storage(&self) -> Option<(usize, usize, usize, usize, usize)> {
+        None
+    }
+
     /// Find blocks for the given hashes in order, stopping on first miss.
     /// Removes matched entries from the index.
     fn find_matches(
@@ -379,7 +386,7 @@ impl<T: BlockMetadata> std::fmt::Debug for SlotState<T> {
 /// Never size from the store's maximum: a manager is built with the maximum
 /// it might grow to (Rhino passes `u32::MAX`) and only its current capacity
 /// bounds the live primaries.
-fn room(live: usize) -> usize {
+pub(crate) fn room(live: usize) -> usize {
     live.saturating_mul(2)
 }
 
@@ -838,6 +845,11 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
 
     pub(crate) fn inactive_len(&self) -> usize {
         self.inner.lock().inactive.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lineage_storage(&self) -> Option<(usize, usize, usize, usize, usize)> {
+        self.inner.lock().inactive.lineage_storage()
     }
 
     /// Test-only: the live-primary index's reported capacity, in entries.
