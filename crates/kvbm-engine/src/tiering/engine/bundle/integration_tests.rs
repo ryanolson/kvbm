@@ -528,6 +528,30 @@ async fn bundle_onboard_success_emits_once_after_physical_completion() -> Result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bundle_onboard_drained_failure_names_the_undispatched_tail() -> Result<()> {
+    let (engine, hanging, sink, plan) = build_hanging_onboard(Duration::from_secs(5)).await?;
+    let request = "bundle-drained-failure".to_owned();
+    let mut onboard = engine.clone().onboard_resources(&request, plan)?;
+    let fence = onboard
+        .take_physical_drain_fence()
+        .expect("bundle drain fence");
+    hanging.wait_started().await;
+    assert_eq!(hanging.dispatches(), RESOURCES[..2]);
+    let running = hanging.take_running_copy()?;
+    hanging.fail_drained(running)?;
+    wait_until(|| !sink.loads().is_empty()).await;
+
+    let expected = LoadOutcome::FailedPartial {
+        block_ids: vec![101, 102],
+    };
+    assert_eq!(sink.loads(), vec![(request, expected.clone())]);
+    assert_eq!(onboard.outcome(), Some(expected));
+    assert_eq!(hanging.dispatches(), RESOURCES[..2]);
+    assert!(fence.is_complete());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bundle_onboard_watchdog_fails_promptly_but_quarantines_until_drain() -> Result<()> {
     let (engine, hanging, sink, plan) = build_hanging_onboard(Duration::from_millis(20)).await?;
     let request = "bundle-watchdog".to_owned();
@@ -741,43 +765,165 @@ async fn bundle_onboard_join_error_after_logical_timeout_stays_fail_closed() -> 
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn bundle_onboard_unproven_transfer_failure_stays_fenced() -> Result<()> {
-    let (engine, hanging, sink, plan) = build_hanging_onboard(Duration::from_secs(5)).await?;
-    let request = "bundle-unproven-failure".to_owned();
-    let mut onboard = engine.clone().onboard_resources(&request, plan)?;
-    let action_id = *onboard.id();
-    let physical_drain = onboard
-        .take_physical_drain_fence()
-        .expect("bundle onboard must expose its physical drain fence");
-    hanging.wait_started().await;
+    assert_bundle_onboard_lost_reply(false).await
+}
 
-    // The receipt fails, but it does not prove that the worker copy drained.
-    // An RPC error after the worker accepted the request has this outcome.
-    hanging.fail_unproven()?;
-    wait_until(|| onboard.is_complete()).await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
+#[tokio::test]
+async fn bundle_onboard_watchdog_before_lost_reply_keeps_fence_until_proof() -> Result<()> {
+    assert_bundle_onboard_lost_reply(true).await
+}
 
-    assert!(matches!(
-        onboard.outcome(),
-        Some(LoadOutcome::FailedPartial { .. })
-    ));
-    assert!(
-        engine
-            .actions
-            .get(&action_id)
-            .is_some_and(|record| record.physical_pending),
-        "an unproven transfer failure must retain the destination quarantine"
-    );
-    assert!(
-        !physical_drain.is_complete(),
-        "an unproven transfer failure must not report the destination as drained"
-    );
-    assert!(
-        sink.loads().is_empty(),
-        "an unproven transfer failure must never expose failed ids for reuse"
-    );
+async fn assert_bundle_onboard_lost_reply(watchdog: bool) -> Result<()> {
+    use super::super::paused::PROBE_INTERVAL;
+    use super::super::test_support::{build_leader_with_resources, wait_onboard_driver_finished};
+    use crate::testing::messenger::create_messenger_pair_tcp;
+    use crate::worker::group::SpmdParallelWorkers;
+    use crate::worker::velo::{
+        LocalTransferCheckTiming, VeloWorkerClient, serve_held_local_transfers,
+    };
+    use kvbm_physical::transfer::{TransferCompleteNotification, TransferDrainOutcome};
+    use tokio::sync::{mpsc, oneshot};
+
+    for (proof, failed_ids) in [
+        (TransferDrainOutcome::Completed, vec![101, 102]),
+        (
+            TransferDrainOutcome::DrainedWithError(anyhow!("drained copy failed")),
+            vec![100, 101, 102],
+        ),
+    ] {
+        let pair = create_messenger_pair_tcp().await?;
+        let (started, mut copies) = mpsc::unbounded_channel();
+        let worker =
+            serve_held_local_transfers(&pair.messenger_b, 0, !watchdog, move |resource, _, _| {
+                let (prove, receipt) = oneshot::channel();
+                started.send((resource, prove))?;
+                Ok(TransferCompleteNotification::from_drain_future(
+                    async move {
+                        receipt
+                            .await
+                            .unwrap_or_else(|error| TransferDrainOutcome::Unproven(error.into()))
+                    },
+                ))
+            })?;
+        let lose_reply = watchdog.then(|| worker.gate_reply_loss());
+        let client = VeloWorkerClient::new_for_worker(
+            pair.messenger_a.clone(),
+            pair.messenger_b.instance_id(),
+            0,
+        )
+        .with_local_transfer_check(LocalTransferCheckTiming {
+            wait: Duration::from_millis(10),
+            ..LocalTransferCheckTiming::default()
+        });
+        let workers = Arc::new(SpmdParallelWorkers::new(
+            vec![Arc::new(client)],
+            Arc::new(velo::EventManager::local()),
+            pair.messenger_a.runtime().clone(),
+        ));
+        let (leader, managers) =
+            build_leader_with_resources(pair.messenger_a, &RESOURCES, 4, BLOCK_SIZE, workers)?;
+        let managers = RESOURCES.into_iter().zip(managers).collect();
+        let sink = Arc::new(RecordingLoadSink::default());
+        let engine = LocalConnectorEngine::new(Arc::new(leader), sink.clone(), BLOCK_SIZE, false);
+        if watchdog {
+            engine.set_bundle_onboard_watchdog_for_test(Duration::from_millis(20));
+        }
+        let plan = commit_one_block_bundle(&engine, &manifest()?.identity(), &managers)?;
+        let key = plan.key;
+        let source_id = plan.resources[0].source_block_ids[0];
+        let tail_sources: Vec<_> = plan.resources[1..]
+            .iter()
+            .map(|transfer| (transfer.resource, transfer.source_block_ids[0]))
+            .collect();
+        let request = "bundle-lost-reply".to_owned();
+        let mut onboard = engine.clone().onboard_resources(&request, plan)?;
+        let action = *onboard.id();
+        let fence = onboard
+            .take_physical_drain_fence()
+            .expect("bundle drain fence");
+        let (resource, prove) = tokio::time::timeout(Duration::from_secs(2), copies.recv())
+            .await?
+            .expect("the worker accepted a bundle copy");
+        assert_eq!(resource, RESOURCES[0]);
+        let watchdog_failure = watchdog.then(|| LoadOutcome::FailedPartial {
+            block_ids: vec![100, 101, 102],
+        });
+        if let Some(lose_reply) = lose_reply {
+            // Observe the logical terminal before letting the running worker
+            // lose its reply. Timer scheduling cannot reverse these events.
+            wait_until(|| onboard.is_complete()).await;
+            assert_eq!(onboard.outcome(), watchdog_failure);
+            assert!(onboard.paused().is_none());
+            assert!(worker.active());
+            assert!(lose_reply.send(()).is_ok());
+        }
+        wait_onboard_driver_finished(action).await;
+
+        assert!(worker.active(), "the first copy is still running");
+        assert!(onboard.paused().is_some());
+        assert_eq!(onboard.outcome(), watchdog_failure);
+        assert!(!fence.is_complete(), "the paused copy has no drain proof");
+        assert!(
+            engine
+                .actions
+                .get(&action)
+                .is_some_and(|record| record.physical_pending)
+        );
+        assert!(sink.loads().is_empty());
+        assert!(copies.try_recv().is_err());
+        assert!(
+            engine
+                .bundle_catalog
+                .lock()
+                .unwrap()
+                .invalidate_key(key)
+                .is_some()
+        );
+        let manager = &managers[&resource];
+        assert!(
+            !bundle_source_is_reusable(manager, source_id),
+            "bundle source {source_id} was reusable while the paused copy may still read it"
+        );
+        for (resource, source_id) in tail_sources {
+            assert!(
+                bundle_source_is_reusable(&managers[&resource], source_id),
+                "undispatched bundle source {resource:?}/{source_id} must be reusable during pause"
+            );
+        }
+
+        assert!(prove.send(proof).is_ok());
+        wait_until(|| !worker.active()).await;
+        tokio::time::pause();
+        tokio::time::advance(PROBE_INTERVAL + Duration::from_millis(1)).await;
+        tokio::time::resume();
+        wait_until(|| !sink.loads().is_empty()).await;
+
+        let expected = watchdog_failure.unwrap_or(LoadOutcome::FailedPartial {
+            block_ids: failed_ids,
+        });
+        assert_eq!(onboard.outcome(), Some(expected.clone()));
+        assert_eq!(sink.loads(), vec![(request, expected)]);
+        assert!(onboard.paused().is_none());
+        assert!(fence.is_complete());
+        assert!(bundle_source_is_reusable(manager, source_id));
+        assert!(
+            copies.try_recv().is_err(),
+            "proof must not dispatch the bundle tail"
+        );
+    }
     Ok(())
+}
+
+fn bundle_source_is_reusable(manager: &BlockManager<G2>, source_id: BlockId) -> bool {
+    let available = manager.available_blocks();
+    assert!(available > 0, "the test pool must still have free blocks");
+    manager
+        .allocate_blocks(available)
+        .unwrap()
+        .iter()
+        .any(|block| block.block_id() == source_id)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

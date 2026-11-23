@@ -2,39 +2,29 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::{BTreeMap, HashSet};
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use kvbm_common::{BlockId, LogicalLayoutHandle, LogicalResourceId, SequenceHash};
+use kvbm_common::{BlockId, LogicalResourceId, SequenceHash};
 use kvbm_logical::ImmutableBlock;
-use kvbm_physical::transfer::TransferCompleteNotification;
 use kvbm_protocols::cache_manifest::{ResourceRequirement, ResourceRole};
 use kvbm_protocols::connector::{
-    ActionFailure, ActionId, ActionStatus, BundleOnboardPlan, FenceHandle, FindBlocksHandle,
-    LeaderEngine, LeaderEngineError, OnboardHandle, RequestId, ResourceDestination,
-    ResourceOnboard,
+    ActionFailure, ActionStatus, BundleOnboardPlan, FindBlocksHandle, LeaderEngineError,
+    OnboardHandle, RequestId, ResourceDestination, ResourceOnboard,
 };
 use tokio_util::sync::CancellationToken;
 
 use super::{BundleOnboard, OnboardTransition};
 use crate::G2;
-use crate::tiering::engine::driver::ActionRecord;
-use crate::tiering::engine::inflight::InflightKey;
 use crate::tiering::engine::local::LocalConnectorEngine;
-use crate::tiering::engine::onboard::{OnboardDrain, await_onboard_drain};
+use crate::tiering::engine::onboard::{
+    OnboardDrain, OnboardWatchdog, OnboardWork, dispatch_onboard, include_undispatched_destinations,
+};
 use crate::tiering::engine::paused::{
-    LoadContinuation, PauseCell, PausedLoad, ResourceContinuation,
+    BundleContinuation, LoadContinuation, PausedLoad, ResourceContinuation,
 };
 
 type ResourcePins = Vec<ImmutableBlock<G2>>;
 type SourceLeases = BTreeMap<LogicalResourceId, ResourcePins>;
-type BundleOnboardTransaction = Arc<Mutex<BundleOnboard<ResourcePins>>>;
-
-struct DispatchedResource {
-    resource: LogicalResourceId,
-    destination_block_ids: Vec<BlockId>,
-    notification: TransferCompleteNotification,
-}
 
 struct DispatchFailure {
     resource: LogicalResourceId,
@@ -54,15 +44,6 @@ enum ResourceStop {
         destination_block_ids: Vec<BlockId>,
         error: anyhow::Error,
     },
-}
-
-/// The result of the physical phase of one bundle onboard.
-struct BundlePhysicalOutcome {
-    status: ActionStatus,
-    /// `false` when a transfer receipt did not prove that its physical work
-    /// drained. The destination blocks can then receive data, and they must
-    /// stay fenced.
-    drain_proven: bool,
 }
 
 impl LocalConnectorEngine {
@@ -117,81 +98,22 @@ impl LocalConnectorEngine {
             });
         }
         validate_resource_transfers(self.as_ref(), &resources)?;
-        let action_id = ActionId::new();
-        let cell = Arc::new(Mutex::new(ActionStatus::Pending));
-        let physical_drain = Arc::new(AtomicBool::new(false));
-        let pause = PauseCell::default();
-        self.actions.insert(
-            action_id,
-            ActionRecord::new(req.clone(), Arc::downgrade(&cell))
-                .with_physical_drain(CancellationToken::new()),
+        let (handle, load) = self.mint_onboard(
+            req.clone(),
+            destination_ids(&resources),
+            Some(CancellationToken::new()),
+            None,
         );
-        self.by_request
-            .entry(req.clone())
-            .or_default()
-            .push(action_id);
-        let destination_block_ids = resources
-            .iter()
-            .flat_map(|transfer| transfer.destination_block_ids.iter().copied())
-            .collect::<Vec<_>>();
-        self.spawn_resource_onboard(
-            PausedLoad {
-                action: action_id,
-                request: req.clone(),
-                destinations: destination_block_ids.clone(),
-                physical_drain: physical_drain.clone(),
-                pause: pause.clone(),
-                // This path takes block IDs. The caller keeps the G2 pins.
-                holds: Box::new(()),
-                continuation: None,
-            },
-            resources.into_iter(),
-        );
-
-        let engine: Arc<dyn LeaderEngine> = self;
-        Ok(OnboardHandle::new_with_physical_drain(
-            action_id,
-            Arc::downgrade(&engine),
-            cell,
-            destination_block_ids,
-            FenceHandle::new(physical_drain),
-        )
-        .with_pause_cell(pause))
+        self.spawn_resource_onboard(load, resources.into_iter());
+        Ok(handle)
     }
 
     pub(in crate::tiering::engine) fn spawn_resource_onboard(
         self: &Arc<Self>,
-        mut load: PausedLoad,
-        mut resources: std::vec::IntoIter<ResourceOnboard>,
+        load: PausedLoad,
+        resources: std::vec::IntoIter<ResourceOnboard>,
     ) {
-        let driver = self.clone();
-        self.leader.runtime().spawn(async move {
-            #[cfg(test)]
-            let action = load.action;
-            let (completed, stop) = driver.execute_resource_onboards(&mut resources).await;
-            match stop {
-                ResourceStop::Proven(dispatch_failure) => {
-                    let status = fold_resource_onboard(dispatch_failure, completed);
-                    load.finish(&driver, status);
-                }
-                ResourceStop::Unproven {
-                    resource,
-                    destination_block_ids,
-                    error,
-                } => {
-                    load.continuation = Some(LoadContinuation::Resource(ResourceContinuation {
-                        failure: ActionFailure::Resource {
-                            resource,
-                            block_ids: Some(destination_block_ids),
-                        },
-                        remaining: resources,
-                    }));
-                    driver.pause_load_action(load, error);
-                }
-            }
-            #[cfg(test)]
-            crate::tiering::engine::test_support::note_onboard_driver_finished(action);
-        });
+        self.spawn_onboard_resources(load, resources, None, None);
     }
 
     fn start_bundle_onboard_with_sources(
@@ -208,137 +130,40 @@ impl LocalConnectorEngine {
                 }
             })?;
         transaction.start();
-        let transaction = Arc::new(Mutex::new(transaction));
 
-        let action_id = ActionId::new();
-        let cell = Arc::new(Mutex::new(ActionStatus::Pending));
         let cancel = CancellationToken::new();
-        let physical_drain = Arc::new(AtomicBool::new(false));
-        self.actions.insert(
-            action_id,
-            ActionRecord::new(req.clone(), Arc::downgrade(&cell))
-                .with_inflight(InflightKey::Action(action_id))
-                .with_physical_drain(cancel.clone()),
+        let (handle, load) = self.mint_onboard(
+            req.clone(),
+            destination_ids(&plan.resources),
+            Some(cancel.clone()),
+            Some(inflight_hashes),
         );
-        self.inflight
-            .lock()
-            .expect("inflight-guard mutex poisoned")
-            .record(InflightKey::Action(action_id), inflight_hashes);
-        self.by_request
-            .entry(req.clone())
-            .or_default()
-            .push(action_id);
-        let handle_dest_ids = plan
-            .resources
-            .iter()
-            .flat_map(|transfer| transfer.destination_block_ids.iter().copied())
-            .collect::<Vec<_>>();
-        let request_id = req.clone();
-        let driver = Arc::clone(&self);
-        let terminal_dest_ids = handle_dest_ids.clone();
-        let physical_driver = Arc::clone(&self);
-        let mut physical = self.leader.runtime().spawn(async move {
-            physical_driver
-                .drive_bundle_onboard(plan.resources, transaction)
-                .await
-        });
-        let watchdog = self.bundle_onboard_watchdog();
-        let drain_cell = Arc::clone(&physical_drain);
-        self.leader.runtime().spawn(async move {
-            tokio::select! {
-                biased;
-                result = &mut physical => {
-                    match result {
-                        Ok(outcome) => {
-                            driver.finish_load_action(
-                                action_id,
-                                &request_id,
-                                outcome.status,
-                                terminal_dest_ids,
-                            );
-                            if outcome.drain_proven {
-                                driver.finish_physical_load_action(action_id, &drain_cell);
-                            } else {
-                                tracing::error!(
-                                    %request_id,
-                                    "bundle onboard transfer did not prove physical drain; destination quarantine remains fail-closed"
-                                );
-                            }
-                        }
-                        Err(error) => {
-                            tracing::error!(
-                                %error,
-                                %request_id,
-                                "bundle onboard physical task failed; destination quarantine remains fail-closed"
-                            );
-                            driver.finish_load_action(
-                                action_id,
-                                &request_id,
-                                ActionStatus::Failed(ActionFailure::AllBlocks),
-                                terminal_dest_ids,
-                            );
-                        }
-                    }
-                }
-                () = cancel.cancelled() => {
-                    driver.finish_load_action(
-                        action_id,
-                        &request_id,
-                        ActionStatus::Failed(ActionFailure::AllBlocks),
-                        terminal_dest_ids,
-                    );
-                    driver.spawn_bundle_drain_waiter(action_id, physical, drain_cell);
-                }
-                () = tokio::time::sleep(watchdog) => {
-                    tracing::warn!(
-                        %request_id,
-                        ?watchdog,
-                        "bundle onboard exceeded its logical watchdog"
-                    );
-                    driver.finish_load_action(
-                        action_id,
-                        &request_id,
-                        ActionStatus::Failed(ActionFailure::AllBlocks),
-                        terminal_dest_ids,
-                    );
-                    driver.spawn_bundle_drain_waiter(action_id, physical, drain_cell);
-                }
-            }
-        });
-
-        let engine: Arc<dyn LeaderEngine> = self;
-        Ok(OnboardHandle::new_with_physical_drain(
-            action_id,
-            Arc::downgrade(&engine),
-            cell,
-            handle_dest_ids,
-            FenceHandle::new(physical_drain),
-        ))
+        let watchdog = OnboardWatchdog {
+            cancel,
+            duration: self.bundle_onboard_watchdog(),
+        };
+        self.spawn_onboard_resources(
+            load,
+            plan.resources.into_iter(),
+            Some(transaction),
+            Some(watchdog),
+        );
+        Ok(handle)
     }
 
-    fn spawn_bundle_drain_waiter(
+    fn spawn_onboard_resources(
         self: &Arc<Self>,
-        action_id: ActionId,
-        physical: tokio::task::JoinHandle<BundlePhysicalOutcome>,
-        physical_drain: Arc<AtomicBool>,
+        load: PausedLoad,
+        resources: std::vec::IntoIter<ResourceOnboard>,
+        bundle: Option<BundleOnboard<ResourcePins>>,
+        watchdog: Option<OnboardWatchdog>,
     ) {
-        let driver = Arc::clone(self);
-        self.leader.runtime().spawn(async move {
-            match physical.await {
-                Ok(outcome) if outcome.drain_proven => {
-                    driver.finish_physical_load_action(action_id, &physical_drain)
-                }
-                Ok(_) => tracing::error!(
-                    ?action_id,
-                    "quarantined bundle onboard transfer did not prove physical drain; destination quarantine remains fail-closed"
-                ),
-                Err(error) => tracing::error!(
-                    %error,
-                    ?action_id,
-                    "quarantined bundle onboard drain task failed; destination quarantine remains fail-closed"
-                ),
-            }
-        });
+        let engine = self.clone();
+        self.spawn_onboard(
+            load,
+            async move { engine.run_resource_onboards(resources, bundle).await },
+            watchdog,
+        );
     }
 
     fn acquire_bundle_sources(
@@ -380,106 +205,112 @@ impl LocalConnectorEngine {
         Ok((source_leases, inflight_hashes))
     }
 
-    async fn drive_bundle_onboard(
+    async fn run_resource_onboards(
         &self,
-        resources: Vec<ResourceOnboard>,
-        transaction: BundleOnboardTransaction,
-    ) -> BundlePhysicalOutcome {
-        let (mut completed, stop) = self
-            .execute_resource_onboards(&mut resources.into_iter())
+        mut resources: std::vec::IntoIter<ResourceOnboard>,
+        bundle: Option<BundleOnboard<ResourcePins>>,
+    ) -> OnboardWork {
+        let (completed, stop) = self
+            .execute_resource_onboards(&mut resources, &bundle)
             .await;
-        let (dispatch_failure, drain_proven) = match stop {
-            ResourceStop::Proven(failure) => (failure, true),
+        match stop {
+            ResourceStop::Proven(failure) => {
+                let status = match bundle {
+                    Some(transaction) => fold_bundle_onboard(transaction, failure, completed),
+                    None => fold_resource_onboard(failure, completed),
+                };
+                OnboardWork::Proven(include_undispatched_destinations(
+                    status,
+                    resources.flat_map(|transfer| transfer.destination_block_ids),
+                ))
+            }
             ResourceStop::Unproven {
                 resource,
                 destination_block_ids,
                 error,
             } => {
-                completed.push(CompletedResource {
+                if let Some(bundle) = bundle {
+                    let unfilled = destination_ids(resources.as_slice());
+                    let continuation = LoadContinuation::Bundle(BundleContinuation {
+                        failure: ActionFailure::Resource {
+                            resource,
+                            block_ids: Some(destination_block_ids),
+                        },
+                        unfilled,
+                        logical_done: false,
+                    });
+                    return OnboardWork::unproven(
+                        error,
+                        bundle.into_paused_reservation(resource),
+                        Some(continuation),
+                    );
+                }
+
+                let failure = ActionFailure::Resource {
                     resource,
-                    destination_block_ids,
-                    result: Err(error),
+                    block_ids: Some(destination_block_ids),
+                };
+                let continuation = LoadContinuation::Resource(ResourceContinuation {
+                    failure,
+                    remaining: resources,
                 });
-                (None, false)
+                OnboardWork::unproven(error, (), Some(continuation))
             }
-        };
-        BundlePhysicalOutcome {
-            status: fold_bundle_onboard(transaction, dispatch_failure, completed),
-            drain_proven,
         }
     }
 
     async fn execute_resource_onboards(
         &self,
         resources: &mut std::vec::IntoIter<ResourceOnboard>,
+        bundle: &Option<BundleOnboard<ResourcePins>>,
     ) -> (Vec<CompletedResource>, ResourceStop) {
         let _admission = self.resource_onboard_admission.lock().await;
         let mut completed = Vec::with_capacity(resources.len());
         for transfer in resources {
-            let dispatched = match self.dispatch_resource_onboard(transfer) {
-                Ok(dispatched) => dispatched,
-                Err(failure) => return (completed, ResourceStop::Proven(Some(failure))),
-            };
-            let result = match await_onboard_drain(dispatched.notification, ()).await {
-                OnboardDrain::Proven(result) => result,
-                OnboardDrain::Unproven { error, .. } => {
+            let resource = transfer.resource;
+            let destination_block_ids = transfer.destination_block_ids.clone();
+            let result = match dispatch_onboard(&self.leader, transfer, bundle).await {
+                Ok(OnboardDrain::Proven(result)) => result,
+                Ok(OnboardDrain::Unproven { error, .. }) => {
                     return (
                         completed,
                         ResourceStop::Unproven {
-                            resource: dispatched.resource,
-                            destination_block_ids: dispatched.destination_block_ids,
+                            resource,
+                            destination_block_ids,
                             error,
                         },
                     );
                 }
+                Err(error) => {
+                    tracing::error!(%error, ?resource, "resource onboard dispatch failed");
+                    return (
+                        completed,
+                        ResourceStop::Proven(Some(DispatchFailure {
+                            resource,
+                            destination_block_ids,
+                        })),
+                    );
+                }
             };
-            let completion = CompletedResource {
-                resource: dispatched.resource,
-                destination_block_ids: dispatched.destination_block_ids,
+            let failed = result.is_err();
+            completed.push(CompletedResource {
+                resource,
+                destination_block_ids,
                 result,
-            };
-            let failed = completion.result.is_err();
-            completed.push(completion);
+            });
             if failed {
                 break;
             }
         }
         (completed, ResourceStop::Proven(None))
     }
+}
 
-    fn dispatch_resource_onboard(
-        &self,
-        transfer: ResourceOnboard,
-    ) -> Result<DispatchedResource, DispatchFailure> {
-        let resource = transfer.resource;
-        let destination_block_ids = transfer.destination_block_ids;
-        let notification = self
-            .leader
-            .execute_local_transfer_for_resource(
-                resource,
-                LogicalLayoutHandle::G2,
-                LogicalLayoutHandle::G1,
-                transfer.source_block_ids,
-                destination_block_ids.clone(),
-                kvbm_physical::TransferOptions::default(),
-            )
-            .map_err(|error| {
-                tracing::error!(
-                    %error,
-                    ?resource,
-                    "resource onboard dispatch failed"
-                );
-                DispatchFailure {
-                    resource,
-                    destination_block_ids: destination_block_ids.clone(),
-                }
-            })?;
-        Ok(DispatchedResource {
-            resource,
-            destination_block_ids,
-            notification,
-        })
-    }
+fn destination_ids(resources: &[ResourceOnboard]) -> Vec<BlockId> {
+    resources
+        .iter()
+        .flat_map(|transfer| transfer.destination_block_ids.iter().copied())
+        .collect()
 }
 
 fn fold_resource_onboard(
@@ -655,7 +486,7 @@ fn validate_resource_transfers(
 }
 
 fn fold_bundle_onboard(
-    transaction: BundleOnboardTransaction,
+    mut transaction: BundleOnboard<ResourcePins>,
     dispatch_failure: Option<DispatchFailure>,
     completed: Vec<CompletedResource>,
 ) -> ActionStatus {
@@ -666,20 +497,19 @@ fn fold_bundle_onboard(
         }),
         None => ActionStatus::Complete,
     };
-    let mut coordinator = transaction.lock().expect("bundle-onboard mutex poisoned");
     if let Some(failure) = dispatch_failure {
-        let _ = coordinator.fail(failure.resource, Some(failure.destination_block_ids));
+        let _ = transaction.fail(failure.resource, Some(failure.destination_block_ids));
     }
     for completed in completed {
         let transition = match completed.result {
-            Ok(()) => coordinator.complete(completed.resource),
+            Ok(()) => transaction.complete(completed.resource),
             Err(error) => {
                 tracing::error!(
                     error = %error,
                     resource = ?completed.resource,
                     "resource onboard transfer failed"
                 );
-                coordinator.fail(
+                transaction.fail(
                     completed.resource,
                     Some(completed.destination_block_ids.clone()),
                 )

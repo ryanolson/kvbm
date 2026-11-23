@@ -119,6 +119,19 @@ impl HeldLocalTransfers {
         assert!(self.0.hooks.defer_next.lock().replace(gate).is_none());
     }
 
+    pub(crate) fn gate_reply_loss(&self) -> tokio::sync::oneshot::Sender<()> {
+        let (open, gate) = tokio::sync::oneshot::channel();
+        assert!(
+            self.0
+                .hooks
+                .lose_running_reply
+                .lock()
+                .replace(gate)
+                .is_none()
+        );
+        open
+    }
+
     pub(crate) fn active(&self) -> bool {
         !self.0.active_ids().is_empty()
     }
