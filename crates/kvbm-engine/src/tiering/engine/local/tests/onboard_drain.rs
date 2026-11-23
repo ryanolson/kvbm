@@ -30,7 +30,9 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::testing::messenger::create_messenger_pair_tcp;
 use crate::worker::group::SpmdParallelWorkers;
-use crate::worker::velo::{LocalTransferCheckTiming, VeloWorkerClient, serve_held_local_transfers};
+use crate::worker::velo::{
+    HeldLocalTransfers, LocalTransferCheckTiming, VeloWorkerClient, serve_held_local_transfers,
+};
 
 const RESOURCE: LogicalResourceId = LogicalResourceId(0);
 const G2_BLOCKS: usize = 2;
@@ -322,7 +324,7 @@ const TAIL: LogicalResourceId = LogicalResourceId(1);
 
 struct ResourceWorker {
     _server: Arc<velo::Messenger>,
-    active: Box<dyn Fn() -> bool>,
+    transfers: HeldLocalTransfers,
     copies: mpsc::UnboundedReceiver<(LogicalResourceId, oneshot::Sender<TransferDrainOutcome>)>,
 }
 
@@ -351,7 +353,7 @@ struct ResourceRestore {
 async fn resource_restore(lose_first_reply: bool) -> Result<ResourceRestore> {
     let pair = create_messenger_pair_tcp().await?;
     let (started, copies) = mpsc::unbounded_channel();
-    let active =
+    let worker_transfers =
         serve_held_local_transfers(&pair.messenger_b, 0, lose_first_reply, move |resource| {
             let (proof, receipt) = oneshot::channel();
             started.send((resource, proof))?;
@@ -404,7 +406,7 @@ async fn resource_restore(lose_first_reply: bool) -> Result<ResourceRestore> {
         sink,
         worker: ResourceWorker {
             _server: pair.messenger_b,
-            active,
+            transfers: worker_transfers,
             copies,
         },
         handle,
@@ -446,7 +448,10 @@ async fn resource_onboard_resumes_the_tail_after_proof() -> Result<()> {
     )
     .await?;
     assert!(first.send(TransferDrainOutcome::Completed).is_ok());
-    eventually("the worker records first-copy proof", || !(worker.active)()).await;
+    eventually("the worker records first-copy proof", || {
+        !worker.transfers.active()
+    })
+    .await;
     tokio::time::pause();
     tick(super::super::super::paused::PROBE_INTERVAL).await;
     eventually("the first proof clears the pause", || {
@@ -477,6 +482,69 @@ async fn resource_onboard_resumes_the_tail_after_proof() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn resource_onboard_pauses_again_after_a_second_lost_reply() -> Result<()> {
+    use super::super::super::paused::PROBE_INTERVAL;
+
+    let mut restore = resource_restore(true).await?;
+    let action = *restore.handle.id();
+    let first = restore.worker.copy(RESOURCE).await;
+    wait_onboard_driver_finished(action).await;
+    let first_pause = restore
+        .handle
+        .paused()
+        .expect("the first lost reply must pause");
+    let fence = restore
+        .handle
+        .take_physical_drain_fence()
+        .expect("resource fence");
+    assert!(!fence.is_complete());
+    assert!(restore.sink.loads().is_empty());
+
+    restore.worker.transfers.lose_next_reply();
+    assert!(first.send(TransferDrainOutcome::Completed).is_ok());
+    eventually("the worker records first-copy proof", || {
+        !restore.worker.transfers.active()
+    })
+    .await;
+    tokio::time::pause();
+    tick(PROBE_INTERVAL).await;
+    let tail = restore.worker.copy(TAIL).await;
+    tokio::time::resume();
+    wait_onboard_driver_finished(action).await;
+    let second_pause = restore
+        .handle
+        .paused()
+        .expect("the second lost reply must reinsert the pause");
+    assert!(second_pause.since() > first_pause.since());
+    assert_eq!(second_pause.worker(), first_pause.worker());
+    assert!(restore.worker.transfers.active());
+    assert!(restore.handle.outcome().is_none());
+    assert!(!fence.is_complete());
+    assert!(restore.sink.loads().is_empty());
+
+    assert!(tail.send(TransferDrainOutcome::Completed).is_ok());
+    eventually("the worker records tail proof", || {
+        !restore.worker.transfers.active()
+    })
+    .await;
+    tokio::time::pause();
+    tick(PROBE_INTERVAL).await;
+    eventually("the re-paused restore settles", || {
+        !restore.sink.loads().is_empty()
+    })
+    .await;
+    assert!(restore.handle.paused().is_none());
+    assert_eq!(restore.handle.outcome(), Some(LoadOutcome::Done));
+    assert!(fence.is_complete());
+    assert_eq!(
+        restore.sink.loads(),
+        vec![(REQUEST.into(), LoadOutcome::Done)]
+    );
+    assert!(restore.worker.copies.try_recv().is_err());
+    Ok(())
+}
+
 async fn resource_failure_keeps_its_destination_ids(lost_reply: bool) -> Result<()> {
     let mut restore = resource_restore(lost_reply).await?;
     let proof = restore.worker.copy(RESOURCE).await;
@@ -503,7 +571,7 @@ async fn resource_failure_keeps_its_destination_ids(lost_reply: bool) -> Result<
     );
     if lost_reply {
         eventually("the worker records the drained failure", || {
-            !(restore.worker.active)()
+            !restore.worker.transfers.active()
         })
         .await;
         tokio::time::pause();
