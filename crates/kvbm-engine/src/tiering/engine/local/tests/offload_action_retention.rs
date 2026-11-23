@@ -271,8 +271,67 @@ async fn direct_restore_refuses_until_the_evicted_save_drains() -> Result<()> {
     worker.release()?;
     crate::tiering::engine::test_support::wait_onboard_driver_finished(*restored.id()).await;
     assert_eq!(restored.outcome(), Some(LoadOutcome::Done));
-    drop((old, restored));
+    let save = engine
+        .clone()
+        .offload(&request, vec![(h(1), 10)])
+        .expect("save after a proven onboard must be admitted");
+    engine.shutdown();
+    drop((old, restored, save));
     assert!(!engine.by_request.contains_key(&request));
+    Ok(())
+}
+
+#[tokio::test]
+async fn request_finish_closes_admission_while_a_save_drains() -> Result<()> {
+    use kvbm_protocols::connector::CacheScope;
+
+    let leader = Arc::new(build_test_leader().await?);
+    let sink = RecordingSink::new();
+    let submit = PendingOffloadSubmit::new();
+    let engine = LocalConnectorEngine::with_offload_submit(
+        leader,
+        sink.clone(),
+        BS,
+        true,
+        submit.clone(),
+        None,
+    );
+    let request = FindBlocksRequest {
+        request_id: "finish-closes-admission".into(),
+        cache: CacheScope::LegacyPrimary,
+        sequence_hashes: Arc::from([h(1)]),
+        num_computed_tokens: 0,
+        total_tokens: BS + 1,
+        transfer_params: None,
+        local_prefill_estimate: None,
+    };
+    let id = &request.request_id;
+
+    assert!(matches!(
+        engine.clone().find_blocks(&request, None)?,
+        FindBlocksOutcome::Resolved { .. }
+    ));
+    let save = engine.clone().offload(id, vec![(h(1), 10)])?;
+    let save_id = *save.id();
+    engine.finish_forward_pass(0);
+    assert_eq!(submit.submit_count(), 1);
+    assert!(engine.begin_request_finish(id));
+    assert!(sink.saves().is_empty());
+
+    assert!(matches!(
+        engine.clone().find_blocks(&request, None)?,
+        FindBlocksOutcome::Deferred
+    ));
+    assert!(matches!(
+        engine.clone().offload(id, vec![(h(2), 11)]),
+        Err(LeaderEngineError::PriorGenerationDraining)
+    ));
+
+    submit.finish(TransferStatus::Complete);
+    wait_for_save_count(&sink, 1).await;
+    assert_eq!(sink.saves(), vec![(id.clone(), SaveOutcome::Done)]);
+    drop(save);
+    wait_for_action_removal(&engine, save_id).await;
     Ok(())
 }
 
