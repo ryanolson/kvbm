@@ -4,6 +4,7 @@
 mod coordinated;
 #[doc = include_str!("../../docs/worker-group.md")]
 pub mod group;
+pub(crate) mod layer_transfer;
 mod physical;
 mod protocol;
 pub mod velo;

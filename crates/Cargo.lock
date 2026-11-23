@@ -2669,6 +2669,7 @@ dependencies = [
  "figment",
  "flume 0.11.1",
  "futures",
+ "futures-timer",
  "kvbm-common",
  "kvbm-config",
  "kvbm-consolidator",

@@ -570,13 +570,15 @@ impl PhysicalWorker {
                 .cuda_stream(stream.clone())
                 .build()?;
 
-            self.manager.execute_transfer(
+            let receipt = self.manager.execute_transfer(
                 g2_handle,
                 src_block_ids,
                 g1_handle,
                 dst_block_ids,
                 options,
             )?;
+
+            super::layer_transfer::finish_layer_transfer(receipt, layer)?;
 
             // Record event on the stream for this layer
             event.record(stream.as_ref())?;

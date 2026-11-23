@@ -951,6 +951,52 @@ fn dispatch_with_metrics(
     Ok((manager, result))
 }
 
+#[tokio::test]
+async fn caller_stream_pattern_sees_post_submit_error() -> Result<()> {
+    use crate::transfer::executor::dispatch_fault::{Point, inject};
+
+    gpu_serial!();
+    assert!(!kvbm_kernels::is_using_stubs(), "CUDA kernels required");
+    let agent = build_agent_for_kinds(&[StorageKind::Device(0)])?;
+    let src = build_layout_for_planner(agent.clone(), LayoutType::FC, StorageKind::Device(0), 1);
+    let dst = build_layout_for_planner(agent.clone(), LayoutType::FC, StorageKind::Device(0), 1);
+    fill_blocks(&src, &[0], FillPattern::Sequential)?;
+    let ctx = create_transfer_context(agent, None)?;
+    let stream = ctx.context().acquire_h2d_stream();
+    let options = TransferOptionsInternal::builder()
+        .copy_engine(crate::transfer::CopyEngine::VectorizedKernel)
+        .cuda_stream(stream.clone())
+        .build()?;
+    let result = inject(Point::VectorizedFree, 1, || {
+        execute_transfer(&src, &dst, &[0], &[0], options, ctx.context())
+    });
+    let caller = async {
+        result?.await?;
+        stream.synchronize()?;
+        Ok::<_, anyhow::Error>(())
+    };
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), caller)
+            .await?
+            .is_err(),
+        "a post-submit dispatch error reached the caller as success"
+    );
+
+    let options = TransferOptionsInternal::builder()
+        .layer_range(0..1)
+        .copy_engine(crate::transfer::CopyEngine::MemcpyBatch)
+        .cuda_stream(stream.clone())
+        .build()?;
+    let receipt = execute_transfer(&src, &dst, &[0], &[0], options, ctx.context())?;
+    assert!(
+        !receipt.could_yield(),
+        "caller-stream success must take the ready path"
+    );
+    receipt.await?;
+    stream.synchronize()?;
+    Ok(())
+}
+
 #[rstest::rstest]
 #[case(false)]
 #[case(true)]

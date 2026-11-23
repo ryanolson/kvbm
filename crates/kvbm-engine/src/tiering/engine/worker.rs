@@ -355,14 +355,14 @@ impl WorkerEngine {
                 .cuda_stream(offload.stream.clone())
                 .build()?;
 
-            if let Some(transfers) = &self.replicated_transfers {
+            let receipt = if let Some(transfers) = &self.replicated_transfers {
                 transfers.execute_local_transfer(
                     LogicalLayoutHandle::G1,
                     LogicalLayoutHandle::G2,
                     offload.g1_src_block_ids.clone(),
                     offload.g2_dst_block_ids.clone(),
                     options,
-                )?;
+                )?
             } else {
                 self.worker.execute_local_transfer(
                     LogicalLayoutHandle::G1,
@@ -370,8 +370,9 @@ impl WorkerEngine {
                     offload.g1_src_block_ids.clone(),
                     offload.g2_dst_block_ids.clone(),
                     options,
-                )?;
-            }
+                )?
+            };
+            crate::worker::layer_transfer::finish_layer_transfer(receipt, layer_index)?;
 
             if is_last_layer {
                 self.offload_complete_event
