@@ -452,8 +452,8 @@ impl actions::Memset for MmappedPinnedStorage {
 ///
 /// After a refused bind, the OS places the pages on the same mapping. A
 /// successful registration records [`PlacementFallback::BindRefused`]. If
-/// CUDA registration also fails, [`StorageError::AllocationFailed`] gives
-/// both causes, the device ID and the mapped bytes. Other `mmap`, CUDA
+/// `cuMemHostRegister_v2` also fails, [`StorageError::AllocationFailed`]
+/// gives both causes, the device ID and the mapped bytes. Other `mmap`, CUDA
 /// context and registration errors propagate. Success logs the placement.
 pub fn allocate_pinned_host(size: usize, device_id: u32) -> Result<MmappedPinnedStorage> {
     if size == 0 {
@@ -505,6 +505,7 @@ fn place_pinned_host(
     decision: PlacementDecision,
     pinned: std::result::Result<(), String>,
 ) -> Result<MmappedPinnedStorage> {
+    ctx.bind_to_thread().map_err(StorageError::Cuda)?;
     let Placed {
         registered,
         mmap,
@@ -518,10 +519,7 @@ fn place_pinned_host(
         read_node_meminfo,
         mbind_to_node,
         crate::numa::placement::read_page,
-        |ptr, len| {
-            ctx.bind_to_thread().map_err(StorageError::Cuda)?;
-            HostRegisterGuard::new(ptr, len, ctx.clone())
-        },
+        |ptr, len| HostRegisterGuard::new(ptr, len, ctx.clone()),
     )?;
     Ok(MmappedPinnedStorage {
         register_guard: registered,
@@ -683,11 +681,13 @@ pub(crate) fn map_place_register<T, R: Into<PageReading>>(
 
         // The raw status is available even when a CUDA error-string lookup fails.
         let registration_detail = match registration_error {
-            StorageError::Cuda(cuda_error) => format!("{:?}", cuda_error.0),
+            StorageError::Cuda(cuda_error) => {
+                format!("cuMemHostRegister_v2 returned {:?}", cuda_error.0)
+            }
             other => other.to_string(),
         };
         StorageError::AllocationFailed(format!(
-            "CUDA registration failed for {} bytes on device {device_id} with {registration_detail}. \
+            "CUDA registration failed for {} bytes on device {device_id}. {registration_detail}. \
              NUMA bind to node {} was refused with {error}",
             mmap.len, node.0,
         ))
@@ -1674,6 +1674,7 @@ Node 0 HugePages_Total:        0
         node: NumaNode,
         mapped_bytes: usize,
         refusal: &str,
+        registration_detail: &str,
     ) {
         let message = match result {
             Err(StorageError::AllocationFailed(message)) => message,
@@ -1697,7 +1698,7 @@ Node 0 HugePages_Total:        0
             "{message}"
         );
         assert!(message.contains(refusal), "{message}");
-        assert!(message.contains("CUDA_ERROR_NOT_PERMITTED"), "{message}");
+        assert!(message.contains(registration_detail), "{message}");
     }
 
     #[test]
@@ -1724,7 +1725,46 @@ Node 0 HugePages_Total:        0
             },
         );
         assert_eq!(registrations, 1);
-        assert_combined_registration_error(result, device_id, node, 2 * page, TEST_BIND_REFUSAL);
+        assert_combined_registration_error(
+            result,
+            device_id,
+            node,
+            2 * page,
+            TEST_BIND_REFUSAL,
+            "cuMemHostRegister_v2 returned CUDA_ERROR_NOT_PERMITTED",
+        );
+    }
+
+    #[test]
+    fn registration_after_refused_bind_keeps_non_cuda_error_detail() {
+        let node = NumaNode(0);
+        let device_id = 7;
+        let page = system_page_size();
+        let result = map_place_register(
+            page,
+            device_id,
+            Some(node),
+            PlacementDecision::Bind(node),
+            Ok(()),
+            ample_node_memory,
+            |_, _, _| Err(TEST_BIND_REFUSAL.into()),
+            |_| PageReading {
+                policy: Ok((MemPolicyMode::Default, vec![])),
+                node: Ok(node),
+            },
+            |_, _| -> Result<()> {
+                Err(StorageError::RegistrationFailed("injected failure".into()))
+            },
+        );
+
+        assert_combined_registration_error(
+            result,
+            device_id,
+            node,
+            page,
+            TEST_BIND_REFUSAL,
+            "registration failed: injected failure",
+        );
     }
 
     #[test]
@@ -1757,6 +1797,7 @@ Node 0 HugePages_Total:        0
             node,
             page,
             "kernel reports Default on nodes []",
+            "cuMemHostRegister_v2 returned CUDA_ERROR_NOT_PERMITTED",
         );
     }
 
@@ -1806,7 +1847,14 @@ Node 0 HugePages_Total:        0
         assert_eq!(allocations, 2);
         assert_eq!(registrations, 2);
         assert_eq!(drops.get(), 1);
-        assert_combined_registration_error(result, device_id, node, 2 * page, TEST_BIND_REFUSAL);
+        assert_combined_registration_error(
+            result,
+            device_id,
+            node,
+            2 * page,
+            TEST_BIND_REFUSAL,
+            "cuMemHostRegister_v2 returned CUDA_ERROR_NOT_PERMITTED",
+        );
     }
 
     #[test]
@@ -1831,6 +1879,31 @@ Node 0 HugePages_Total:        0
             },
         );
         assert_eq!(registrations, 1);
+        match result {
+            Err(StorageError::Cuda(error)) => assert_eq!(error.0, TEST_CUDA_REGISTRATION_STATUS),
+            Err(_) => panic!("expected the CUDA error, got another error variant"),
+            Ok(_) => panic!("expected the CUDA error, got a region"),
+        }
+    }
+
+    #[test]
+    fn registration_after_unavailable_budget_keeps_plain_cuda_error() {
+        let node = NumaNode(0);
+        let result = map_place_register(
+            system_page_size(),
+            0,
+            Some(node),
+            PlacementDecision::Bind(node),
+            Ok(()),
+            |_| Err("read node meminfo: permission denied".into()),
+            |_, _, _| panic!("no bind without a memory budget"),
+            |_| PageReading {
+                policy: Ok((MemPolicyMode::Default, vec![])),
+                node: Ok(node),
+            },
+            |_, _| -> Result<()> { Err(failed_cuda_registration()) },
+        );
+
         match result {
             Err(StorageError::Cuda(error)) => assert_eq!(error.0, TEST_CUDA_REGISTRATION_STATUS),
             Err(_) => panic!("expected the CUDA error, got another error variant"),
