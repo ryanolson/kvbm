@@ -20,6 +20,7 @@ mod registered_presence;
 mod registration_provenance;
 mod reset_only_allocation;
 mod retained_race;
+mod store_growth;
 mod temporary_registration;
 
 // Type alias for backward compatibility
