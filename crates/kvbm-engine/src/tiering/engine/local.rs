@@ -7011,6 +7011,38 @@ mod tests {
             rig.holder_f.last_opened().expect("holder session recorded")
         }
 
+        #[tokio::test]
+        async fn prefill_validation_refuses_fpst_before_attach_or_copy() -> Result<()> {
+            use kvbm_protocols::disagg::{DISAGG_PROTOCOL_VERSION, TransferParams};
+
+            let rig = prefill_rig().await?;
+            let session_id = Uuid::new_v4();
+            let holder = open_holder(&rig, session_id);
+            let mut request = fb("fpst", rig.plhs.clone(), rig.plhs.len() * BS + 1);
+            let mut params = RemotePrefillParams::new(session_id, InstanceId::new_v4());
+            params.decode_endpoint = holder.endpoint();
+            params.num_provided_tokens = BS;
+            params.protocol_version = 2;
+            request.transfer_params = Some(TransferParams::remote_prefill(params.clone()));
+
+            let result = rig.engine.clone().find_blocks(&request, None);
+            assert!(matches!(
+                result,
+                Err(LeaderEngineError::InvalidPrefillRequest { reason })
+                    if reason.contains("protocol version 2") && reason.contains("requires 1")
+            ));
+            assert!(rig.resolver.calls().is_empty());
+            assert!(rig.puller_f.attach_calls().is_empty());
+            assert!(rig.workers.transfer_calls().is_empty());
+
+            params.protocol_version = DISAGG_PROTOCOL_VERSION;
+            request.transfer_params = Some(TransferParams::remote_prefill(params));
+            let _admitted = rig.engine.clone().find_blocks(&request, None)?;
+            wait_for(|| rig.puller_f.attach_calls().len() == 1).await;
+            assert_eq!(rig.puller_f.attach_calls()[0].0, session_id);
+            Ok(())
+        }
+
         /// Test-local RAII stand-in for the connector's parked prefill lifecycle
         /// handle (the unified seam parks one opaque `FindBlocksHandle`); this
         /// lease fires `prefill_release` on drop so the existing drop-site release

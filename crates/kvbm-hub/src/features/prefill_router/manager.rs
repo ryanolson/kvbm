@@ -123,7 +123,7 @@ impl PrefillRouterManager {
     /// Build a manager with the given selector config and NO circuit breaker
     /// (the default; a runtime no-op). Use [`Self::with_breaker`] to opt in.
     pub fn new(config: SelectorConfig) -> Arc<Self> {
-        Self::build(config, None, None)
+        Self::with_options(config, None, false)
     }
 
     /// Build a manager with the circuit breaker enabled, constructed from the
@@ -131,21 +131,28 @@ impl PrefillRouterManager {
     /// dedicated breaker-tick task. Only call this when the operator opted in
     /// (`cd_breaker_enabled = true`).
     pub fn with_breaker(config: SelectorConfig, breaker_config: BreakerConfig) -> Arc<Self> {
-        let breaker = Arc::new(CircuitBreaker::new(breaker_config, boot_epoch_seed()));
+        Self::with_options(config, Some(breaker_config), false)
+    }
+
+    /// Build a manager with an optional circuit breaker and FPST opt-in.
+    ///
+    /// Set `allow_fpst` when the fleet can serve FPST requests. The router
+    /// continues to accept ordinary remote prefill requests.
+    pub fn with_options(
+        config: SelectorConfig,
+        breaker_config: Option<BreakerConfig>,
+        allow_fpst: bool,
+    ) -> Arc<Self> {
+        let breaker =
+            breaker_config.map(|config| Arc::new(CircuitBreaker::new(config, boot_epoch_seed())));
         // The broadcaster shares the breaker Arc; the tick task fans transitions
         // out through it. Metrics are wired by the binary (None here keeps the
         // breaker push-only when no hub /metrics surface is present).
-        let broadcaster = TierBroadcaster::new(Arc::clone(&breaker), None);
-        Self::build(config, Some(breaker), Some(broadcaster))
-    }
-
-    fn build(
-        config: SelectorConfig,
-        breaker: Option<Arc<CircuitBreaker>>,
-        broadcaster: Option<Arc<TierBroadcaster>>,
-    ) -> Arc<Self> {
+        let broadcaster = breaker
+            .as_ref()
+            .map(|breaker| TierBroadcaster::new(Arc::clone(breaker), None));
         let selector = Selector::new(config);
-        let router = PrefillRouter::new(Arc::clone(&selector));
+        let router = PrefillRouter::with_fpst(Arc::clone(&selector), allow_fpst);
         Arc::new(Self {
             router,
             selector,

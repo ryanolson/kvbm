@@ -66,6 +66,10 @@ struct Cli {
     #[arg(long)]
     prefill_router: bool,
 
+    /// Allow frontier prefill state transfer (FPST) requests on the hub.
+    #[arg(long, requires = "prefill_router")]
+    prefill_router_fpst: bool,
+
     /// Per-worker in-flight concurrency cap used by the prefill router.
     /// The fleet-wide backpressure shape is preserved by per-worker
     /// semaphores; a worker at the cap is skipped during selection and
@@ -539,9 +543,7 @@ async fn main() -> anyhow::Result<()> {
             per_worker_concurrency: cli.prefill_worker_concurrency,
             block_size,
         };
-        // CD circuit breaker: opt-in (`--cd-breaker`). OFF ⇒ plain `new`, no
-        // breaker, no tick task, no tier push — byte-identical to today.
-        let router_manager = if cli.cd_breaker {
+        let breaker_config = cli.cd_breaker.then(|| {
             let breaker_config = kvbm_hub::BreakerConfig {
                 warm_high: cli.cd_breaker_warm_high,
                 hot_high: cli.cd_breaker_hot_high,
@@ -557,14 +559,18 @@ async fn main() -> anyhow::Result<()> {
                 clear_debounce_ticks = cli.cd_breaker_clear_debounce_ticks,
                 "CD prefill-overload circuit breaker ENABLED"
             );
-            kvbm_hub::PrefillRouterManager::with_breaker(selector_config, breaker_config)
-        } else {
-            kvbm_hub::PrefillRouterManager::new(selector_config)
-        };
+            breaker_config
+        });
+        let router_manager = kvbm_hub::PrefillRouterManager::with_options(
+            selector_config,
+            breaker_config,
+            cli.prefill_router_fpst,
+        );
         tracing::info!(
             per_worker_concurrency = cli.prefill_worker_concurrency,
             block_size,
             cd_breaker = cli.cd_breaker,
+            fpst = cli.prefill_router_fpst,
             "prefill router feature enabled (continuous fleet membership)"
         );
         router_for_late_bind = Some(Arc::clone(&router_manager));
@@ -658,6 +664,14 @@ mod tests {
         ];
         v.extend(extra.iter().map(|s| s.to_string()));
         v
+    }
+
+    #[test]
+    fn fpst_is_opt_in_and_requires_the_prefill_router() {
+        assert!(!Cli::parse_from(args(&[])).prefill_router_fpst);
+        assert!(Cli::try_parse_from(args(&["--prefill-router-fpst"])).is_err());
+        let cli = Cli::parse_from(args(&["--prefill-router", "--prefill-router-fpst"]));
+        assert!(cli.prefill_router_fpst);
     }
 
     #[test]
