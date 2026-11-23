@@ -674,21 +674,21 @@ mod tests {
 
     #[test]
     fn test_create_fc_layout_system() {
-        let agent = create_test_agent("test_fc_system");
+        let agent = create_test_agent_with_backends("test_fc_system", &["UCX"]).unwrap();
         let layout = create_fc_layout(agent, StorageKind::System, 4);
         assert!(layout.layout().as_ref().is_fully_contiguous());
     }
 
     #[test]
     fn test_create_lw_layout_system() {
-        let agent = create_test_agent("test_lw_system");
+        let agent = create_test_agent_with_backends("test_lw_system", &["UCX"]).unwrap();
         let layout = create_lw_layout(agent, StorageKind::System, 4);
         assert!(!layout.layout().as_ref().is_fully_contiguous());
     }
 
     #[test]
     fn test_fill_and_checksum() {
-        let agent = create_test_agent("test_fill_checksum");
+        let agent = create_test_agent_with_backends("test_fill_checksum", &["UCX"]).unwrap();
         let layout = create_fc_layout(agent, StorageKind::System, 4);
 
         let block_ids = vec![0, 1, 2];

@@ -77,7 +77,9 @@ use crate::{
     BlockId,
     layout::{
         BlockDimension, LayoutConfig,
-        builder::{HasConfig, NoLayout, NoMemory, PhysicalLayoutBuilder},
+        builder::{
+            HasConfig, NoLayout, NoMemory, PhysicalLayoutBuilder, PhysicalLayoutBuilderDefault,
+        },
     },
 };
 use anyhow::Result;
@@ -169,7 +171,9 @@ pub fn standard_config_with_page_size(num_blocks: usize, page_size: usize) -> La
 pub fn builder(num_blocks: usize) -> PhysicalLayoutBuilder<HasConfig, NoLayout, NoMemory> {
     let agent = create_test_agent("test_agent");
     let config = standard_config(num_blocks);
-    PhysicalLayout::builder(agent).with_config(config)
+    PhysicalLayout::builder(agent)
+        .local_only()
+        .with_config(config)
 }
 
 /// Create a test agent with no backends.
@@ -185,47 +189,39 @@ pub fn create_test_agent_with_backends(name: &str, backends: &[&str]) -> Result<
     NixlAgent::with_backends(name, backends)
 }
 
-/// Create a fully contiguous physical layout with the specified storage type.
+/// Create a fully contiguous layout for a local-copy test.
 pub fn create_fc_layout(
     agent: NixlAgent,
     storage_kind: StorageKind,
     num_blocks: usize,
 ) -> PhysicalLayout {
-    let config = standard_config(num_blocks);
-    let builder = PhysicalLayout::builder(agent)
-        .with_config(config)
-        .fully_contiguous();
-
-    match storage_kind {
-        StorageKind::System => builder.allocate_system().build().unwrap(),
-        StorageKind::Pinned => builder.allocate_pinned(None).build().unwrap(),
-        StorageKind::Device(device_id) => builder.allocate_device(device_id).build().unwrap(),
-        StorageKind::Disk(_) => builder.allocate_disk(None).build().unwrap(),
-    }
+    create_layout(
+        agent,
+        LayoutSpec::new(LayoutKind::FC, storage_kind),
+        num_blocks,
+    )
 }
 
-/// Create a layer-separate physical layout with the specified storage type.
+/// Create a layer-separate layout for a local-copy test.
 pub fn create_lw_layout(
     agent: NixlAgent,
     storage_kind: StorageKind,
     num_blocks: usize,
 ) -> PhysicalLayout {
-    let config = standard_config(num_blocks);
-    let builder = PhysicalLayout::builder(agent)
-        .with_config(config)
-        .layer_separate(BlockDimension::BlockIsFirstDim);
-
-    match storage_kind {
-        StorageKind::System => builder.allocate_system().build().unwrap(),
-        StorageKind::Pinned => builder.allocate_pinned(None).build().unwrap(),
-        StorageKind::Device(device_id) => builder.allocate_device(device_id).build().unwrap(),
-        StorageKind::Disk(_) => builder.allocate_disk(None).build().unwrap(),
-    }
+    create_layout(
+        agent,
+        LayoutSpec::new(LayoutKind::LW, storage_kind),
+        num_blocks,
+    )
 }
-
 /// Create a physical layout based on the specification, using the default page_size (16).
 pub fn create_layout(agent: NixlAgent, spec: LayoutSpec, num_blocks: usize) -> PhysicalLayout {
-    create_layout_with_page_size(agent, spec, num_blocks, 16)
+    create_layout_with_page_size(
+        PhysicalLayout::builder(agent).local_only(),
+        spec,
+        num_blocks,
+        16,
+    )
 }
 
 /// Create a physical layout with a caller-chosen `page_size` (tokens per block).
@@ -233,7 +229,7 @@ pub fn create_layout(agent: NixlAgent, spec: LayoutSpec, num_blocks: usize) -> P
 /// Used by page-size sweep tests to exercise FC/LW layout indexing across the range
 /// of production block sizes without disturbing the default helpers.
 pub fn create_layout_with_page_size(
-    agent: NixlAgent,
+    builder: PhysicalLayoutBuilderDefault,
     spec: LayoutSpec,
     num_blocks: usize,
     page_size: usize,
@@ -241,9 +237,7 @@ pub fn create_layout_with_page_size(
     let config = standard_config_with_page_size(num_blocks, page_size);
     match spec.kind {
         LayoutKind::FC => {
-            let b = PhysicalLayout::builder(agent)
-                .with_config(config)
-                .fully_contiguous();
+            let b = builder.with_config(config).fully_contiguous();
             match spec.storage {
                 StorageKind::System => b.allocate_system().build().unwrap(),
                 StorageKind::Pinned => b.allocate_pinned(None).build().unwrap(),
@@ -252,7 +246,7 @@ pub fn create_layout_with_page_size(
             }
         }
         LayoutKind::LW => {
-            let b = PhysicalLayout::builder(agent)
+            let b = builder
                 .with_config(config)
                 .layer_separate(BlockDimension::BlockIsFirstDim);
             match spec.storage {

@@ -392,8 +392,8 @@ pub(crate) fn execute_planner_nixl_transfer(
     let t_ctrl0 = std::time::Instant::now();
 
     let nixl_agent = ctx.nixl_agent();
-    let src_metadata = src.nixl_metadata();
-    let dst_metadata = dst.nixl_metadata();
+    let src_metadata = src.nixl_metadata()?;
+    let dst_metadata = dst.nixl_metadata()?;
     let src_is_local = nixl_agent.name() == src_metadata.agent_name();
     let dst_is_local = nixl_agent.name() == dst_metadata.agent_name();
     match xfer_op {
@@ -1635,8 +1635,8 @@ impl OwnedStagedContext {
             ),
         };
 
-        let src_metadata = src.nixl_metadata();
-        let dst_metadata = dst.nixl_metadata();
+        let src_metadata = src.nixl_metadata()?;
+        let dst_metadata = dst.nixl_metadata()?;
         let mut src_dl = XferDescList::new(src_metadata.mem_type())?;
         let mut dst_dl = XferDescList::new(dst_metadata.mem_type())?;
         let mut guards = Vec::new();
@@ -1748,10 +1748,11 @@ fn dispatch_staged_nixl_transform(
         );
     }
     let nixl_agent_local = ctx.nixl_agent();
-    if bounce_layout.nixl_metadata().agent_name() != nixl_agent_local.name() {
+    let bounce_agent = bounce_layout.nixl_metadata()?.agent_name();
+    if bounce_agent != nixl_agent_local.name() {
         bail!(
             "dispatch_staged_nixl_transform: bounce agent {:?} != local agent {:?}",
-            bounce_layout.nixl_metadata().agent_name(),
+            bounce_agent,
             nixl_agent_local.name()
         );
     }
@@ -1777,8 +1778,8 @@ fn dispatch_staged_nixl_transform(
     }
 
     // ──────── Locality check (mirrors the Direct path). ────────
-    let src_metadata = src.nixl_metadata();
-    let dst_metadata = dst.nixl_metadata();
+    let src_metadata = src.nixl_metadata()?;
+    let dst_metadata = dst.nixl_metadata()?;
     match xfer_op {
         XferOp::Write => {
             if nixl_agent_local.name() != src_metadata.agent_name() {

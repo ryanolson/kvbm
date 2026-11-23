@@ -591,7 +591,12 @@ impl TransferContext {
             // Same-layout direct copies don't use a prepared plan.
             return Ok(());
         }
-        let plan = select_strategy(src_layout, dst_layout, self)?;
+        let plan = select_strategy(
+            src_layout,
+            dst_layout,
+            &self.nixl_agent().name(),
+            self.capabilities(),
+        )?;
         let strategy = match plan {
             TransferPlan::Direct(strategy) => strategy,
             // Two-hop plans bypass the prepared-plan cache (per-call

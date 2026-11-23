@@ -9,14 +9,16 @@
 //! 2. Select a concrete layout (fully contiguous or layer separate)
 //! 3. Specify memory backing (either by allocating or by supplying existing regions)
 //!
-//! NIXL registration is always enabled. Callers must provide a [`nixl_sys::Agent`], and any memory
-//! supplied to the builder must implement [`NixlCompatible`].
+//! The public builder requires NIXL registration. It accepts an agent and either
+//! registers memory that implements [`NixlCompatible`] or accepts regions that
+//! already carry a descriptor.
 
 use crate::layout::physical::PhysicalLayout;
 
 use super::{
     BlockDimension, FullyContiguousLayout, KvBlockLayout, LayerSeparateLayout, Layout,
-    LayoutConfig, MemoryDescriptor, RaggedLayerSeparateLayout, physical::NixlMetadata,
+    LayoutConfig, MemoryDescriptor, RaggedLayerSeparateLayout,
+    physical::{LayoutRegistration, NixlMetadata},
 };
 use crate::layout::serialize::BlockFormat;
 
@@ -81,6 +83,19 @@ enum MemoryPlan {
     Allocate(AllocationKind),
 }
 
+#[derive(Clone, Copy)]
+enum RegistrationPolicy {
+    Required,
+    // The policy compiles in every build. Only test fixtures can select it.
+    #[cfg_attr(not(all(test, feature = "testing-kvbm")), allow(dead_code))]
+    LocalOnly,
+}
+
+struct RegistrationConfig {
+    agent: NixlAgent,
+    policy: RegistrationPolicy,
+}
+
 /// Memory tenancy captured during the build process.
 #[derive(Debug, Clone)]
 struct MemoryEntry {
@@ -117,24 +132,18 @@ impl MemoryEntry {
         }
     }
 
-    fn ensure_registered(mut self) -> Result<Self> {
+    fn validate_registration(mut self, policy: RegistrationPolicy) -> Result<Self> {
         if self.descriptor.is_none() {
             self.descriptor = self.region.nixl_descriptor();
             self.registration = self.descriptor.clone();
         }
 
-        #[cfg(not(test))]
-        {
-            // In production, require NIXL registration
-            if self.descriptor.is_none() {
-                bail!(
-                    "memory region {} is not registered with NIXL",
-                    self.region.addr()
-                );
-            }
+        if matches!(policy, RegistrationPolicy::Required) && self.descriptor.is_none() {
+            bail!(
+                "memory region {} is not registered with NIXL",
+                self.region.addr()
+            );
         }
-
-        // In test builds, allow None descriptors for local-only layouts
         Ok(self)
     }
 }
@@ -154,7 +163,7 @@ pub type PhysicalLayoutBuilderDefault = PhysicalLayoutBuilder<NoConfig, NoLayout
 
 /// Typed builder enforcing configuration, layout selection, and memory provisioning phases.
 pub struct PhysicalLayoutBuilder<C, L, M> {
-    agent: NixlAgent,
+    registration: RegistrationConfig,
     config: Option<LayoutConfig>,
     layout_kind: Option<LayoutKind>,
     memory_plan: Option<MemoryPlan>,
@@ -170,7 +179,10 @@ impl PhysicalLayoutBuilder<NoConfig, NoLayout, NoMemory> {
     /// Create a new builder in its initial state.
     pub fn new(agent: NixlAgent) -> Self {
         Self {
-            agent,
+            registration: RegistrationConfig {
+                agent,
+                policy: RegistrationPolicy::Required,
+            },
             config: None,
             layout_kind: None,
             memory_plan: None,
@@ -180,20 +192,26 @@ impl PhysicalLayoutBuilder<NoConfig, NoLayout, NoMemory> {
             _memory: PhantomData,
         }
     }
+
+    #[cfg(all(test, feature = "testing-kvbm"))]
+    pub(crate) fn local_only(mut self) -> Self {
+        self.registration.policy = RegistrationPolicy::LocalOnly;
+        self
+    }
 }
 
 impl<C, L, M> PhysicalLayoutBuilder<C, L, M> {
     fn into_parts(
         self,
     ) -> (
-        NixlAgent,
+        RegistrationConfig,
         Option<LayoutConfig>,
         Option<LayoutKind>,
         Option<MemoryPlan>,
         Option<KvBlockLayout>,
     ) {
         (
-            self.agent,
+            self.registration,
             self.config,
             self.layout_kind,
             self.memory_plan,
@@ -202,14 +220,14 @@ impl<C, L, M> PhysicalLayoutBuilder<C, L, M> {
     }
 
     fn from_parts<C2, L2, M2>(
-        agent: NixlAgent,
+        registration: RegistrationConfig,
         config: Option<LayoutConfig>,
         layout_kind: Option<LayoutKind>,
         memory_plan: Option<MemoryPlan>,
         block_layout: Option<KvBlockLayout>,
     ) -> PhysicalLayoutBuilder<C2, L2, M2> {
         PhysicalLayoutBuilder {
-            agent,
+            registration,
             config,
             layout_kind,
             memory_plan,
@@ -238,9 +256,9 @@ impl<C, L, M> PhysicalLayoutBuilder<C, L, M> {
 impl<L, M> PhysicalLayoutBuilder<NoConfig, L, M> {
     /// Attach the [`LayoutConfig`] required to size the layout and allocations.
     pub fn with_config(self, config: LayoutConfig) -> PhysicalLayoutBuilder<HasConfig, L, M> {
-        let (agent, _config, layout_kind, memory_plan, block_layout) = self.into_parts();
+        let (registration, _config, layout_kind, memory_plan, block_layout) = self.into_parts();
         PhysicalLayoutBuilder::<HasConfig, L, M>::from_parts(
-            agent,
+            registration,
             Some(config),
             layout_kind,
             memory_plan,
@@ -252,9 +270,9 @@ impl<L, M> PhysicalLayoutBuilder<NoConfig, L, M> {
 impl<M> PhysicalLayoutBuilder<HasConfig, NoLayout, M> {
     /// Select the fully contiguous layout variant.
     pub fn fully_contiguous(self) -> PhysicalLayoutBuilder<HasConfig, HasLayout, M> {
-        let (agent, config, _layout, memory_plan, block_layout) = self.into_parts();
+        let (registration, config, _layout, memory_plan, block_layout) = self.into_parts();
         PhysicalLayoutBuilder::<HasConfig, HasLayout, M>::from_parts(
-            agent,
+            registration,
             config,
             Some(LayoutKind::FullyContiguous),
             memory_plan,
@@ -267,9 +285,9 @@ impl<M> PhysicalLayoutBuilder<HasConfig, NoLayout, M> {
         self,
         block_dim: BlockDimension,
     ) -> PhysicalLayoutBuilder<HasConfig, HasLayout, M> {
-        let (agent, config, _layout, memory_plan, block_layout) = self.into_parts();
+        let (registration, config, _layout, memory_plan, block_layout) = self.into_parts();
         PhysicalLayoutBuilder::<HasConfig, HasLayout, M>::from_parts(
-            agent,
+            registration,
             config,
             Some(LayoutKind::LayerSeparate { block_dim }),
             memory_plan,
@@ -282,9 +300,9 @@ impl<M> PhysicalLayoutBuilder<HasConfig, NoLayout, M> {
         self,
         bytes_per_layer_block: Vec<usize>,
     ) -> PhysicalLayoutBuilder<HasConfig, HasLayout, M> {
-        let (agent, config, _layout, memory_plan, block_layout) = self.into_parts();
+        let (registration, config, _layout, memory_plan, block_layout) = self.into_parts();
         PhysicalLayoutBuilder::<HasConfig, HasLayout, M>::from_parts(
-            agent,
+            registration,
             config,
             Some(LayoutKind::RaggedLayerSeparate {
                 bytes_per_layer_block,
@@ -300,9 +318,9 @@ impl PhysicalLayoutBuilder<HasConfig, HasLayout, NoMemory> {
         self,
         plan: MemoryPlan,
     ) -> PhysicalLayoutBuilder<HasConfig, HasLayout, HasMemory> {
-        let (agent, config, layout_kind, _memory, block_layout) = self.into_parts();
+        let (registration, config, layout_kind, _memory, block_layout) = self.into_parts();
         PhysicalLayoutBuilder::<HasConfig, HasLayout, HasMemory>::from_parts(
-            agent,
+            registration,
             config,
             layout_kind,
             Some(plan),
@@ -370,11 +388,11 @@ impl PhysicalLayoutBuilder<HasConfig, HasLayout, NoMemory> {
     where
         S: MemoryDescriptor + NixlCompatible + 'static,
     {
-        let (agent, config, layout_kind, _memory, block_layout) = self.into_parts();
-        let entries = register_existing_regions(&agent, regions)?;
+        let (registration, config, layout_kind, _memory, block_layout) = self.into_parts();
+        let entries = register_existing_regions(&registration, regions)?;
         Ok(
             PhysicalLayoutBuilder::<HasConfig, HasLayout, HasMemory>::from_parts(
-                agent,
+                registration,
                 config,
                 layout_kind,
                 Some(MemoryPlan::Provided(entries)),
@@ -404,10 +422,10 @@ impl PhysicalLayoutBuilder<HasConfig, HasLayout, NoMemory> {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let (agent, config, layout_kind, _memory, block_layout) = self.into_parts();
+        let (registration, config, layout_kind, _memory, block_layout) = self.into_parts();
         Ok(
             PhysicalLayoutBuilder::<HasConfig, HasLayout, HasMemory>::from_parts(
-                agent,
+                registration,
                 config,
                 layout_kind,
                 Some(MemoryPlan::Provided(entries)),
@@ -452,7 +470,7 @@ impl PhysicalLayoutBuilder<HasConfig, HasLayout, NoMemory> {
             bail!("with_external_device_regions requires at least one tensor");
         }
 
-        let (agent, config, layout_kind, _memory, block_layout) = self.into_parts();
+        let (registration, config, layout_kind, _memory, block_layout) = self.into_parts();
 
         let mut entries = Vec::with_capacity(tensors.len());
 
@@ -466,7 +484,7 @@ impl PhysicalLayoutBuilder<HasConfig, HasLayout, NoMemory> {
             // Arc<dyn TensorDescriptor> implements both MemoryDescriptor and NixlCompatible,
             // so we can register it directly. This is the critical step that enables
             // remote GPU-to-GPU transfers via UCX backend.
-            let entry = register_storage(tensor, &agent).map_err(|e| {
+            let entry = register_storage(tensor, &registration).map_err(|e| {
                 anyhow!(
                     "failed to register tensor {} with NIXL (UCX backend required for VRAM): {}",
                     index,
@@ -479,7 +497,7 @@ impl PhysicalLayoutBuilder<HasConfig, HasLayout, NoMemory> {
 
         Ok(
             PhysicalLayoutBuilder::<HasConfig, HasLayout, HasMemory>::from_parts(
-                agent,
+                registration,
                 config,
                 layout_kind,
                 Some(MemoryPlan::Provided(entries)),
@@ -492,7 +510,7 @@ impl PhysicalLayoutBuilder<HasConfig, HasLayout, NoMemory> {
 impl PhysicalLayoutBuilder<HasConfig, HasLayout, HasMemory> {
     /// Finalize the builder, constructing the [`PhysicalLayout`].
     pub fn build(self) -> Result<PhysicalLayout> {
-        let (agent, config, layout_kind, memory_plan, block_layout) = self.into_parts();
+        let (registration, config, layout_kind, memory_plan, block_layout) = self.into_parts();
 
         let config = config.ok_or_else(|| anyhow!("layout config missing despite type state"))?;
         let layout_kind =
@@ -501,12 +519,15 @@ impl PhysicalLayoutBuilder<HasConfig, HasLayout, HasMemory> {
             memory_plan.ok_or_else(|| anyhow!("memory plan missing despite type state"))?;
 
         let required_sizes = compute_allocation_sizes(&config, &layout_kind)?;
-        let entries = resolve_memory_plan(&agent, memory_plan, &required_sizes)?;
-        let registrations = collect_registrations(&entries);
-
+        let entries = resolve_memory_plan(&registration, memory_plan, &required_sizes)?;
         validate_memory_sizes(&entries, &required_sizes)?;
         let kind = derive_storage_kind(&entries)?;
-        let metadata = derive_nixl_metadata(&agent, &entries)?;
+        let metadata = derive_layout_registration(&registration, &entries)?;
+        let registrations = if matches!(metadata, LayoutRegistration::Registered(_)) {
+            collect_registrations(&entries)
+        } else {
+            Vec::new()
+        };
 
         let kv_block_layout = block_layout.unwrap_or(KvBlockLayout::Unknown);
 
@@ -572,18 +593,21 @@ fn collect_registrations(entries: &[MemoryEntry]) -> Vec<NixlDescriptor> {
     registrations
 }
 
-fn register_existing_regions<S>(agent: &NixlAgent, regions: Vec<S>) -> Result<Vec<MemoryEntry>>
+fn register_existing_regions<S>(
+    registration: &RegistrationConfig,
+    regions: Vec<S>,
+) -> Result<Vec<MemoryEntry>>
 where
     S: MemoryDescriptor + NixlCompatible + 'static,
 {
     regions
         .into_iter()
-        .map(|region| register_storage(region, agent))
+        .map(|region| register_storage(region, registration))
         .collect()
 }
 
 fn resolve_memory_plan(
-    agent: &NixlAgent,
+    registration: &RegistrationConfig,
     plan: MemoryPlan,
     sizes: &[usize],
 ) -> Result<Vec<MemoryEntry>> {
@@ -598,15 +622,15 @@ fn resolve_memory_plan(
             }
             entries
                 .into_iter()
-                .map(MemoryEntry::ensure_registered)
+                .map(|entry| entry.validate_registration(registration.policy))
                 .collect()
         }
-        MemoryPlan::Allocate(strategy) => allocate_regions(agent, strategy, sizes),
+        MemoryPlan::Allocate(strategy) => allocate_regions(registration, strategy, sizes),
     }
 }
 
 fn allocate_regions(
-    agent: &NixlAgent,
+    registration: &RegistrationConfig,
     strategy: AllocationKind,
     sizes: &[usize],
 ) -> Result<Vec<MemoryEntry>> {
@@ -617,29 +641,29 @@ fn allocate_regions(
     let reserve_size = total_allocation_size(sizes, REGION_ALIGNMENT)?;
 
     let base_entry = match strategy {
-        AllocationKind::System => allocate_system_entry(reserve_size, agent)?,
+        AllocationKind::System => allocate_system_entry(reserve_size, registration)?,
         AllocationKind::Pinned {
             device_id,
             allocator,
-        } => allocate_pinned_entry(reserve_size, agent, device_id, allocator)?,
+        } => allocate_pinned_entry(reserve_size, registration, device_id, allocator)?,
         AllocationKind::Device { device_id } => {
-            allocate_device_entry(reserve_size, agent, device_id)?
+            allocate_device_entry(reserve_size, registration, device_id)?
         }
-        AllocationKind::Disk { path } => allocate_disk_entry(reserve_size, agent, path)?,
+        AllocationKind::Disk { path } => allocate_disk_entry(reserve_size, registration, path)?,
     };
 
     create_offset_entries(base_entry, sizes, REGION_ALIGNMENT)
 }
 
-fn allocate_system_entry(size: usize, agent: &NixlAgent) -> Result<MemoryEntry> {
+fn allocate_system_entry(size: usize, registration: &RegistrationConfig) -> Result<MemoryEntry> {
     let storage = SystemStorage::new(size)
         .map_err(|e| anyhow!("failed to allocate system memory ({size} bytes): {e}"))?;
-    register_storage(storage, agent)
+    register_storage(storage, registration)
 }
 
 fn allocate_pinned_entry(
     size: usize,
-    agent: &NixlAgent,
+    registration: &RegistrationConfig,
     device_id: Option<u32>,
     allocator: PinnedAllocator,
 ) -> Result<MemoryEntry> {
@@ -647,7 +671,7 @@ fn allocate_pinned_entry(
         PinnedAllocator::CuMemHostAlloc => {
             let storage = PinnedStorage::new_for_device(size, device_id)
                 .map_err(|e| anyhow!("failed to allocate pinned memory ({size} bytes): {e}"))?;
-            register_storage(storage, agent)
+            register_storage(storage, registration)
         }
         PinnedAllocator::RegisteredMmap => {
             let device_id = device_id
@@ -657,21 +681,25 @@ fn allocate_pinned_entry(
                     "failed to allocate registered-mmap pinned memory ({size} bytes) on device {device_id}: {e}"
                 )
             })?;
-            register_storage(storage, agent)
+            register_storage(storage, registration)
         }
     }
 }
 
-fn allocate_device_entry(size: usize, agent: &NixlAgent, device_id: u32) -> Result<MemoryEntry> {
+fn allocate_device_entry(
+    size: usize,
+    registration: &RegistrationConfig,
+    device_id: u32,
+) -> Result<MemoryEntry> {
     let storage = DeviceStorage::new(size, device_id).map_err(|e| {
         anyhow!("failed to allocate device memory ({size} bytes) on device {device_id}: {e}")
     })?;
-    register_storage(storage, agent)
+    register_storage(storage, registration)
 }
 
 fn allocate_disk_entry(
     size: usize,
-    agent: &NixlAgent,
+    registration: &RegistrationConfig,
     path: Option<PathBuf>,
 ) -> Result<MemoryEntry> {
     let storage = if let Some(path) = path {
@@ -680,64 +708,18 @@ fn allocate_disk_entry(
     } else {
         DiskStorage::new(size).map_err(|e| anyhow!("failed to allocate disk storage: {e}"))?
     };
-    register_storage(storage, agent)
+    register_storage(storage, registration)
 }
 
-// When testing, we allow unregistered layouts to help with test time. NIXL + UCX is very expensive to setup
-// so we only use that backend when it's needed.
-#[cfg(test)]
-fn register_storage<S>(storage: S, agent: &NixlAgent) -> Result<MemoryEntry>
+fn register_storage<S>(storage: S, registration: &RegistrationConfig) -> Result<MemoryEntry>
 where
     S: MemoryDescriptor + NixlCompatible + 'static,
 {
-    let storage_kind = storage.storage_kind();
-
-    // Determine if registration is needed based on storage type and available backends
-    let should_register = match storage_kind {
-        StorageKind::System | StorageKind::Pinned => {
-            // System/Pinned memory needs UCX for remote transfers
-            agent.has_backend("UCX") || agent.has_backend("POSIX")
-        }
-        StorageKind::Device(_) => {
-            // Device memory needs UCX for remote transfers OR GDS for direct disk transfers
-            agent.has_backend("UCX") || agent.has_backend("GDS_MT")
-        }
-        StorageKind::Disk(_) => {
-            // Disk storage needs POSIX for regular I/O OR GDS for GPU direct I/O
-            agent.has_backend("POSIX") || agent.has_backend("GDS_MT")
-        }
-    };
-
-    if !should_register {
-        // Skip registration - only local non-NIXL transfers will be used
-        let region = Buffer::from_arc(Arc::new(storage));
-        return Ok(MemoryEntry::new(region, None));
+    if matches!(registration.policy, RegistrationPolicy::LocalOnly) {
+        return Ok(MemoryEntry::new(create_buffer(storage), None));
     }
 
-    // Register with NIXL using the appropriate backend
-    match register_with_nixl(storage, agent, None) {
-        Ok(registered) => {
-            let descriptor = registered.descriptor();
-            let region = Buffer::from_arc(Arc::new(registered));
-            Ok(MemoryEntry::new(region, Some(descriptor)))
-        }
-        Err(RegisterError { source, .. }) => {
-            bail!(
-                "failed to register memory with NIXL agent {}: {source}",
-                agent.name()
-            )
-        }
-    }
-}
-
-// Production builds always register
-#[cfg(not(test))]
-fn register_storage<S>(storage: S, agent: &NixlAgent) -> Result<MemoryEntry>
-where
-    S: MemoryDescriptor + NixlCompatible + 'static,
-{
-    // Production builds always register for safety
-    match register_with_nixl(storage, agent, None) {
+    match register_with_nixl(storage, &registration.agent, None) {
         Ok(registered) => {
             let descriptor = registered.descriptor();
             let region: Buffer = create_buffer(registered);
@@ -746,7 +728,7 @@ where
         Err(RegisterError { source, .. }) => {
             bail!(
                 "failed to register memory with NIXL agent {}: {source}",
-                agent.name()
+                registration.agent.name()
             )
         }
     }
@@ -940,49 +922,24 @@ fn derive_storage_kind(entries: &[MemoryEntry]) -> Result<StorageKind> {
     Ok(first_kind)
 }
 
-fn derive_nixl_metadata(agent: &NixlAgent, entries: &[MemoryEntry]) -> Result<NixlMetadata> {
-    // Try to find a descriptor from entries
-    let descriptor_opt = entries.iter().find_map(|entry| entry.descriptor.clone());
-
-    #[cfg(test)]
-    {
-        // In test builds, allow layouts without NIXL registration
-        // Use defaults for local-only transfers
-        if let Some(descriptor) = descriptor_opt {
-            Ok(NixlMetadata::new(
-                agent.name().to_string(),
+fn derive_layout_registration(
+    registration: &RegistrationConfig,
+    entries: &[MemoryEntry],
+) -> Result<LayoutRegistration> {
+    let agent_name = registration.agent.name().to_string();
+    match registration.policy {
+        RegistrationPolicy::Required => {
+            let descriptor = entries
+                .iter()
+                .find_map(|entry| entry.descriptor.as_ref())
+                .ok_or_else(|| anyhow!("memory entries missing NIXL registration metadata"))?;
+            Ok(LayoutRegistration::Registered(NixlMetadata::new(
+                agent_name,
                 descriptor.mem_type,
                 descriptor.device_id,
-            ))
-        } else {
-            // Use placeholder metadata for unregistered layouts
-            let first_entry = entries
-                .first()
-                .ok_or_else(|| anyhow!("no memory entries"))?;
-            let storage_kind = first_entry.region.storage_kind();
-            let (mem_type, device_id) = match storage_kind {
-                StorageKind::System => (MemType::Dram, 0),
-                StorageKind::Pinned => (MemType::Dram, 0),
-                StorageKind::Device(id) => (MemType::Vram, id as u64),
-                StorageKind::Disk(id) => (MemType::File, id),
-            };
-            Ok(NixlMetadata::new(
-                agent.name().to_string(),
-                mem_type,
-                device_id,
-            ))
+            )))
         }
-    }
-
-    #[cfg(not(test))]
-    {
-        let descriptor = descriptor_opt
-            .ok_or_else(|| anyhow!("memory entries missing NIXL registration metadata"))?;
-        Ok(NixlMetadata::new(
-            agent.name().to_string(),
-            descriptor.mem_type,
-            descriptor.device_id,
-        ))
+        RegistrationPolicy::LocalOnly => Ok(LayoutRegistration::LocalOnly { agent_name }),
     }
 }
 
@@ -1041,6 +998,17 @@ mod tests {
         }
     }
 
+    impl NixlCompatible for TestRegisteredRegion {
+        fn nixl_params(&self) -> (*const u8, usize, MemType, u64) {
+            (
+                self.data.as_ptr(),
+                self.data.len(),
+                self.descriptor.mem_type,
+                self.descriptor.device_id,
+            )
+        }
+    }
+
     fn make_layout_config() -> LayoutConfig {
         LayoutConfig::builder()
             .num_blocks(2)
@@ -1064,6 +1032,102 @@ mod tests {
 
     fn per_layer_size(cfg: &LayoutConfig) -> usize {
         cfg.num_blocks * cfg.outer_dim * cfg.page_size * cfg.inner_dim * cfg.dtype_width_bytes
+    }
+
+    #[test]
+    fn registration_policy_default_requires_native_registration() -> Result<()> {
+        let agent = NixlAgent::new("registration-policy-default")?;
+        let cfg = make_layout_config();
+        let storage = SystemStorage::new(fully_contiguous_size(&cfg))?;
+        let result = PhysicalLayout::builder(agent)
+            .with_config(cfg)
+            .fully_contiguous()
+            .with_memory_regions(vec![storage])
+            .and_then(PhysicalLayoutBuilder::build);
+
+        let error = result.expect_err("default builder requires NIXL registration");
+        assert_eq!(
+            error.to_string(),
+            "failed to register memory with NIXL agent registration-policy-default: Backend error occurred"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn registration_policy_local_only_has_no_peer_descriptor_or_route() -> Result<()> {
+        use crate::transfer::TransferCapabilities;
+        use crate::transfer::strategy::{TransferPlan, TransferStrategy, select_strategy};
+
+        let agent = NixlAgent::new("registration-policy-local")?;
+        let cfg = make_layout_config();
+        let storage = SystemStorage::new(fully_contiguous_size(&cfg))?;
+        let local = PhysicalLayout::builder(agent.clone())
+            .local_only()
+            .with_config(cfg.clone())
+            .fully_contiguous()
+            .with_memory_regions(vec![storage])?
+            .build()?;
+        assert!(local.registrations().is_empty());
+        assert!(
+            local.layout().memory_regions()[0]
+                .nixl_descriptor()
+                .is_none()
+        );
+        assert_eq!(
+            local.to_descriptor().unwrap_err().to_string(),
+            "local-only layout has no NIXL registration"
+        );
+
+        let caps = TransferCapabilities::default();
+        assert_eq!(
+            select_strategy(&local, &local, &agent.name(), &caps)?,
+            TransferPlan::Direct(TransferStrategy::Memcpy)
+        );
+
+        let peer = PhysicalLayout::builder(NixlAgent::with_backends(
+            "registration-policy-peer",
+            &["UCX"],
+        )?)
+        .with_config(cfg)
+        .fully_contiguous()
+        .allocate_system()
+        .build()?;
+        for (src, dst) in [(&local, &peer), (&peer, &local)] {
+            assert_eq!(
+                select_strategy(src, dst, &agent.name(), &caps)
+                    .unwrap_err()
+                    .to_string(),
+                "local-only layout has no NIXL registration"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn registration_policy_required_preserves_a_supplied_descriptor() -> Result<()> {
+        let agent = NixlAgent::new("registration-policy-pre-registered")?;
+        let cfg = make_layout_config();
+        let region = TestRegisteredRegion::new(
+            fully_contiguous_size(&cfg),
+            StorageKind::System,
+            MemType::Dram,
+            0,
+        );
+        let expected = region.descriptor.clone();
+        let layout = PhysicalLayout::builder(agent)
+            .with_config(cfg)
+            .fully_contiguous()
+            .with_memory_regions(vec![region])?
+            .build()?;
+        let [registration] = layout.registrations() else {
+            bail!("expected the original registration");
+        };
+        assert_eq!(registration.addr, expected.addr);
+        assert_eq!(registration.size, expected.size);
+        assert_eq!(registration.mem_type, expected.mem_type);
+        assert_eq!(registration.device_id, expected.device_id);
+        assert_eq!(layout.to_descriptor()?.memory_descriptors().len(), 1);
+        Ok(())
     }
 
     #[test]
@@ -1108,7 +1172,7 @@ mod tests {
         assert_eq!(physical.layout().config().num_blocks, cfg.num_blocks);
         assert_eq!(physical.layout().config().num_layers, cfg.num_layers);
 
-        let metadata = physical.nixl_metadata();
+        let metadata = physical.nixl_metadata().unwrap();
         assert_eq!(metadata.agent_name(), agent.name());
         assert_eq!(metadata.mem_type(), MemType::Dram);
     }
@@ -1142,7 +1206,7 @@ mod tests {
         assert!(!physical.layout().as_ref().is_fully_contiguous());
         assert_eq!(physical.layout().config().num_layers, cfg.num_layers);
 
-        let metadata = physical.nixl_metadata();
+        let metadata = physical.nixl_metadata().unwrap();
         assert_eq!(metadata.agent_name(), agent.name());
         assert_eq!(metadata.mem_type(), MemType::Dram);
     }

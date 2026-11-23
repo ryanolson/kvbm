@@ -5,7 +5,7 @@
 
 use kvbm_memory::StorageKind;
 
-use crate::{layout::PhysicalLayout, transfer::TransferContext};
+use crate::layout::PhysicalLayout;
 
 use super::TransferCapabilities;
 
@@ -78,10 +78,11 @@ pub enum TransferPlan {
 pub(crate) fn select_strategy(
     src: &PhysicalLayout,
     dst: &PhysicalLayout,
-    ctx: &TransferContext,
+    agent_name: &str,
+    capabilities: &TransferCapabilities,
 ) -> anyhow::Result<TransferPlan> {
-    let is_src_local = src.nixl_metadata().agent_name() == ctx.nixl_agent().name();
-    let is_dst_local = dst.nixl_metadata().agent_name() == ctx.nixl_agent().name();
+    let is_src_local = src.agent_name() == agent_name;
+    let is_dst_local = dst.agent_name() == agent_name;
 
     if !is_src_local && !is_dst_local {
         return Err(anyhow::anyhow!(
@@ -94,16 +95,18 @@ pub(crate) fn select_strategy(
             src.location(),
             dst.location(),
             false,
-            ctx.capabilities(),
+            capabilities,
         ));
     }
 
+    src.nixl_metadata()?;
+    dst.nixl_metadata()?;
     select_remote_strategy_nixl(
         src.location(),
         is_src_local,
         dst.location(),
         is_dst_local,
-        ctx.capabilities(),
+        capabilities,
     )
 }
 

@@ -147,11 +147,13 @@ pub(crate) fn append_pair(
     if bytes == 0 {
         return Ok(());
     }
+    let src_device_id = src.nixl_metadata()?.device_id();
+    let dst_device_id = dst.nixl_metadata()?.device_id();
     let source = acquire(src, src_address, bytes, guards)?;
     let destination = acquire(dst, dst_address, bytes, guards)?;
     for (source, destination, size) in split_pairs(&source, &destination) {
-        src_dl.add_desc(source, size, src.nixl_metadata().device_id());
-        dst_dl.add_desc(destination, size, dst.nixl_metadata().device_id());
+        src_dl.add_desc(source, size, src_device_id);
+        dst_dl.add_desc(destination, size, dst_device_id);
     }
     Ok(())
 }

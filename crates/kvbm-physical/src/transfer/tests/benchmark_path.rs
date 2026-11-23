@@ -40,6 +40,7 @@ fn build_fc_with_block_layout(
 ) -> PhysicalLayout {
     let config = standard_config(num_blocks);
     PhysicalLayout::builder(agent)
+        .local_only()
         .with_config(config)
         .with_block_layout(block_layout)
         .fully_contiguous()

@@ -209,7 +209,12 @@ async fn run_one_transfer(
     // Strategy must resolve to the expected variant — catches drift
     // in select_strategy that would silently move the test off its
     // target path (e.g. NixlReadFlipped → NixlRead).
-    let plan = select_strategy(&src, &dst, ctx.context())?;
+    let plan = select_strategy(
+        &src,
+        &dst,
+        &ctx.context().nixl_agent().name(),
+        ctx.context().capabilities(),
+    )?;
     let resolved = match plan {
         TransferPlan::Direct(s) => s,
         other => bail!(

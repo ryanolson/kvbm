@@ -254,8 +254,10 @@ impl<'a> NixlTransferBuilder<'a, Set, Set, Set, Set, Set> {
         // Validate locality constraints based on operation type:
         // - For Write operations (push): source must be local, we're writing FROM local TO remote
         // - For Read operations (pull): destination must be local, we're reading FROM remote INTO local
-        let src_is_local = nixl_agent.name() == src.nixl_metadata().agent_name();
-        let dst_is_local = nixl_agent.name() == dst.nixl_metadata().agent_name();
+        let src_metadata = src.nixl_metadata()?;
+        let dst_metadata = dst.nixl_metadata()?;
+        let src_is_local = nixl_agent.name() == src_metadata.agent_name();
+        let dst_is_local = nixl_agent.name() == dst_metadata.agent_name();
 
         // These are invariant assertions — a violation means a bug in `select_strategy`,
         // not a user error. The strategy selection guarantees locality constraints.
@@ -264,7 +266,7 @@ impl<'a> NixlTransferBuilder<'a, Set, Set, Set, Set, Set> {
                 assert!(
                     src_is_local,
                     "For NIXL Write (push), the source must be local. src_agent='{}', local_agent='{}'",
-                    src.nixl_metadata().agent_name(),
+                    src_metadata.agent_name(),
                     nixl_agent.name()
                 );
             }
@@ -272,15 +274,11 @@ impl<'a> NixlTransferBuilder<'a, Set, Set, Set, Set, Set> {
                 assert!(
                     dst_is_local,
                     "For NIXL Read (pull), the destination must be local. dst_agent='{}', local_agent='{}'",
-                    dst.nixl_metadata().agent_name(),
+                    dst_metadata.agent_name(),
                     nixl_agent.name()
                 );
             }
         }
-
-        // Capture NIXL metadata for both layouts
-        let src_metadata = src.nixl_metadata();
-        let dst_metadata = dst.nixl_metadata();
 
         let src_mem_type = src_metadata.mem_type();
         let dst_mem_type = dst_metadata.mem_type();
