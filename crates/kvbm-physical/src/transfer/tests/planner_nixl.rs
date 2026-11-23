@@ -977,7 +977,11 @@ async fn dispatch_nixl_fault(
         // Keep the test buffers available even under the mutation that drops the request.
         std::mem::forget((src.clone(), dst.clone(), bounce.clone()));
     }
-    if must_retain || point == Point::NixlSuccessfulReceipt {
+    let completes = matches!(
+        point,
+        Point::NixlSuccessfulReceipt | Point::NixlSynchronousPost
+    );
+    if must_retain || completes {
         NIXL_REQUEST_PROBE.set(Some(request_probe.clone()));
     }
     if point == Point::NixlEventShutdown {
@@ -1043,7 +1047,7 @@ async fn dispatch_nixl_fault(
             "dropped the live registration guard"
         );
     }
-    if point == Point::NixlSuccessfulReceipt {
+    if completes {
         assert!(
             NIXL_REQUEST_PROBE.take().is_none(),
             "request probe was never attached"
@@ -1161,12 +1165,14 @@ async fn nixl_dispatch_failure_retains_request_when_completion_is_lost(
     Ok(())
 }
 
+#[rstest::rstest]
+#[case(Point::NixlSuccessfulReceipt)]
+#[case(Point::NixlSynchronousPost)]
 #[tokio::test]
-async fn nixl_successful_receipt_releases_its_request() -> Result<()> {
+async fn nixl_successful_receipt_releases_its_request(#[case] point: Point) -> Result<()> {
     nixl_serial!();
     let metrics = std::sync::Arc::new(KvbmObservability::new()?);
-    let outcome =
-        dispatch_nixl_fault(Point::NixlSuccessfulReceipt, true, metrics.clone()).await??;
+    let outcome = dispatch_nixl_fault(point, true, metrics.clone()).await??;
     assert!(matches!(outcome, TransferDrainOutcome::Completed));
     assert_eq!(
         metrics

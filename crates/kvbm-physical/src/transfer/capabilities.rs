@@ -206,14 +206,7 @@ impl TransferCapabilities {
             .context()
             .tokio()
             .block_on(wait_for_gds_probe(receipt, GDS_PROBE_TIMEOUT));
-        match outcome {
-            TransferDrainOutcome::Completed => Ok(()),
-            TransferDrainOutcome::DrainedWithError(error) => Err(error),
-            TransferDrainOutcome::Unproven(error) => {
-                std::mem::forget((src, dst, ctx));
-                Err(error)
-            }
-        }
+        gds_probe_result(outcome, (ctx, dst, src))
     }
 
     /// Enable GDS after a direct device-to-disk probe completes.
@@ -316,6 +309,17 @@ mod tests {
     }
 }
 
+fn gds_probe_result<T>(outcome: TransferDrainOutcome, holds: T) -> anyhow::Result<()> {
+    match outcome {
+        TransferDrainOutcome::Completed => Ok(()),
+        TransferDrainOutcome::DrainedWithError(error) => Err(error),
+        TransferDrainOutcome::Unproven(error) => {
+            std::mem::forget(holds);
+            Err(error)
+        }
+    }
+}
+
 fn probe_support(supported: &OnceLock<()>, probe: impl FnOnce() -> anyhow::Result<()>) -> bool {
     if supported.get().is_some() {
         return true;
@@ -350,7 +354,7 @@ async fn wait_for_gds_probe(
 
 #[cfg(test)]
 mod probe_receipt_tests {
-    use super::{probe_support, wait_for_gds_probe};
+    use super::{gds_probe_result, probe_support, wait_for_gds_probe};
     use crate::transfer::{TransferCompleteNotification, TransferDrainOutcome};
     use std::sync::Arc;
     use std::time::Duration;
@@ -366,29 +370,25 @@ mod probe_receipt_tests {
         )));
     }
 
+    #[rstest::rstest]
+    #[case(TransferDrainOutcome::Completed, true, false)]
+    #[case(TransferDrainOutcome::DrainedWithError(anyhow::anyhow!("copy failed")), false, false)]
+    #[case(TransferDrainOutcome::Unproven(anyhow::anyhow!("drain unproven")), false, true)]
     #[tokio::test]
-    async fn gds_support_requires_a_completed_receipt() {
-        for (outcome, supported) in [
-            (TransferDrainOutcome::Completed, true),
-            (
-                TransferDrainOutcome::DrainedWithError(anyhow::anyhow!("copy failed")),
-                false,
-            ),
-            (
-                TransferDrainOutcome::Unproven(anyhow::anyhow!("drain unproven")),
-                false,
-            ),
-        ] {
-            let receipt =
-                TransferCompleteNotification::from_drain_future(std::future::ready(outcome));
-            assert_eq!(
-                matches!(
-                    wait_for_gds_probe(receipt, Duration::from_secs(1)).await,
-                    TransferDrainOutcome::Completed
-                ),
-                supported,
-            );
-        }
+    async fn gds_support_requires_a_completed_receipt(
+        #[case] outcome: TransferDrainOutcome,
+        #[case] supported: bool,
+        #[case] keeps_holds: bool,
+    ) {
+        let receipt = TransferCompleteNotification::from_drain_future(std::future::ready(outcome));
+        let hold = Arc::new(());
+        let outcome = wait_for_gds_probe(receipt, Duration::from_secs(1)).await;
+        let result = gds_probe_result(outcome, hold.clone());
+        assert_eq!(
+            probe_support(&std::sync::OnceLock::new(), || result),
+            supported
+        );
+        assert_eq!(Arc::strong_count(&hold), 1 + usize::from(keeps_holds));
     }
 
     #[tokio::test]

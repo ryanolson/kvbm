@@ -108,6 +108,7 @@ impl CompletionChecker for NixlStatusChecker {
     }
 
     fn completion_notified(&self) {
+        // A failed Velo trigger leaves the receipt unproven and the hold retained.
         self.hold.confirm_drain();
     }
 }

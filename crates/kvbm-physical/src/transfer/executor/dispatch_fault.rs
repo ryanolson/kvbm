@@ -21,6 +21,7 @@ pub(crate) enum Point {
     NixlEventShutdown,
     NixlDroppedReceipt,
     NixlSuccessfulReceipt,
+    NixlSynchronousPost,
     NixlStatusEvent,
     HostCopy,
 }
@@ -110,19 +111,34 @@ pub(super) fn after_nixl_post(
         Some(Point::NixlSuccessfulReceipt) => {
             let _ = check(Point::NixlSuccessfulReceipt);
         }
+        Some(Point::NixlSynchronousPost) => {
+            let _ = check(Point::NixlSynchronousPost);
+            if pending {
+                wait_for_test_nixl_drain(agent, request)?;
+            }
+            return Ok(false);
+        }
         Some(Point::NixlStatusEvent) if pending => {
             // The late-reservation mutation still posts. Drain the fixture before
             // the injected reservation error lets the fixture release its buffers.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while !agent.get_xfer_status(request)?.is_success() {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "test NIXL post did not drain"
-                );
-                std::thread::yield_now();
-            }
+            wait_for_test_nixl_drain(agent, request)?;
         }
         _ => {}
     }
     Ok(pending)
+}
+
+fn wait_for_test_nixl_drain(
+    agent: &kvbm_memory::nixl::NixlAgent,
+    request: &kvbm_memory::nixl::XferRequest,
+) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !agent.get_xfer_status(request)?.is_success() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "test NIXL post did not drain"
+        );
+        std::thread::yield_now();
+    }
+    Ok(())
 }
