@@ -221,13 +221,13 @@ pub trait LeaderEngine: Send + Sync + 'static {
     /// cross-process impl would read a leader-side completion cache fed by an
     /// engine→leader stream (batched per tick) — never a per-request RPC.
     ///
-    /// kvbm-engine's `LocalConnectorEngine` returns `Failed(AllBlocks)` for an
-    /// unknown id — never tracked, released on handle drop, or whose live
-    /// completion cell is gone — because polling cannot prove that a dead cell
-    /// has no physical work. Stand-in engines may report `Complete` for any id
-    /// (`NoopBlockEngine` does). No handle reads this today; each
-    /// `OnboardHandle`/`OffloadHandle` reads its own shared status cell, and the
-    /// connector does not call it either.
+    /// Every in-tree engine returns `Failed(AllBlocks)` for an unknown id —
+    /// never tracked, released on handle drop, or whose live completion cell is
+    /// gone — because polling cannot prove that a dead cell has no physical
+    /// work. That includes kvbm-engine's `LocalConnectorEngine`, the public
+    /// `NoopBlockEngine`, and the test doubles. No handle reads this today;
+    /// each `OnboardHandle`/`OffloadHandle` reads its own shared status cell,
+    /// and the connector does not call it either.
     fn poll_action(&self, id: &ActionId) -> ActionStatus;
 
     /// ENGINE-INTERNAL RAII target for a search-kind [`FindBlocksHandle`] drop
