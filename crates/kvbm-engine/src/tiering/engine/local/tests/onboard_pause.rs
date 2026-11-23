@@ -659,3 +659,134 @@ async fn paused_onboard_watchdog_allows_configured_probe_budget() -> Result<()> 
     assert_eq!(action.handle.outcome(), None);
     Ok(())
 }
+
+fn check_target(fixture: &Fixture, worker: u64) -> LocalTransferRecheck {
+    LocalTransferRecheck {
+        instance: fixture.worker.instance_id(),
+        worker_id: Some(worker),
+        incarnation: Some(Uuid::new_v4()),
+        transfer_id: Uuid::new_v4(),
+    }
+}
+
+async fn check_and_pause(fixture: &Fixture, check: &LocalTransferRecheck) -> Action {
+    let action = fixture.mint();
+    let TransferDrainOutcome::Unproven(error) = check
+        .check(fixture.engine.leader.messenger(), DEADLINE)
+        .await
+    else {
+        panic!("this check cannot prove the copy drained");
+    };
+    fixture
+        .engine
+        .pause_load_action(fixture.load(&action), error);
+    action
+}
+
+#[tokio::test]
+async fn paused_onboard_reports_missing_handler_until_it_registers() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let check = check_target(&fixture, 99);
+    let action = check_and_pause(&fixture, &check).await;
+
+    assert_eq!(
+        metric(&fixture.registry, SAMPLE_COUNT, &["worker_no_proof"]),
+        Some(1.0)
+    );
+    assert_eq!(action.handle.outcome(), None);
+    assert_eq!(fixture.g2.available_blocks(), 1);
+    assert!(metric(&fixture.registry, SAMPLE_ANSWER, &[]).is_some());
+
+    let payload = reply(check.incarnation.unwrap(), serde_json::json!("Completed"));
+    let handler = velo::Handler::unary_handler_async(
+        handler_names::scoped(handler_names::LOCAL_TRANSFER_CHECK, check.worker_id),
+        move |_| {
+            let payload = payload.clone();
+            async move { Ok(Some(payload)) }
+        },
+    )
+    .build();
+    fixture.worker.register_handler(handler)?;
+    tokio::time::pause();
+    tick(PROBE_INTERVAL).await;
+    eventually("the newly registered handler proves the copy", || {
+        action.physical.load(Ordering::Acquire)
+    })
+    .await;
+    assert_eq!(action.handle.outcome(), Some(LoadOutcome::Done));
+    assert_eq!(fixture.g2.available_blocks(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn paused_onboard_keeps_transport_failure_waiting() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let worker = fixture.worker(0).await?;
+    fixture
+        .engine
+        .leader
+        .messenger()
+        .unregister_peer(worker.check.instance);
+    let action = check_and_pause(&fixture, &worker.check).await;
+    fixture.assert_paused(&action, &worker);
+    assert_eq!(metric(&fixture.registry, SAMPLE_ANSWER, &[]), None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn paused_onboard_uses_fresh_handler_list_instead_of_cached_list() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let absent = check_target(&fixture, 1);
+    let present = check_target(&fixture, 2);
+    let absent_name = handler_names::scoped(handler_names::LOCAL_TRANSFER_CHECK, absent.worker_id);
+    let present_name =
+        handler_names::scoped(handler_names::LOCAL_TRANSFER_CHECK, present.worker_id);
+    fixture.worker.register_handler(
+        velo::Handler::unary_handler_async(&present_name, |_| async {
+            Err::<Option<bytes::Bytes>, _>(anyhow!("the check failed"))
+        })
+        .build(),
+    )?;
+    // Simulate a stale handshake view. The worker's actual handler list has
+    // the opposite answer for both checks.
+    let cached_name = absent_name.clone();
+    fixture.worker.register_streaming_handler(
+        velo::Handler::typed_unary_async(
+            "_hello",
+            move |_: velo::TypedContext<serde_json::Value>| {
+                let name = cached_name.clone();
+                async move { Ok::<_, anyhow::Error>(serde_json::json!({"handlers": [name]})) }
+            },
+        )
+        .build(),
+    )?;
+    let messenger = fixture.engine.leader.messenger();
+    timeout(DEADLINE, messenger.refresh_handlers(absent.instance)).await??;
+    let cached = timeout(DEADLINE, messenger.available_handlers(absent.instance)).await??;
+    assert!(cached.contains(&absent_name));
+    assert!(!cached.contains(&present_name));
+
+    let absent_action = check_and_pause(&fixture, &absent).await;
+    let present_action = check_and_pause(&fixture, &present).await;
+    let absent_worker = format!("{}#1", absent.instance);
+    let present_worker = format!("{}#2", present.instance);
+    assert_eq!(
+        [
+            metric(
+                &fixture.registry,
+                SAMPLE_COUNT,
+                &[&absent_worker, "worker_no_proof"]
+            ),
+            metric(
+                &fixture.registry,
+                SAMPLE_COUNT,
+                &[&present_worker, "worker_not_answering"]
+            ),
+        ],
+        [Some(1.0), Some(1.0)]
+    );
+    assert_eq!(absent_action.handle.outcome(), None);
+    assert_eq!(present_action.handle.outcome(), None);
+    assert_eq!(fixture.g2.available_blocks(), 0);
+    Ok(())
+}

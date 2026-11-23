@@ -10,7 +10,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ::velo::{InstanceId, Messenger};
+use ::velo::{InstanceId, Messenger, RequestTimeout};
 use bytes::Bytes;
 use kvbm_physical::transfer::TransferDrainOutcome;
 use parking_lot::Mutex;
@@ -111,6 +111,16 @@ struct UnprovenCheck {
     reason: String,
 }
 
+enum CheckAnswer {
+    Reply(Bytes),
+    MissingHandler,
+}
+
+#[derive(Deserialize)]
+struct HandlerList {
+    handlers: Vec<String>,
+}
+
 impl CheckEvidence {
     pub(crate) fn from_error(error: &anyhow::Error) -> Self {
         error
@@ -141,11 +151,19 @@ impl LocalTransferRecheck {
         // The outer timeout also bounds any handshake velo runs first, which
         // the request's own timeout may not cover.
         match tokio::time::timeout(deadline, self.ask(messenger, deadline)).await {
-            Ok(Ok(bytes)) => {
+            Ok(Ok(answer)) => {
                 evidence.answered = Some(ClockInstant::now());
-                match serde_json::from_slice(&bytes) {
-                    Ok(reply) => self.decide(incarnation, reply, evidence),
-                    Err(error) => self.unproven(evidence, format!("invalid check reply: {error}")),
+                match answer {
+                    CheckAnswer::Reply(bytes) => match serde_json::from_slice(&bytes) {
+                        Ok(reply) => self.decide(incarnation, reply, evidence),
+                        Err(error) => {
+                            self.unproven(evidence, format!("invalid check reply: {error}"))
+                        }
+                    },
+                    CheckAnswer::MissingHandler => self.unproven(
+                        evidence,
+                        "the reachable worker has no transfer check handler",
+                    ),
                 }
             }
             Ok(Err(error)) => {
@@ -158,18 +176,37 @@ impl LocalTransferRecheck {
         }
     }
 
-    async fn ask(&self, messenger: &Messenger, deadline: Duration) -> anyhow::Result<Bytes> {
+    async fn ask(&self, messenger: &Messenger, deadline: Duration) -> anyhow::Result<CheckAnswer> {
         let handler = handler_names::scoped(handler_names::LOCAL_TRANSFER_CHECK, self.worker_id);
         let payload = serde_json::to_vec(&CheckMessage {
             transfer_id: self.transfer_id,
         })?;
-        messenger
+        let result = messenger
             .unary(&handler)?
             .raw_payload(Bytes::from(payload))
             .instance(self.instance)
             .timeout(deadline)
             .send()
-            .await
+            .await;
+        let error = match result {
+            Ok(bytes) => return Ok(CheckAnswer::Reply(bytes)),
+            Err(error) if error.is::<RequestTimeout>() => return Err(error),
+            Err(error) => error,
+        };
+
+        // Velo flattens remote errors and transport errors into the same result.
+        // Only a fresh list that lacks the handler proves the peer answered.
+        // The caller's outer timeout covers both requests.
+        let list = messenger
+            .typed_unary_streaming::<HandlerList>("_list_handlers")
+            .payload(())?
+            .instance(self.instance)
+            .send()
+            .await;
+        match list {
+            Ok(list) if !list.handlers.contains(&handler) => Ok(CheckAnswer::MissingHandler),
+            _ => Err(error),
+        }
     }
 
     fn decide(
