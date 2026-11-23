@@ -216,8 +216,14 @@ pub trait LeaderEngine: Send + Sync + 'static {
     /// ENGINE-INTERNAL completion source for `OnboardHandle`/`OffloadHandle`.
     /// In-process this is an in-process map read (DashMap-style); a future M3
     /// cross-process impl would read a leader-side completion cache fed by an
-    /// engine→leader stream (batched per tick) — never a per-request RPC. The
-    /// connector never calls this directly; the handles do.
+    /// engine→leader stream (batched per tick) — never a per-request RPC.
+    ///
+    /// An unknown id — never tracked, released on handle drop, or whose live
+    /// completion cell is gone — returns `Failed(AllBlocks)`: polling cannot
+    /// prove that a dead cell has no physical work, so it fails closed rather
+    /// than reporting success. No handle reads this today; each
+    /// `OnboardHandle`/`OffloadHandle` reads its own shared status cell. The
+    /// connector does not call it either.
     fn poll_action(&self, id: &ActionId) -> ActionStatus;
 
     /// ENGINE-INTERNAL RAII target for a search-kind [`FindBlocksHandle`] drop

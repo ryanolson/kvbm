@@ -1041,10 +1041,10 @@ impl LeaderEngine for LocalConnectorEngine {
         if let Some(cell) = live {
             return cell.lock().expect("action-status mutex poisoned").clone();
         }
-        // A missing entry and a dropped handle both use the stateless default.
-        // Record removal belongs to handle release or the physical terminal.
-        // Polling cannot prove that a dead cell has no physical work.
-        ActionStatus::Complete
+        // A missing entry and a dropped handle both fail closed: polling
+        // cannot prove that a dead cell has no physical work. Record removal
+        // belongs to handle release or the physical terminal.
+        ActionStatus::Failed(ActionFailure::AllBlocks)
     }
 
     fn release_search(&self, id: &SearchId) {
@@ -2783,6 +2783,22 @@ mod tests {
             ActionStatus::Failed(kvbm_protocols::connector::ActionFailure::Partial {
                 block_ids: vec![10]
             })
+        );
+        Ok(())
+    }
+
+    /// An id the engine never tracked must not report success. Polling cannot
+    /// prove that a dead cell has no physical work, so an unknown id fails
+    /// closed (`Failed(AllBlocks)`) instead of claiming `Complete`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn poll_action_unknown_id_fails_closed() -> Result<()> {
+        let leader = Arc::new(build_test_leader().await?);
+        let sink = RecordingSink::new();
+        let engine = LocalConnectorEngine::new(leader, sink, BS, true);
+
+        assert_eq!(
+            engine.poll_action(&ActionId::new()),
+            ActionStatus::Failed(ActionFailure::AllBlocks)
         );
         Ok(())
     }
