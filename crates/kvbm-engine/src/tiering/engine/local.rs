@@ -1029,6 +1029,10 @@ impl LeaderEngine for LocalConnectorEngine {
         }))
     }
 
+    fn begin_request_finish(&self, req: &RequestId) -> bool {
+        self.arm_request_finish(req)
+    }
+
     fn poll_action(&self, id: &ActionId) -> ActionStatus {
         // Sync map read — NO await on this path (the driver is async; this is a
         // plain lookup + cell read). A live cell (handle still alive) carries the
@@ -2305,6 +2309,9 @@ mod tests {
 
     #[path = "onboard_pause.rs"]
     mod onboard_pause;
+
+    #[path = "request_release.rs"]
+    mod request_release;
 
     fn connector_config(block_size: usize, remote: RemoteOps) -> ConnectorEngineConfig {
         ConnectorEngineConfig {

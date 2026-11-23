@@ -48,6 +48,17 @@ must find the failure stash and close the session. The worker sink runs
 after the physical terminal.
 [Prefill logical-terminal test](../crates/kvbm-engine/src/tiering/engine/local/tests/cd_tests/prefill_drain.rs)
 
+## Decide request release under the same lock as physical settlement
+
+Request finish and the load driver share the request index lock when they
+claim a release or publish drain proof. A complete fence can still have a
+receive waiting for delivery. Track it through the worker sink call so
+finish can join the receive or convert it to the request drain.
+
+Test by pausing after the receive claim and again after fence publication.
+Check both finished sets before delivery and verify one entry after it.
+[Request release tests](../crates/kvbm-engine/src/tiering/engine/local/tests/request_release.rs)
+
 ## Keep paused onboard blocks through connector teardown
 
 Keep the engine's pause registry alive while a worker can still touch its

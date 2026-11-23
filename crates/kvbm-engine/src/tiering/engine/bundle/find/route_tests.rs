@@ -154,8 +154,11 @@ impl RemoteBlockDiscovery for BlockingBundleDirectory {
         let release = Arc::clone(&self.release);
         let candidate = self.candidate.clone();
         Box::pin(async move {
+            let mut released = std::pin::pin!(release.notified());
+            // Register before the test observes started and calls notify_waiters.
+            released.as_mut().enable();
             started.store(true, Ordering::Release);
-            release.notified().await;
+            released.await;
             Ok(BundleDiscoveryOutcome::Hit(Box::new(candidate)))
         })
     }

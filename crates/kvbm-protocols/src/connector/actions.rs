@@ -47,9 +47,9 @@ pub trait EngineWorkerSink: Send + Sync + 'static {
     /// [`LoadOutcome`]. Fired on the engine's aggregated onboard terminal.
     fn mark_load_finished(&self, req: &RequestId, outcome: LoadOutcome);
 
-    /// Offload (save) reached its single per-request terminal — fired once when
-    /// the leader consumes the request's
-    /// [`super::handles::RequestOffloadDrain`], never by the per-action driver.
+    /// The request drain reached its single terminal. The engine arms the drain
+    /// through [`super::engine::LeaderEngine::begin_request_finish`] or a legacy
+    /// [`super::handles::RequestOffloadDrain`] commit.
     fn mark_save_finished(&self, req: &RequestId, outcome: SaveOutcome);
 
     /// The eviction drain is complete for the worker named by the token's
