@@ -114,3 +114,27 @@ async fn many_heterogeneous_ragged_regions_survive_repeated_round_trips() -> Res
     verify_checksums_by_position(&checksums, &[0], &restored, &[0])?;
     Ok(())
 }
+
+#[tokio::test]
+async fn cuda_dispatch_failure_after_first_ragged_region() -> Result<()> {
+    use crate::transfer::executor::dispatch_fault::{Point, inject};
+
+    gpu_serial!();
+    assert!(!kvbm_kernels::is_using_stubs(), "CUDA kernels required");
+    let agent = build_agent_for_kinds(&[StorageKind::Pinned, StorageKind::Device(0)])?;
+    let src = build_many_region_layout(agent.clone(), StorageKind::Pinned, 1);
+    let dst = build_many_region_layout(agent.clone(), StorageKind::Device(0), 1);
+    let ctx = create_transfer_context(agent, None)?;
+    let result = inject(Point::RaggedCopy, 2, || {
+        execute_transfer(
+            &src,
+            &dst,
+            &[0],
+            &[0],
+            TransferOptionsInternal::default(),
+            ctx.context(),
+        )
+    });
+    super::planner_path::assert_dispatch_failure_drained(result).await;
+    Ok(())
+}

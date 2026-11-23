@@ -9,6 +9,9 @@ mod nixl;
 pub(crate) mod planner;
 pub(crate) mod registration;
 
+#[cfg(all(test, feature = "testing-kvbm"))]
+pub(crate) mod dispatch_fault;
+
 use super::strategy::select_strategy;
 use super::strategy::{TransferPlan, TransferStrategy};
 use super::validation::validate_block_transfer;

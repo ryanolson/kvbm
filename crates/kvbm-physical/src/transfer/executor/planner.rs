@@ -43,6 +43,7 @@ use kvbm_kernels::MemcpyBatchMode;
 use kvbm_memory::nixl::{XferDescList, XferOp};
 
 use super::TransferContext;
+use super::registration::{CudaSubmissionGuard, record_completion_event};
 use super::{PhysicalLayout, TransferStrategy};
 use crate::BlockId;
 use crate::layout::KvBlockLayout;
@@ -59,65 +60,11 @@ use crate::transfer::plan::{
 };
 use crate::transfer::prepared::{PreparedPlanKey, PreparedTransferPlan};
 
-/// RAII guard that drains any work queued on a CUDA stream before
-/// `Drop` returns. Used by [`with_transform_scratch_upload`] to
-/// guarantee that async H2D copies feeding the kernel from a
-/// prepared-plan scratch lease have fully drained before the lease is
-/// returned to its pool — closes the race where a concurrent
-/// transfer could re-acquire the leased `Vec` from the pool and
-/// overwrite bytes still being read by an in-flight `cudaMemcpyAsync`.
-///
-/// The guard records a stream event and host-synchronizes on it. If
-/// event recording fails (rare; e.g. driver OOM), we fall back to a
-/// full-stream `synchronize()` so the drain is best-effort guaranteed
-/// even on error paths. Both record failures and synchronize failures
-/// are swallowed: this runs from `Drop` and the only sane recovery is
-/// to block long enough for CUDA to settle.
-struct DrainOnDrop<'a> {
-    stream: &'a Arc<CudaStream>,
-}
-
-impl<'a> DrainOnDrop<'a> {
-    fn new(stream: &'a Arc<CudaStream>) -> Self {
-        Self { stream }
-    }
-}
-
-impl Drop for DrainOnDrop<'_> {
-    fn drop(&mut self) {
-        match self.stream.record_event(None) {
-            Ok(event) => {
-                let _ = event.synchronize();
-            }
-            Err(_) => {
-                // record_event failed — fall back to a heavier
-                // whole-stream sync so anything queued still drains
-                // before the leased Vec returns to the pool.
-                let _ = self.stream.synchronize();
-            }
-        }
-    }
-}
-
-/// Shared scratch fill + H2D upload for the permute-kernel dispatch
-/// path. The single owner of the prepared-plan lease lifetime
-/// contract:
-/// 1. Acquire a [`TransformScratchLease`] from the plan's pool.
-/// 2. Hand the two scratch `Vec<usize>` slots to the caller's `fill`
-///    closure — caller populates them via the appropriate emit method
-///    on the [`PreparedTransferPlan`].
-/// 3. `clone_htod` each slot to device memory.
-/// 4. Record + host-synchronize on a stream event (via `DrainOnDrop`)
-///    so the H2D copies drain before the lease returns to the pool.
-/// 5. Drop the lease; the kernel launch continues async on the stream.
-///
-/// The `DrainOnDrop` guard fires on every exit path — including `?`
-/// early-returns inside `fill` or between `clone_htod` calls — so a
-/// concurrent transfer can never re-acquire the leased `Vec` while
-/// an H2D against it is still in flight.
+/// Upload the pointer tables and drain the uploads before returning the scratch.
 fn with_transform_scratch_upload<F>(
     stream: &Arc<CudaStream>,
     prepared: &PreparedTransferPlan,
+    submitted: &mut bool,
     fill: F,
 ) -> Result<(
     cudarc::driver::CudaSlice<usize>,
@@ -127,38 +74,36 @@ where
     F: FnOnce(&mut Vec<usize>, &mut Vec<usize>) -> Result<()>,
 {
     let mut lease = prepared.acquire_transform_scratch()?;
-    let (a_dev, b_dev) = {
-        let _drain = DrainOnDrop::new(stream);
-        {
-            let (a, b) = lease.both_mut();
-            fill(a, b)?;
-        }
+    let (a, b) = lease.both_mut();
+    fill(a, b)?;
+
+    #[cfg(all(test, feature = "testing-kvbm"))]
+    super::dispatch_fault::check(super::dispatch_fault::Point::BeforeTransformUpload)?;
+    // clone_htod combines allocation and upload in a single call.
+    *submitted = true;
+    let uploaded = (|| -> Result<_> {
         let a_dev = stream.clone_htod(lease.op_ptrs())?;
+        #[cfg(all(test, feature = "testing-kvbm"))]
+        super::dispatch_fault::check(super::dispatch_fault::Point::TransformUpload)?;
         let b_dev = stream.clone_htod(lease.univ_ptrs())?;
-        (a_dev, b_dev)
-    };
-    drop(lease);
-    Ok((a_dev, b_dev))
+        Ok((a_dev, b_dev))
+    })();
+    let drain = stream
+        .record_event(None)
+        .and_then(|event| event.synchronize())
+        .or_else(|_| stream.synchronize());
+    if let Err(error) = drain {
+        // A pooled table must stay intact while an upload may still read it.
+        std::mem::forget(lease);
+        return Err(error.into());
+    }
+    uploaded
 }
 
-/// Dispatch a CudaAsync transfer through the stride-aware planner.
+/// Dispatch a CUDA copy or transform chosen by the planner.
 ///
-/// Returns the same kind of [`TransferCompleteNotification`] the
-/// legacy `execute_cuda_transfer` returns, or an `Err` when the
-/// transfer cannot be safely handled by the PR-5 planner path.
-///
-/// Bails (no fallback) when:
-/// - the strategy is not one of `CudaAsync{H2D, D2H, D2D}` —
-///   enforced by [`validate_cuda_planner_entry`];
-/// - the src/dst block-id lists have unequal length —
-///   enforced by [`validate_planner_block_ids`];
-/// - `src.block_layout()` and `dst.block_layout()` would require a
-///   semantic transformation (NHD↔HND, ↔Universal, etc.). The
-///   planner-side projection collapses the per-token NHD/HND
-///   substructure into a single trailing `Payload` axis, so a
-///   raw-copy without going through the kernel catalog would silently
-///   transpose-corrupt the data. PR-6.1 wires the kernel catalog
-///   and removes this gate from the Cuda* entrypoint.
+/// Returns `Err` only before any work can reach the stream. A later error
+/// returns a receipt that proves the drain only if the stream synchronizes.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_planner_cuda_transfer(
     src: &PhysicalLayout,
@@ -219,7 +164,8 @@ pub(crate) fn execute_planner_cuda_transfer(
     let completion_admission = (!caller_manages_sync)
         .then(|| ctx.reserve_cuda_event())
         .transpose()?;
-    let mut submission = super::registration::CudaSubmissionGuard::new(stream.clone(), guards);
+    let mut submission = CudaSubmissionGuard::new(stream.clone(), guards);
+    let mut submitted = false;
 
     // PR-7.6: capture telemetry fields from the outcome before dispatch
     // so we can compute bytes/descriptors once without a second projection.
@@ -233,36 +179,42 @@ pub(crate) fn execute_planner_cuda_transfer(
     // time — just the planner-dispatch submit path itself.
     let tel_t0 = std::time::Instant::now();
 
-    match outcome {
+    let result = match outcome {
         PlanOutcome::Empty => unreachable!("handled above"),
         PlanOutcome::Direct(ops) => {
             // Group by `size` so each `memcpy_batch` call has a
             // uniform `size_per_copy`. Common case is one group;
             // heterogeneous sizes get one batch per size.
-            dispatch_ops_grouped_by_size(&ops, stream.as_ref())?;
+            dispatch_ops_grouped_by_size(&ops, stream.as_ref(), &mut submitted)
         }
         PlanOutcome::Transform {
             invocation,
             block_pairs,
             prepared,
             layer_range,
-        } => {
-            dispatch_transform_kernel(
-                &invocation,
-                src,
-                dst,
-                &block_pairs,
-                layer_range,
-                &stream,
-                &prepared,
-            )?;
-        }
+        } => dispatch_transform_kernel(
+            &invocation,
+            src,
+            dst,
+            &block_pairs,
+            layer_range,
+            &stream,
+            &prepared,
+            &mut submitted,
+        ),
         PlanOutcome::SmallStridedCopy(ops) => {
-            dispatch_small_strided_copy(&ops, &stream)?;
+            dispatch_small_strided_copy(&ops, &stream, &mut submitted)
         }
-        PlanOutcome::CudaGraphReplay { cache_key, ops } => {
-            dispatch_cuda_graph_replay_planner(&ops, &cache_key, ctx.graph_cache(), &stream)?;
-        }
+        PlanOutcome::CudaGraphReplay { cache_key, ops } => dispatch_cuda_graph_replay_planner(
+            &ops,
+            &cache_key,
+            ctx.graph_cache(),
+            &stream,
+            &mut submitted,
+        ),
+    };
+    if let Err(error) = result {
+        return submission.dispatch_error(submitted, error);
     }
 
     let tel_latency_us = tel_t0.elapsed().as_micros() as u64;
@@ -303,12 +255,14 @@ pub(crate) fn execute_planner_cuda_transfer(
     if caller_manages_sync {
         return Ok(TransferCompleteNotification::completed());
     }
-    let event = stream.record_event(None)?;
-    Ok(ctx.register_cuda_event(
-        event,
-        completion_admission.expect("planner CUDA transfer reserved completion admission"),
-        submission.take(),
-    ))
+    match record_completion_event(&stream) {
+        Ok(event) => Ok(ctx.register_cuda_event(
+            event,
+            completion_admission.expect("planner CUDA transfer reserved completion admission"),
+            submission.take(),
+        )),
+        Err(error) => submission.dispatch_error(submitted, error),
+    }
 }
 
 /// Dispatch a NIXL transfer through the stride-aware planner.
@@ -1301,6 +1255,7 @@ pub(crate) fn validate_nixl_planner_entry(
 /// The shared scratch + upload + drain path is owned by
 /// [`with_transform_scratch_upload`]; this function only picks the
 /// per-kind emit method and FFI entrypoint.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch_transform_kernel(
     invocation: &crate::transfer::kernel_catalog::KernelInvocation,
     src: &PhysicalLayout,
@@ -1309,6 +1264,7 @@ pub(crate) fn dispatch_transform_kernel(
     layer_range: Option<std::ops::Range<usize>>,
     stream: &Arc<CudaStream>,
     prepared: &PreparedTransferPlan,
+    submitted: &mut bool,
 ) -> Result<()> {
     use cudarc::driver::DevicePtr;
 
@@ -1359,7 +1315,7 @@ pub(crate) fn dispatch_transform_kernel(
         .collect();
 
     let layer_range_ref = layer_range.as_ref();
-    let (a_dev, b_dev) = with_transform_scratch_upload(stream, prepared, |a, b| {
+    let (a_dev, b_dev) = with_transform_scratch_upload(stream, prepared, submitted, |a, b| {
         match invocation.kind {
             KernelKind::UniversalFromBlock => prepared.emit_universal_kind_pointers(
                 src, // operational side
@@ -1897,6 +1853,7 @@ fn dispatch_staged_nixl_transform(
                 None, // staged NIXL transforms run full-extent
                 &staged.stream,
                 &stage1_prepared,
+                &mut false,
             )?;
             let cuda_event = staged.stream.record_event(None)?;
             let notification = staged.register_cuda_event(cuda_event, completion_admission)?;
@@ -1947,6 +1904,7 @@ fn dispatch_staged_nixl_transform(
                         None, // staged NIXL transforms run full-extent
                         &staged.stream,
                         &stage2_prepared,
+                        &mut false,
                     )?;
                     let cuda_event = staged.stream.record_event(None)?;
                     let notification =
@@ -2030,7 +1988,11 @@ fn dispatch_staged_nixl_transform(
 ///
 /// The pointer arrays must be device-accessible. We stage host-side arrays
 /// then push them to device via `clone_htod`, mirroring `dispatch_transform_kernel`.
-fn dispatch_small_strided_copy(ops: &[CopyOp], stream: &Arc<CudaStream>) -> Result<()> {
+fn dispatch_small_strided_copy(
+    ops: &[CopyOp],
+    stream: &Arc<CudaStream>,
+    submitted: &mut bool,
+) -> Result<()> {
     use cudarc::driver::DevicePtr;
 
     if ops.is_empty() {
@@ -2058,6 +2020,7 @@ fn dispatch_small_strided_copy(ops: &[CopyOp], stream: &Arc<CudaStream>) -> Resu
         dst_ptrs.push(op.dst_addr);
     }
 
+    *submitted = true;
     let src_dev = stream.clone_htod(&src_ptrs)?;
     let dst_dev = stream.clone_htod(&dst_ptrs)?;
     let (src_raw, _src_guard) = src_dev.device_ptr(stream.as_ref());
@@ -2086,7 +2049,11 @@ fn dispatch_small_strided_copy(ops: &[CopyOp], stream: &Arc<CudaStream>) -> Resu
 /// `kvbm_kernels::memcpy_batch` in `BatchedWithFallback` mode (try
 /// `cudaMemcpyBatchAsync` when the runtime supports it, fall back to
 /// individual `cudaMemcpyAsync` otherwise).
-fn dispatch_ops_grouped_by_size(ops: &[CopyOp], stream: &CudaStream) -> Result<()> {
+fn dispatch_ops_grouped_by_size(
+    ops: &[CopyOp],
+    stream: &CudaStream,
+    submitted: &mut bool,
+) -> Result<()> {
     use std::collections::BTreeMap;
 
     // Stable grouping: map size -> indices into `ops`, in insertion
@@ -2107,6 +2074,8 @@ fn dispatch_ops_grouped_by_size(ops: &[CopyOp], stream: &CudaStream) -> Result<(
             src_ptrs.push(ops[i].src_addr as *const c_void);
             dst_ptrs.push(ops[i].dst_addr as *mut c_void);
         }
+        // The batch fallback may enqueue copies before reporting an error.
+        *submitted = true;
         let status = unsafe {
             kvbm_kernels::memcpy_batch(
                 src_ptrs.as_ptr(),
@@ -2117,6 +2086,8 @@ fn dispatch_ops_grouped_by_size(ops: &[CopyOp], stream: &CudaStream) -> Result<(
                 stream_raw,
             )
         };
+        #[cfg(all(test, feature = "testing-kvbm"))]
+        super::dispatch_fault::check(super::dispatch_fault::Point::PlannerBatch)?;
         if status != cudarc::runtime::sys::cudaError::cudaSuccess {
             return Err(anyhow!(
                 "execute_planner_cuda_transfer: memcpy_batch failed with size={size}, \
@@ -2175,6 +2146,7 @@ fn dispatch_cuda_graph_replay_planner(
     cache_key: &GraphCacheKey,
     graph_cache: &Arc<GraphCache>,
     work_stream: &Arc<CudaStream>,
+    submitted: &mut bool,
 ) -> Result<()> {
     use std::mem::MaybeUninit;
 
@@ -2230,15 +2202,7 @@ fn dispatch_cuda_graph_replay_planner(
                 );
             }
         }
-        // Launch on the caller's work stream.
-        let result = unsafe { cu_sys::cuGraphLaunch(exec, work_stream.cu_stream()) };
-        if result != cu_sys::CUresult::CUDA_SUCCESS {
-            bail!(
-                "dispatch_cuda_graph_replay_planner: cuGraphLaunch (cache hit) \
-                 failed with result={result:?}"
-            );
-        }
-        return Ok(());
+        return launch_cuda_graph(exec, work_stream, submitted);
     }
 
     // ── 2. Cache miss: capture the graph ─────────────────────────────────────
@@ -2487,14 +2451,21 @@ fn dispatch_cuda_graph_replay_planner(
         }
     }
 
-    let result = unsafe { cu_sys::cuGraphLaunch(cu_graph_exec, work_stream.cu_stream()) };
-    if result != cu_sys::CUresult::CUDA_SUCCESS {
-        bail!(
-            "dispatch_cuda_graph_replay_planner: cuGraphLaunch (first launch) \
-             failed with result={result:?}"
-        );
-    }
+    launch_cuda_graph(cu_graph_exec, work_stream, submitted)
+}
 
+fn launch_cuda_graph(
+    exec: cu_sys::CUgraphExec,
+    stream: &CudaStream,
+    submitted: &mut bool,
+) -> Result<()> {
+    #[cfg(all(test, feature = "testing-kvbm"))]
+    super::dispatch_fault::check(super::dispatch_fault::Point::BeforeGraphLaunch)?;
+    *submitted = true;
+    let status = unsafe { cu_sys::cuGraphLaunch(exec, stream.cu_stream()) };
+    if status != cu_sys::CUresult::CUDA_SUCCESS {
+        bail!("cuGraphLaunch failed: {status:?}");
+    }
     Ok(())
 }
 

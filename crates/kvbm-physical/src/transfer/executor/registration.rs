@@ -1,22 +1,66 @@
 use super::PhysicalLayout;
-use anyhow::{Result, ensure};
+use crate::transfer::{TransferCompleteNotification, TransferDrainOutcome};
+use anyhow::{Error, Result, ensure};
+use cudarc::driver::{CudaEvent, CudaStream};
 use kvbm_memory::nixl::{MappedRegistrationGuard, XferDescList};
 use std::{ops::Range, sync::Arc};
 
 pub(crate) type RegistrationGuards = Vec<Arc<dyn MappedRegistrationGuard>>;
 
 pub(crate) struct CudaSubmissionGuard {
-    stream: Arc<cudarc::driver::CudaStream>,
+    stream: Arc<CudaStream>,
     guards: RegistrationGuards,
 }
 
 impl CudaSubmissionGuard {
-    pub(crate) fn new(stream: Arc<cudarc::driver::CudaStream>, guards: RegistrationGuards) -> Self {
+    pub(crate) fn new(stream: Arc<CudaStream>, guards: RegistrationGuards) -> Self {
         Self { stream, guards }
     }
     pub(crate) fn take(&mut self) -> RegistrationGuards {
         std::mem::take(&mut self.guards)
     }
+
+    pub(super) fn dispatch_error(
+        mut self,
+        submitted: bool,
+        error: Error,
+    ) -> Result<TransferCompleteNotification> {
+        let guards = self.take();
+        cuda_dispatch_error(submitted, guards, error, || {
+            Ok(self.stream.synchronize()?)
+        })
+    }
+}
+
+fn cuda_dispatch_error(
+    submitted: bool,
+    guards: RegistrationGuards,
+    error: Error,
+    synchronize: impl FnOnce() -> Result<()>,
+) -> Result<TransferCompleteNotification> {
+    if !submitted {
+        return Err(error);
+    }
+
+    let outcome = match synchronize() {
+        Ok(()) => TransferDrainOutcome::DrainedWithError(error),
+        Err(sync_error) => {
+            // A failed synchronize cannot release mappings used by a queued copy.
+            std::mem::forget(guards);
+            TransferDrainOutcome::Unproven(error.context(format!(
+                "CUDA stream synchronization failed: {sync_error:#}"
+            )))
+        }
+    };
+    Ok(TransferCompleteNotification::from_drain_future(
+        std::future::ready(outcome),
+    ))
+}
+
+pub(super) fn record_completion_event(stream: &CudaStream) -> Result<CudaEvent> {
+    #[cfg(all(test, feature = "testing-kvbm"))]
+    super::dispatch_fault::check(super::dispatch_fault::Point::CompletionEvent)?;
+    Ok(stream.record_event(None)?)
 }
 
 impl Drop for CudaSubmissionGuard {
@@ -138,6 +182,35 @@ fn split_pairs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cuda_dispatch_error_proves_drain_only_after_successful_sync() {
+        use futures::FutureExt;
+
+        let guard = Arc::new(());
+        let guards = || -> RegistrationGuards { vec![guard.clone()] };
+        let error = || anyhow::anyhow!("dispatch failed");
+        assert!(cuda_dispatch_error(false, guards(), error(), || panic!("no work")).is_err());
+        assert_eq!(Arc::strong_count(&guard), 1);
+
+        let drained = cuda_dispatch_error(true, guards(), error(), || Ok(())).unwrap();
+        assert!(matches!(
+            drained.await_drain().now_or_never(),
+            Some(TransferDrainOutcome::DrainedWithError(_))
+        ));
+        assert_eq!(Arc::strong_count(&guard), 1);
+
+        let unproven = cuda_dispatch_error(true, guards(), error(), || {
+            Err(anyhow::anyhow!("sync failed"))
+        })
+        .unwrap();
+        assert!(matches!(
+            unproven.await_drain().now_or_never(),
+            Some(TransferDrainOutcome::Unproven(_))
+        ));
+        assert_eq!(Arc::strong_count(&guard), 2);
+    }
+
     #[test]
     fn splits_at_both_registration_boundaries() {
         assert_eq!(
