@@ -456,6 +456,15 @@ pub(crate) struct BlockSlot<T: BlockMetadata> {
     pub(crate) state: SlotState<T>,
 }
 
+#[cfg(test)]
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ResetIdWork {
+    moved: usize,
+    /// IDs classified by push or inserted into the opposite reset set.
+    reprocessed: usize,
+    dropped: usize,
+}
+
 /// Inner state of a `BlockStore` — protected by a single mutex.
 pub(crate) struct BlockStoreInner<T: BlockMetadata> {
     capacity: usize,
@@ -465,8 +474,10 @@ pub(crate) struct BlockStoreInner<T: BlockMetadata> {
     free: BTreeSet<BlockId>,
     /// Reset blocks fenced off from allocation by the current ceiling.
     fenced: BTreeSet<BlockId>,
-    /// Optional allocation ceiling, clamped to the current capacity.
+    /// Requested allocation fence. The effective ceiling clamps this to capacity.
     fence: Option<usize>,
+    #[cfg(test)]
+    reset_id_work: ResetIdWork,
     /// Inactive eviction index (T-free).
     inactive: Box<dyn InactiveIndex>,
     /// Primary `block_id` for each currently-registered sequence hash.
@@ -723,6 +734,8 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
             free,
             fenced: BTreeSet::new(),
             fence: None,
+            #[cfg(test)]
+            reset_id_work: ResetIdWork::default(),
             inactive,
             active_by_hash_full: active_by_hash.capacity(),
             active_by_hash,
@@ -878,9 +891,16 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         let mut inner = self.inner.lock();
         self.check_capacity(&inner, capacity)?;
         let previous = inner.capacity;
+        // With the same requested fence, resize only adds or removes tail IDs.
+        // Each surviving reset ID stays on the same side of the ceiling.
         if capacity < previous {
-            inner.free.retain(|id| *id < capacity);
-            inner.fenced.retain(|id| *id < capacity);
+            let free_tail = inner.free.split_off(&capacity);
+            let fenced_tail = inner.fenced.split_off(&capacity);
+            #[cfg(test)]
+            {
+                inner.reset_id_work.dropped += free_tail.len() + fenced_tail.len();
+            }
+            drop((free_tail, fenced_tail));
             self.metrics
                 .dec_reset_pool_size_by((previous - capacity) as i64);
         } else if capacity > previous && capacity > inner.slots.len() {
@@ -924,12 +944,6 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
             self.metrics
                 .inc_reset_pool_size_by((capacity - previous) as i64);
         }
-        let reset_ids: Vec<_> = inner.free.union(&inner.fenced).copied().collect();
-        inner.free.clear();
-        inner.fenced.clear();
-        for id in reset_ids {
-            push_reset_id_locked(&mut inner, id);
-        }
         Ok(())
     }
 
@@ -943,13 +957,9 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
                 inner.capacity
             ));
         }
+        let previous = effective_ceiling(&inner);
         inner.fence = fence;
-        let reset_ids: Vec<_> = inner.free.union(&inner.fenced).copied().collect();
-        inner.free.clear();
-        inner.fenced.clear();
-        for id in reset_ids {
-            push_reset_id_locked(&mut inner, id);
-        }
+        apply_ceiling_change(&mut inner, previous);
         Ok(())
     }
 
@@ -2443,12 +2453,36 @@ fn effective_ceiling<T: BlockMetadata>(inner: &BlockStoreInner<T>) -> usize {
     inner.fence.unwrap_or(inner.capacity).min(inner.capacity)
 }
 
+fn apply_ceiling_change<T: BlockMetadata>(inner: &mut BlockStoreInner<T>, previous: usize) {
+    let ceiling = effective_ceiling(inner);
+    let (crossing, destination) = match ceiling.cmp(&previous) {
+        std::cmp::Ordering::Less => (inner.free.split_off(&ceiling), &mut inner.fenced),
+        std::cmp::Ordering::Greater => {
+            let kept = inner.fenced.split_off(&ceiling);
+            (std::mem::replace(&mut inner.fenced, kept), &mut inner.free)
+        }
+        std::cmp::Ordering::Equal => return,
+    };
+    #[cfg(test)]
+    let moved = crossing.len();
+    destination.extend(crossing);
+    #[cfg(test)]
+    {
+        inner.reset_id_work.moved += moved;
+        inner.reset_id_work.reprocessed += moved;
+    }
+}
+
 pub(super) fn push_reset_id_locked<T: BlockMetadata>(
     inner: &mut BlockStoreInner<T>,
     block_id: BlockId,
 ) {
     debug_assert!(block_id < inner.capacity);
     debug_assert!(matches!(inner.slots[block_id].state, SlotState::Reset));
+    #[cfg(test)]
+    {
+        inner.reset_id_work.reprocessed += 1;
+    }
     if block_id < effective_ceiling(inner) {
         inner.fenced.remove(&block_id);
         inner.free.insert(block_id);
@@ -2595,7 +2629,232 @@ pub(crate) fn upgrade_or_resurrect<T: BlockMetadata + Sync>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manager::BlockManager;
     use crate::pools::IdBuildHasher;
+    use crate::testing::{TestMeta, create_test_manager_with_backend};
+    use proptest::prelude::*;
+
+    fn ceiling_manager() -> BlockManager<TestMeta> {
+        create_test_manager_with_backend(8, |builder| {
+            builder.maximum_block_count(16).with_lineage_backend()
+        })
+    }
+
+    fn take_reset_id_work(store: &BlockStore<TestMeta>) -> ResetIdWork {
+        std::mem::take(&mut store.inner.lock().reset_id_work)
+    }
+
+    #[test]
+    fn unchanged_ceiling_reprocesses_no_ids() {
+        let manager = ceiling_manager();
+        let _in_use = manager.allocate_blocks_from_reset(2).unwrap();
+        manager.set_allocation_ceiling(Some(4)).unwrap();
+        let store = manager.store_for_test();
+        let before = store.debug_snapshot();
+        assert_eq!(before.free, [2, 3]);
+        assert_eq!(before.fenced, [4, 5, 6, 7]);
+        take_reset_id_work(store);
+
+        manager.set_allocation_ceiling(Some(4)).unwrap();
+
+        assert_eq!(store.debug_snapshot(), before);
+        assert_eq!(
+            take_reset_id_work(store),
+            ResetIdWork::default(),
+            "an unchanged ceiling must leave the six reset IDs alone"
+        );
+    }
+
+    #[test]
+    fn raw_fence_is_kept_when_effective_ceiling_is_unchanged() {
+        for (initial, requested) in [(None, Some(8)), (Some(8), None)] {
+            let manager = ceiling_manager();
+            let store = manager.store_for_test();
+            manager.set_allocation_ceiling(initial).unwrap();
+            take_reset_id_work(store);
+
+            manager.set_allocation_ceiling(requested).unwrap();
+            assert_eq!(store.inner.lock().fence, requested);
+            assert_eq!(take_reset_id_work(store), ResetIdWork::default());
+            manager.set_capacity(10).unwrap();
+            let snapshot = store.debug_snapshot();
+            let ceiling = requested.unwrap_or(10);
+            assert_eq!(snapshot.free, (0..ceiling).collect::<Vec<_>>());
+            assert_eq!(snapshot.fenced, (ceiling..10).collect::<Vec<_>>());
+            assert_eq!(
+                take_reset_id_work(store),
+                ResetIdWork {
+                    reprocessed: 2,
+                    ..ResetIdWork::default()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn ceiling_moves_only_crossing_ids() {
+        let manager = ceiling_manager();
+        let store = manager.store_for_test();
+        let mut in_use = manager.allocate_blocks_from_reset(3).unwrap();
+        drop(in_use.remove(1));
+        manager.set_allocation_ceiling(Some(7)).unwrap();
+        take_reset_id_work(store);
+
+        manager.set_allocation_ceiling(Some(2)).unwrap();
+        let lowered = store.debug_snapshot();
+        assert_eq!(lowered.free, [1]);
+        assert_eq!(lowered.fenced, [3, 4, 5, 6, 7]);
+        assert_eq!(
+            take_reset_id_work(store),
+            ResetIdWork {
+                moved: 4,
+                reprocessed: 4,
+                dropped: 0,
+            }
+        );
+
+        manager.set_allocation_ceiling(Some(5)).unwrap();
+        let raised = store.debug_snapshot();
+        assert_eq!(raised.free, [1, 3, 4]);
+        assert_eq!(raised.fenced, [5, 6, 7]);
+        assert_eq!(
+            take_reset_id_work(store),
+            ResetIdWork {
+                moved: 2,
+                reprocessed: 2,
+                dropped: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn shrink_and_regrow_keeps_requested_ceiling() {
+        let manager = ceiling_manager();
+        let store = manager.store_for_test();
+        manager.set_allocation_ceiling(Some(6)).unwrap();
+        take_reset_id_work(store);
+
+        manager.set_capacity(4).unwrap();
+        assert_eq!(manager.allocation_ceiling(), 4);
+        assert_eq!(store.inner.lock().fence, Some(6));
+        assert_eq!(store.debug_snapshot().free, [0, 1, 2, 3]);
+        assert!(store.debug_snapshot().fenced.is_empty());
+        assert_eq!(
+            take_reset_id_work(store),
+            ResetIdWork {
+                dropped: 4,
+                ..ResetIdWork::default()
+            }
+        );
+
+        manager.set_capacity(8).unwrap();
+        assert_eq!(manager.allocation_ceiling(), 6);
+        assert_eq!(store.inner.lock().fence, Some(6));
+        let restored = store.debug_snapshot();
+        assert_eq!(restored.free, [0, 1, 2, 3, 4, 5]);
+        assert_eq!(restored.fenced, [6, 7]);
+        assert_eq!(
+            take_reset_id_work(store),
+            ResetIdWork {
+                reprocessed: 4,
+                ..ResetIdWork::default()
+            }
+        );
+        manager.set_capacity(8).unwrap();
+        assert_eq!(take_reset_id_work(store), ResetIdWork::default());
+    }
+
+    #[test]
+    fn rejected_ceiling_keeps_the_requested_fence() {
+        let manager = ceiling_manager();
+        let store = manager.store_for_test();
+        manager.set_allocation_ceiling(Some(6)).unwrap();
+        manager.set_capacity(4).unwrap();
+        take_reset_id_work(store);
+        let before = store.debug_snapshot();
+
+        assert_eq!(
+            manager.set_allocation_ceiling(Some(7)),
+            Err("allocation ceiling 7 exceeds block capacity 4".into())
+        );
+        assert_eq!(store.inner.lock().fence, Some(6));
+        assert_eq!(store.debug_snapshot(), before);
+        assert_eq!(take_reset_id_work(store), ResetIdWork::default());
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum CeilingOp {
+        Allocate(usize),
+        Release(BlockId),
+        Capacity(usize),
+        Fence(Option<usize>),
+    }
+
+    fn ceiling_ops() -> impl Strategy<Value = CeilingOp> {
+        prop_oneof![
+            (0usize..=5).prop_map(CeilingOp::Allocate),
+            (0usize..16).prop_map(CeilingOp::Release),
+            (0usize..=18).prop_map(CeilingOp::Capacity),
+            proptest::option::of(0usize..=18).prop_map(CeilingOp::Fence),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn reset_sets_match_the_ceiling_model(ops in prop::collection::vec(ceiling_ops(), 1..128)) {
+            let manager = ceiling_manager();
+            let store = manager.store_for_test();
+            let mut capacity = 8;
+            let mut fence: Option<usize> = None;
+            let mut held = std::collections::BTreeMap::new();
+
+            for op in ops {
+                match op {
+                    CeilingOp::Allocate(count) => {
+                        let ceiling = fence.unwrap_or(capacity).min(capacity);
+                        let expected: Vec<_> = (0..ceiling)
+                            .filter(|id| !held.contains_key(id))
+                            .take(count)
+                            .collect();
+                        let allocated = manager.allocate_blocks(count);
+                        prop_assert_eq!(allocated.is_some(), expected.len() == count, "{:?}", op);
+                        if let Some(allocated) = allocated {
+                            prop_assert_eq!(allocated.len(), expected.len());
+                            for (id, block) in expected.into_iter().zip(allocated) {
+                                prop_assert_eq!(block.block_id(), id);
+                                prop_assert!(held.insert(id, block).is_none());
+                            }
+                        }
+                    }
+                    CeilingOp::Release(id) => drop(held.remove(&id)),
+                    CeilingOp::Capacity(next) => {
+                        let valid = next <= 16 && held.keys().all(|id| *id < next);
+                        prop_assert_eq!(manager.set_capacity(next).is_ok(), valid, "{:?}", op);
+                        if valid {
+                            capacity = next;
+                        }
+                    }
+                    CeilingOp::Fence(next) => {
+                        let valid = next.is_none_or(|value| value <= capacity);
+                        prop_assert_eq!(manager.set_allocation_ceiling(next).is_ok(), valid, "{:?}", op);
+                        if valid {
+                            fence = next;
+                        }
+                    }
+                }
+
+                let ceiling = fence.unwrap_or(capacity).min(capacity);
+                let (free, fenced): (Vec<_>, Vec<_>) = (0..capacity)
+                    .filter(|id| !held.contains_key(id))
+                    .partition(|id| *id < ceiling);
+                let inner = store.inner.lock();
+                prop_assert_eq!(inner.capacity, capacity, "{:?}", op);
+                prop_assert_eq!(inner.fence, fence, "{:?}", op);
+                prop_assert_eq!(inner.free.iter().copied().collect::<Vec<_>>(), free, "{:?}", op);
+                prop_assert_eq!(inner.fenced.iter().copied().collect::<Vec<_>>(), fenced, "{:?}", op);
+            }
+        }
+    }
 
     /// A handful of distinct, realistically-constructed `SequenceHash`
     /// values. `SequenceHash` (`PositionalLineageHash`) packs
