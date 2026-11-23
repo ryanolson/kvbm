@@ -8,10 +8,12 @@ unproven outcome, keep the source blocks pinned and leave the destination
 fence incomplete. Sending a load failure too early lets the scheduler reuse
 blocks the worker can still overwrite.
 
-Test by losing the reply while holding the running copy. Check that the
-source stays pinned, the fence stays incomplete, and the scheduler gets no
-load terminal.
-[Lost-reply test](../crates/kvbm-engine/src/tiering/engine/local/tests/onboard_drain.rs)
+Start an onboard over loopback and wait for the worker to start the copy.
+Lose the transfer reply while the copy runs. With a fake clock, wait for the
+client to see the loss before advancing the initial check timer. Check that
+the source stays pinned, the fence stays incomplete, and the scheduler gets
+no load terminal.
+[Lost-reply test](../crates/kvbm-engine/src/tiering/engine/local/tests/onboard_pause.rs)
 
 ## Report the undispatched tail of a failed onboard
 
