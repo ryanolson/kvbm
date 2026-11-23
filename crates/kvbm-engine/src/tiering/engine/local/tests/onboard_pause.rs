@@ -688,6 +688,13 @@ async fn paused_onboard_honors_configured_probe_deadline() -> Result<()> {
 #[tokio::test]
 async fn local_onboard_pause_names_the_reporting_worker() -> Result<()> {
     let mut log = tempfile::tempfile()?;
+    // Keep a second dispatch alive so tracing checks the capture's interest
+    // when another test thread registers the event first.
+    let _quiet = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::level_filters::LevelFilter::OFF)
+            .finish(),
+    );
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
         .without_time()

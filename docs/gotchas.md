@@ -74,3 +74,13 @@ body calls code that can take the same lock or wait for another thread.
 Test both orders of a reset and re-registration marker update. Pause each
 operation after it releases the store mutex and verify that the other can
 reach its own pause. [Presence ordering test](../crates/kvbm-logical/src/manager/tests/lineage_ghosts.rs)
+
+## Keep scoped trace captures visible to parallel tests
+
+Keep a second, disabled tracing dispatch alive during a scoped capture.
+With a single dispatch, another test thread can register the same event
+first and cache it as disabled because that thread lacks the capture.
+
+Run the log assertion in the full parallel suite. It checks the worker
+label even if another test logs a pause first.
+[Pause worker test](../crates/kvbm-engine/src/tiering/engine/local/tests/onboard_pause.rs)
