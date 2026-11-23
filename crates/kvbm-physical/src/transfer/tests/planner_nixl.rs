@@ -42,7 +42,7 @@ use super::gate::nixl_serial;
 use super::local_transfers::{LayoutType, is_nixl_backend_available};
 use super::*;
 use crate::layout::KvBlockLayout;
-use crate::transfer::executor::dispatch_fault::{Point, inject};
+use crate::transfer::executor::dispatch_fault::{NIXL_POSTS, Point, inject};
 use crate::transfer::executor::{TransferOptionsInternal, execute_transfer};
 use crate::transfer::strategy::{TransferPlan, TransferStrategy, select_strategy};
 use crate::transfer::{BounceBufferInternal, TransferCompleteNotification, TransferDrainOutcome};
@@ -977,5 +977,42 @@ async fn nixl_dispatch_failure_after_post_returns_unproven(
             .get(),
         1
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn nixl_dispatch_failure_reserves_staged_status_before_post() -> Result<()> {
+    nixl_serial!();
+    let before = NIXL_POSTS.get();
+    let result = dispatch_nixl_fault(
+        Point::NixlStatusEvent,
+        true,
+        std::sync::Arc::new(KvbmObservability::new()?),
+    )?;
+    let error = result
+        .err()
+        .expect("stage must fail to reserve its status event");
+    assert!(
+        error
+            .to_string()
+            .contains("injected NIXL status event failure")
+    );
+    assert_eq!(
+        NIXL_POSTS.get(),
+        before,
+        "NIXL must wait for status event admission"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn nixl_dispatch_failure_recording_staged_cuda_event() -> Result<()> {
+    nixl_serial!();
+    let result = dispatch_nixl_fault(
+        Point::CompletionEvent,
+        true,
+        std::sync::Arc::new(KvbmObservability::new()?),
+    )?;
+    super::planner_path::assert_dispatch_failure_drained(result).await;
     Ok(())
 }

@@ -158,9 +158,8 @@ pub trait WorkerTransfers: Send + Sync {
     /// # Returns
     /// A receipt that reports the transfer's drain outcome.
     ///
-    /// For CUDA copies, a dispatch error means no copy was submitted. A
-    /// submission that may have reached the stream reports errors through
-    /// its receipt.
+    /// A dispatch error means no copy was submitted. Once a copy may have
+    /// started, the receipt reports any error and whether the work drained.
     fn execute_local_transfer(
         &self,
         src: LogicalLayoutHandle,
