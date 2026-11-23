@@ -32,6 +32,7 @@
 
 pub(crate) mod reconcile;
 
+mod admission;
 mod bundle;
 mod config;
 mod driver;

@@ -267,7 +267,7 @@ async fn finish_with_pending_load_and_save(load_first: bool) -> Result<()> {
         engine
             .actions
             .insert(save, ActionRecord::new_save(request.clone(), Weak::new()));
-        engine.by_request.insert(request.clone(), vec![save]);
+        engine.by_request.insert(request.clone(), vec![save].into());
         save
     })
     .await?;
@@ -382,13 +382,13 @@ impl EngineWorkerSink for HeldReceiveSink {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn request_release_joins_an_in_progress_receive_and_keeps_the_old_eviction_fence()
+async fn request_release_joins_an_in_progress_receive_with_an_unrelated_eviction_fence()
 -> Result<()> {
     finish_during_receive(false).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn request_release_joins_an_in_progress_receive_and_keeps_the_old_eviction_fence_with_failed_load()
+async fn request_release_joins_an_in_progress_failed_receive_with_an_unrelated_eviction_fence()
 -> Result<()> {
     finish_during_receive(true).await
 }
@@ -402,20 +402,21 @@ async fn finish_during_receive(failed: bool) -> Result<()> {
         entered: Mutex::new(Some(enter)),
         resume: Mutex::new(blocked),
     });
-    let (load, (old_save, eviction)) =
-        HeldLoad::start_with_sink(true, sink, gated, |engine, request| {
-            // The prior generation's save has its own eviction fence. Drop the
-            // visible handle before restoring a new load for the same request.
-            let save = ActionId::new();
-            engine
-                .actions
-                .insert(save, ActionRecord::new_save(request.clone(), Weak::new()));
-            engine.by_request.insert(request.clone(), vec![save]);
-            let eviction = engine.evict(request);
-            engine.release_action(&save);
-            (save, eviction)
-        })
-        .await?;
+    let other_request = RequestId::from("different-request");
+    let (load, (old_save, eviction)) = HeldLoad::start_with_sink(true, sink, gated, |engine, _| {
+        let save = ActionId::new();
+        engine.actions.insert(
+            save,
+            ActionRecord::new_save(other_request.clone(), Weak::new()),
+        );
+        engine
+            .by_request
+            .insert(other_request.clone(), vec![save].into());
+        let eviction = engine.evict(&other_request);
+        engine.release_action(&save);
+        (save, eviction)
+    })
+    .await?;
     let old_fence = eviction.handle.expect("the old save has a fence");
     load.assert_before_proof();
     load.prove(failed)?;
@@ -443,7 +444,7 @@ async fn finish_during_receive(failed: bool) -> Result<()> {
     assert!(load.sink.fences().is_empty());
 
     load.engine
-        .finish_save_action(old_save, &load.request, ActionStatus::Complete);
+        .finish_save_action(old_save, &other_request, ActionStatus::Complete);
     assert!(old_fence.is_complete());
     assert_eq!(load.sink.fences(), eviction.fence.per_worker);
     assert!(load.sink.saves().is_empty());

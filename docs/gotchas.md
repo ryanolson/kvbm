@@ -85,6 +85,12 @@ then finishing with and without an in-flight save. Without the acknowledgment,
 finish joins an entry the scheduler already consumed.
 [Consumed receive test](../crates/kvbm-connector/src/connector/leader/tests/request_finish.rs)
 
+A preempted request's old save can overlap its restored onboard even though
+the worker waits on an eviction fence before the next forward pass. Defer
+the restored match until the old drain proves completion. Test both delivery
+orders and check that the scheduler accepts one terminal entry.
+[Preemption release test](../crates/kvbm-connector/src/connector/leader/tests/request_finish/restore.rs)
+
 ## Keep paused onboard blocks through connector teardown
 
 Keep the engine's pause registry alive while a worker can still touch its

@@ -518,7 +518,7 @@ impl LocalConnectorEngine {
             .actions
             .get(&action_id)
             .map(|record| record.request_id.clone());
-        let request_guard = request_id
+        let mut request_guard = request_id
             .as_ref()
             .and_then(|req| self.by_request.get_mut(req));
         let (claimed, fence, drain, drained_load, remove_now) = {
@@ -529,6 +529,9 @@ impl LocalConnectorEngine {
                         return;
                     }
                     record.physical_pending = false;
+                    if let Some(request) = request_guard.as_deref_mut() {
+                        request.physical_loads -= 1;
+                    }
                     record.cancel = None;
                     let suppress_terminal = record.fence.is_some() || record.drain.is_some();
                     let ActionKind::Load(terminal) = &mut record.kind else {
@@ -730,7 +733,7 @@ impl LocalConnectorEngine {
         let action_ids: Vec<ActionId> = self
             .by_request
             .get(req)
-            .map(|ids| ids.clone())
+            .map(|actions| actions.ids.clone())
             .unwrap_or_default();
         for id in &action_ids {
             if let Some(mut record) = self.actions.get_mut(id) {
@@ -749,10 +752,11 @@ impl LocalConnectorEngine {
     pub(super) fn arm_request_finish(&self, req: &RequestId) -> bool {
         let actions = self.by_request.get_mut(req);
         self.offload_drains.remove(req);
-        let Some(actions) = actions else {
+        let Some(mut actions) = actions else {
             return false;
         };
-        if actions.iter().any(|id| {
+        actions.finishing = true;
+        if actions.ids.iter().any(|id| {
             self.actions.get(id).is_some_and(|record| {
                 record.drain.is_some()
                     || matches!(record.kind, ActionKind::Load(LoadTerminalState::Delivering))
@@ -762,7 +766,7 @@ impl LocalConnectorEngine {
         }
 
         let mut emission = None;
-        for id in actions.iter() {
+        for id in &actions.ids {
             if let Some(mut record) = self.actions.get_mut(id)
                 && (record.has_pending_work()
                     || matches!(record.kind, ActionKind::Load(LoadTerminalState::Claimed(_))))
@@ -780,11 +784,10 @@ impl LocalConnectorEngine {
     /// Sever a finished action's `request_id → action_ids` link, dropping the
     /// per-request entry once it is empty.
     pub(super) fn untrack_action(&self, request_id: &RequestId, action_id: ActionId) {
-        if let Some(mut ids) = self.by_request.get_mut(request_id) {
-            ids.retain(|a| *a != action_id);
+        if let Some(mut actions) = self.by_request.get_mut(request_id) {
+            actions.ids.retain(|a| *a != action_id);
         }
-        self.by_request
-            .remove_if(request_id, |_, ids| ids.is_empty());
+        self.prune_request_actions(request_id);
     }
 
     /// Remove an action's `actions` entry and scrub its `by_request` link. The

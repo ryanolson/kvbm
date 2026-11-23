@@ -54,7 +54,7 @@ impl LocalConnectorEngine {
     ) -> Result<OnboardHandle, LeaderEngineError> {
         validate_resource_transfers(self.as_ref(), &plan.resources)?;
         let (source_leases, inflight_hashes) = self.acquire_bundle_sources(&plan)?;
-        self.start_bundle_onboard_with_sources(req, plan, source_leases, inflight_hashes)
+        self.start_bundle_onboard_with_sources(req, plan, source_leases, inflight_hashes, None)
     }
 
     pub(in crate::tiering::engine) fn start_searched_bundle_onboard(
@@ -83,8 +83,13 @@ impl LocalConnectorEngine {
         validate_resource_transfers(self.as_ref(), &plan.resources)?;
         let request_id = state.request_id.clone();
         drop(state);
-        self.bundle_searches.remove(&search_id);
-        self.start_bundle_onboard_with_sources(&request_id, plan, source_leases, inflight_hashes)
+        self.start_bundle_onboard_with_sources(
+            &request_id,
+            plan,
+            source_leases,
+            inflight_hashes,
+            Some(search_id),
+        )
     }
 
     pub(in crate::tiering::engine) fn start_resource_onboard(
@@ -98,8 +103,9 @@ impl LocalConnectorEngine {
             });
         }
         validate_resource_transfers(self.as_ref(), &resources)?;
+        let admitted = self.admit_action(req, None, false)?;
         let (handle, load) = self.mint_onboard(
-            req.clone(),
+            admitted,
             destination_ids(&resources),
             Some(CancellationToken::new()),
             None,
@@ -122,6 +128,7 @@ impl LocalConnectorEngine {
         plan: BundleOnboardPlan,
         source_leases: SourceLeases,
         inflight_hashes: Vec<SequenceHash>,
+        search: Option<kvbm_protocols::connector::SearchId>,
     ) -> Result<OnboardHandle, LeaderEngineError> {
         let mut transaction =
             BundleOnboard::new(plan.identity, plan.key, source_leases).map_err(|error| {
@@ -131,13 +138,25 @@ impl LocalConnectorEngine {
             })?;
         transaction.start();
 
+        let admitted = self.admit_action(
+            req,
+            search.map(crate::tiering::engine::admission::AdmissionOffer::Search),
+            false,
+        )?;
+        let previous = search.map(|id| self.bundle_searches.remove(&id));
+        if matches!(previous, Some(None)) {
+            drop(admitted);
+            self.prune_request_actions(req);
+            return Err(LeaderEngineError::SearchNotMatched);
+        }
         let cancel = CancellationToken::new();
         let (handle, load) = self.mint_onboard(
-            req.clone(),
+            admitted,
             destination_ids(&plan.resources),
             Some(cancel.clone()),
             Some(inflight_hashes),
         );
+        drop(previous);
         let watchdog = OnboardWatchdog {
             cancel,
             duration: self.bundle_onboard_watchdog(),

@@ -452,7 +452,12 @@ impl LocalConnectorEngine {
             let Some(sid) = state.local_search_id() else {
                 return Err(LeaderEngineError::SearchNotMatched);
             };
-            return Arc::clone(self).local_onboard(sid, dest, num_external_tokens);
+            return Arc::clone(self).local_onboard_with_offer(
+                sid,
+                dest,
+                num_external_tokens,
+                super::admission::AdmissionOffer::Prefill(accept_id),
+            );
         }
         // vLLM commits exactly what `find_blocks` promised; the promise is the
         // engine-stored cell this same generation refreshes. A divergence means

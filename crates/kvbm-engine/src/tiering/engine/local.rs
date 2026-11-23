@@ -64,6 +64,7 @@ use kvbm_protocols::connector::{BlockId, RequestId, SequenceHash};
 use kvbm_logical::BlockEvictionObserver;
 use kvbm_logical::blocks::ImmutableBlock;
 
+use super::admission::{AdmissionGuard, AdmissionOffer, RequestActions};
 use super::bundle::{
     BundleAdmissionConfig, BundleCatalog, BundleDirectoryOrder, BundleLease,
     BundlePublicationRuntime,
@@ -206,8 +207,9 @@ pub(crate) struct LocalConnectorEngine {
     pub(super) bundle_searches: DashMap<SearchId, BundleSearchState>,
     pub(super) actions: DashMap<ActionId, ActionRecord>,
     pub(super) paused_onboards: super::paused::PausedOnboards,
-    /// `request_id → in-flight onboard/offload action ids` (read by `evict`).
-    pub(super) by_request: DashMap<RequestId, Vec<ActionId>>,
+    /// Serializes admission, eviction and finish for the same request.
+    pub(super) by_request: DashMap<RequestId, RequestActions>,
+    pub(super) admission_offers: DashMap<AdmissionOffer, (RequestId, u64)>,
     /// The offload-submission seam (real: [`super::offload::OffloadEngineSubmit`];
     /// onboard-only tests default to [`DisabledOffloadSubmit`]). Behind a trait
     /// so the GPU/velo-bound `OffloadEngine` stays mockable.
@@ -536,6 +538,7 @@ impl LocalConnectorEngine {
                 actions: DashMap::new(),
                 paused_onboards,
                 by_request: DashMap::new(),
+                admission_offers: DashMap::new(),
                 offload_submit,
                 offload_buffer: Mutex::new(Vec::new()),
                 bundle_catalog: Mutex::new(BundleCatalog::new()),
@@ -865,16 +868,14 @@ impl LocalConnectorEngine {
         {
             return Err(LeaderEngineError::ResourceOffloadNotConfigured { resource });
         }
+        let mut admitted = self.admit_action(req, None, true)?;
         let action_id = ActionId::new();
         let cell = Arc::new(Mutex::new(ActionStatus::Pending));
         self.actions.insert(
             action_id,
             ActionRecord::new_save(req.clone(), Arc::downgrade(&cell)),
         );
-        self.by_request
-            .entry(req.clone())
-            .or_default()
-            .push(action_id);
+        admitted.ids.push(action_id);
         self.offload_drains.insert(req.clone(), ());
 
         self.offload_buffer
@@ -889,6 +890,7 @@ impl LocalConnectorEngine {
                 iteration: self.current_iteration.load(Ordering::Relaxed),
                 completion: BufferedOffloadCompletion::Single,
             });
+        drop(admitted);
 
         let me: Arc<dyn LeaderEngine> = self;
         Ok(OffloadHandle::new(action_id, Arc::downgrade(&me), cell))
@@ -925,11 +927,9 @@ impl LeaderEngine for LocalConnectorEngine {
         // Find in-flight actions for this request and, if any, flag them
         // cancelled-for-emission: their terminal fires `mark_fence_complete`
         // (not `mark_load_finished`) and mints one barrier token per worker.
-        let action_ids: Vec<ActionId> = self
-            .by_request
-            .get(req)
-            .map(|ids| ids.clone())
-            .unwrap_or_default();
+        let mut request = self.by_request.entry(req.clone()).or_default();
+        request.eviction_epoch += 1;
+        request.evictions += 1;
 
         // ONE critical section per action: re-check pending AND arm the fence under
         // the SAME `get_mut` write guard, serialized against `finish_*_action`'s
@@ -943,7 +943,7 @@ impl LeaderEngine for LocalConnectorEngine {
         // drained — never on the first.
         let mut barrier: Option<Arc<FenceBarrier>> = None;
         let mut cancellations = Vec::new();
-        for id in &action_ids {
+        for id in &request.ids {
             if let Some(mut record) = self.actions.get_mut(id) {
                 // Arm only an unfenced action. The drain-holder/fresh-GNMT design
                 // precludes re-evicting the same in-flight action, but guarding
@@ -963,9 +963,25 @@ impl LeaderEngine for LocalConnectorEngine {
                 }
             }
         }
+        let handle = barrier.as_ref().map(|barrier| barrier.leader_handle());
+        request.eviction_fences.retain(|fence| !fence.is_complete());
+        request
+            .eviction_fences
+            .extend(barrier.iter().map(|barrier| barrier.leader_handle()));
+
+        // The buffer lock decides whether eviction or a concurrent flush owns
+        // each save. Anything still here is known to have submitted no copy.
+        let undispatched = self
+            .offload_buffer
+            .lock()
+            .expect("offload-buffer mutex poisoned")
+            .extract_if(.., |offload| &offload.request_id == req)
+            .collect();
+        drop(request);
         for cancel in cancellations {
             cancel.cancel();
         }
+        self.fail_undispatched_offloads(undispatched);
 
         // Tokens (and the leader's observational handle) are returned IFF at least
         // one action was armed (`barrier` is Some), so an empty arm set yields no
@@ -973,10 +989,9 @@ impl LeaderEngine for LocalConnectorEngine {
         // if every armed action already drained during the loop, that drop is the
         // last clone and completes the fence immediately (the worker's await — and
         // the leader's `is_complete` poll — then see an already-complete fence).
-        let (per_worker, handle) = match barrier.as_ref() {
-            Some(b) => (b.tokens().to_vec(), Some(b.leader_handle())),
-            None => (Vec::new(), None),
-        };
+        let per_worker = barrier
+            .as_ref()
+            .map_or_else(Vec::new, |b| b.tokens().to_vec());
 
         // Bubble eviction into CD: close the parked session and release the
         // budget reservation (idempotent + identity-checked). Not under any
@@ -995,6 +1010,12 @@ impl LeaderEngine for LocalConnectorEngine {
                 self.prefill_release(req, state.accept_id());
             }
         }
+        drop(barrier);
+        self.by_request
+            .get_mut(req)
+            .expect("eviction registered")
+            .evictions -= 1;
+        self.prune_request_actions(req);
 
         EvictionOutcome {
             fence: EvictionFence {
@@ -1052,6 +1073,7 @@ impl LeaderEngine for LocalConnectorEngine {
     }
 
     fn release_search(&self, id: &SearchId) {
+        self.release_admission_offer(AdmissionOffer::Search(*id));
         // Clear this lifecycle's in-flight onboard deferral record FIRST,
         // unconditionally: an onboarded lifecycle's `searches` entry was
         // consumed at onboard time, so the map check below must not gate the
@@ -1120,8 +1142,15 @@ impl LeaderEngine for LocalConnectorEngine {
         req: &FindBlocksRequest,
         live: Option<&FindBlocksHandle>,
     ) -> Result<FindBlocksOutcome, LeaderEngineError> {
-        // Body in `super::find` (the unified source-agnostic router).
-        self.route_find_blocks(req, live)
+        let Some(epoch) = self.begin_admitted_find(&req.request_id) else {
+            return Ok(FindBlocksOutcome::Deferred);
+        };
+        let outcome = self.route_find_blocks(req, live);
+        if self.end_admitted_find(&req.request_id, epoch, &outcome) {
+            outcome
+        } else {
+            Ok(FindBlocksOutcome::Deferred)
+        }
     }
 
     fn onboard_blocks(
@@ -1159,6 +1188,7 @@ impl LeaderEngine for LocalConnectorEngine {
     }
 
     fn release_prefill_session(&self, request_id: &RequestId, accept_id: AcceptId) {
+        self.release_admission_offer(AdmissionOffer::Prefill(accept_id));
         self.prefill_release_after_park(request_id, accept_id);
     }
 }
@@ -1183,6 +1213,28 @@ pub(super) enum LocalSearchOutcome {
 }
 
 impl LocalConnectorEngine {
+    fn fail_undispatched_offloads(&self, buffered: Vec<BufferedOffload>) {
+        for BufferedOffload {
+            action_id,
+            request_id,
+            resource,
+            pairs,
+            completion,
+            ..
+        } in buffered
+        {
+            self.finish_offload_child(
+                action_id,
+                &request_id,
+                resource,
+                pairs,
+                None,
+                completion,
+                ActionStatus::Failed(ActionFailure::AllBlocks),
+            );
+        }
+    }
+
     /// The initial-search core: issue the find, latch the reconciled state into
     /// `searches`, and (on a resolved hit) run the conditional-disagg
     /// interposition. Search failures collapse to `NoMatch` (loud log, never an
@@ -1341,9 +1393,24 @@ impl LocalConnectorEngine {
         dest: &[BlockId],
         num_external_tokens: usize,
     ) -> Result<OnboardHandle, LeaderEngineError> {
+        self.local_onboard_with_offer(
+            search_id,
+            dest,
+            num_external_tokens,
+            AdmissionOffer::Search(search_id),
+        )
+    }
+
+    pub(super) fn local_onboard_with_offer(
+        self: Arc<Self>,
+        search_id: SearchId,
+        dest: &[BlockId],
+        num_external_tokens: usize,
+        offer: AdmissionOffer,
+    ) -> Result<OnboardHandle, LeaderEngineError> {
         // Sufficient precondition: a latch exists and its pin is still live
         // (Matched). The guard drops before the take below.
-        let accepted_blocks = {
+        let (request_id, accepted_blocks) = {
             let Some(entry) = self.searches.get(&search_id) else {
                 return Err(LeaderEngineError::SearchNotMatched);
             };
@@ -1366,22 +1433,26 @@ impl LocalConnectorEngine {
                             got: num_external_tokens,
                         });
                     }
-                    (num_external_tokens / self.block_size) as u32
+                    (
+                        entry.request_id.clone(),
+                        (num_external_tokens / self.block_size) as u32,
+                    )
                 }
                 MatchStatus::Pending | MatchStatus::Lost => {
                     return Err(LeaderEngineError::SearchNotMatched);
                 }
             }
         };
+        let admitted = self.admit_action(&request_id, Some(offer), false)?;
 
         // Take ownership of the pinned state: the onboard now owns the sources'
         // lifecycle. The driver holds the source blocks through dispatch and
         // passes them to the pause registry if the receipt cannot prove drain.
-        let (_id, search_state) = self
-            .searches
-            .remove(&search_id)
-            .ok_or(LeaderEngineError::SearchNotMatched)?;
-        let request_id = search_state.request_id;
+        let Some((_id, search_state)) = self.searches.remove(&search_id) else {
+            drop(admitted);
+            self.prune_request_actions(&request_id);
+            return Err(LeaderEngineError::SearchNotMatched);
+        };
         let mut onboarding = search_state.onboarding;
         // The absolute-indexed hash buffer, snapshotted before the local mint so
         // the in-flight guard records the accepted window even though `onboarding`
@@ -1412,9 +1483,9 @@ impl LocalConnectorEngine {
         let cd_state = self.cd.as_ref().and_then(|cd| cd.requests.get(&request_id));
         if let Some(state) = cd_state {
             return Ok(self.cd_onboard(
+                admitted,
                 state,
                 search_id,
-                request_id,
                 onboarding,
                 g1_block_ids,
                 accepted_blocks,
@@ -1428,7 +1499,7 @@ impl LocalConnectorEngine {
             .collect();
 
         let (handle, load) = self.mint_onboard(
-            request_id,
+            admitted,
             g1_block_ids.clone(),
             Some(tokio_util::sync::CancellationToken::new()),
             None,
@@ -1805,14 +1876,15 @@ impl LocalConnectorEngine {
     /// its pins until drain is proven. The terminal settles the load, closes or
     /// finalizes the originating CD lifecycle, then releases the physical fence.
     fn cd_onboard(
-        self: Arc<Self>,
+        self: &Arc<Self>,
+        admitted: AdmissionGuard<'_>,
         state: Arc<CdRequestState>,
         search_id: SearchId,
-        request_id: RequestId,
         mut onboarding: OnboardingState,
         external_ids: Vec<BlockId>,
         unified: u32,
     ) -> OnboardHandle {
+        let request_id = admitted.key().clone();
         let block_size = self.block_size;
         let unified = unified as usize;
         let local_hit = state.local_hit_blocks() as usize;
@@ -1822,7 +1894,7 @@ impl LocalConnectorEngine {
         //    dispatch resolved Err) surfaces here with the now-known dest ids.
         if state.pending_failure().is_some() {
             tracing::warn!(%request_id, "cd onboard: replaying pre-onboard failure stash");
-            return self.reject_cd_onboard(request_id, external_ids, state);
+            return self.reject_cd_onboard(admitted, external_ids, state);
         }
 
         // b. Count / split guards (the legacy USAA-1 bails, never a panic).
@@ -1835,7 +1907,7 @@ impl LocalConnectorEngine {
                 window = window.len(),
                 "cd onboard: external/window split mismatch; failing the load"
             );
-            return self.reject_cd_onboard(request_id, external_ids, state);
+            return self.reject_cd_onboard(admitted, external_ids, state);
         }
 
         let local_g1: Vec<BlockId> = external_ids[..local_hit].to_vec();
@@ -1849,7 +1921,7 @@ impl LocalConnectorEngine {
         // take_session — the driver must not consume it).
         let Some(session) = state.clone_session() else {
             tracing::error!(%request_id, "cd onboard: session already gone; failing the load");
-            return self.reject_cd_onboard(request_id, external_ids, state);
+            return self.reject_cd_onboard(admitted, external_ids, state);
         };
 
         let staging_futs: Vec<_> = onboarding
@@ -1859,7 +1931,7 @@ impl LocalConnectorEngine {
             .collect();
 
         let (handle, mut load) = self.mint_onboard(
-            request_id.clone(),
+            admitted,
             external_ids.clone(),
             Some(tokio_util::sync::CancellationToken::new()),
             None,
@@ -2153,25 +2225,7 @@ impl WorkerEngineDriver for LocalConnectorEngine {
                 .expect("offload-buffer mutex poisoned");
             std::mem::take(&mut *buffer)
         };
-        for BufferedOffload {
-            action_id,
-            request_id,
-            resource,
-            pairs,
-            completion,
-            ..
-        } in buffered
-        {
-            self.finish_offload_child(
-                action_id,
-                &request_id,
-                resource,
-                pairs,
-                None,
-                completion,
-                ActionStatus::Failed(ActionFailure::AllBlocks),
-            );
-        }
+        self.fail_undispatched_offloads(buffered);
     }
 }
 
@@ -2891,7 +2945,7 @@ mod tests {
         engine
             .actions
             .insert(a2, ActionRecord::new(req.clone(), Arc::downgrade(&cell2)));
-        engine.by_request.insert(req.clone(), vec![a1, a2]);
+        engine.by_request.insert(req.clone(), vec![a1, a2].into());
 
         let fence = engine.evict(&req).fence;
         assert!(
@@ -2956,7 +3010,7 @@ mod tests {
             a1,
             ActionRecord::new_save(req.clone(), Arc::downgrade(&cell)),
         );
-        engine.by_request.insert(req.clone(), vec![a1]);
+        engine.by_request.insert(req.clone(), vec![a1].into());
 
         let fence = engine.evict(&req).fence;
         assert!(
@@ -3006,7 +3060,7 @@ mod tests {
         engine
             .actions
             .insert(a2, ActionRecord::new(req.clone(), Arc::downgrade(&cell2)));
-        engine.by_request.insert(req.clone(), vec![a1, a2]);
+        engine.by_request.insert(req.clone(), vec![a1, a2].into());
 
         let outcome = engine.evict(&req);
         let handle = outcome
@@ -3071,7 +3125,7 @@ mod tests {
         engine
             .actions
             .insert(a1, ActionRecord::new(req.clone(), Arc::downgrade(&cell)));
-        engine.by_request.insert(req.clone(), vec![a1]);
+        engine.by_request.insert(req.clone(), vec![a1].into());
 
         engine.finish_load_action(
             a1,
@@ -3110,7 +3164,7 @@ mod tests {
         engine
             .actions
             .insert(a1, ActionRecord::new(req.clone(), Arc::downgrade(&cell1)));
-        engine.by_request.insert(req.clone(), vec![a1]);
+        engine.by_request.insert(req.clone(), vec![a1].into());
 
         let fence = engine.evict(&req).fence;
         assert!(!fence.per_worker.is_empty());
@@ -3784,7 +3838,7 @@ mod tests {
             a2,
             ActionRecord::new_save(req.clone(), Arc::downgrade(&cell2)),
         );
-        engine.by_request.insert(req.clone(), vec![a1, a2]);
+        engine.by_request.insert(req.clone(), vec![a1, a2].into());
         engine.offload_drains.insert(req.clone(), ());
 
         // request_finished(Pending) arm point: take + commit with work pending.
@@ -3827,7 +3881,7 @@ mod tests {
         engine
             .actions
             .insert(a1, ActionRecord::new(req.clone(), Arc::downgrade(&cell1)));
-        engine.by_request.insert(req.clone(), vec![a1]);
+        engine.by_request.insert(req.clone(), vec![a1].into());
         engine.offload_drains.insert(req.clone(), ());
 
         engine.take_offload_drain(&req).expect("drain").commit();
@@ -3882,7 +3936,7 @@ mod tests {
             a1,
             ActionRecord::new_save(req.clone(), Arc::downgrade(&cell1)),
         );
-        engine.by_request.insert(req.clone(), vec![a1]);
+        engine.by_request.insert(req.clone(), vec![a1].into());
         engine.offload_drains.insert(req.clone(), ());
 
         engine.take_offload_drain(&req).expect("drain").commit();
@@ -10097,18 +10151,15 @@ mod tests {
             Ok(())
         }
 
-        /// Preemption-restore self-deferral is INTENDED behavior, and it
-        /// terminates at the drain-holder's RELEASE — not at evict, not at
-        /// the fence-armed driver terminal: the restored request's fresh poll
-        /// defers on its own prior generation's still-draining load until the
-        /// connector's drain-holder drops the old handle (release_search).
+        /// The fresh poll waits for physical proof even if the prior
+        /// generation's search handle has already been released.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn find_blocks_evict_restore_self_deferral_holds_until_release() -> Result<()> {
+        async fn find_blocks_evict_restore_self_deferral_holds_until_proof() -> Result<()> {
             let leader = Arc::new(build_test_leader().await?);
             let sink = RecordingSink::new();
             let engine = LocalConnectorEngine::new(leader, sink, BS, false);
 
-            let (find_session, _tx) = pending_async(); // park the driver pre-terminal
+            let (find_session, tx) = pending_async();
             let search_id = SearchId::new();
             let cell = Arc::new(Mutex::new(MatchStatus::Matched { hit_blocks: 1 }));
             engine.searches.insert(
@@ -10152,15 +10203,19 @@ mod tests {
                 "the restored poll stays deferred past the terminal"
             );
 
-            // The drain-holder's eventual handle drop releases the old
-            // generation and lifts the self-deferral.
             engine.release_search(&search_id);
+            assert!(matches!(
+                engine.clone().find_blocks(&repoll, None)?,
+                FindBlocksOutcome::Deferred
+            ));
+            drop(tx);
+            super::super::super::test_support::wait_onboard_driver_finished(*onboard.id()).await;
             assert!(
                 !matches!(
                     engine.clone().find_blocks(&repoll, None)?,
                     FindBlocksOutcome::Deferred
                 ),
-                "the deferral terminates at the old generation's release"
+                "the deferral terminates at the old generation's physical proof"
             );
             Ok(())
         }
