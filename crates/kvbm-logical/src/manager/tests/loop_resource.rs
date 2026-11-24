@@ -36,10 +36,7 @@ fn register_token(
     manager.register_block(block)
 }
 
-fn stage_under_hash(
-    manager: &TestManager,
-    hash: SequenceHash,
-) -> CompleteBlock<TestBlockData> {
+fn stage_under_hash(manager: &TestManager, hash: SequenceHash) -> CompleteBlock<TestBlockData> {
     manager
         .allocate_blocks(1)
         .expect("allocate one block")
