@@ -15,13 +15,12 @@ use crate::{BlockId, ManagerId, SequenceHash};
 
 use super::BlockEvictionObserver;
 
-/// Opaque proof that one inactive candidate still names one complete lineage.
+/// Opaque snapshot of one complete inactive lineage.
 ///
 /// A preflight records the exact root-to-leaf source set under the store lock.
-/// [`crate::BlockManager::try_hold_prepared_inactive_lineage`] consumes it and
-/// rechecks the manager, candidate, and full source set under that same lock
-/// before it mutates the pool.
-#[must_use = "consume the preflight through its owning BlockManager"]
+/// A prepared hold or pin checks the manager, leaf tenure, and source set
+/// under the store lock before it changes the pool.
+#[must_use = "use the preflight through its owning BlockManager"]
 pub struct InactiveLineagePreflight<T: BlockMetadata> {
     manager_id: ManagerId,
     candidate: InactiveCandidate,
@@ -43,15 +42,14 @@ impl<T: BlockMetadata> InactiveLineagePreflight<T> {
         }
     }
 
-    /// Exact number of blocks that the later hold must claim.
+    /// Number of blocks in the prepared lineage.
     pub fn block_count(&self) -> usize {
         self.source_blocks.len()
     }
 
     /// Logical hashes in root-to-leaf order.
     ///
-    /// This exposes no physical slot identity. The manager keeps that identity
-    /// inside the proof until a later exact hold succeeds.
+    /// The proof keeps the physical slot identities private.
     pub fn source_hashes(&self) -> Vec<SequenceHash> {
         self.source_blocks.iter().map(|(hash, _)| *hash).collect()
     }
@@ -63,6 +61,14 @@ impl<T: BlockMetadata> InactiveLineagePreflight<T> {
 
     pub(super) fn matches_manager(&self, manager_id: ManagerId) -> bool {
         self.manager_id == manager_id
+    }
+
+    pub(super) fn manager_id(&self) -> ManagerId {
+        self.manager_id
+    }
+
+    pub(super) fn source_blocks(&self) -> &[(SequenceHash, BlockId)] {
+        &self.source_blocks
     }
 
     pub(super) fn into_parts(self) -> (InactiveCandidate, Vec<(SequenceHash, BlockId)>) {

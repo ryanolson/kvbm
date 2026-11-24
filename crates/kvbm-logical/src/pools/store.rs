@@ -156,6 +156,15 @@ pub(crate) trait InactiveIndex: Send + Sync {
         self.find_matches(&[hash], touch).into_iter().next()
     }
 
+    /// Remove one block for a prepared lineage pin without a touch or an
+    /// ancestor age refresh. Only backends with complete lineage proofs use it.
+    fn find_match_preserving_ancestor_age(
+        &mut self,
+        _hash: SequenceHash,
+    ) -> Option<(SequenceHash, BlockId)> {
+        None
+    }
+
     /// Like `find_matches` but does not stop on miss.
     fn scan_matches(
         &mut self,
@@ -1932,24 +1941,30 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         matched
             .into_iter()
             .map(|(seq_hash, block_id)| {
-                let handle = take_inactive_handle(&mut inner.slots[block_id], block_id);
-                // Resurrection: the per-slot `reset_on_release` atomic
-                // carries the previous holder's override untouched.
-                let inner_arc = ImmutableBlockInner::new_primary(
-                    self.clone(),
-                    block_id,
-                    seq_hash,
-                    handle.clone(),
-                );
-                inner.slots[block_id].state = SlotState::Primary {
-                    seq_hash,
-                    handle,
-                    inner: Arc::downgrade(&inner_arc),
-                };
-                inner.active_by_hash.insert(seq_hash, block_id);
-                (seq_hash, inner_arc)
+                let block = self.promote_inactive_slot_locked(&mut inner, seq_hash, block_id);
+                (seq_hash, block)
             })
             .collect()
+    }
+
+    #[inline]
+    fn promote_inactive_slot_locked(
+        self: &Arc<Self>,
+        inner: &mut BlockStoreInner<T>,
+        seq_hash: SequenceHash,
+        block_id: BlockId,
+    ) -> Arc<ImmutableBlockInner<T>> {
+        let handle = take_inactive_handle(&mut inner.slots[block_id], block_id);
+        // Keep the previous holder's per-slot reset-on-release override.
+        let block =
+            ImmutableBlockInner::new_primary(self.clone(), block_id, seq_hash, handle.clone());
+        inner.slots[block_id].state = SlotState::Primary {
+            seq_hash,
+            handle,
+            inner: Arc::downgrade(&block),
+        };
+        inner.active_by_hash.insert(seq_hash, block_id);
+        block
     }
 
     // ---------- guard transitions (called from guard methods / drops) ----------

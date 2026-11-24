@@ -334,7 +334,7 @@ impl LineageBackend {
 
     /// A childless ghost stays in the index while its backing block is live.
     /// Unlink it so it does not keep its ancestors out of the leaf order.
-    fn unplace(&mut self, mut index: u32) {
+    fn unplace<const PRESERVE_AGE: bool>(&mut self, mut index: u32) {
         loop {
             #[cfg(test)]
             {
@@ -368,7 +368,11 @@ impl LineageBackend {
                         return;
                     }
                     if matches!(parent_slot.data, SlotData::Real { .. }) {
-                        self.leaves.on_leaf_added(parent);
+                        if PRESERVE_AGE {
+                            self.leaves.on_leaf_added_preserving_age(parent);
+                        } else {
+                            self.leaves.on_leaf_added(parent);
+                        }
                         return;
                     }
                     debug_assert!(matches!(parent_slot.data, SlotData::Ghost));
@@ -380,7 +384,7 @@ impl LineageBackend {
 
     fn remove_slot(&mut self, index: u32) {
         self.release_children(index);
-        self.unplace(index);
+        self.unplace::<false>(index);
         self.index.remove(&self.slots[index as usize].key());
         self.free_slot(index);
     }
@@ -487,12 +491,20 @@ impl LineageBackend {
         lineage_hash: &PositionalLineageHash,
         removal: Removal,
     ) -> Option<(SequenceHash, BlockId)> {
+        self.remove_by_hash_with_age::<false>(lineage_hash, removal)
+    }
+
+    fn remove_by_hash_with_age<const PRESERVE_AGE: bool>(
+        &mut self,
+        lineage_hash: &PositionalLineageHash,
+        removal: Removal,
+    ) -> Option<(SequenceHash, BlockId)> {
         let position = lineage_hash.position();
         let fragment = lineage_hash.parent_fragment_for_child_position(position + 1);
         let idx = *self.index.get(&(position, fragment))?;
         match self.slots[idx as usize].data {
             SlotData::Real { seq_hash, .. } if seq_hash == *lineage_hash => {
-                Some(self.remove_node_at(idx, removal))
+                Some(self.remove_node_at_with_age::<PRESERVE_AGE>(idx, removal))
             }
             _ => None,
         }
@@ -500,6 +512,14 @@ impl LineageBackend {
 
     /// Keep the slot on a cache hit or hold. Eviction frees it.
     fn remove_node_at(&mut self, idx: u32, removal: Removal) -> (SequenceHash, BlockId) {
+        self.remove_node_at_with_age::<false>(idx, removal)
+    }
+
+    fn remove_node_at_with_age<const PRESERVE_AGE: bool>(
+        &mut self,
+        idx: u32,
+        removal: Removal,
+    ) -> (SequenceHash, BlockId) {
         let payload = match std::mem::replace(&mut self.slots[idx as usize].data, SlotData::Ghost) {
             SlotData::Real { seq_hash, block_id } => (seq_hash, block_id),
             _ => unreachable!("remove_node_at called on a non-Real slot"),
@@ -510,7 +530,9 @@ impl LineageBackend {
         self.leaves.on_node_removed(idx);
 
         match removal {
-            Removal::Keep if self.slots[idx as usize].is_leaf() => self.unplace(idx),
+            Removal::Keep if self.slots[idx as usize].is_leaf() => {
+                self.unplace::<PRESERVE_AGE>(idx)
+            }
             Removal::Keep => {}
             Removal::Evict => self.remove_slot(idx),
         }
@@ -761,6 +783,13 @@ impl InactiveIndex for LineageBackend {
 
     fn find_match(&mut self, hash: SequenceHash, _touch: bool) -> Option<(SequenceHash, BlockId)> {
         self.remove_by_hash(&hash, Removal::Keep)
+    }
+
+    fn find_match_preserving_ancestor_age(
+        &mut self,
+        hash: SequenceHash,
+    ) -> Option<(SequenceHash, BlockId)> {
+        self.remove_by_hash_with_age::<true>(&hash, Removal::Keep)
     }
 
     fn scan_matches(

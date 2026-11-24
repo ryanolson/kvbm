@@ -80,6 +80,240 @@ fn inactive_chain(
 }
 
 #[test]
+fn prepared_pin_rejects_relocated_ancestor_before_promotion() {
+    let manager = valued_manager(3);
+    let (sources, candidate) = inactive_chain(&manager, &[101, 102]);
+    let (root, old_root_id) = sources[0];
+    let leaf = candidate.seq_hash;
+    let prepared = manager.preflight_inactive_lineage(candidate).unwrap();
+
+    // Validate before moving the root. The split pin only sees logical hashes.
+    let split_check = manager.preflight_inactive_lineage(candidate).unwrap();
+    assert_eq!(split_check.into_parts().1, sources);
+    let tokens = TokenBlockSequence::from_slice(&[101, 102], 1, Some(TEST_SALT));
+    let replacement = manager
+        .allocate_blocks(1)
+        .unwrap()
+        .pop()
+        .unwrap()
+        .complete(&tokens.blocks()[0])
+        .unwrap();
+    let mut root_pin = manager.scan_matches(&[root], false);
+    let original = root_pin.remove(&root).unwrap();
+    manager.release_blocks(vec![original], Some(true));
+    let replacement = manager.register_block(replacement);
+    let new_root_id = replacement.block_id();
+    assert_ne!(new_root_id, old_root_id);
+    drop(replacement);
+
+    let current = manager
+        .preflight_inactive_lineage(candidate)
+        .expect("the same leaf tenure still names a complete lineage");
+    assert_eq!(current.source_hashes(), prepared.source_hashes());
+    let before = manager.store_for_test().debug_snapshot();
+    let tenure_before = manager
+        .store_for_test()
+        .slot_inactive_epoch_for_test(candidate.block_id);
+    let pin = manager.pin_prepared_inactive_lineage(&prepared, &[root, leaf]);
+    assert!(
+        pin.is_none(),
+        "a prepared pin must reject after the ancestor moves to another slot"
+    );
+    assert_eq!(manager.store_for_test().debug_snapshot(), before);
+    assert_eq!(
+        manager
+            .store_for_test()
+            .slot_inactive_epoch_for_test(candidate.block_id),
+        tenure_before,
+        "reject before promoting even a block that could return to the same slot"
+    );
+
+    let split_pins = manager.scan_matches(&[root, leaf], false);
+    assert_eq!(split_pins[&root].block_id(), new_root_id);
+    assert_eq!(split_pins[&leaf].block_id(), candidate.block_id);
+}
+
+#[rstest]
+#[case::tick(Some(LineageEviction::Tick), true)]
+#[case::valued(None, true)]
+#[case::fifo(Some(LineageEviction::Fifo), true)]
+#[case::ordinary_valued(None, false)]
+fn pin_last_child_exposes_root_in_policy_order(
+    #[case] policy: Option<LineageEviction>,
+    #[case] prepared_pin: bool,
+) {
+    let manager = create_test_manager_with_backend(3, |builder| {
+        let builder = builder.block_size(1);
+        match policy {
+            Some(policy) => builder.with_lineage_backend_eviction(policy),
+            None => builder.with_valued_lineage_backend(ScorerParams::default()),
+        }
+    });
+    let (sources, candidate) = inactive_chain(&manager, &[103, 104]);
+    let (root, root_id) = sources[0];
+    let sibling = register_divergent(&manager, &[105], 0);
+    let sibling_hash = sibling.sequence_hash();
+    drop(sibling);
+
+    let epoch = manager
+        .store_for_test()
+        .slot_inactive_epoch_for_test(root_id);
+    let before = manager.inactive_advice(&[root, sibling_hash]);
+    assert!(!before[0].unwrap().is_leaf);
+    let pin = if prepared_pin {
+        let prepared = manager.preflight_inactive_lineage(candidate).unwrap();
+        manager
+            .pin_prepared_inactive_lineage(&prepared, &[candidate.seq_hash])
+            .unwrap()
+            .pop()
+            .unwrap()
+    } else {
+        manager
+            .scan_matches(&[candidate.seq_hash], false)
+            .remove(&candidate.seq_hash)
+            .unwrap()
+    };
+
+    assert_eq!(pin.block_id(), candidate.block_id);
+    assert_eq!(manager.inactive_len(), 2);
+    assert_eq!(
+        manager
+            .store_for_test()
+            .slot_inactive_epoch_for_test(root_id),
+        epoch
+    );
+    let after = manager.inactive_advice(&[root, sibling_hash]);
+    assert!(after[0].unwrap().is_leaf);
+    let ages = |advice: &[Option<InactiveFeatures>]| {
+        (advice[0].unwrap().age_ticks, advice[1].unwrap().age_ticks)
+    };
+    let (root_age, sibling_age) = ages(&after);
+    if policy == Some(LineageEviction::Fifo) {
+        assert_eq!((root_age, sibling_age), (None, None));
+        let candidates: Vec<_> = manager
+            .inactive_candidates(2)
+            .into_iter()
+            .map(|entry| entry.seq_hash)
+            .collect();
+        assert_eq!(candidates, [sibling_hash, root]);
+    } else {
+        let (old_root_age, old_sibling_age) = ages(&before);
+        assert!(old_root_age.unwrap() > old_sibling_age.unwrap());
+        if prepared_pin {
+            assert_eq!((root_age, sibling_age), (old_root_age, old_sibling_age));
+        } else {
+            assert!(
+                root_age.unwrap() < sibling_age.unwrap(),
+                "ordinary promotion restamps the root"
+            );
+        }
+    }
+}
+
+#[test]
+fn prepared_pin_checks_selection_and_returns_pins_in_order() {
+    let manager = valued_manager(3);
+    let (sources, candidate) = inactive_chain(&manager, &[106, 107]);
+    let root = sources[0].0;
+    let leaf = candidate.seq_hash;
+    let outside = register_divergent(&manager, &[108], 0);
+    let outside_hash = outside.sequence_hash();
+    drop(outside);
+    let prepared = manager.preflight_inactive_lineage(candidate).unwrap();
+    let before = manager.store_for_test().debug_snapshot();
+    let advice = manager.inactive_advice(&[root, leaf, outside_hash]);
+
+    for selected in [[root, root], [root, outside_hash]] {
+        assert!(
+            manager
+                .pin_prepared_inactive_lineage(&prepared, &selected)
+                .is_none()
+        );
+        assert_eq!(manager.store_for_test().debug_snapshot(), before);
+        assert_eq!(manager.inactive_advice(&[root, leaf, outside_hash]), advice);
+    }
+    assert!(
+        manager
+            .pin_prepared_inactive_lineage(&prepared, &[])
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(manager.store_for_test().debug_snapshot(), before);
+
+    let pins = manager
+        .pin_prepared_inactive_lineage(&prepared, &[leaf, root])
+        .unwrap();
+    let pinned: Vec<_> = pins
+        .iter()
+        .map(|pin| (pin.sequence_hash(), pin.block_id()))
+        .collect();
+    assert_eq!(pinned, [sources[1], sources[0]]);
+}
+
+#[test]
+fn prepared_pin_rejects_wrong_manager_even_when_the_proof_would_match() {
+    let first = valued_manager(2);
+    let second = valued_manager(2);
+    let (sources, candidate) = inactive_chain(&first, &[109, 110]);
+    let (other_sources, other_candidate) = inactive_chain(&second, &[109, 110]);
+    assert_eq!(sources, other_sources);
+    assert_eq!(candidate, other_candidate);
+    let prepared = first.preflight_inactive_lineage(candidate).unwrap();
+    let before = second.store_for_test().debug_snapshot();
+
+    assert!(
+        second
+            .pin_prepared_inactive_lineage(&prepared, &[candidate.seq_hash])
+            .is_none()
+    );
+    assert_eq!(second.store_for_test().debug_snapshot(), before);
+}
+
+#[test]
+fn prepared_pin_rejects_held_missing_and_renewed_lineages() {
+    let manager = valued_manager(2);
+    let (sources, candidate) = inactive_chain(&manager, &[111, 112]);
+    let root = sources[0].0;
+    let leaf = candidate.seq_hash;
+    let prepared = manager.preflight_inactive_lineage(candidate).unwrap();
+    let hold = manager.try_hold_inactive_lineage(candidate).unwrap();
+    let held = manager.store_for_test().debug_snapshot();
+    assert!(
+        manager
+            .pin_prepared_inactive_lineage(&prepared, &[leaf])
+            .is_none()
+    );
+    assert_eq!(manager.store_for_test().debug_snapshot(), held);
+    drop(hold);
+
+    let pins = manager
+        .pin_prepared_inactive_lineage(&prepared, &[leaf])
+        .unwrap();
+    drop(pins);
+    let renewed = manager.preflight_inactive_lineage_by_hash(leaf).unwrap();
+    assert_eq!(renewed.candidate().block_id, candidate.block_id);
+    assert_eq!(renewed.candidate().generation, candidate.generation);
+    assert_ne!(renewed.candidate().inactive_epoch, candidate.inactive_epoch);
+    let before = manager.store_for_test().debug_snapshot();
+    assert!(
+        manager
+            .pin_prepared_inactive_lineage(&prepared, &[leaf])
+            .is_none()
+    );
+    assert_eq!(manager.store_for_test().debug_snapshot(), before);
+
+    let original = manager.scan_matches(&[root], false).remove(&root).unwrap();
+    manager.release_blocks(vec![original], Some(true));
+    let missing = manager.store_for_test().debug_snapshot();
+    assert!(
+        manager
+            .pin_prepared_inactive_lineage(&renewed, &[leaf])
+            .is_none()
+    );
+    assert_eq!(manager.store_for_test().debug_snapshot(), missing);
+}
+
+#[test]
 fn exact_candidate_holds_the_complete_lineage_exclusively() {
     let manager = valued_manager(8);
     let (expected, candidate) = inactive_chain(&manager, &[1, 2, 3]);

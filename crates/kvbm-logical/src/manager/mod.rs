@@ -753,10 +753,10 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
             })
     }
 
-    /// Name the current complete inactive lineage for one later exact hold.
+    /// Name the current complete inactive lineage for a later exact hold or pin.
     ///
     /// This read-only preflight stores the manager identity, candidate tenure,
-    /// and complete root-to-leaf source set. A later prepared hold must still
+    /// and complete root-to-leaf source set. A later hold or pin must still
     /// find that exact set under the store lock.
     pub fn preflight_inactive_lineage(
         &self,
@@ -799,6 +799,31 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
             .map(|store_hold| {
                 InactiveLineageHold::new(self.id(), store_hold, self.eviction_notifier.clone())
             })
+    }
+
+    /// Pin selected blocks of a prepared inactive lineage in selection order.
+    ///
+    /// One store lock covers validation and promotion. Returns `None` without
+    /// changing the pool if the proof came from another manager, its leaf
+    /// tenure or ordered source slots changed, any source is missing or held,
+    /// or a selected hash is repeated or outside the lineage. An empty
+    /// selection still validates the proof and returns an empty vector.
+    ///
+    /// Only selected blocks are promoted, without recording a touch. Unselected
+    /// blocks stay in the same inactive tenure. Tick and Valued keep their
+    /// tracked age when an ancestor becomes a leaf. FIFO tracks leaf insertion
+    /// order and appends any newly exposed ancestor.
+    pub fn pin_prepared_inactive_lineage(
+        &self,
+        prepared: &InactiveLineagePreflight<T>,
+        selected: &[SequenceHash],
+    ) -> Option<Vec<ImmutableBlock<T>>> {
+        self.store.pin_prepared_inactive_lineage(
+            prepared.manager_id(),
+            prepared.candidate(),
+            prepared.source_blocks(),
+            selected,
+        )
     }
 
     /// Membership-based point advice, positionally aligned with `hashes`.
