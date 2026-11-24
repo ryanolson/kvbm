@@ -4,9 +4,67 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::thread;
 
+use dynamo_tokens::TokenBlockSequence;
+use kvbm_logical::manager::BlockManagerConfigBuilder;
 use kvbm_logical::testing::{
     count_store_lock_acquisitions, create_iota_token_block, create_test_manager,
+    create_test_manager_with_backend,
 };
+use kvbm_logical::{BlockManager, InactiveLineagePreflight};
+
+fn prepared_lineage() -> (BlockManager<()>, InactiveLineagePreflight<()>) {
+    let manager =
+        create_test_manager_with_backend(2, BlockManagerConfigBuilder::with_lineage_backend);
+    let sequence = TokenBlockSequence::from_slice(&[1, 2, 3, 4, 5, 6, 7, 8], 4, None);
+    let pins = manager
+        .allocate_blocks_from_reset(2)
+        .unwrap()
+        .into_iter()
+        .zip(sequence.blocks())
+        .map(|(slot, block)| manager.register_block(slot.complete(block).unwrap()))
+        .collect::<Vec<_>>();
+    let leaf = pins.last().unwrap().sequence_hash();
+    drop(pins);
+    let prepared = manager.preflight_inactive_lineage_by_hash(leaf).unwrap();
+    assert_eq!(prepared.block_count(), 2);
+    (manager, prepared)
+}
+
+#[test]
+fn prepared_pin_counts_one_lock_for_multiple_blocks() {
+    let (manager, prepared) = prepared_lineage();
+    let selected = prepared.source_hashes();
+
+    // Keep the pins alive past the count so it measures the call alone.
+    let (pins, count) = count_store_lock_acquisitions(|_| {
+        manager.pin_prepared_inactive_lineage(&prepared, &selected)
+    });
+
+    assert_eq!(pins.unwrap().len(), selected.len());
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn prepared_pin_rejection_counts_one_lock() {
+    let (manager, prepared) = prepared_lineage();
+    let selected = prepared.source_hashes();
+    let (other_manager, _) = prepared_lineage();
+    let (wrong_manager, count) = count_store_lock_acquisitions(|_| {
+        other_manager.pin_prepared_inactive_lineage(&prepared, &selected)
+    });
+    assert!(wrong_manager.is_none());
+    assert_eq!(count, 1);
+
+    let pins = manager
+        .pin_prepared_inactive_lineage(&prepared, &selected)
+        .unwrap();
+    let (stale, count) = count_store_lock_acquisitions(|_| {
+        manager.pin_prepared_inactive_lineage(&prepared, &selected)
+    });
+    assert!(stale.is_none());
+    assert_eq!(count, 1);
+    drop(pins);
+}
 
 #[test]
 fn armed_mutable_drop_counts() {
