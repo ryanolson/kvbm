@@ -117,6 +117,31 @@ fn loop_resource_distinct_registries_look_up_equal_hashes_independently() {
         block_b.pin().manager_id(),
         "equal hashes live in different physical resources"
     );
+    assert_eq!(registry_a.registered_count(), 1);
+    assert_eq!(registry_b.registered_count(), 1);
+
+    // Control: each registry owns only its own hashes. Sharing one
+    // BlockRegistry across the two managers makes both cross-presence checks
+    // and both counts fail, even though manager routing still works.
+    let unique_a = register_token(&manager_a, &create_iota_token_block(500, 4));
+    let unique_b = register_token(&manager_b, &create_iota_token_block(600, 4));
+    let hash_a_only = unique_a.sequence_hash();
+    let hash_b_only = unique_b.sequence_hash();
+    assert_ne!(hash_a_only, hash);
+    assert_ne!(hash_b_only, hash);
+    assert_ne!(hash_a_only, hash_b_only);
+    assert!(registry_a.is_registered(hash_a_only));
+    assert!(
+        !registry_a.is_registered(hash_b_only),
+        "resource one must not see resource two's registry"
+    );
+    assert!(registry_b.is_registered(hash_b_only));
+    assert!(
+        !registry_b.is_registered(hash_a_only),
+        "resource two must not see resource one's registry"
+    );
+    assert_eq!(registry_a.registered_count(), 2);
+    assert_eq!(registry_b.registered_count(), 2);
 
     let hit_a = resources
         .get(LogicalResourceId(1))
@@ -130,15 +155,18 @@ fn loop_resource_distinct_registries_look_up_equal_hashes_independently() {
     assert_eq!(hit_b.len(), 1);
     assert_eq!(hit_a[0].pin().manager_id(), manager_a.id());
     assert_eq!(hit_b[0].pin().manager_id(), manager_b.id());
-    assert_eq!(registry_a.registered_count(), 1);
-    assert_eq!(registry_b.registered_count(), 1);
 
     // Releasing resource one does not remove resource two's primary or its
-    // registry entry.
+    // registry entry, and the registries still see only their own unique
+    // hashes.
     drop(hit_a);
     drop(block_a);
     assert!(registry_a.is_registered(hash));
     assert!(registry_b.is_registered(hash));
+    assert!(!registry_a.is_registered(hash_b_only));
+    assert!(!registry_b.is_registered(hash_a_only));
+    assert_eq!(registry_a.registered_count(), 2);
+    assert_eq!(registry_b.registered_count(), 2);
     let still_b = manager_b.match_blocks(&[hash]);
     assert_eq!(still_b.len(), 1);
     assert_eq!(still_b[0].pin().manager_id(), manager_b.id());

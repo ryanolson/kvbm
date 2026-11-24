@@ -192,8 +192,11 @@ through that resource. A positional lineage hash names tokens, position, and
 ancestry, not a loop pass or stream. Within one resource the store keeps one
 primary per hash: `Reject` returns the existing primary and discards the new
 payload, and `Allow` keeps a duplicate that a hash lookup cannot reach. The
-untiered event stream carries no resource, so publish only the model's primary
-resource.
+untiered event stream carries no resource. Rhino publishes only the primary
+resource's registry; the KVBM vLLM connector still attaches one `EventsManager`
+to every resource registry, so equal hashes in two resources can publish a
+duplicate Create or a premature Remove. Until that connector is fixed, keep
+equal hashes off its live event stream.
 
 Test two payloads with the same hash in one resource, then the same hash in two
 resources with distinct registries. The first must return the existing primary;
