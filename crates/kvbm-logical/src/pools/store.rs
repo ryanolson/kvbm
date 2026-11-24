@@ -42,6 +42,12 @@ use parking_lot::Mutex;
 #[cfg(test)]
 use tracing_mutex::parkinglot::Mutex;
 
+// Keep direct mutex calls in builds without the counter.
+#[cfg(not(feature = "store-lock-counter"))]
+use self::Mutex as StoreMutex;
+#[cfg(feature = "store-lock-counter")]
+use self::mutex::StoreMutex;
+
 use crate::BlockId;
 use crate::blocks::{
     BlockDuplicationPolicy, BlockMetadata, CompleteBlock, ImmutableBlock, ImmutableBlockInner,
@@ -59,12 +65,16 @@ use super::{ExactInactiveVictim, IdBuildHasher, SeqHashMap};
 mod exact_inactive;
 mod exact_reclaim;
 mod inactive_lineage_hold;
+#[cfg(feature = "store-lock-counter")]
+mod mutex;
 mod rebind;
 #[cfg(test)]
 mod rebind_proptest;
 
 pub(crate) use exact_reclaim::ExactReclaimPlanError;
 pub(crate) use inactive_lineage_hold::StoreInactiveLineageHold;
+#[cfg(feature = "store-lock-counter")]
+pub use mutex::{StoreLockCount, count_store_lock_acquisitions};
 pub use rebind::{RebindOutcome, RebindPlan, RebindPrepareError};
 
 #[cfg(test)]
@@ -604,7 +614,7 @@ pub(crate) struct BlockStore<T: BlockMetadata> {
     /// `LifecyclePin::manager_id` so type-erased pins remain
     /// runtime-addressable to a unique physical pool.
     id: crate::ManagerId,
-    inner: Mutex<BlockStoreInner<T>>,
+    inner: StoreMutex<BlockStoreInner<T>>,
     block_size: usize,
     total_blocks: usize,
     metrics: Arc<BlockPoolMetrics>,
@@ -745,7 +755,7 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         };
         Arc::new(Self {
             id: crate::ManagerId::next(),
-            inner: Mutex::new(inner),
+            inner: StoreMutex::new(inner),
             block_size,
             total_blocks: maximum_blocks,
             metrics,

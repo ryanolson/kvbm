@@ -36,6 +36,7 @@ xxhash-rust = { workspace = true }
 
 [features]
 testing = []
+store-lock-counter = ["testing"]
 
 [dev-dependencies]
 # Test-only edge. The tier-placement wire types live in `kvbm-protocols`
@@ -60,6 +61,10 @@ tokio = { workspace = true, features = ["full"] }
 # unacceptable on production hot paths.
 tracing-mutex = { version = "0.3", features = ["parking_lot"] }
 tracing-subscriber = { workspace = true }
+
+[[test]]
+name = "store_lock_acquisitions"
+required-features = ["store-lock-counter"]
 
 # Criterion benchmark for the match_blocks / acquire hot path. Needs the
 # `testing` feature for src/testing/ helpers (create_test_manager, etc.).

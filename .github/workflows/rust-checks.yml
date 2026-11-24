@@ -119,6 +119,23 @@ jobs:
         working-directory: ${{ matrix.workdir }}
         run: cargo metadata --locked --format-version 1 > /dev/null
 
+      - name: Keep the store lock counter out of the wheel
+        if: matrix.workdir == '.'
+        working-directory: ${{ matrix.workdir }}
+        run: |
+          logical_features=$(cargo tree --locked -e features --edges normal -i kvbm-logical)
+          if grep -Fq 'kvbm-logical feature "store-lock-counter"' <<< "$logical_features"; then
+            echo 'The wheel enables the store-lock-counter test feature.'
+            exit 1
+          fi
+
+      - name: Test and lint the store lock counter
+        if: matrix.workdir == 'crates'
+        working-directory: ${{ matrix.workdir }}
+        run: |
+          timeout 300 cargo test --locked -j2 -p kvbm-logical --features store-lock-counter --test store_lock_acquisitions
+          timeout 600 cargo clippy --locked -j2 -p kvbm-logical --features store-lock-counter --no-deps --all-targets -- -D warnings
+
       - name: Clippy (all targets, deny warnings)
         working-directory: ${{ matrix.workdir }}
         # Default features only. NOT --all-features: on crates/ that would turn

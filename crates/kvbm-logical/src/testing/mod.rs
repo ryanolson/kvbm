@@ -20,6 +20,9 @@ mod token_blocks;
 
 pub use metered_tracker::MeteredFrequencyTracker;
 
+#[cfg(feature = "store-lock-counter")]
+pub use crate::pools::store::{StoreLockCount, count_store_lock_acquisitions};
+
 // ============================================================================
 // Canonical test metadata types
 // ============================================================================
