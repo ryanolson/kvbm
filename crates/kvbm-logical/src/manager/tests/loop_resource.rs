@@ -170,22 +170,56 @@ fn loop_resource_distinct_registries_look_up_equal_hashes_independently() {
     assert!(!registry_b.is_registered(hash_a_only));
     assert_eq!(registry_a.registered_count(), 2);
     assert_eq!(registry_b.registered_count(), 2);
+    let still_b = manager_b.match_blocks(&[hash]);
+    assert_eq!(still_b.len(), 1);
+    assert_eq!(still_b[0].pin().manager_id(), manager_b.id());
+}
 
-    // Evict resource one's inactive blocks. Its own entries go; resource two's
-    // entries stay and still resolve. A shared registry would still hold
-    // resource two's entries here, so this probe fails on a shared boundary.
-    drop(unique_a);
+#[test]
+fn loop_resource_eviction_removes_only_the_evicted_resource_entry() {
+    let registry_a = BlockRegistry::new();
+    let registry_b = BlockRegistry::new();
+    let manager_a = manager_with_registry(registry_a.clone(), 1);
+    let manager_b = manager_with_registry(registry_b.clone(), 1);
+    let mut resources = BlockManagerSet::new();
+    resources
+        .insert(LogicalResourceId(1), Arc::clone(&manager_a))
+        .expect("resource one");
+    resources
+        .insert(LogicalResourceId(2), Arc::clone(&manager_b))
+        .expect("resource two");
+
+    let token = create_iota_token_block(800, 4);
+    let hash = token.kvbm_sequence_hash();
+    let block_a = register_token(&manager_a, &token);
+    let block_b = manager_b.register_block(stage_under_hash(&manager_b, hash));
+    assert_eq!(block_a.sequence_hash(), hash);
+    assert_eq!(block_b.sequence_hash(), hash);
+
+    // Release alone leaves resource one's own entry in place: the inactive
+    // slot still owns the registration.
+    drop(block_a);
+    assert!(
+        registry_a.is_registered(hash),
+        "the inactive slot keeps resource one's own entry"
+    );
+    assert!(registry_b.is_registered(hash));
+
+    // Eviction removes resource one's own entry and nothing from resource two.
+    // A shared registry still holds resource two's entry here, so this probe
+    // fails when the registry boundary is removed.
     manager_a
         .reset_inactive_pool()
         .expect("resource one has no live blocks");
     assert!(!registry_a.is_registered(hash));
-    assert!(!registry_a.is_registered(hash_a_only));
     assert_eq!(registry_a.registered_count(), 0);
     assert!(registry_b.is_registered(hash));
-    assert!(registry_b.is_registered(hash_b_only));
-    assert_eq!(registry_b.registered_count(), 2);
+    assert_eq!(registry_b.registered_count(), 1);
     assert!(manager_a.match_blocks(&[hash]).is_empty());
-    let still_b = manager_b.match_blocks(&[hash]);
+    let still_b = resources
+        .get(LogicalResourceId(2))
+        .expect("resource two")
+        .match_blocks(&[hash]);
     assert_eq!(still_b.len(), 1);
     assert_eq!(still_b[0].pin().manager_id(), manager_b.id());
 }
