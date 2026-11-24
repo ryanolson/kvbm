@@ -36,7 +36,38 @@ G2 `BlockManager` exposes the aggregate capacity, so TP=2 has twice the deduplic
 lower-tier capacity of one worker. G1 allocation must assign the same logical
 destination block IDs on every replica.
 
+### Resource scope of a lineage hash
+
+`SequenceHash` names token content, absolute position, and prefix lineage. It
+does not name a loop pass, a stream, or a model layout. Two payloads at the same
+positions with the same tokens and salt therefore produce the same hash, even
+when they belong to different attention groups.
+
+The base contract is:
+
+- **One resource, one primary.** A `BlockManager` keeps one primary block per
+  `SequenceHash` in `active_by_hash`. With `BlockDuplicationPolicy::Reject`, the
+  second registration returns the existing primary and sends the new slot back
+  to the reset pool. With `Allow`, the second slot is a duplicate, but a hash
+  lookup still returns the primary; the duplicate is not addressable by hash.
+  A second payload at the same positions must not be registered in the first
+  resource's manager.
+- **One registry and manager per resource.** The connector and Rhino build a
+  distinct `BlockRegistry` and `BlockManager` for each `LogicalResourceId`.
+  The logical identity is `(LogicalResourceId, SequenceHash)`. A lookup asks the
+  resource's manager; equal hashes in two resources stay independent.
+- **The untiered event stream has no resource field.** A hash-only consumer
+  cannot tell two resources' equal hashes apart. Only the model's primary
+  resource publishes on that stream; a second resource publishes nothing there.
+  The event shape is unchanged.
+
+Legacy base lookup is unchanged: `BlockManager::match_blocks` preserves the
+positional lineage and resolves a hash from that manager's active or inactive
+pool. The fixture is
+`crates/kvbm-logical/src/manager/tests/loop_resource.rs`.
+
 ## Transfer bookkeeping
+
 
 Offload takes paired `(replicated G1 ID, global G2 ID)` values. Each rank keeps
 only pairs whose G2 owner is that rank, translates the global G2 ID to its local
