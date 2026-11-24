@@ -1,12 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared test fixtures for logical module tests.
+//! Shared test fixtures for the logical crate.
 //!
-//! This module consolidates duplicated test helpers across registry, pools, and manager tests.
-//! It uses internal types like `Block<T, Staged>` so it must be behind `#[cfg(test)]`.
-//!
-//! Note: the testing module uses only the public API and remains separate.
+//! Enable the `testing` feature to use the public fixtures and measure
+//! block-store mutex acquisitions in integration tests.
 
 pub mod config;
 
@@ -19,6 +17,9 @@ mod sequences;
 mod token_blocks;
 
 pub use metered_tracker::MeteredFrequencyTracker;
+
+#[cfg(feature = "testing")]
+pub use crate::pools::store::count_store_lock_acquisitions;
 
 // ============================================================================
 // Canonical test metadata types
