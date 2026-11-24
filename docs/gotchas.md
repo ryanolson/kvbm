@@ -173,3 +173,14 @@ first and cache it as disabled because that thread lacks the capture.
 Run the log assertion in the full parallel suite. It checks the worker
 label even if another test logs a pause first.
 [Pause worker test](../crates/kvbm-engine/src/tiering/engine/local/tests/onboard_pause.rs)
+
+## Check the prepared lineage under the lock that pins it
+
+Check the manager, leaf tenure, and ordered physical source slots before
+promoting any selected block. An ancestor can move to a new slot between a
+separate check and pin while the leaf and every logical hash stay the same.
+
+Test by preparing a root and child, releasing the root with reset, and
+registering the root in another slot. Check that a hash-only pin accepts the
+replacement and that the prepared pin rejects before changing any tenure.
+[Relocation test](../crates/kvbm-logical/src/manager/tests/inactive_lineage_hold.rs)

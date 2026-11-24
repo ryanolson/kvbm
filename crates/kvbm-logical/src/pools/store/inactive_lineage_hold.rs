@@ -1,14 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Exclusive store ownership for an inactive lineage pressure action.
+//! Proofs, holds, and pins for inactive lineages.
 
 use std::sync::Arc;
 
-use crate::blocks::BlockMetadata;
-use crate::pools::InactiveCandidate;
+use crate::blocks::{BlockMetadata, ImmutableBlock};
+use crate::pools::{InactiveCandidate, SeqHashMap};
 use crate::registry::BlockRegistrationHandle;
-use crate::{BlockId, SequenceHash};
+use crate::{BlockId, ManagerId, SequenceHash};
 
 use super::{BlockSlot, BlockStore, BlockStoreInner, SlotState};
 
@@ -82,6 +82,43 @@ impl<T: BlockMetadata> BlockStore<T> {
     ) -> Option<Vec<(SequenceHash, BlockId)>> {
         let inner = self.inner.lock();
         current_inactive_lineage(&inner, candidate)
+    }
+
+    pub(crate) fn pin_prepared_inactive_lineage(
+        self: &Arc<Self>,
+        manager_id: ManagerId,
+        candidate: InactiveCandidate,
+        expected_source_blocks: &[(SequenceHash, BlockId)],
+        selected: &[SequenceHash],
+    ) -> Option<Vec<ImmutableBlock<T>>> {
+        // A pin's drop takes the store lock. Even on unwind, release the
+        // guard before dropping any pins already built.
+        let mut pins;
+        let mut inner = self.inner.lock();
+        if manager_id != self.id() {
+            return None;
+        }
+        let source_blocks = current_inactive_lineage(&inner, candidate)?;
+        if source_blocks != expected_source_blocks {
+            return None;
+        }
+
+        let mut available: SeqHashMap<_> = source_blocks.into_iter().collect();
+        if selected.iter().any(|hash| available.remove(hash).is_none()) {
+            return None;
+        }
+
+        pins = Vec::with_capacity(selected.len());
+        for &hash in selected {
+            let (seq_hash, block_id) = inner
+                .inactive
+                .find_match_preserving_ancestor_age(hash)
+                .expect("the selected hash was validated under the store lock");
+            let block = self.promote_inactive_slot_locked(&mut inner, seq_hash, block_id);
+            pins.push(ImmutableBlock::from_inner(block));
+        }
+        self.metrics.dec_inactive_pool_size_by(pins.len() as i64);
+        Some(pins)
     }
 
     pub(crate) fn try_hold_inactive_lineage(

@@ -199,8 +199,17 @@ impl ValuedPolicy {
     /// A `Real` node is now a leaf — stamp its recency and add it to the eviction order.
     /// A node poisoned while interior joins the poison set here, as it re-leafs.
     pub(crate) fn on_leaf_added(&mut self, idx: u32) {
-        self.now += 1;
-        let now = self.now;
+        self.add_leaf::<true>(idx);
+    }
+
+    pub(crate) fn on_leaf_added_preserving_age(&mut self, idx: u32) {
+        self.add_leaf::<false>(idx);
+    }
+
+    fn add_leaf<const REFRESH_AGE: bool>(&mut self, idx: u32) {
+        if REFRESH_AGE {
+            self.now += 1;
+        }
         let dense_pos = self.leaf_dense.len() as u32;
         let poisoned = {
             let state = self.slots[idx as usize]
@@ -210,7 +219,9 @@ impl ValuedPolicy {
                 state.dense_idx.is_none(),
                 "ValuedPolicy: leaf {idx} added while already in the eviction order"
             );
-            state.last_touch = now;
+            if REFRESH_AGE {
+                state.last_touch = self.now;
+            }
             state.dense_idx = Some(dense_pos);
             state.poisoned
         };

@@ -97,6 +97,19 @@ let total = manager.total_blocks();
 # }
 ```
 
+## Pin a prepared inactive lineage
+
+Use `BlockManager::preflight_inactive_lineage_by_hash` to prepare a complete
+root-to-leaf lineage. Pass the proof and the hashes you need to
+`BlockManager::pin_prepared_inactive_lineage`. It checks the proof and pins
+those blocks under one store lock. The pins arrive in the order you requested.
+If the proof is stale or the selection is invalid, the call returns `None`
+without changing the pool.
+
+Unselected ancestors stay inactive in the same tenure. If pinning exposes an
+ancestor as a leaf, Tick and Valued keep its age. FIFO tracks when blocks
+become leaves and appends the exposed ancestor to its queue.
+
 ## Prometheus Metrics
 
 All metrics carry a `pool` label identifying the storage tier.

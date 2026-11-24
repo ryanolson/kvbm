@@ -121,6 +121,15 @@ impl LeafPolicy {
         }
     }
 
+    pub(crate) fn on_leaf_added_preserving_age(&mut self, idx: u32) {
+        match self {
+            // FIFO records leaf insertion order only. It has no node age.
+            Self::Fifo(p) => p.on_leaf_added(idx),
+            Self::Tick(p) => p.on_leaf_added(idx),
+            Self::Valued(p) => p.on_leaf_added_preserving_age(idx),
+        }
+    }
+
     /// A `Real` leaf gained a child — remove it from the eviction order but
     /// keep its per-node ordering state for a possible later re-leafing.
     pub(crate) fn on_leaf_demoted(&mut self, idx: u32) {
