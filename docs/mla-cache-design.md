@@ -57,9 +57,14 @@ The base contract is:
   The logical identity is `(LogicalResourceId, SequenceHash)`. A lookup asks the
   resource's manager; equal hashes in two resources stay independent.
 - **The untiered event stream has no resource field.** A hash-only consumer
-  cannot tell two resources' equal hashes apart. Only the model's primary
-  resource publishes on that stream; a second resource publishes nothing there.
-  The event shape is unchanged.
+  cannot tell two resources' equal hashes apart. Rhino publishes only the
+  model's primary resource: `KvBlockRegistries::for_model` attaches events to
+  one registry, so a secondary resource publishes nothing there. The KVBM vLLM
+  connector currently attaches the same `EventsManager` to every resource
+  registry (`crates/kvbm-connector/src/connector/leader/construct.rs:397-398`).
+  With equal hashes in two resources it can publish a second Create and a
+  premature Remove for the same hash. Closing that gap is a connector
+  follow-up; this base proof keeps the event shape unchanged.
 
 Legacy base lookup is unchanged: `BlockManager::match_blocks` preserves the
 positional lineage and resolves a hash from that manager's active or inactive
