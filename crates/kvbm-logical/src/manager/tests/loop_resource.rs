@@ -156,17 +156,35 @@ fn loop_resource_distinct_registries_look_up_equal_hashes_independently() {
     assert_eq!(hit_a[0].pin().manager_id(), manager_a.id());
     assert_eq!(hit_b[0].pin().manager_id(), manager_b.id());
 
-    // Releasing resource one does not remove resource two's primary or its
-    // registry entry, and the registries still see only their own unique
-    // hashes.
+    // A released block stays in resource one's own registry while its slot is
+    // inactive. Resource two's entry is separate and is untouched. Eviction,
+    // not release, removes resource one's own entry.
     drop(hit_a);
     drop(block_a);
-    assert!(registry_a.is_registered(hash));
+    assert!(
+        registry_a.is_registered(hash),
+        "the inactive slot keeps resource one's own entry"
+    );
     assert!(registry_b.is_registered(hash));
     assert!(!registry_a.is_registered(hash_b_only));
     assert!(!registry_b.is_registered(hash_a_only));
     assert_eq!(registry_a.registered_count(), 2);
     assert_eq!(registry_b.registered_count(), 2);
+
+    // Evict resource one's inactive blocks. Its own entries go; resource two's
+    // entries stay and still resolve. A shared registry would still hold
+    // resource two's entries here, so this probe fails on a shared boundary.
+    drop(unique_a);
+    manager_a
+        .reset_inactive_pool()
+        .expect("resource one has no live blocks");
+    assert!(!registry_a.is_registered(hash));
+    assert!(!registry_a.is_registered(hash_a_only));
+    assert_eq!(registry_a.registered_count(), 0);
+    assert!(registry_b.is_registered(hash));
+    assert!(registry_b.is_registered(hash_b_only));
+    assert_eq!(registry_b.registered_count(), 2);
+    assert!(manager_a.match_blocks(&[hash]).is_empty());
     let still_b = manager_b.match_blocks(&[hash]);
     assert_eq!(still_b.len(), 1);
     assert_eq!(still_b[0].pin().manager_id(), manager_b.id());
