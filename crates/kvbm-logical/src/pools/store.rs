@@ -43,9 +43,9 @@ use parking_lot::Mutex;
 use tracing_mutex::parkinglot::Mutex;
 
 // Keep direct mutex calls in builds without the counter.
-#[cfg(not(feature = "testing"))]
+#[cfg(not(feature = "store-lock-counter"))]
 use self::Mutex as StoreMutex;
-#[cfg(feature = "testing")]
+#[cfg(feature = "store-lock-counter")]
 use self::mutex::StoreMutex;
 
 use crate::BlockId;
@@ -65,7 +65,7 @@ use super::{ExactInactiveVictim, IdBuildHasher, SeqHashMap};
 mod exact_inactive;
 mod exact_reclaim;
 mod inactive_lineage_hold;
-#[cfg(feature = "testing")]
+#[cfg(feature = "store-lock-counter")]
 mod mutex;
 mod rebind;
 #[cfg(test)]
@@ -73,8 +73,8 @@ mod rebind_proptest;
 
 pub(crate) use exact_reclaim::ExactReclaimPlanError;
 pub(crate) use inactive_lineage_hold::StoreInactiveLineageHold;
-#[cfg(feature = "testing")]
-pub use mutex::count_store_lock_acquisitions;
+#[cfg(feature = "store-lock-counter")]
+pub use mutex::{StoreLockCount, count_store_lock_acquisitions};
 pub use rebind::{RebindOutcome, RebindPlan, RebindPrepareError};
 
 #[cfg(test)]
