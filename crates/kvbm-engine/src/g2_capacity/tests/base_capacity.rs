@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Base page admission for a resource with more than one backing pool.
+//!
+//! The footprint half of this fixture lives next to `RaggedLayerSeparateLayout`;
+//! this half proves the page-count admission and pin lifetime.
 
 use super::*;
 
@@ -11,7 +14,7 @@ const BLOCKS: usize = 3;
 fn base_capacity_refuses_one_more_page_without_dropping_pins() {
     let manager = TestManagerBuilder::<G2>::new()
         .block_count(BLOCKS)
-        .block_size(4)
+        .block_size(8)
         .build();
     let pins = manager.allocate_blocks(BLOCKS).expect("N pages fit");
 
