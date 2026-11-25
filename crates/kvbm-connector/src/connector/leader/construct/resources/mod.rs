@@ -176,8 +176,8 @@ fn resource_tiers_from_config(
                 .required_bytes()
                 .checked_div(layout.num_blocks)
                 .ok_or_else(|| anyhow!("resource {resource:?} has zero device blocks"))?;
-            let host_block_count = host.compute_num_blocks(bytes_per_block).unwrap_or(0)
-                / resource_count;
+            let host_block_count =
+                host.compute_num_blocks(bytes_per_block).unwrap_or(0) / resource_count;
             let disk_block_count = disk
                 .and_then(|disk| disk.compute_num_blocks(bytes_per_block))
                 .map(|count| count / resource_count);
