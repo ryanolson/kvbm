@@ -37,7 +37,7 @@ pub use kvbm_kernels::TensorDataType;
 pub(crate) use layer_separate::LayerSeparateLayout;
 pub use physical::NixlMetadata;
 pub use physical::PhysicalLayout;
-pub(crate) use ragged_layer_separate::{RaggedLayerSeparateLayout, aligned_pool_bytes};
+pub(crate) use ragged_layer_separate::RaggedLayerSeparateLayout;
 pub use serialize::{
     BlockFormat, FullyContiguousDetails, LayerSeparateDetails, LayoutDescriptor, LayoutTypeDetails,
     RaggedLayerSeparateDetails,

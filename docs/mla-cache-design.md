@@ -81,14 +81,15 @@ separate:
 
 - **Configured** is `LayoutConfig::num_blocks`, the page count the model asks
   for.
-- **Reserved** is the per-pool footprint. Round each pool's bytes per page up to
-  `LayoutConfig::alignment`, then multiply by the configured page count
-  (`RaggedLayerSeparateLayout::required_allocations`). The exact tensor stride
-  can be smaller; the reservation is the storage a caller must hold.
-  `PhysicalLayoutBuilder` allocates the reserved size for every pool and
-  rejects a supplied region smaller than it. The layout still addresses the
-  exact stride inside the reservation. The proof is
-  `base_capacity_builder_allocates_aligned_two_pool_footprint`; the direct
+- **Reserved** is the accounting footprint. Round each pool's bytes per page up
+  to `LayoutConfig::alignment`, then multiply by the configured page count
+  (`RaggedLayerSeparateLayout::required_allocations`). This is accounting, not
+  acceptance: `PhysicalLayoutBuilder` accepts and allocates the exact supplied
+  region sizes, and the layout addresses the exact stride inside them. In the
+  fixture, N=3, alignment 64 and pools [16, 24] give exact regions [48, 72]
+  (120 bytes) and an aligned reservation [192, 192] (384 bytes). 264 of the 384
+  reserved bytes are unused because the stride is exact. The proof is
+  `base_capacity_builder_accepts_exact_regions_and_accounts_aligned`; the direct
   layout test `base_capacity_two_pool_footprint_includes_aligned_pools` keeps
   the same math as a unit test.
 - **Live** is the pages a `BlockManager` currently owns. Admission uses the
@@ -98,6 +99,10 @@ separate:
   (`base_capacity_two_pool_footprint_includes_aligned_pools`) and
   `crates/kvbm-engine/src/g2_capacity/tests/base_capacity.rs`
   (`base_capacity_refuses_one_more_page_without_dropping_pins`).
+
+A reconstructed `PhysicalLayout::from_descriptor` reports the actual regions in
+the descriptor, not the local aligned reservation. The fixture is
+`base_capacity_descriptor_reports_exact_regions`.
 
 The exact block footprint is the sum of every pool (`Layout::bytes_per_block`).
 `LayoutConfig` can describe only uniform dimensions, so it cannot represent

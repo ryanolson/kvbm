@@ -12,7 +12,7 @@ use super::{Buffer, KvBlockLayout, Layout, LayoutConfig, MemoryRegion};
 
 /// The reserved bytes for one pool page: round the exact per-block bytes up
 /// to `alignment` before multiplying by the live page count.
-pub(crate) fn aligned_pool_bytes(bytes: usize, alignment: usize) -> usize {
+fn aligned_pool_bytes(bytes: usize, alignment: usize) -> usize {
     let alignment = alignment.max(1);
     bytes.div_ceil(alignment).saturating_mul(alignment)
 }
@@ -24,6 +24,7 @@ pub struct RaggedLayerSeparateLayout {
     bytes_per_layer_block: Vec<usize>,
     bytes_per_block: usize,
     memory_regions: Vec<Buffer>,
+    reserved_allocations: Vec<usize>,
 }
 
 impl RaggedLayerSeparateLayout {
@@ -63,6 +64,15 @@ impl RaggedLayerSeparateLayout {
             bail!("ragged layer {layer} has zero bytes per block");
         }
 
+        let reserved_allocations = bytes_per_layer_block
+            .iter()
+            .map(|bytes| {
+                config
+                    .num_blocks
+                    .saturating_mul(aligned_pool_bytes(*bytes, config.alignment))
+            })
+            .collect();
+
         let mut bytes_per_block = 0usize;
         for (layer, (&segment_bytes, region)) in bytes_per_layer_block
             .iter()
@@ -89,7 +99,16 @@ impl RaggedLayerSeparateLayout {
             bytes_per_layer_block,
             bytes_per_block,
             memory_regions,
+            reserved_allocations,
         })
+    }
+
+    /// Reconstructed descriptors report the actual regions they carry, not the
+    /// local aligned accounting reservation.
+    pub(crate) fn with_reserved_allocations(mut self, reserved: Vec<usize>) -> Self {
+        debug_assert_eq!(reserved.len(), self.bytes_per_layer_block.len());
+        self.reserved_allocations = reserved;
+        self
     }
 }
 
@@ -146,19 +165,11 @@ impl Layout for RaggedLayerSeparateLayout {
         Ok(MemoryRegion::new(addr, segment_bytes))
     }
 
-    /// The reserved pool footprint. Round each pool's per-block bytes up to
-    /// the configured alignment before applying the page count, so the
-    /// configured pages fit even when the exact tensor stride is unaligned.
-    /// The exact stride stays in `block_region_sizes` and `memory_region`.
+    /// The reserved accounting footprint. This is larger than the exact
+    /// region sizes when a pool's per-block bytes are not aligned. The builder
+    /// still accepts the exact supplied sizes; only this reservation rounds up.
     fn required_allocations(&self) -> Vec<usize> {
-        self.bytes_per_layer_block
-            .iter()
-            .map(|bytes| {
-                self.config
-                    .num_blocks
-                    .saturating_mul(aligned_pool_bytes(*bytes, self.config.alignment))
-            })
-            .collect()
+        self.reserved_allocations.clone()
     }
 
     fn is_fully_contiguous(&self) -> bool {

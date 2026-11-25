@@ -317,12 +317,18 @@ impl PhysicalLayout {
                 Arc::new(layout)
             }
             LayoutTypeDetails::RaggedLayerSeparate(details) => {
+                let reserved_allocations = serialized
+                    .memory_descriptors
+                    .iter()
+                    .map(|descriptor| descriptor.size)
+                    .collect::<Vec<_>>();
                 let layout = RaggedLayerSeparateLayout::new(
                     serialized.layout_config.clone(),
                     remote_regions.into_iter().map(Buffer::from_arc).collect(),
                     details.bytes_per_layer_block,
                     details.kv_block_layout,
-                )?;
+                )?
+                .with_reserved_allocations(reserved_allocations);
                 Arc::new(layout)
             }
         };
