@@ -197,14 +197,16 @@ impl Layout for RaggedLayerSeparateLayout {
 #[cfg(all(test, feature = "testing-kvbm"))]
 mod tests {
     use super::*;
+    use crate::layout::PhysicalLayout;
     use crate::layout::tests::MockMemory;
+    use kvbm_memory::nixl::NixlAgent;
 
     const BLOCKS: usize = 3;
     const ALIGNMENT: usize = 64;
     const POOLS: [usize; 2] = [16, 24];
 
-    fn two_pool_layout() -> RaggedLayerSeparateLayout {
-        let config = LayoutConfig::builder()
+    fn two_pool_config() -> LayoutConfig {
+        LayoutConfig::builder()
             .num_blocks(BLOCKS)
             .num_layers(POOLS.len())
             .outer_dim(1)
@@ -213,7 +215,11 @@ mod tests {
             .alignment(ALIGNMENT)
             .dtype_width_bytes(1)
             .build()
-            .expect("two-pool layout config");
+            .expect("two-pool layout config")
+    }
+
+    fn two_pool_layout() -> RaggedLayerSeparateLayout {
+        let config = two_pool_config();
         let regions = POOLS
             .iter()
             .enumerate()
@@ -245,6 +251,45 @@ mod tests {
                 align_up(POOLS[1], ALIGNMENT) * BLOCKS,
             ],
             "the reserved footprint aligns each pool before multiplying by live pages"
+        );
+    }
+
+    #[test]
+    fn base_capacity_builder_allocates_aligned_two_pool_footprint() {
+        let agent = NixlAgent::new("base-capacity-builder").expect("test NIXL agent");
+        let layout = PhysicalLayout::builder(agent)
+            .local_only()
+            .with_config(two_pool_config())
+            .ragged_layer_separate(POOLS.to_vec())
+            .allocate_system()
+            .build()
+            .expect("two-pool ragged layout through the builder");
+
+        assert_eq!(
+            layout.layout().bytes_per_block(),
+            POOLS.iter().sum::<usize>(),
+            "the exact block bytes include both backing pools"
+        );
+        assert_eq!(
+            layout.layout().required_allocations(),
+            vec![
+                align_up(POOLS[0], ALIGNMENT) * BLOCKS,
+                align_up(POOLS[1], ALIGNMENT) * BLOCKS,
+            ],
+            "the reserved footprint aligns each pool before multiplying by live pages"
+        );
+        assert_eq!(
+            layout
+                .layout()
+                .memory_regions()
+                .iter()
+                .map(|region| region.size())
+                .collect::<Vec<_>>(),
+            vec![
+                align_up(POOLS[0], ALIGNMENT) * BLOCKS,
+                align_up(POOLS[1], ALIGNMENT) * BLOCKS,
+            ],
+            "the production builder must allocate the aligned pools"
         );
     }
 }
