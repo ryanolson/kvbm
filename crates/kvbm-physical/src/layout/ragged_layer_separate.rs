@@ -139,10 +139,18 @@ impl Layout for RaggedLayerSeparateLayout {
         Ok(MemoryRegion::new(addr, segment_bytes))
     }
 
+    /// The reserved pool footprint. Round each pool's per-block bytes up to
+    /// the configured alignment before applying the page count, so the
+    /// configured pages fit even when the exact tensor stride is unaligned.
+    /// The exact stride stays in `block_region_sizes` and `memory_region`.
     fn required_allocations(&self) -> Vec<usize> {
+        let alignment = self.config.alignment.max(1);
         self.bytes_per_layer_block
             .iter()
-            .map(|bytes| self.config.num_blocks.saturating_mul(*bytes))
+            .map(|bytes| {
+                let aligned_bytes = bytes.div_ceil(alignment).saturating_mul(alignment);
+                self.config.num_blocks.saturating_mul(aligned_bytes)
+            })
             .collect()
     }
 

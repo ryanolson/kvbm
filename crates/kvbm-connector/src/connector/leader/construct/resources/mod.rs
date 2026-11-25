@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use kvbm_common::LogicalResourceId;
+use kvbm_config::{DiskCacheConfig, HostCacheConfig};
 use kvbm_engine::worker::{ResourceTierConfig, WorkerCacheConfig};
 use kvbm_physical::layout::LayoutConfig;
 use kvbm_protocols::cache_manifest::CacheManifestId;
@@ -148,6 +149,24 @@ fn resource_tiers(
     runtime: &Arc<KvbmRuntime>,
     resources: &WorkerCacheConfig,
 ) -> Result<BTreeMap<LogicalResourceId, ResourceTierConfig>> {
+    resource_tiers_from_config(
+        resources,
+        &runtime.config().cache.host,
+        runtime.config().cache.disk.as_ref(),
+    )
+}
+
+/// Give every resource an equal share of each configured lower tier.
+///
+/// The byte estimate comes from [`LayoutConfig::required_bytes`] because the
+/// worker wire carries only the layout config. A ragged resource with backing
+/// pools of unequal bytes is not representable there; its exact footprint is
+/// in its physical layout.
+fn resource_tiers_from_config(
+    resources: &WorkerCacheConfig,
+    host: &HostCacheConfig,
+    disk: Option<&DiskCacheConfig>,
+) -> Result<BTreeMap<LogicalResourceId, ResourceTierConfig>> {
     let resource_count = resources.resources.len();
     resources
         .resources
@@ -157,18 +176,9 @@ fn resource_tiers(
                 .required_bytes()
                 .checked_div(layout.num_blocks)
                 .ok_or_else(|| anyhow!("resource {resource:?} has zero device blocks"))?;
-            let host_block_count = runtime
-                .config()
-                .cache
-                .host
-                .compute_num_blocks(bytes_per_block)
-                .unwrap_or(0)
+            let host_block_count = host.compute_num_blocks(bytes_per_block).unwrap_or(0)
                 / resource_count;
-            let disk_block_count = runtime
-                .config()
-                .cache
-                .disk
-                .as_ref()
+            let disk_block_count = disk
                 .and_then(|disk| disk.compute_num_blocks(bytes_per_block))
                 .map(|count| count / resource_count);
             if host_block_count == 0 && disk_block_count.is_none_or(|count| count == 0) {

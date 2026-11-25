@@ -73,6 +73,38 @@ positional lineage and resolves a hash from that manager's active or inactive
 pool. The fixture is
 `crates/kvbm-logical/src/manager/tests/loop_resource.rs`.
 
+### Base page and pool accounting
+
+A block-backed resource can own more than one backing pool. The base KV latent
+and the applicable indexer pool are the first case. Three capacities must stay
+separate:
+
+- **Configured** is `LayoutConfig::num_blocks`, the page count the model asks
+  for.
+- **Reserved** is the per-pool footprint. Round each pool's bytes per page up to
+  `LayoutConfig::alignment`, then multiply by the configured page count
+  (`RaggedLayerSeparateLayout::required_allocations`). The exact tensor stride
+  can be smaller; the reservation is the storage a caller must hold.
+- **Live** is the pages a `BlockManager` currently owns. Admission uses the
+  page count, not the byte estimate: with N pages pinned, page N+1 is refused
+  and the N pins stay valid. The fixtures are
+  `crates/kvbm-physical/src/layout/ragged_layer_separate.rs`
+  (`base_capacity_two_pool_footprint_includes_aligned_pools`) and
+  `crates/kvbm-engine/src/g2_capacity/tests/base_capacity.rs`
+  (`base_capacity_refuses_one_more_page_without_dropping_pins`).
+
+The exact block footprint is the sum of every pool (`Layout::bytes_per_block`).
+`LayoutConfig` can describe only uniform dimensions, so it cannot represent
+unequal pools: its `required_bytes`/`num_blocks` is not the footprint of a
+ragged resource. The connector's `resource_tiers` still derives its lower-tier
+byte estimate from `LayoutConfig` and splits the result equally by resource
+count (`crates/kvbm-connector/src/connector/leader/construct/resources/mod.rs`).
+That equal split is why a tiny private window must not become a second managed
+resource: it would receive an equal share of host pages while its byte estimate
+would not describe its pools. The Rhino caller builds the real two-pool layout
+with `ragged_layer_separate` and its per-pool region bytes. The fixture
+`base_capacity_resource_tiers_split_is_equal` records the equal split.
+
 ## Transfer bookkeeping
 
 

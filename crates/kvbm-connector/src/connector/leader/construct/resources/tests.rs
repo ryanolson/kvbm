@@ -1,13 +1,14 @@
 use std::collections::BTreeMap;
 
 use kvbm_common::LogicalResourceId;
+use kvbm_config::HostCacheConfig;
 use kvbm_engine::worker::WorkerCacheConfig;
 use kvbm_physical::layout::LayoutConfig;
 use kvbm_protocols::cache_manifest::{
     CacheManifest, ModelIdentity, ResourceRequirement, ResourceRole,
 };
 
-use super::validate_manifest_geometry;
+use super::{resource_tiers_from_config, validate_manifest_geometry};
 
 fn layout(page_size: usize) -> LayoutConfig {
     LayoutConfig::builder()
@@ -71,4 +72,30 @@ fn manifest_geometry_rejects_native_block_size_drift() {
         .expect_err("manifest and physical native sizes must match");
 
     assert!(error.to_string().contains("manifest native block size"));
+}
+
+#[test]
+fn base_capacity_resource_tiers_split_is_equal() {
+    let resources = WorkerCacheConfig {
+        manifest: None,
+        primary: LogicalResourceId(1),
+        resources: BTreeMap::from([
+            (LogicalResourceId(1), layout(8)),
+            (LogicalResourceId(2), layout(8)),
+        ]),
+    };
+    let host = HostCacheConfig {
+        num_blocks: Some(16),
+        ..Default::default()
+    };
+
+    let tiers = resource_tiers_from_config(&resources, &host, None).expect("tier planning");
+
+    assert_eq!(tiers.len(), 2);
+    for tier in tiers.values() {
+        assert_eq!(
+            tier.host_block_count, 8,
+            "each resource receives half of the configured host pages"
+        );
+    }
 }
