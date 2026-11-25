@@ -197,9 +197,8 @@ impl Layout for RaggedLayerSeparateLayout {
 #[cfg(all(test, feature = "testing-kvbm"))]
 mod tests {
     use super::*;
-    use crate::layout::PhysicalLayout;
+    use crate::layout::builder::PhysicalLayoutBuilderDefault;
     use crate::layout::tests::MockMemory;
-    use kvbm_memory::nixl::NixlAgent;
 
     const BLOCKS: usize = 3;
     const ALIGNMENT: usize = 64;
@@ -256,9 +255,7 @@ mod tests {
 
     #[test]
     fn base_capacity_builder_allocates_aligned_two_pool_footprint() {
-        let agent = NixlAgent::new("base-capacity-builder").expect("test NIXL agent");
-        let layout = PhysicalLayout::builder(agent)
-            .local_only()
+        let layout = PhysicalLayoutBuilderDefault::new_local("base-capacity-builder")
             .with_config(two_pool_config())
             .ragged_layer_separate(POOLS.to_vec())
             .allocate_system()
