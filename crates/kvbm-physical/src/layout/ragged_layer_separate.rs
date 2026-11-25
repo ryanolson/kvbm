@@ -185,3 +185,58 @@ impl Layout for RaggedLayerSeparateLayout {
         KvBlockLayout::Unknown
     }
 }
+
+#[cfg(all(test, feature = "testing-kvbm"))]
+mod tests {
+    use super::*;
+    use crate::layout::tests::MockMemory;
+
+    const BLOCKS: usize = 3;
+    const ALIGNMENT: usize = 64;
+    const POOLS: [usize; 2] = [16, 24];
+
+    fn two_pool_layout() -> RaggedLayerSeparateLayout {
+        let config = LayoutConfig::builder()
+            .num_blocks(BLOCKS)
+            .num_layers(POOLS.len())
+            .outer_dim(1)
+            .page_size(8)
+            .inner_dim(1)
+            .alignment(ALIGNMENT)
+            .dtype_width_bytes(1)
+            .build()
+            .expect("two-pool layout config");
+        let regions = POOLS
+            .iter()
+            .enumerate()
+            .map(|(index, bytes)| {
+                Buffer::from_arc(MockMemory::new(0x1000 + index * 0x1000, BLOCKS * bytes))
+            })
+            .collect();
+        RaggedLayerSeparateLayout::new(config, regions, POOLS.to_vec(), KvBlockLayout::Unknown)
+            .expect("two-pool ragged layout")
+    }
+
+    fn align_up(bytes: usize, alignment: usize) -> usize {
+        bytes.div_ceil(alignment) * alignment
+    }
+
+    #[test]
+    fn base_capacity_two_pool_footprint_includes_aligned_pools() {
+        let layout = two_pool_layout();
+
+        assert_eq!(
+            layout.bytes_per_block(),
+            POOLS.iter().sum::<usize>(),
+            "the exact block bytes include both backing pools"
+        );
+        assert_eq!(
+            layout.required_allocations(),
+            vec![
+                align_up(POOLS[0], ALIGNMENT) * BLOCKS,
+                align_up(POOLS[1], ALIGNMENT) * BLOCKS,
+            ],
+            "the reserved footprint aligns each pool before multiplying by live pages"
+        );
+    }
+}
