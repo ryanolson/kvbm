@@ -206,6 +206,11 @@ mod tests {
     use super::*;
     use crate::layout::builder::PhysicalLayoutBuilderDefault;
     use crate::layout::tests::MockMemory;
+    use crate::layout::{
+        LayoutDescriptor, LayoutTypeDetails, NixlMetadata, PhysicalLayout,
+        RaggedLayerSeparateDetails,
+    };
+    use kvbm_memory::{MemoryRegion, StorageKind, SystemStorage, nixl::MemType};
 
     const BLOCKS: usize = 3;
     const ALIGNMENT: usize = 64;
@@ -261,11 +266,16 @@ mod tests {
     }
 
     #[test]
-    fn base_capacity_builder_allocates_aligned_two_pool_footprint() {
+    fn base_capacity_builder_accepts_exact_regions_and_accounts_aligned() {
+        let regions = vec![
+            SystemStorage::new(BLOCKS * POOLS[0]).expect("pool 0 region"),
+            SystemStorage::new(BLOCKS * POOLS[1]).expect("pool 1 region"),
+        ];
         let layout = PhysicalLayoutBuilderDefault::new_local("base-capacity-builder")
             .with_config(two_pool_config())
             .ragged_layer_separate(POOLS.to_vec())
-            .allocate_system()
+            .with_memory_regions(regions)
+            .expect("exact supplied regions are accepted")
             .build()
             .expect("two-pool ragged layout through the builder");
 
@@ -274,13 +284,68 @@ mod tests {
             POOLS.iter().sum::<usize>(),
             "the exact block bytes include both backing pools"
         );
+        let region_sizes = layout
+            .layout()
+            .memory_regions()
+            .iter()
+            .map(|region| region.size())
+            .collect::<Vec<_>>();
         assert_eq!(
-            layout.layout().required_allocations(),
+            region_sizes,
+            vec![BLOCKS * POOLS[0], BLOCKS * POOLS[1]],
+            "the builder accepts the exact supplied regions"
+        );
+        let reserved = layout.layout().required_allocations();
+        assert_eq!(
+            reserved,
             vec![
                 align_up(POOLS[0], ALIGNMENT) * BLOCKS,
                 align_up(POOLS[1], ALIGNMENT) * BLOCKS,
             ],
-            "the reserved footprint aligns each pool before multiplying by live pages"
+            "the accounting uses the aligned reservation"
+        );
+        let reserved: usize = reserved.iter().sum();
+        let exact: usize = region_sizes.iter().sum();
+        assert_eq!(reserved, 384);
+        assert_eq!(exact, 120);
+        assert_eq!(
+            reserved - exact,
+            264,
+            "264 of 384 reserved bytes are unused because the stride is exact"
+        );
+    }
+
+    #[test]
+    fn base_capacity_descriptor_reports_exact_regions() {
+        let descriptor = LayoutDescriptor {
+            version: LayoutDescriptor::CURRENT_VERSION,
+            layout_config: two_pool_config(),
+            location: StorageKind::System,
+            nixl_metadata: NixlMetadata::new("base-capacity-remote".to_string(), MemType::Dram, 0),
+            memory_descriptors: vec![
+                MemoryRegion {
+                    addr: 0x1000,
+                    size: BLOCKS * POOLS[0],
+                },
+                MemoryRegion {
+                    addr: 0x2000,
+                    size: BLOCKS * POOLS[1],
+                },
+            ],
+            layout_type_details: LayoutTypeDetails::RaggedLayerSeparate(
+                RaggedLayerSeparateDetails {
+                    bytes_per_layer_block: POOLS.to_vec(),
+                    kv_block_layout: KvBlockLayout::Unknown,
+                },
+            ),
+        };
+
+        let layout = PhysicalLayout::from_descriptor(descriptor).expect("reconstruct descriptor");
+
+        assert_eq!(
+            layout.layout().required_allocations(),
+            vec![BLOCKS * POOLS[0], BLOCKS * POOLS[1]],
+            "a descriptor reports the actual supplied regions"
         );
         assert_eq!(
             layout
@@ -289,11 +354,7 @@ mod tests {
                 .iter()
                 .map(|region| region.size())
                 .collect::<Vec<_>>(),
-            vec![
-                align_up(POOLS[0], ALIGNMENT) * BLOCKS,
-                align_up(POOLS[1], ALIGNMENT) * BLOCKS,
-            ],
-            "the production builder must allocate the aligned pools"
+            vec![BLOCKS * POOLS[0], BLOCKS * POOLS[1]]
         );
     }
 }
