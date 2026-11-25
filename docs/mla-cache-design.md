@@ -85,6 +85,12 @@ separate:
   `LayoutConfig::alignment`, then multiply by the configured page count
   (`RaggedLayerSeparateLayout::required_allocations`). The exact tensor stride
   can be smaller; the reservation is the storage a caller must hold.
+  `PhysicalLayoutBuilder` allocates the reserved size for every pool and
+  rejects a supplied region smaller than it. The layout still addresses the
+  exact stride inside the reservation. The proof is
+  `base_capacity_builder_allocates_aligned_two_pool_footprint`; the direct
+  layout test `base_capacity_two_pool_footprint_includes_aligned_pools` keeps
+  the same math as a unit test.
 - **Live** is the pages a `BlockManager` currently owns. Admission uses the
   page count, not the byte estimate: with N pages pinned, page N+1 is refused
   and the N pins stay valid. The fixtures are

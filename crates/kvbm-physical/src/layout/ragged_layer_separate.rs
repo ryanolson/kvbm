@@ -10,6 +10,13 @@ use super::serialize::{LayoutTypeDetails, RaggedLayerSeparateDetails};
 use super::view::LayoutView;
 use super::{Buffer, KvBlockLayout, Layout, LayoutConfig, MemoryRegion};
 
+/// The reserved bytes for one pool page: round the exact per-block bytes up
+/// to `alignment` before multiplying by the live page count.
+pub(crate) fn aligned_pool_bytes(bytes: usize, alignment: usize) -> usize {
+    let alignment = alignment.max(1);
+    bytes.div_ceil(alignment).saturating_mul(alignment)
+}
+
 /// A logical block assembled from independently sized contiguous segments.
 #[derive(Debug)]
 pub struct RaggedLayerSeparateLayout {
@@ -144,12 +151,12 @@ impl Layout for RaggedLayerSeparateLayout {
     /// configured pages fit even when the exact tensor stride is unaligned.
     /// The exact stride stays in `block_region_sizes` and `memory_region`.
     fn required_allocations(&self) -> Vec<usize> {
-        let alignment = self.config.alignment.max(1);
         self.bytes_per_layer_block
             .iter()
             .map(|bytes| {
-                let aligned_bytes = bytes.div_ceil(alignment).saturating_mul(alignment);
-                self.config.num_blocks.saturating_mul(aligned_bytes)
+                self.config
+                    .num_blocks
+                    .saturating_mul(aligned_pool_bytes(*bytes, self.config.alignment))
             })
             .collect()
     }

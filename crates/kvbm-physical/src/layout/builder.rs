@@ -17,7 +17,7 @@ use crate::layout::physical::PhysicalLayout;
 
 use super::{
     BlockDimension, FullyContiguousLayout, KvBlockLayout, LayerSeparateLayout, Layout,
-    LayoutConfig, MemoryDescriptor, RaggedLayerSeparateLayout,
+    LayoutConfig, MemoryDescriptor, RaggedLayerSeparateLayout, aligned_pool_bytes,
     physical::{LayoutRegistration, NixlMetadata},
 };
 use crate::layout::serialize::BlockFormat;
@@ -866,7 +866,8 @@ fn compute_allocation_sizes(config: &LayoutConfig, kind: &LayoutKind) -> Result<
         } => bytes_per_layer_block
             .iter()
             .map(|bytes| {
-                config.num_blocks.checked_mul(*bytes).ok_or_else(|| {
+                let aligned_bytes = aligned_pool_bytes(*bytes, config.alignment);
+                config.num_blocks.checked_mul(aligned_bytes).ok_or_else(|| {
                     anyhow!("allocation size overflow during ragged layout computation")
                 })
             })
