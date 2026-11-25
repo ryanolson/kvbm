@@ -92,7 +92,8 @@ enum RegistrationPolicy {
 }
 
 struct RegistrationConfig {
-    agent: NixlAgent,
+    agent: Option<NixlAgent>,
+    agent_name: String,
     policy: RegistrationPolicy,
 }
 
@@ -181,10 +182,31 @@ pub struct PhysicalLayoutBuilder<C, L, M> {
 impl PhysicalLayoutBuilder<NoConfig, NoLayout, NoMemory> {
     /// Create a new builder in its initial state.
     pub fn new(agent: NixlAgent) -> Self {
+        let agent_name = agent.name().to_string();
         Self {
             registration: RegistrationConfig {
-                agent,
+                agent: Some(agent),
+                agent_name,
                 policy: RegistrationPolicy::Required,
+            },
+            config: None,
+            layout_kind: None,
+            memory_plan: None,
+            block_layout: None,
+            _config: PhantomData,
+            _layout: PhantomData,
+            _memory: PhantomData,
+        }
+    }
+
+    /// Create a local-only builder for layout tests that run without NIXL.
+    #[cfg(all(test, feature = "testing-kvbm"))]
+    pub(crate) fn new_local(agent_name: impl Into<String>) -> Self {
+        Self {
+            registration: RegistrationConfig {
+                agent: None,
+                agent_name: agent_name.into(),
+                policy: RegistrationPolicy::LocalOnly,
             },
             config: None,
             layout_kind: None,
@@ -722,7 +744,11 @@ where
         return Ok(MemoryEntry::new(create_buffer(storage), None));
     }
 
-    match register_with_nixl(storage, &registration.agent, None) {
+    let agent = registration
+        .agent
+        .as_ref()
+        .ok_or_else(|| anyhow!("NIXL registration policy requires an agent"))?;
+    match register_with_nixl(storage, agent, None) {
         Ok(registered) => {
             let descriptor = registered.descriptor();
             let region: Buffer = create_buffer(registered);
@@ -731,7 +757,7 @@ where
         Err(RegisterError { source, .. }) => {
             bail!(
                 "failed to register memory with NIXL agent {}: {source}",
-                registration.agent.name()
+                registration.agent_name
             )
         }
     }
@@ -929,7 +955,7 @@ fn derive_layout_registration(
     registration: &RegistrationConfig,
     entries: &[MemoryEntry],
 ) -> Result<LayoutRegistration> {
-    let agent_name = registration.agent.name().to_string();
+    let agent_name = registration.agent_name.clone();
     match registration.policy {
         RegistrationPolicy::Required => {
             let descriptor = entries

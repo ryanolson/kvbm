@@ -13,6 +13,7 @@ use super::*;
 use crate::G2;
 use crate::testing::managers::TestManagerBuilder;
 
+mod base_capacity;
 mod compatibility;
 mod exact;
 mod policy_route;
