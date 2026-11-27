@@ -103,12 +103,16 @@ Use `BlockManager::preflight_inactive_lineage_by_hash` to prepare a complete
 root-to-leaf lineage. Pass the proof and the hashes you need to
 `BlockManager::pin_prepared_inactive_lineage`. It checks the proof and pins
 those blocks under one store lock. The pins arrive in the order you requested.
-If the proof is stale or the selection is invalid, the call returns `None`
-without changing the pool.
+Validation checks the manager, the leaf's inactive tenure, and the ordered
+source hashes and slots. An ancestor that returns to the same inactive slot
+with the same hash can pass the check in a new tenure. The call returns `None`
+without changing the pool if the prepared leaf now has a registered child,
+the proof is otherwise stale, or the selection is invalid.
 
-Unselected ancestors stay inactive in the same tenure. If pinning exposes an
-ancestor as a leaf, Tick and Valued keep its age. FIFO tracks when blocks
-become leaves and appends the exposed ancestor to its queue.
+During the call, unselected ancestors stay inactive in their current tenure.
+The returned pins protect only the selected blocks. If pinning exposes an
+ancestor as a leaf, Tick and Valued keep its age. FIFO appends it to the leaf
+queue.
 
 ## Prometheus Metrics
 

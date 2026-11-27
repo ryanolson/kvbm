@@ -179,6 +179,8 @@ label even if another test logs a pause first.
 Check the manager, leaf tenure, and ordered physical source slots before
 promoting any selected block. An ancestor can move to a new slot between a
 separate check and pin while the leaf and every logical hash stay the same.
+If the ancestor returns to the original slot with the same hash, the slot check
+passes even if its inactive tenure changed.
 
 Test by preparing a root and child, releasing the root with reset, and
 registering the root in another slot. Check that a hash-only pin accepts the
