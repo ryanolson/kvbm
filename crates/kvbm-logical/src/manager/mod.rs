@@ -803,16 +803,20 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
 
     /// Pin selected blocks of a prepared inactive lineage in selection order.
     ///
-    /// One store lock covers validation and promotion. Returns `None` without
-    /// changing the pool if the proof came from another manager, its leaf
-    /// tenure or ordered source slots changed, any source is missing or held,
-    /// or a selected hash is repeated or outside the lineage. An empty
-    /// selection still validates the proof and returns an empty vector.
+    /// One store lock covers validation and promotion. Validation checks the
+    /// manager, the leaf's inactive tenure, and the ordered source hashes and
+    /// slots. An ancestor can return to the same slot with the same hash in a
+    /// new inactive tenure. The proof still matches if the other checks pass.
     ///
-    /// Only selected blocks are promoted, without recording a touch. Unselected
-    /// blocks stay in the same inactive tenure. Tick and Valued keep their
-    /// tracked age when an ancestor becomes a leaf. FIFO tracks leaf insertion
-    /// order and appends any newly exposed ancestor.
+    /// Returns `None` without changing the pool if those checks fail, the prepared
+    /// leaf now has a registered child, a source is missing or held, or a selected
+    /// hash is repeated or outside the lineage.
+    /// An empty selection still validates the proof and returns an empty vector.
+    ///
+    /// The call promotes only selected blocks and records no touch. It leaves
+    /// unselected ancestors in their current inactive tenure during the call.
+    /// The returned pins protect only the selected blocks. Tick and Valued keep
+    /// an exposed ancestor's age. FIFO appends it to the leaf queue.
     pub fn pin_prepared_inactive_lineage(
         &self,
         prepared: &InactiveLineagePreflight<T>,
